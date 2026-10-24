@@ -2,7 +2,7 @@
 
 **Open-Source Hybrid Music Production, AI Track Restoration, Vocal Surgery, Music Theory & REAPER 7.82 Mastering Suite**
 
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-2021%20Edition-orange.svg)](Cargo.toml)
 [![REAPER](https://img.shields.io/badge/REAPER-7.82%2B%20Native%20JSFX%20%26%20RPP-green.svg)](reaper-jsfx/)
 
@@ -100,4 +100,4 @@ cargo run --bin forge -- master --input mix.wav --output master_24bit.wav --targ
 
 ## License
 
-Dual-licensed under **MIT** or **Apache-2.0** at your option.
+Licensed under the **Apache License, Version 2.0** ([`LICENSE`](LICENSE)).

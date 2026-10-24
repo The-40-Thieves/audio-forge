@@ -14,9 +14,9 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
-authors = ["ForgeAudio Contributors"]
-repository = "https://github.com/suavecito/audio-forge"
+license = "Apache-2.0"
+authors = ["The 40 Thieves"]
+repository = "https://github.com/The-40-Thieves/audio-forge"
 description = "Open-source studio DSP, stem/vocal/MIDI surgery, music theory, and REAPER 7.82 production engine"
 
 [workspace.dependencies]

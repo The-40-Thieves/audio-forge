@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Ephemeral PyTorch/ONNX GPU worker for ForgeAudio (Mel-Band-RoFormer, BS-RoFormer De-Reverb, Apollo, Seed-VC, SheetSage2, Basic Pitch, ACE-Step 1.5, YuE2-3B)"
 readme = "../README.md"
 requires-python = ">=3.10"
-license = { text = "MIT OR Apache-2.0" }
+license = { text = "Apache-2.0" }
 dependencies = [
     "audio-separator[gpu]>=0.28.0",
     "basic-pitch>=0.4.0",
