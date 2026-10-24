@@ -1,0 +1,58 @@
+desc:ForgeAudio - Surgical Vocal Strip (De-Plosive, De-Breath, De-Ess & Airwindows Console)
+//tags: vocal de-esser de-plosive de-breath saturation
+//author: ForgeAudio (MIT / Apache-2.0)
+
+slider1:1<0,1,1{Off,On}>Dynamic Plosive Suppressor (<110 Hz)
+slider2:-12.0<-24.0,0.0,0.5>De-Breath Attenuation (dB)
+slider3:6.0<0.0,15.0,0.5>Split-Band Sibilance De-Esser (dB)
+slider4:0.20<0.0,1.0,0.01>Airwindows Console8 Pure-Sine Warmth
+
+@init
+srate_safe = max(srate, 44100);
+lo_l = 0; lo_r = 0;
+hi_l = 0; hi_r = 0;
+env_lo = 0; env_mid = 0; env_sib = 0;
+
+@slider
+alpha_plosive = 1.0 - exp(-2.0 * $pi * 110.0 / srate_safe);
+alpha_sib = 1.0 - exp(-2.0 * $pi * 6200.0 / srate_safe);
+deess_min_g = 10 ^ (-slider3 / 20);
+drive = slider4;
+
+@sample
+// 1. Split low band (<110 Hz) for plosive detection
+lo_l += alpha_plosive * (spl0 - lo_l);
+lo_r += alpha_plosive * (spl1 - lo_r);
+mid_l = spl0 - lo_l;
+mid_r = spl1 - lo_r;
+
+env_lo = 0.992 * env_lo + 0.008 * max(abs(lo_l), abs(lo_r));
+env_mid = 0.992 * env_mid + 0.008 * max(abs(mid_l), abs(mid_r));
+
+plosive_g = (slider1 > 0.5 && env_lo > env_mid * 2.6 && env_lo > 0.015) ? max(0.18, (env_mid * 2.6) / env_lo) : 1.0;
+
+v_l = mid_l + lo_l * plosive_g;
+v_r = mid_r + lo_r * plosive_g;
+
+// 2. Split high band (>6.2 kHz) for sibilance suppression
+hi_l += alpha_sib * (v_l - hi_l);
+hi_r += alpha_sib * (v_r - hi_r);
+sib_l = v_l - hi_l;
+sib_r = v_r - hi_r;
+
+env_sib = 0.985 * env_sib + 0.015 * max(abs(sib_l), abs(sib_r));
+sib_g = (env_sib > env_mid * 0.55 && env_sib > 0.01) ? max(deess_min_g, (env_mid * 0.55) / env_sib) : 1.0;
+
+clean_l = hi_l + sib_l * sib_g;
+clean_r = hi_r + sib_r * sib_g;
+
+// 3. Airwindows Console8 pure sine warmth
+drive > 0.001 ? (
+  sat_l = sin(min(1.55, max(-1.55, clean_l * (1.0 + 0.4 * drive))) * ($pi * 0.5 / 1.55));
+  sat_r = sin(min(1.55, max(-1.55, clean_r * (1.0 + 0.4 * drive))) * ($pi * 0.5 / 1.55));
+  spl0 = (1.0 - 0.5 * drive) * clean_l + 0.5 * drive * sat_l;
+  spl1 = (1.0 - 0.5 * drive) * clean_r + 0.5 * drive * sat_r;
+) : (
+  spl0 = clean_l;
+  spl1 = clean_r;
+);

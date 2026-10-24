@@ -1,0 +1,44 @@
+desc:ForgeAudio - Sub-Bass Mono-Maker & Phase-Locked Sub-Harmonic Synthesizer
+//tags: bass sub-harmonic mono-maker low-end
+//author: ForgeAudio (MIT / Apache-2.0)
+
+slider1:150<60,250,1>Mono Bass Crossover (Hz)
+slider2:0.20<0.0,1.0,0.01>Sub-Harmonic Reinforce Mix (35-85 Hz)
+slider3:0.15<0.0,1.0,0.01>Warm Tape Low-End Drive
+
+@init
+srate_safe = max(srate, 44100);
+lp_l = 0; lp_r = 0;
+sub_osc = 1.0;
+prev_lo = 0.0;
+sub_lp = 0.0;
+
+@slider
+alpha = 1.0 - exp(-2.0 * $pi * slider1 / srate_safe);
+alpha_sub = 1.0 - exp(-2.0 * $pi * 75.0 / srate_safe);
+sub_mix = slider2;
+drive = slider3;
+
+@sample
+lp_l += alpha * (spl0 - lp_l);
+lp_r += alpha * (spl1 - lp_r);
+hp_l = spl0 - lp_l;
+hp_r = spl1 - lp_r;
+
+// Sum sub-crossover strictly to phase-coherent Mono
+mono_lo = 0.5 * (lp_l + lp_r);
+
+// Zero-crossing octave divider for phase-locked sub-harmonic reinforcement
+(mono_lo >= 0.0 && prev_lo < 0.0) ? (
+  sub_osc = -sub_osc;
+);
+prev_lo = mono_lo;
+raw_sub = sub_osc * abs(mono_lo);
+sub_lp += alpha_sub * (raw_sub - sub_lp);
+
+combined_lo = mono_lo + sub_lp * sub_mix;
+driven_lo = sin(min(1.5, max(-1.5, combined_lo * (1.0 + drive * 0.5))));
+final_lo = (1.0 - drive * 0.5) * combined_lo + (drive * 0.5) * driven_lo;
+
+spl0 = final_lo + hp_l;
+spl1 = final_lo + hp_r;

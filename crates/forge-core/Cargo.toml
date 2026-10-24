@@ -1,0 +1,13 @@
+[package]
+name = "forge-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core 64-bit planar AudioBuffer, WAV/FFmpeg I/O, telemetry models, and error contracts for ForgeAudio"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hound.workspace = true
+tempfile.workspace = true

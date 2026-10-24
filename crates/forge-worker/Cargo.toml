@@ -1,0 +1,15 @@
+[package]
+name = "forge-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hybrid AI model router (Local RTX 3080 uv worker, Remote Colab A100, Google Lyria 3.5 API, XO/Atlas Drum Matcher, and Pure-Rust DSP fallback)"
+
+[dependencies]
+forge-core = { path = "../forge-core" }
+forge-dsp = { path = "../forge-dsp" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+tokio.workspace = true

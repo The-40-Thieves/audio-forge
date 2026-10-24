@@ -1,0 +1,13 @@
+[package]
+name = "forge-reaper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "REAPER 7.82 multitrack .RPP AST builder, JSFX installer, live UDP OSC / HTTP controller, and ISO 3901 ISRC DistroKid tagger"
+
+[dependencies]
+forge-core = { path = "../forge-core" }
+forge-dsp = { path = "../forge-dsp" }
+forge-vocal = { path = "../forge-vocal" }
+rosc.workspace = true
+serde.workspace = true

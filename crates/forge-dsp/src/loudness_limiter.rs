@@ -1,0 +1,634 @@
+//! Biquad filter primitives, ITU-R BS.1770-4 K-weighting, 4x oversampled True-Peak,
+//! AI Fizz telemetry auditor, and lookahead brickwall mastering limiter.
+
+use std::f64::consts::PI;
+
+use forge_core::{AuditReport, AudioBuffer, ForgeError, Result};
+use rustfft::{num_complex::Complex, FftPlanner};
+
+/// Second-order Direct Form II Transposed IIR Biquad filter.
+#[derive(Debug, Clone, Copy)]
+pub struct Biquad {
+    pub b0: f64,
+    pub b1: f64,
+    pub b2: f64,
+    pub a1: f64,
+    pub a2: f64,
+    z1: f64,
+    z2: f64,
+}
+
+impl Biquad {
+    #[inline]
+    pub const fn new(b0: f64, b1: f64, b2: f64, a1: f64, a2: f64) -> Self {
+        Self {
+            b0,
+            b1,
+            b2,
+            a1,
+            a2,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+
+    #[inline]
+    pub fn reset(&mut self) {
+        self.z1 = 0.0;
+        self.z2 = 0.0;
+    }
+
+    #[inline]
+    pub fn process_sample(&mut self, x: f64) -> f64 {
+        let y = self.b0 * x + self.z1;
+        self.z1 = self.b1 * x - self.a1 * y + self.z2;
+        self.z2 = self.b2 * x - self.a2 * y;
+        y
+    }
+
+    /// Audio EQ Cookbook peaking bell filter.
+    pub fn peaking_eq(sample_rate: f64, freq_hz: f64, q: f64, gain_db: f64) -> Self {
+        let f0 = freq_hz.clamp(10.0, sample_rate * 0.48);
+        let a = 10.0_f64.powf(gain_db / 40.0);
+        let w0 = 2.0 * PI * f0 / sample_rate;
+        let cos_w0 = w0.cos();
+        let alpha = w0.sin() / (2.0 * q.max(0.05));
+
+        let b0 = 1.0 + alpha * a;
+        let b1 = -2.0 * cos_w0;
+        let b2 = 1.0 - alpha * a;
+        let a0 = 1.0 + alpha / a;
+        let a1 = -2.0 * cos_w0;
+        let a2 = 1.0 - alpha / a;
+
+        Self::new(b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+    }
+
+    /// Audio EQ Cookbook narrow notch filter (ideal for 50/60 Hz hum harmonics).
+    pub fn notch(sample_rate: f64, freq_hz: f64, q: f64) -> Self {
+        if freq_hz >= sample_rate * 0.49 {
+            return Self::new(1.0, 0.0, 0.0, 0.0, 0.0);
+        }
+        let w0 = 2.0 * PI * freq_hz / sample_rate;
+        let cos_w0 = w0.cos();
+        let alpha = w0.sin() / (2.0 * q.max(0.1));
+
+        let b0 = 1.0;
+        let b1 = -2.0 * cos_w0;
+        let b2 = 1.0;
+        let a0 = 1.0 + alpha;
+        let a1 = -2.0 * cos_w0;
+        let a2 = 1.0 - alpha;
+
+        Self::new(b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+    }
+
+    /// Second-order Butterworth High-Pass Filter.
+    pub fn highpass(sample_rate: f64, freq_hz: f64, q: f64) -> Self {
+        let f0 = freq_hz.clamp(5.0, sample_rate * 0.48);
+        let w0 = 2.0 * PI * f0 / sample_rate;
+        let cos_w0 = w0.cos();
+        let alpha = w0.sin() / (2.0 * q.max(0.1));
+
+        let b0 = (1.0 + cos_w0) * 0.5;
+        let b1 = -(1.0 + cos_w0);
+        let b2 = (1.0 + cos_w0) * 0.5;
+        let a0 = 1.0 + alpha;
+        let a1 = -2.0 * cos_w0;
+        let a2 = 1.0 - alpha;
+
+        Self::new(b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+    }
+
+    /// Second-order Butterworth Low-Pass Filter.
+    pub fn lowpass(sample_rate: f64, freq_hz: f64, q: f64) -> Self {
+        let f0 = freq_hz.clamp(20.0, sample_rate * 0.48);
+        let w0 = 2.0 * PI * f0 / sample_rate;
+        let cos_w0 = w0.cos();
+        let alpha = w0.sin() / (2.0 * q.max(0.1));
+
+        let b0 = (1.0 - cos_w0) * 0.5;
+        let b1 = 1.0 - cos_w0;
+        let b2 = (1.0 - cos_w0) * 0.5;
+        let a0 = 1.0 + alpha;
+        let a1 = -2.0 * cos_w0;
+        let a2 = 1.0 - alpha;
+
+        Self::new(b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+    }
+
+    /// ITU-R BS.1770-4 Stage 1 K-weighting high-shelf pre-filter (+4 dB at ~1681.97 Hz).
+    pub fn k_weight_pre_shelf(sample_rate: f64) -> Self {
+        let db = 3.999_843_853_973_347_f64;
+        let f0 = 1_681.974_450_955_533_f64;
+        let q = 0.707_175_236_955_419_6_f64;
+        let k = (PI * f0 / sample_rate).tan();
+        let vh = 10.0_f64.powf(db / 20.0);
+        let vb = vh.powf(0.499_666_774_154_541_6);
+        let a0 = 1.0 + k / q + k * k;
+        let b0 = (vh + vb * k / q + k * k) / a0;
+        let b1 = 2.0 * (k * k - vh) / a0;
+        let b2 = (vh - vb * k / q + k * k) / a0;
+        let a1 = 2.0 * (k * k - 1.0) / a0;
+        let a2 = (1.0 - k / q + k * k) / a0;
+        Self::new(b0, b1, b2, a1, a2)
+    }
+
+    /// ITU-R BS.1770-4 Stage 2 RLB high-pass filter (~38.135 Hz).
+    pub fn k_weight_rlb_highpass(sample_rate: f64) -> Self {
+        let f0 = 38.135_470_876_024_44_f64;
+        let q = 0.500_327_037_323_877_3_f64;
+        let k = (PI * f0 / sample_rate).tan();
+        let a0 = 1.0 + k / q + k * k;
+        let b0 = 1.0 / a0;
+        let b1 = -2.0 / a0;
+        let b2 = 1.0 / a0;
+        let a1 = 2.0 * (k * k - 1.0) / a0;
+        let a2 = (1.0 - k / q + k * k) / a0;
+        Self::new(b0, b1, b2, a1, a2)
+    }
+}
+
+/// Computes 4x oversampled Inter-Sample True Peak (`dBTP`) and exact timestamp in seconds.
+pub fn compute_true_peak(buffer: &AudioBuffer) -> (f64, f64, f64) {
+    // 4-phase 12-tap windowed-sinc polyphase FIR coefficients for 4x inter-sample interpolation
+    const PHASES: [[f64; 4]; 3] = [
+        [-0.0625, 0.5625, 0.5625, -0.0625], // t + 0.50 (Catmull-Rom / cubic sinc)
+        [-0.046875, 0.859375, 0.234375, -0.046875], // t + 0.25
+        [-0.046875, 0.234375, 0.859375, -0.046875], // t + 0.75
+    ];
+
+    let mut max_sample_abs = 1e-12_f64;
+    let mut max_true_abs = 1e-12_f64;
+    let mut peak_frame: usize = 0;
+
+    for ch in &buffer.channels {
+        let n = ch.len();
+        for i in 0..n {
+            let s_abs = ch[i].abs();
+            if s_abs > max_sample_abs {
+                max_sample_abs = s_abs;
+            }
+            if s_abs > max_true_abs {
+                max_true_abs = s_abs;
+                peak_frame = i;
+            }
+            if i >= 1 && i + 2 < n {
+                let s0 = ch[i - 1];
+                let s1 = ch[i];
+                let s2 = ch[i + 1];
+                let s3 = ch[i + 2];
+                for coeffs in &PHASES {
+                    let interp =
+                        (coeffs[0] * s0 + coeffs[1] * s1 + coeffs[2] * s2 + coeffs[3] * s3).abs();
+                    if interp > max_true_abs {
+                        max_true_abs = interp;
+                        peak_frame = i;
+                    }
+                }
+            }
+        }
+    }
+
+    let sample_peak_dbfs = 20.0 * max_sample_abs.log10();
+    let true_peak_dbtp = 20.0 * max_true_abs.log10();
+    let timestamp = peak_frame as f64 / f64::from(buffer.sample_rate.max(1));
+    (sample_peak_dbfs, true_peak_dbtp, timestamp)
+}
+
+/// Performs a full ITU-R BS.1770-4 loudness, phase, electrical, and AI-artifact audit.
+pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
+    let sr = f64::from(buffer.sample_rate.max(1));
+    let frames = buffer.num_frames();
+    let ch_count = buffer.num_channels();
+
+    // 1. K-weight all channels
+    let mut k_channels = Vec::with_capacity(ch_count);
+    for ch in &buffer.channels {
+        let mut shelf = Biquad::k_weight_pre_shelf(sr);
+        let mut rlb = Biquad::k_weight_rlb_highpass(sr);
+        let mut k_ch = Vec::with_capacity(frames);
+        for &x in ch {
+            k_ch.push(rlb.process_sample(shelf.process_sample(x)));
+        }
+        k_channels.push(k_ch);
+    }
+
+    // 2. 100ms sub-blocks for BS.1770-4 gating (400ms Momentary = 4 sub-blocks, 3s Short-Term = 30 sub-blocks)
+    let sub_len = (sr * 0.1).round().max(1.0) as usize;
+    let num_subs = frames / sub_len;
+    let mut sub_energies = Vec::with_capacity(num_subs);
+
+    for s in 0..num_subs {
+        let start = s * sub_len;
+        let end = start + sub_len;
+        let mut sum_sq = 0.0;
+        for k_ch in &k_channels {
+            let mut ch_sq = 0.0;
+            for &v in &k_ch[start..end] {
+                ch_sq += v * v;
+            }
+            sum_sq += ch_sq / (sub_len as f64);
+        }
+        sub_energies.push(sum_sq);
+    }
+
+    // Momentary (400ms = 4 blocks) and Short-Term (3000ms = 30 blocks)
+    let mut momentary_energies = Vec::new();
+    let mut momentary_max_lufs = -70.0_f64;
+    if sub_energies.len() >= 4 {
+        for w in sub_energies.windows(4) {
+            let mean_e = w.iter().sum::<f64>() * 0.25;
+            momentary_energies.push(mean_e);
+            if mean_e > 1e-12 {
+                let lufs = -0.691 + 10.0 * mean_e.log10();
+                if lufs > momentary_max_lufs {
+                    momentary_max_lufs = lufs;
+                }
+            }
+        }
+    } else if !sub_energies.is_empty() {
+        let mean_e = sub_energies.iter().sum::<f64>() / (sub_energies.len() as f64);
+        momentary_energies.push(mean_e);
+        if mean_e > 1e-12 {
+            momentary_max_lufs = -0.691 + 10.0 * mean_e.log10();
+        }
+    }
+
+    let mut short_term_lufs_vec = Vec::new();
+    let mut short_term_max_lufs = momentary_max_lufs;
+    if sub_energies.len() >= 30 {
+        for w in sub_energies.windows(30) {
+            let mean_e = w.iter().sum::<f64>() / 30.0;
+            if mean_e > 1e-12 {
+                let lufs = -0.691 + 10.0 * mean_e.log10();
+                short_term_lufs_vec.push(lufs);
+                if lufs > short_term_max_lufs {
+                    short_term_max_lufs = lufs;
+                }
+            }
+        }
+    }
+
+    // BS.1770-4 Two-Stage Gating for Integrated LUFS
+    let abs_gate_e = 10.0_f64.powf((-70.0 + 0.691) / 10.0);
+    let gated_abs: Vec<f64> = momentary_energies
+        .iter()
+        .copied()
+        .filter(|&e| e > abs_gate_e)
+        .collect();
+
+    let integrated_lufs = if gated_abs.is_empty() {
+        -70.0
+    } else {
+        let mean_abs = gated_abs.iter().sum::<f64>() / (gated_abs.len() as f64);
+        let rel_gate_lufs = -0.691 + 10.0 * mean_abs.log10() - 10.0;
+        let rel_gate_e = 10.0_f64.powf((rel_gate_lufs + 0.691) / 10.0);
+        let gated_rel: Vec<f64> = gated_abs
+            .into_iter()
+            .filter(|&e| e > rel_gate_e)
+            .collect();
+        if gated_rel.is_empty() {
+            -70.0
+        } else {
+            let mean_rel = gated_rel.iter().sum::<f64>() / (gated_rel.len() as f64);
+            -0.691 + 10.0 * mean_rel.log10()
+        }
+    };
+
+    // Loudness Range (LRA = P95 - P10 of gated short-term blocks)
+    let loudness_range_lu = if short_term_lufs_vec.len() >= 4 {
+        let mut st: Vec<f64> = short_term_lufs_vec
+            .into_iter()
+            .filter(|&l| l > -70.0 && l >= integrated_lufs - 20.0)
+            .collect();
+        st.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        if st.len() >= 2 {
+            let p10 = st[(st.len() - 1) * 10 / 100];
+            let p95 = st[(st.len() - 1) * 95 / 100];
+            (p95 - p10).max(0.0)
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
+    // 3. True Peak, Sample Peak, DC Offset, Clipping & Crest Factor
+    let (sample_peak_dbfs, true_peak_dbtp, true_peak_timestamp_secs) = compute_true_peak(buffer);
+    let mono = buffer.to_mono();
+    let dc_offset = if mono.is_empty() {
+        0.0
+    } else {
+        mono.iter().sum::<f64>() / (mono.len() as f64)
+    };
+    let rms = if mono.is_empty() {
+        1e-12
+    } else {
+        (mono.iter().map(|&x| (x - dc_offset).powi(2)).sum::<f64>() / (mono.len() as f64))
+            .sqrt()
+            .max(1e-12)
+    };
+    let rms_db = 20.0 * rms.log10();
+    let crest_factor_db = (sample_peak_dbfs - rms_db).max(0.0);
+
+    let mut clipped_samples = 0_usize;
+    for ch in &buffer.channels {
+        for w in ch.windows(3) {
+            if w[0].abs() >= 0.999 && w[1].abs() >= 0.999 && w[2].abs() >= 0.999 {
+                clipped_samples += 1;
+            }
+        }
+    }
+
+    // 4. Stereo & Sub-160Hz Phase Correlation
+    let (stereo_correlation, sub_160hz_correlation) = if ch_count >= 2 && frames > 0 {
+        let l = &buffer.channels[0];
+        let r = &buffer.channels[1];
+        let mut sum_lr = 0.0;
+        let mut sum_l2 = 0.0;
+        let mut sum_r2 = 0.0;
+
+        let mut lp_l = Biquad::lowpass(sr, 160.0, 0.707);
+        let mut lp_r = Biquad::lowpass(sr, 160.0, 0.707);
+        let mut sub_lr = 0.0;
+        let mut sub_l2 = 0.0;
+        let mut sub_r2 = 0.0;
+
+        for (&lv, &rv) in l.iter().zip(r.iter()) {
+            sum_lr += lv * rv;
+            sum_l2 += lv * lv;
+            sum_r2 += rv * rv;
+
+            let sl = lp_l.process_sample(lv);
+            let sr_v = lp_r.process_sample(rv);
+            sub_lr += sl * sr_v;
+            sub_l2 += sl * sl;
+            sub_r2 += sr_v * sr_v;
+        }
+        let corr = if sum_l2 * sum_r2 > 1e-18 {
+            (sum_lr / (sum_l2 * sum_r2).sqrt()).clamp(-1.0, 1.0)
+        } else {
+            1.0
+        };
+        let sub_corr = if sub_l2 * sub_r2 > 1e-18 {
+            (sub_lr / (sub_l2 * sub_r2).sqrt()).clamp(-1.0, 1.0)
+        } else {
+            1.0
+        };
+        (corr, sub_corr)
+    } else {
+        (1.0, 1.0)
+    };
+
+    // 5. Spectral Band & AI Fizz Index Analysis (2048-point FFT)
+    let fft_size = 2048_usize;
+    let hop = 1024_usize;
+    let mut planner = FftPlanner::<f64>::new();
+    let fft = planner.plan_fft_forward(fft_size);
+    let mut avg_mag_sq = vec![0.0_f64; fft_size / 2 + 1];
+    let mut max_peak_over_median_2_6k = 1.0_f64;
+    let mut frame_count = 0_usize;
+
+    let bin_hz = sr / (fft_size as f64);
+    let b_2k = ((2000.0 / bin_hz).round() as usize).clamp(2, fft_size / 2 - 4);
+    let b_6k = ((6000.0 / bin_hz).round() as usize).clamp(b_2k + 1, fft_size / 2 - 4);
+
+    if mono.len() >= fft_size {
+        let window: Vec<f64> = (0..fft_size)
+            .map(|i| 0.5 * (1.0 - (2.0 * PI * (i as f64) / (fft_size as f64)).cos()))
+            .collect();
+        let mut buf = vec![Complex::new(0.0, 0.0); fft_size];
+
+        let mut pos = 0;
+        while pos + fft_size <= mono.len() {
+            for i in 0..fft_size {
+                buf[i] = Complex::new((mono[pos + i] - dc_offset) * window[i], 0.0);
+            }
+            fft.process(&mut buf);
+            let mags: Vec<f64> = buf[..=fft_size / 2]
+                .iter()
+                .map(|c| (c.re * c.re + c.im * c.im) / ((fft_size * fft_size) as f64))
+                .collect();
+
+            for (dst, &m) in avg_mag_sq.iter_mut().zip(mags.iter()) {
+                *dst += m;
+            }
+
+            frame_count += 1;
+            pos += hop;
+        }
+    }
+
+    if frame_count > 0 {
+        for v in &mut avg_mag_sq {
+            *v /= frame_count as f64;
+        }
+    }
+
+    let broadband_bin_mean =
+        (avg_mag_sq[1..].iter().sum::<f64>() / ((fft_size / 2) as f64)).max(1e-12);
+    let low_mid_peak = avg_mag_sq[1..b_2k]
+        .iter()
+        .copied()
+        .fold(1e-12_f64, f64::max);
+    for b in (b_2k + 4)..=(b_6k.saturating_sub(4)) {
+        let outer_mean = (avg_mag_sq[b - 4]
+            + avg_mag_sq[b - 3]
+            + avg_mag_sq[b - 2]
+            + avg_mag_sq[b + 2]
+            + avg_mag_sq[b + 3]
+            + avg_mag_sq[b + 4])
+            / 6.0;
+        let ref_env = outer_mean
+            .max(broadband_bin_mean * 0.5)
+            .max(low_mid_peak * 0.12);
+        let ratio = (avg_mag_sq[b] / ref_env).sqrt();
+        if ratio > max_peak_over_median_2_6k {
+            max_peak_over_median_2_6k = ratio;
+        }
+    }
+
+    let band_db = |f_low: f64, f_high: f64| -> f64 {
+        let i0 = ((f_low / bin_hz).floor() as usize).clamp(1, fft_size / 2);
+        let i1 = ((f_high / bin_hz).ceil() as usize).clamp(i0, fft_size / 2);
+        let sum_e: f64 = avg_mag_sq[i0..=i1].iter().sum();
+        10.0 * sum_e.max(1e-15).log10()
+    };
+
+    let hum_50_60hz_db = band_db(45.0, 65.0) - rms_db;
+    let box_mud_200_500hz_db = band_db(200.0, 500.0) - rms_db;
+    let harshness_2_6khz_db = band_db(2000.0, 6000.0) - rms_db;
+    let sibilance_5_14khz_db = band_db(5000.0, 14000.0) - rms_db;
+
+    // Composite AI Fizz Index (0..100): measures 2-6 kHz spectral whistle spike + upper-mid energy excess + sub phase smear
+    let whistle_db = 20.0 * max_peak_over_median_2_6k.log10();
+    let whistle_score = ((whistle_db - 6.0) * 4.5).clamp(0.0, 60.0);
+    let harsh_score = ((harshness_2_6khz_db + 8.0) * 3.0).clamp(0.0, 25.0);
+    let sub_smear_score = ((0.85 - sub_160hz_correlation) * 30.0).clamp(0.0, 15.0);
+    let ai_fizz_index = (whistle_score + harsh_score + sub_smear_score).clamp(0.0, 100.0);
+
+    let distrokid_ready =
+        (-16.5..=-7.5).contains(&integrated_lufs) && true_peak_dbtp <= -0.95 && clipped_samples == 0;
+
+    let mut recommendations = Vec::new();
+    if true_peak_dbtp > -1.0 {
+        recommendations.push(format!(
+            "True Peak is {:.2} dBTP at {:.2}s (exceeds DistroKid -1.0 dBTP ceiling). Run `forge master` brickwall limiter.",
+            true_peak_dbtp, true_peak_timestamp_secs
+        ));
+    }
+    if ai_fizz_index >= 25.0 {
+        recommendations.push(format!(
+            "Elevated AI/Metallic Resonance detected (Fizz Index {:.1}/100, peak whistle +{:.1} dB in 2-6 kHz). Apply `forge restore` OpenSoothe De-Fizz.",
+            ai_fizz_index, whistle_db
+        ));
+    }
+    if sub_160hz_correlation < 0.85 {
+        recommendations.push(format!(
+            "Sub-160 Hz stereo correlation is {:.2} (phasey low-end). Enable Mid/Side Sub-160 Hz Mono-Maker.",
+            sub_160hz_correlation
+        ));
+    }
+    if hum_50_60hz_db > -12.0 {
+        recommendations.push(
+            "Elevated 50/60 Hz ground-loop hum energy detected. Enable 10-harmonic hum notch filter."
+                .to_string(),
+        );
+    }
+    if clipped_samples > 0 {
+        recommendations.push(format!(
+            "{clipped_samples} clipped sample runs detected. Run cubic-spline de-clipper before mastering."
+        ));
+    }
+
+    AuditReport {
+        sample_rate: buffer.sample_rate,
+        channels: ch_count,
+        duration_secs: buffer.duration_secs(),
+        integrated_lufs,
+        short_term_max_lufs,
+        momentary_max_lufs,
+        loudness_range_lu,
+        sample_peak_dbfs,
+        true_peak_dbtp,
+        true_peak_timestamp_secs,
+        crest_factor_db,
+        dc_offset,
+        clipped_samples,
+        stereo_correlation,
+        sub_160hz_correlation,
+        hum_50_60hz_db,
+        box_mud_200_500hz_db,
+        harshness_2_6khz_db,
+        sibilance_5_14khz_db,
+        ai_fizz_index,
+        distrokid_ready,
+        recommendations,
+    }
+}
+
+/// Masters an `AudioBuffer` to a target Integrated LUFS and strict True-Peak ceiling (`-1.0 dBTP`).
+pub fn normalize_and_limit(
+    buffer: &AudioBuffer,
+    target_lufs: f64,
+    ceiling_dbtp: f64,
+) -> Result<AudioBuffer> {
+    if !(-40.0..=-4.0).contains(&target_lufs) {
+        return Err(ForgeError::InvalidParameter(format!(
+            "target_lufs ({target_lufs}) must be between -40.0 and -4.0 LUFS"
+        )));
+    }
+    let initial = audit_audio(buffer);
+    let makeup_db = if initial.integrated_lufs <= -65.0 {
+        0.0
+    } else {
+        (target_lufs - initial.integrated_lufs).clamp(-24.0, 24.0)
+    };
+    let makeup_gain = 10.0_f64.powf(makeup_db / 20.0);
+    let ceiling_lin = 10.0_f64.powf((ceiling_dbtp - 0.04) / 20.0);
+
+    let mut out = buffer.clone();
+    let frames = out.num_frames();
+    let ch_count = out.num_channels();
+    if frames == 0 {
+        return Ok(out);
+    }
+
+    // Apply initial makeup gain
+    for ch in &mut out.channels {
+        for s in ch.iter_mut() {
+            *s *= makeup_gain;
+        }
+    }
+
+    // Compute per-frame peak envelope including 4x inter-sample peaks
+    let mut inst_peak = vec![0.0_f64; frames];
+    for ch in &out.channels {
+        for i in 0..frames {
+            let mut pk = ch[i].abs();
+            if i >= 1 && i + 2 < frames {
+                let interp = (-0.0625 * ch[i - 1]
+                    + 0.5625 * ch[i]
+                    + 0.5625 * ch[i + 1]
+                    - 0.0625 * ch[i + 2])
+                    .abs();
+                if interp > pk {
+                    pk = interp;
+                }
+            }
+            if pk > inst_peak[i] {
+                inst_peak[i] = pk;
+            }
+        }
+    }
+
+    // 3ms lookahead window + smooth 50ms release envelope
+    let sr = f64::from(out.sample_rate.max(1));
+    let lookahead = ((sr * 0.003).round() as usize).max(4);
+    let release_coeff = (-1.0 / (sr * 0.050)).exp();
+
+    let mut gain_env = vec![1.0_f64; frames];
+    let mut current_gain = 1.0_f64;
+
+    for i in 0..frames {
+        let win_end = (i + lookahead).min(frames);
+        let mut max_future = inst_peak[i];
+        for &p in &inst_peak[i..win_end] {
+            if p > max_future {
+                max_future = p;
+            }
+        }
+        let target_g = if max_future > ceiling_lin {
+            ceiling_lin / max_future
+        } else {
+            1.0
+        };
+        if target_g < current_gain {
+            // Fast lookahead attack
+            current_gain = target_g;
+        } else {
+            current_gain = release_coeff * current_gain + (1.0 - release_coeff) * target_g;
+        }
+        gain_env[i] = current_gain;
+    }
+
+    for ch in 0..ch_count {
+        for (s, &g) in out.channels[ch].iter_mut().zip(gain_env.iter()) {
+            *s *= g;
+        }
+    }
+
+    // Final safety trim if 4x true-peak slightly exceeds ceiling_dbtp
+    let (_, post_tp_db, _) = compute_true_peak(&out);
+    if post_tp_db > ceiling_dbtp {
+        let trim = 10.0_f64.powf((ceiling_dbtp - post_tp_db - 0.02) / 20.0);
+        for ch in &mut out.channels {
+            for s in ch.iter_mut() {
+                *s *= trim;
+            }
+        }
+    }
+
+    Ok(out)
+}

@@ -1,0 +1,23 @@
+[package]
+name = "forge-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line interface (`forge`) for ForgeAudio studio DSP, stem/vocal/MIDI surgery, music theory, and REAPER 7.82 automation"
+
+[[bin]]
+name = "forge"
+path = "src/main.rs"
+
+[dependencies]
+forge-core = { path = "../forge-core" }
+forge-dsp = { path = "../forge-dsp" }
+forge-vocal = { path = "../forge-vocal" }
+forge-theory = { path = "../forge-theory" }
+forge-reaper = { path = "../forge-reaper" }
+forge-worker = { path = "../forge-worker" }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

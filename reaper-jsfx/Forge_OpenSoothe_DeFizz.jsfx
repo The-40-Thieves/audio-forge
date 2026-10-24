@@ -1,0 +1,104 @@
+desc:ForgeAudio - OpenSoothe Dynamic Spectral Resonance Suppressor (AI De-Fizz)
+//tags: equalizer spectral resonance suppressor de-esser ai-cleanup
+//author: ForgeAudio (MIT / Apache-2.0)
+
+options:gmem=ForgeAudioStudio
+
+slider1:3.5<0.5,12.0,0.1>Sensitivity (dB above local envelope)
+slider2:9.0<0.0,18.0,0.1>Max Suppression Depth (dB)
+slider3:1.25<0.0,2.0,0.05>2.0-6.5 kHz AI Fizz / Metallic Weight
+slider4:1.00<0.0,2.0,0.05>5.5-14.0 kHz Sibilance Spray Weight
+slider5:160<20,300,1>Side-Channel Mono Cutoff (Hz)
+slider6:0<0,1,1{Normal (Suppressed Output),Delta Listen (Solo Removed Fizz)}>Monitor Mode
+
+@init
+srate_safe = max(srate, 44100);
+env_fizz = 0.0;
+env_sib = 0.0;
+env_ref = 0.0001;
+gain_fizz = 1.0;
+gain_sib = 1.0;
+
+// State variables for 2-pole SVF bandpass detectors
+ic1_f = 0; ic2_f = 0;
+ic1_s = 0; ic2_s = 0;
+ic1_side = 0; ic2_side = 0;
+
+@slider
+thresh_lin = 10 ^ (slider1 / 20);
+min_gain = 10 ^ (-slider2 / 20);
+w_fizz = slider3;
+w_sib = slider4;
+delta_mode = slider6;
+
+// SVF coefficients for 3800 Hz (2-6.5 kHz fizz zone) and 8500 Hz (sibilance zone)
+g_f = tan($pi * min(3800, srate_safe * 0.45) / srate_safe);
+k_f = 1.0 / 1.2;
+a1_f = 1.0 / (1.0 + g_f * (g_f + k_f));
+a2_f = g_f * a1_f;
+a3_f = g_f * a2_f;
+
+g_s = tan($pi * min(8500, srate_safe * 0.45) / srate_safe);
+k_s = 1.0 / 1.4;
+a1_s = 1.0 / (1.0 + g_s * (g_s + k_s));
+a2_s = g_s * a1_s;
+a3_s = g_s * a2_s;
+
+// Side-channel highpass SVF at slider5 Hz
+g_side = tan($pi * min(slider5, srate_safe * 0.45) / srate_safe);
+k_side = 1.4142;
+a1_side = 1.0 / (1.0 + g_side * (g_side + k_side));
+a2_side = g_side * a1_side;
+a3_side = g_side * a2_side;
+
+@sample
+mid = 0.5 * (spl0 + spl1);
+side = 0.5 * (spl0 - spl1);
+
+// High-pass Side channel below Mono Cutoff
+v3_side = side - ic2_side;
+v1_side = a1_side * ic1_side + a2_side * v3_side;
+v2_side = ic2_side + a2_side * ic1_side + a3_side * v3_side;
+ic1_side = 2.0 * v1_side - ic1_side;
+ic2_side = 2.0 * v2_side - ic2_side;
+side_clean = side - k_side * v1_side - v2_side;
+
+// Extract 2-6.5 kHz Fizz Band
+v3_f = mid - ic2_f;
+v1_f = a1_f * ic1_f + a2_f * v3_f;
+v2_f = ic2_f + a2_f * ic1_f + a3_f * v3_f;
+ic1_f = 2.0 * v1_f - ic1_f;
+ic2_f = 2.0 * v2_f - ic2_f;
+bp_fizz = k_f * v1_f;
+
+// Extract 5.5-14 kHz Sibilance Band
+v3_s = mid - ic2_s;
+v1_s = a1_s * ic1_s + a2_s * v3_s;
+v2_s = ic2_s + a2_s * ic1_s + a3_s * v3_s;
+ic1_s = 2.0 * v1_s - ic1_s;
+ic2_s = 2.0 * v2_s - ic2_s;
+bp_sib = k_s * v1_s;
+
+env_ref = 0.9992 * env_ref + 0.0008 * abs(mid) + 0.000001;
+env_fizz = 0.992 * env_fizz + 0.008 * abs(bp_fizz);
+env_sib = 0.992 * env_sib + 0.008 * abs(bp_sib);
+
+ratio_f = (env_fizz * w_fizz) / (env_ref * thresh_lin * 0.45);
+target_gf = ratio_f > 1.0 ? max(min_gain, 1.0 / ratio_f) : 1.0;
+gain_fizz = target_gf < gain_fizz ? (0.85 * gain_fizz + 0.15 * target_gf) : (0.996 * gain_fizz + 0.004 * target_gf);
+
+ratio_s = (env_sib * w_sib) / (env_ref * thresh_lin * 0.35);
+target_gs = ratio_s > 1.0 ? max(min_gain, 1.0 / ratio_s) : 1.0;
+gain_sib = target_gs < gain_sib ? (0.80 * gain_sib + 0.20 * target_gs) : (0.995 * gain_sib + 0.005 * target_gs);
+
+removed_fizz = bp_fizz * (1.0 - gain_fizz) + bp_sib * (1.0 - gain_sib);
+gmem[0] = 20.0 * log10(max(0.001, min(gain_fizz, gain_sib)));
+
+delta_mode > 0.5 ? (
+  spl0 = removed_fizz;
+  spl1 = removed_fizz;
+) : (
+  mid_clean = mid - removed_fizz;
+  spl0 = mid_clean + side_clean;
+  spl1 = mid_clean - side_clean;
+);

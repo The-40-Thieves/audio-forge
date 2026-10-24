@@ -1,0 +1,12 @@
+[package]
+name = "forge-dsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SIMD-accelerated studio DSP, ITU-R BS.1770-4 loudness/limiter, OpenSoothe spectral de-fizz, OpenSpacer sidechain unmasker, GCC-PHAT phase align, and FastDTW vocalign"
+
+[dependencies]
+forge-core = { path = "../forge-core" }
+rustfft.workspace = true
+rayon.workspace = true
+serde.workspace = true

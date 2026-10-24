@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+*.pdb
+.env
+.venv/
+__pycache__/
+*.pyc
+/outputs/
+/tmp/

@@ -1,0 +1,64 @@
+desc:ForgeAudio - OpenSpacer Sidechain Spectral Frequency Unmasker
+//tags: sidechain dynamic eq unmasker trackspacer
+//author: ForgeAudio (MIT / Apache-2.0)
+
+options:gmem=ForgeAudioStudio
+
+slider1:0<0,1,1{Vocal over Instruments (200Hz-7.5kHz),Kick over Sub-Bass (30Hz-130Hz)}>Unmasking Preset
+slider2:5.0<0.5,15.0,0.1>Max Pocket Reduction (dB)
+slider3:1.0<0.1,2.0,0.05>Sidechain Sensitivity (Ch 3/4)
+
+@init
+srate_safe = max(srate, 44100);
+sc_env = 0.0;
+duck_gain = 1.0;
+ic1_m0 = 0; ic2_m0 = 0;
+ic1_m1 = 0; ic2_m1 = 0;
+ic1_sc = 0; ic2_sc = 0;
+
+@slider
+min_gain = 10 ^ (-slider2 / 20);
+sens = slider3;
+center_hz = slider1 < 0.5 ? 1600.0 : 68.0;
+q_val = slider1 < 0.5 ? 0.55 : 0.90;
+
+g = tan($pi * min(center_hz, srate_safe * 0.45) / srate_safe);
+k = 1.0 / q_val;
+a1 = 1.0 / (1.0 + g * (g + k));
+a2 = g * a1;
+a3 = g * a2;
+
+@sample
+sc_in = 0.5 * (spl2 + spl3);
+
+// Band-pass filter sidechain input (Ch 3/4)
+v3_sc = sc_in - ic2_sc;
+v1_sc = a1 * ic1_sc + a2 * v3_sc;
+v2_sc = ic2_sc + a2 * ic1_sc + a3 * v3_sc;
+ic1_sc = 2.0 * v1_sc - ic1_sc;
+ic2_sc = 2.0 * v2_sc - ic2_sc;
+sc_band = k * v1_sc;
+
+sc_env = 0.990 * sc_env + 0.010 * abs(sc_band);
+trig = min(1.0, sc_env * 8.0 * sens);
+target_g = 1.0 - trig * (1.0 - min_gain);
+duck_gain = target_g < duck_gain ? (0.85 * duck_gain + 0.15 * target_g) : (0.996 * duck_gain + 0.004 * target_g);
+
+// Extract target band on Left (spl0) and Right (spl1) and carve dynamic mirror pocket
+v3_0 = spl0 - ic2_m0;
+v1_0 = a1 * ic1_m0 + a2 * v3_0;
+v2_0 = ic2_m0 + a2 * ic1_m0 + a3 * v3_0;
+ic1_m0 = 2.0 * v1_0 - ic1_m0;
+ic2_m0 = 2.0 * v2_0 - ic2_m0;
+bp0 = k * v1_0;
+
+v3_1 = spl1 - ic2_m1;
+v1_1 = a1 * ic1_m1 + a2 * v3_1;
+v2_1 = ic2_m1 + a2 * ic1_m1 + a3 * v3_1;
+ic1_m1 = 2.0 * v1_1 - ic1_m1;
+ic2_m1 = 2.0 * v2_1 - ic2_m1;
+bp1 = k * v1_1;
+
+spl0 = spl0 - bp0 * (1.0 - duck_gain);
+spl1 = spl1 - bp1 * (1.0 - duck_gain);
+gmem[1] = 20.0 * log10(max(0.001, duck_gain));
