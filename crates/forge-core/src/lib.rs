@@ -323,13 +323,15 @@ impl AudioBuffer {
             }
             (SampleFormat::Int, 16) => {
                 let scale = 32767.0_f64;
+                let mut err_state = vec![0.0_f64; ch_count];
                 for f in 0..frames {
-                    for ch in 0..ch_count {
+                    for (ch, err_prev) in err_state.iter_mut().enumerate().take(ch_count) {
                         let raw = self.channels[ch].get(f).copied().unwrap_or(0.0);
                         let tpdf = next_uniform() + next_uniform();
-                        let s = (clean_unit(raw) * scale + tpdf)
-                            .round()
-                            .clamp(-32768.0, 32767.0) as i16;
+                        let shaped = clean_unit(raw) * scale - 0.5 * (*err_prev);
+                        let q = (shaped + tpdf).round().clamp(-32768.0, 32767.0);
+                        *err_prev = (q - shaped).clamp(-1.5, 1.5);
+                        let s = q as i16;
                         writer.write_sample(s).map_err(|e| ForgeError::AudioIo {
                             path: path_ref.display().to_string(),
                             message: e.to_string(),
@@ -339,13 +341,15 @@ impl AudioBuffer {
             }
             (SampleFormat::Int, _) => {
                 let scale = 8_388_607.0_f64;
+                let mut err_state = vec![0.0_f64; ch_count];
                 for f in 0..frames {
-                    for ch in 0..ch_count {
+                    for (ch, err_prev) in err_state.iter_mut().enumerate().take(ch_count) {
                         let raw = self.channels[ch].get(f).copied().unwrap_or(0.0);
                         let tpdf = next_uniform() + next_uniform();
-                        let s = (clean_unit(raw) * scale + tpdf)
-                            .round()
-                            .clamp(-8_388_608.0, 8_388_607.0) as i32;
+                        let shaped = clean_unit(raw) * scale - 0.5 * (*err_prev);
+                        let q = (shaped + tpdf).round().clamp(-8_388_608.0, 8_388_607.0);
+                        *err_prev = (q - shaped).clamp(-1.5, 1.5);
+                        let s = q as i32;
                         writer.write_sample(s).map_err(|e| ForgeError::AudioIo {
                             path: path_ref.display().to_string(),
                             message: e.to_string(),

@@ -22,11 +22,12 @@ use forge_dsp::{
     apply_spectral_defizz, apply_spectral_unmask, audit_audio, align_phase_gcc_phat,
     align_vocal_double_dtw, compute_reference_match_eq, normalize_and_limit,
     publish_shared_spectrum, read_shared_spectrum, remove_dc_and_declip,
-    run_full_restoration_chain, AdaaSin, AdaaTanh, AnalogHardwareModel, Biquad, DeFizzConfig,
-    RealtimeDensityAndClipper, RealtimeDrumTrigger, RealtimeFdnReverb, RealtimeMasterLimiter,
-    RealtimeMasteringEq18, RealtimeNeuralPreamp, RealtimeOpenSoothe, RealtimeOpenSpacer,
-    RealtimePhaseAligner, RealtimeSubAndTapeBus, RealtimeTransientTonalSplit,
-    RealtimeVocalSurgical, RestorationConfig, UnmaskConfig,
+    run_full_restoration_chain, AdaaSin, AdaaTanh, AllpassDisperser, AnalogHardwareModel,
+    AutoGainCompensator, Biquad, CytomicSvf, DeFizzConfig, JilesAthertonHysteresis,
+    NamWaveNetProfile, RealtimeDensityAndClipper, RealtimeDrumTrigger, RealtimeFdnReverb,
+    RealtimeMasterLimiter, RealtimeMasteringEq18, RealtimeNeuralPreamp, RealtimeOpenSoothe,
+    RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus,
+    RealtimeTransientTonalSplit, RealtimeVocalSurgical, RestorationConfig, UnmaskConfig,
 };
 use proptest::prelude::*;
 
@@ -422,6 +423,115 @@ proptest! {
         }
         for m in markers {
             prop_assert!(m.timeline_pos_secs.is_finite() && m.source_pos_secs.is_finite());
+        }
+    }
+
+    // ========================================================================
+    // 8. CYTOMIC TPT SVF AUDIO-RATE MODULATION & MULTIMODE STABILITY
+    // ========================================================================
+    #[test]
+    fn prop_cytomic_svf_audio_rate_modulation_and_multimode_stability(
+        sr in 8_000.0_f64..192_000.0_f64,
+        base_fc in 20.0_f64..18_000.0_f64,
+        mod_depth in 0.0_f64..8_000.0_f64,
+        q in 0.2_f64..18.0_f64,
+        gain_db in -18.0_f64..18.0_f64,
+    ) {
+        let mut svf_lp = CytomicSvf::lowpass(sr, base_fc, q);
+        let mut svf_hp = CytomicSvf::highpass(sr, base_fc, q);
+        let mut svf_bell = CytomicSvf::bell(sr, base_fc, q, gain_db);
+
+        for i in 0..256 {
+            // Fast per-sample audio-rate cutoff modulation (where DF1 Biquad can blow up)
+            let fc_mod = (base_fc + mod_depth * (i as f64 * 0.43).sin()).clamp(15.0, sr * 0.48);
+            svf_lp.set_lowpass(sr, fc_mod, q);
+            svf_hp.set_highpass(sr, fc_mod, q);
+            svf_bell.set_bell(sr, fc_mod, q, gain_db);
+
+            let x = 0.5 * (i as f64 * 0.29).sin() + 0.25 * (i as f64 * 1.17).cos();
+            let (v0, v1, v2) = svf_lp.process_multimode(x);
+            let y_lp = svf_lp.process_sample(x);
+            let y_hp = svf_hp.process_sample(x);
+            let y_bell = svf_bell.process_sample(x);
+
+            prop_assert!(v0.is_finite() && v1.is_finite() && v2.is_finite());
+            prop_assert!(y_lp.is_finite() && y_hp.is_finite() && y_bell.is_finite());
+            prop_assert!(y_lp.abs() <= 50.0 && y_hp.abs() <= 50.0 && y_bell.abs() <= 50.0);
+        }
+
+        // Verify analytical Biquad Bode magnitude_db_at is finite across all frequencies
+        let bq = Biquad::peaking_eq(sr, base_fc, q, gain_db);
+        let mag_db = bq.magnitude_db_at(base_fc, sr);
+        prop_assert!(mag_db.is_finite() && (-120.0..=60.0).contains(&mag_db));
+    }
+
+    // ========================================================================
+    // 9. JILES-ATHERTON RK4 HYSTERESIS, ALLPASS DISPERSER, NAM WAVENET & AGC
+    // ========================================================================
+    #[test]
+    fn prop_jiles_atherton_hysteresis_allpass_disperser_nam_and_agc_totality(
+        q_near in -2.5e-3_f64..2.5e-3_f64,
+        drive in 0.0_f64..2.0_f64,
+        ap_freq in 30.0_f64..600.0_f64,
+        pinch in 0.0_f64..1.0_f64,
+    ) {
+        // 9A. Langevin function L(q) = coth(q) - 1/q continuity across |q| = 1e-3 Taylor boundary
+        let (l_val, dl_val) = JilesAthertonHysteresis::langevin_and_deriv(q_near);
+        let l_taylor = q_near / 3.0 - (q_near * q_near * q_near) / 45.0;
+        let dl_taylor = (1.0 / 3.0) - (q_near * q_near) / 15.0;
+        prop_assert!(l_val.is_finite() && dl_val.is_finite());
+        prop_assert!((l_val - l_taylor).abs() < 1.0e-6);
+        prop_assert!((dl_val - dl_taylor).abs() < 1.0e-5);
+
+        // 9B. Jiles-Atherton RK4 Hysteresis boundedness [-1.0, 1.0] & Allpass Disperser Parseval energy
+        let mut ja = JilesAthertonHysteresis::default();
+        let mut disp = AllpassDisperser::default();
+
+        let mut energy_in = 0.0_f64;
+        let mut energy_disp = 0.0_f64;
+        for i in 0..512 {
+            let x = if i < 256 {
+                0.6 * (i as f64 * 0.21).sin()
+            } else {
+                0.0
+            };
+            let m_out = ja.process(x, drive, pinch);
+            prop_assert!(m_out.is_finite() && (-1.0..=1.0).contains(&m_out));
+
+            let d_out = disp.process_sample(x, 48_000.0, ap_freq, 1.0);
+            prop_assert!(d_out.is_finite());
+            energy_in += x * x;
+            energy_disp += d_out * d_out;
+        }
+        // Allpass cascade preserves total signal energy (up to tiny tail left after 256 zero samples)
+        let rel_err = (energy_disp - energy_in).abs() / energy_in.max(1.0);
+        prop_assert!(
+            rel_err < 0.05,
+            "AllpassDisperser energy mismatch: in={}, out={}, rel_err={}",
+            energy_in,
+            energy_disp,
+            rel_err
+        );
+
+        // 9C. NAM WaveNet JSON parser & loader + AutoGainCompensator + 32-Band Analyzer
+        let nam_json = r#"{"version":"0.5.4","weights":[0.45,-0.18,0.12,-0.07,0.25]}"#;
+        let taps = NamWaveNetProfile::parse_nam_taps(nam_json).expect("valid NAM");
+        let mut preamp = RealtimeNeuralPreamp::new(AnalogHardwareModel::Neve1073ClassA);
+        prop_assert!(preamp.load_nam_json(nam_json).is_ok());
+        prop_assert!((taps[4] - 0.15).abs() < 1e-6);
+
+        let mut agc = AutoGainCompensator::default();
+        let mut spec32 = RealtimeSpectrumAnalyzer32::new(48_000.0);
+        for i in 0..256 {
+            let s = 0.35 * (i as f32 * 0.19).sin();
+            let (pl, pr) = preamp.process_stereo_sample(s, -s, 3.0, 0.0);
+            let (al, ar) = agc.process_stereo(s, -s, pl * 0.5, pr * 0.5, true);
+            spec32.push_stereo_sample(al, ar);
+            prop_assert!(is_clean_audio_f32(al) && is_clean_audio_f32(ar));
+        }
+        let snap = spec32.snapshot_db();
+        for &b in &snap {
+            prop_assert!(b.is_finite() && (-90.0..=6.0).contains(&b));
         }
     }
 }

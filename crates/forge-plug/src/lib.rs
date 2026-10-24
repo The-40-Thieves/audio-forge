@@ -18,31 +18,35 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use forge_dsp::{
-    AnalogHardwareModel, GenreTonalTarget, RealtimeDensityAndClipper, RealtimeDrumTrigger,
-    RealtimeFdnReverb, RealtimeMasterLimiter, RealtimeMasteringEq18, RealtimeNeuralPreamp,
-    RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSubAndTapeBus,
-    RealtimeTransientTonalSplit, RealtimeVocalSurgical, publish_shared_spectrum,
-    read_shared_spectrum,
+    AnalogHardwareModel, AutoGainCompensator, GenreTonalTarget, RealtimeDensityAndClipper,
+    RealtimeDrumTrigger, RealtimeFdnReverb, RealtimeMasterLimiter, RealtimeMasteringEq18,
+    RealtimeNeuralPreamp, RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner,
+    RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus, RealtimeTransientTonalSplit,
+    RealtimeVocalSurgical, publish_shared_spectrum, read_shared_spectrum,
 };
 use nih_plug::prelude::*;
 use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
 
-/// Lock-free 32-band telemetry & gain-reduction meter shared between the real-time audio thread
-/// and the 60 FPS `nih_plug_egui` OpenGL hardware-accelerated studio GUI.
+/// Lock-free 32-band telemetry, dynamic Gain-Reduction / Bode curve, and A/B snapshot indicator
+/// shared between the real-time audio thread and the 60 FPS `nih_plug_egui` OpenGL studio GUI.
 pub struct GuiTelemetry {
     pub spectrum_db: [AtomicU32; 32],
+    pub band_gr_db: [AtomicU32; 32],
     pub peak_in_db: AtomicU32,
     pub peak_out_db: AtomicU32,
     pub gr_db: AtomicU32,
+    pub ab_slot: AtomicU32,
 }
 
 impl Default for GuiTelemetry {
     fn default() -> Self {
         Self {
             spectrum_db: std::array::from_fn(|_| AtomicU32::new((-90.0_f32).to_bits())),
+            band_gr_db: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
             peak_in_db: AtomicU32::new((-90.0_f32).to_bits()),
             peak_out_db: AtomicU32::new((-90.0_f32).to_bits()),
             gr_db: AtomicU32::new(0.0_f32.to_bits()),
+            ab_slot: AtomicU32::new(0),
         }
     }
 }
@@ -68,10 +72,28 @@ impl GuiTelemetry {
         self.peak_out_db.store(sm_out.to_bits(), Ordering::Relaxed);
         self.gr_db.store(gr.to_bits(), Ordering::Relaxed);
     }
+
+    #[inline]
+    pub fn update_spectrum_and_gr(&self, spec_32: &[f32; 32], gr_32: &[f32; 32]) {
+        for i in 0..32 {
+            let s = if spec_32[i].is_finite() {
+                spec_32[i].clamp(-90.0, 6.0)
+            } else {
+                -90.0
+            };
+            let g = if gr_32[i].is_finite() {
+                gr_32[i].clamp(-24.0, 24.0)
+            } else {
+                0.0
+            };
+            self.spectrum_db[i].store(s.to_bits(), Ordering::Relaxed);
+            self.band_gr_db[i].store(g.to_bits(), Ordering::Relaxed);
+        }
+    }
 }
 
-/// Renders the shared ForgeAudio dark-mode studio header, I/O + Gain Reduction meters,
-/// and 32-band Cross-Instance Spectrum analyzer inside any `nih_plug_egui` window.
+/// Renders the shared ForgeAudio dark-mode studio header, A/B State toggle, I/O + Gain Reduction meters,
+/// 32-band Real-Time Spectrum analyzer, and Dynamic Gain-Reduction / Bode Curve polyline inside any `nih_plug_egui` window.
 fn draw_forge_studio_header_and_spectrum(
     ui: &mut egui::Ui,
     title: &str,
@@ -85,6 +107,19 @@ fn draw_forge_studio_header_and_spectrum(
             ui.label(egui::RichText::new(subtitle).color(egui::Color32::from_rgb(165, 175, 195)).small());
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let cur_ab = telemetry.ab_slot.load(Ordering::Relaxed);
+            let ab_label = if cur_ab == 0 { "A/B: [STATE A]" } else { "A/B: [STATE B]" };
+            if ui
+                .button(
+                    egui::RichText::new(ab_label)
+                        .monospace()
+                        .color(egui::Color32::from_rgb(250, 204, 21)),
+                )
+                .clicked()
+            {
+                telemetry.ab_slot.store(1 - (cur_ab & 1), Ordering::Relaxed);
+            }
+            ui.add_space(8.0);
             let pk_in = f32::from_bits(telemetry.peak_in_db.load(Ordering::Relaxed));
             let pk_out = f32::from_bits(telemetry.peak_out_db.load(Ordering::Relaxed));
             let gr = f32::from_bits(telemetry.gr_db.load(Ordering::Relaxed));
@@ -100,7 +135,7 @@ fn draw_forge_studio_header_and_spectrum(
     });
     ui.add_space(4.0);
 
-    // 32-Band Real-Time Spectral / Cross-Instance Bus Canvas
+    // 32-Band Real-Time Spectral + Dynamic GR / Bode Curve Overlay Canvas
     let (rect, _resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 92.0), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(16, 20, 28));
@@ -114,9 +149,13 @@ fn draw_forge_studio_header_and_spectrum(
     let shared_vals = shared_slot.map(read_shared_spectrum);
     let n_bars = 32_usize;
     let bar_w = (rect.width() - 16.0) / (n_bars as f32);
+    let mut curve_pts = Vec::with_capacity(n_bars);
+    let mid_y = rect.center().y;
+
     for b in 0..n_bars {
         let db = if let Some(ref sv) = shared_vals {
-            sv[b]
+            let local_db = f32::from_bits(telemetry.spectrum_db[b].load(Ordering::Relaxed));
+            local_db.max(sv[b])
         } else {
             f32::from_bits(telemetry.spectrum_db[b].load(Ordering::Relaxed))
         };
@@ -128,6 +167,17 @@ fn draw_forge_studio_header_and_spectrum(
             egui::pos2(x0 + bar_w - 2.0, rect.bottom() - 6.0),
         );
         painter.rect_filled(bar_rect, 2.0, egui::Color32::from_rgb(56, 189, 248));
+
+        // Plot 32-band Dynamic Gain Reduction / EQ Bode response curve point (-18 dB .. +18 dB)
+        let gr_b = f32::from_bits(telemetry.band_gr_db[b].load(Ordering::Relaxed)).clamp(-18.0, 18.0);
+        let y_pt = (mid_y - (gr_b / 18.0) * (rect.height() * 0.40)).clamp(rect.top() + 4.0, rect.bottom() - 4.0);
+        curve_pts.push(egui::pos2(x0 + bar_w * 0.5, y_pt));
+    }
+    if curve_pts.len() >= 2 {
+        painter.add(egui::Shape::line(
+            curve_pts,
+            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(251, 146, 60)),
+        ));
     }
     ui.add_space(6.0);
 }
@@ -388,14 +438,10 @@ impl Plugin for ForgeOpenSoothePlug {
             }
         }
 
-        // Publish 32-band spectral energy to the lock-free Cross-Instance Shared Bus
-        let pk_db = f32::from_bits(self.telemetry.peak_out_db.load(Ordering::Relaxed));
-        let mut bands = [0.0_f32; 32];
-        for (idx, b) in bands.iter_mut().enumerate() {
-            let tilt = -0.35 * (idx as f32 - 8.0).abs();
-            *b = (pk_db + tilt).clamp(-90.0, 6.0);
-            self.telemetry.spectrum_db[idx].store(b.to_bits(), Ordering::Relaxed);
-        }
+        // Publish true 2048-pt STFT 32-band spectral energy & dynamic GR curve to GUI & Cross-Instance Bus
+        let bands = self.dsp.last_spectrum_32_db();
+        let gr_curve = self.dsp.last_band_gr_32_db();
+        self.telemetry.update_spectrum_and_gr(&bands, &gr_curve);
         publish_shared_spectrum(bus_slot, &bands);
 
         ProcessStatus::Normal
@@ -433,11 +479,15 @@ impl Vst3Plugin for ForgeOpenSoothePlug {
 
 pub struct ForgeOpenSpacerPlug {
     params: Arc<OpenSpacerParams>,
+    telemetry: Arc<GuiTelemetry>,
+    analyzer: RealtimeSpectrumAnalyzer32,
     dsp: RealtimeOpenSpacer,
 }
 
 #[derive(Params)]
 pub struct OpenSpacerParams {
+    #[persist = "editor-state"]
+    pub editor_state: Arc<EguiState>,
     #[id = "amt"]
     pub amount: FloatParam,
     #[id = "maxcut"]
@@ -453,6 +503,7 @@ pub struct OpenSpacerParams {
 impl Default for OpenSpacerParams {
     fn default() -> Self {
         Self {
+            editor_state: EguiState::from_size(680, 380),
             amount: FloatParam::new(
                 "Unmask Amount",
                 0.50,
@@ -497,6 +548,8 @@ impl Default for ForgeOpenSpacerPlug {
     fn default() -> Self {
         Self {
             params: Arc::new(OpenSpacerParams::default()),
+            telemetry: Arc::new(GuiTelemetry::default()),
+            analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
             dsp: RealtimeOpenSpacer::new(48_000.0),
         }
     }
@@ -524,13 +577,56 @@ impl Plugin for ForgeOpenSpacerPlug {
         self.params.clone()
     }
 
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        let params = self.params.clone();
+        let telemetry = self.telemetry.clone();
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            (),
+            |_, _| {},
+            move |egui_ctx, setter, _state| {
+                egui::CentralPanel::default().show(egui_ctx, |ui| {
+                    draw_forge_studio_header_and_spectrum(
+                        ui,
+                        "FORGE OPENSPACER UNMASK",
+                        "4-Channel Sidechain Dynamic Spectral Unmasker (Vocal -> Music & Kick -> Sub-Bass)",
+                        &telemetry,
+                        None,
+                    );
+                    egui::Grid::new("openspacer_grid")
+                        .num_columns(2)
+                        .spacing([16.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("Unmask Amount");
+                            ui.add(widgets::ParamSlider::for_param(&params.amount, setter));
+                            ui.end_row();
+                            ui.label("Max Carve Depth (dB)");
+                            ui.add(widgets::ParamSlider::for_param(&params.max_cut_db, setter));
+                            ui.end_row();
+                            ui.label("Low Crossover (Hz)");
+                            ui.add(widgets::ParamSlider::for_param(&params.low_hz, setter));
+                            ui.end_row();
+                            ui.label("High Crossover (Hz)");
+                            ui.add(widgets::ParamSlider::for_param(&params.high_hz, setter));
+                            ui.end_row();
+                            ui.label("Kick -> Sub-Bass Mode");
+                            ui.add(widgets::ParamSlider::for_param(&params.kick_bass_mode, setter));
+                            ui.end_row();
+                        });
+                });
+            },
+        )
+    }
+
     fn initialize(
         &mut self,
         _audio_io_layout: &AudioIOLayout,
         buffer_config: &BufferConfig,
         context: &mut impl InitContext<Self>,
     ) -> bool {
-        self.dsp.reset(f64::from(buffer_config.sample_rate));
+        let sr = f64::from(buffer_config.sample_rate);
+        self.dsp.reset(sr);
+        self.analyzer.reset(sr);
         context.set_latency_samples(self.dsp.latency_samples());
         true
     }
@@ -573,6 +669,13 @@ impl Plugin for ForgeOpenSpacerPlug {
                 self.dsp
                     .process_sample(tgt_l, tgt_r, sc_l, sc_r, low_hz, high_hz, amt, max_cut);
 
+            self.analyzer.push_stereo_sample(out_l, out_r);
+            let gr_est = 20.0
+                * (out_l.abs().max(out_r.abs()) / tgt_l.abs().max(tgt_r.abs()).max(1e-5))
+                    .clamp(0.05, 1.0)
+                    .log10();
+            self.telemetry.update_peaks(tgt_l, tgt_r, out_l, out_r, gr_est);
+
             let out_slices = buffer.as_slice();
             if let Some(c0) = out_slices.first_mut() {
                 c0[i] = out_l;
@@ -581,6 +684,8 @@ impl Plugin for ForgeOpenSpacerPlug {
                 c1[i] = out_r;
             }
         }
+        self.telemetry
+            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &[0.0; 32]);
 
         ProcessStatus::Normal
     }
@@ -615,11 +720,15 @@ impl Vst3Plugin for ForgeOpenSpacerPlug {
 
 pub struct ForgeVocalSurgicalPlug {
     params: Arc<VocalSurgicalParams>,
+    telemetry: Arc<GuiTelemetry>,
+    analyzer: RealtimeSpectrumAnalyzer32,
     dsp: RealtimeVocalSurgical,
 }
 
 #[derive(Params)]
 pub struct VocalSurgicalParams {
+    #[persist = "editor-state"]
+    pub editor_state: Arc<EguiState>,
     #[id = "declick"]
     pub declick_sensitivity: FloatParam,
     #[id = "deplosive"]
@@ -633,6 +742,7 @@ pub struct VocalSurgicalParams {
 impl Default for VocalSurgicalParams {
     fn default() -> Self {
         Self {
+            editor_state: EguiState::from_size(680, 380),
             declick_sensitivity: FloatParam::new(
                 "Mouth De-Click",
                 0.65,
@@ -669,6 +779,8 @@ impl Default for ForgeVocalSurgicalPlug {
     fn default() -> Self {
         Self {
             params: Arc::new(VocalSurgicalParams::default()),
+            telemetry: Arc::new(GuiTelemetry::default()),
+            analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
             dsp: RealtimeVocalSurgical::new(48_000.0),
         }
     }
@@ -695,13 +807,53 @@ impl Plugin for ForgeVocalSurgicalPlug {
         self.params.clone()
     }
 
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        let params = self.params.clone();
+        let telemetry = self.telemetry.clone();
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            (),
+            |_, _| {},
+            move |egui_ctx, setter, _state| {
+                egui::CentralPanel::default().show(egui_ctx, |ui| {
+                    draw_forge_studio_header_and_spectrum(
+                        ui,
+                        "FORGE VOCAL SURGICAL STRIP",
+                        "Zero-Latency Mouth De-Click, Dynamic Plosive Suppressor, Split-Band De-Esser & Breath Gate",
+                        &telemetry,
+                        None,
+                    );
+                    egui::Grid::new("vocal_surgical_grid")
+                        .num_columns(2)
+                        .spacing([16.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("Mouth De-Click Sensitivity");
+                            ui.add(widgets::ParamSlider::for_param(&params.declick_sensitivity, setter));
+                            ui.end_row();
+                            ui.label("Plosive Duck (<115 Hz)");
+                            ui.add(widgets::ParamSlider::for_param(&params.deplosive_strength, setter));
+                            ui.end_row();
+                            ui.label("Split-Band De-Esser (dB)");
+                            ui.add(widgets::ParamSlider::for_param(&params.deess_threshold_db, setter));
+                            ui.end_row();
+                            ui.label("Breath Gate Threshold (dB)");
+                            ui.add(widgets::ParamSlider::for_param(&params.breath_gate_db, setter));
+                            ui.end_row();
+                        });
+                });
+            },
+        )
+    }
+
     fn initialize(
         &mut self,
         _audio_io_layout: &AudioIOLayout,
         buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
-        self.dsp.reset(f64::from(buffer_config.sample_rate));
+        let sr = f64::from(buffer_config.sample_rate);
+        self.dsp.reset(sr);
+        self.analyzer.reset(sr);
         true
     }
 
@@ -722,6 +874,12 @@ impl Plugin for ForgeVocalSurgicalPlug {
             let (out_l, out_r) =
                 self.dsp
                     .process_stereo_sample(in_l, in_r, declick, deplosive, deess, gate);
+            self.analyzer.push_stereo_sample(out_l, out_r);
+            let gr_est = 20.0
+                * (out_l.abs().max(out_r.abs()) / in_l.abs().max(in_r.abs()).max(1e-5))
+                    .clamp(0.05, 1.0)
+                    .log10();
+            self.telemetry.update_peaks(in_l, in_r, out_l, out_r, gr_est);
             if let Some(s0) = channel_samples.get_mut(0) {
                 *s0 = out_l;
             }
@@ -729,6 +887,8 @@ impl Plugin for ForgeVocalSurgicalPlug {
                 *s1 = out_r;
             }
         }
+        self.telemetry
+            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &[0.0; 32]);
         ProcessStatus::Normal
     }
 }
@@ -763,11 +923,15 @@ impl Vst3Plugin for ForgeVocalSurgicalPlug {
 
 pub struct ForgeSubAndTapePlug {
     params: Arc<SubAndTapeParams>,
+    telemetry: Arc<GuiTelemetry>,
+    analyzer: RealtimeSpectrumAnalyzer32,
     dsp: RealtimeSubAndTapeBus,
 }
 
 #[derive(Params)]
 pub struct SubAndTapeParams {
+    #[persist = "editor-state"]
+    pub editor_state: Arc<EguiState>,
     #[id = "cutoff"]
     pub mono_cutoff_hz: FloatParam,
     #[id = "sub"]
@@ -781,6 +945,7 @@ pub struct SubAndTapeParams {
 impl Default for SubAndTapeParams {
     fn default() -> Self {
         Self {
+            editor_state: EguiState::from_size(680, 380),
             mono_cutoff_hz: FloatParam::new(
                 "Sub Mono Cutoff",
                 160.0,
@@ -801,7 +966,7 @@ impl Default for SubAndTapeParams {
                 FloatRange::Linear { min: 0.0, max: 2.0 },
             ),
             tape_drive: FloatParam::new(
-                "Console8 / ChowTape Drive",
+                "Console8 / ChowTape RK4 Drive",
                 0.22,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             ),
@@ -813,6 +978,8 @@ impl Default for ForgeSubAndTapePlug {
     fn default() -> Self {
         Self {
             params: Arc::new(SubAndTapeParams::default()),
+            telemetry: Arc::new(GuiTelemetry::default()),
+            analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
             dsp: RealtimeSubAndTapeBus::new(48_000.0, 160.0),
         }
     }
@@ -839,16 +1006,56 @@ impl Plugin for ForgeSubAndTapePlug {
         self.params.clone()
     }
 
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        let params = self.params.clone();
+        let telemetry = self.telemetry.clone();
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            (),
+            |_, _| {},
+            move |egui_ctx, setter, _state| {
+                egui::CentralPanel::default().show(egui_ctx, |ui| {
+                    draw_forge_studio_header_and_spectrum(
+                        ui,
+                        "FORGE SUBMONO & CONSOLE TAPE (JILES-ATHERTON RK4)",
+                        "Linkwitz-Riley <160Hz Mono-Maker, Allpass Disperser, Jiles-Atherton RK4 Hysteresis & Head-Bump",
+                        &telemetry,
+                        None,
+                    );
+                    egui::Grid::new("subtape_grid")
+                        .num_columns(2)
+                        .spacing([16.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("Sub Mono Cutoff (Hz)");
+                            ui.add(widgets::ParamSlider::for_param(&params.mono_cutoff_hz, setter));
+                            ui.end_row();
+                            ui.label("Sub Harmonic + Disperser Reinforce");
+                            ui.add(widgets::ParamSlider::for_param(&params.sub_reinforce, setter));
+                            ui.end_row();
+                            ui.label("High Stereo Width");
+                            ui.add(widgets::ParamSlider::for_param(&params.stereo_width, setter));
+                            ui.end_row();
+                            ui.label("Jiles-Atherton RK4 + Console8 Drive");
+                            ui.add(widgets::ParamSlider::for_param(&params.tape_drive, setter));
+                            ui.end_row();
+                        });
+                });
+            },
+        )
+    }
+
     fn initialize(
         &mut self,
         _audio_io_layout: &AudioIOLayout,
         buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
+        let sr = f64::from(buffer_config.sample_rate);
         self.dsp = RealtimeSubAndTapeBus::new(
-            f64::from(buffer_config.sample_rate),
+            sr,
             f64::from(self.params.mono_cutoff_hz.value()),
         );
+        self.analyzer.reset(sr);
         true
     }
 
@@ -870,6 +1077,8 @@ impl Plugin for ForgeSubAndTapePlug {
             let (out_l, out_r) = self
                 .dsp
                 .process_stereo_sample(in_l, in_r, sub, width, drive);
+            self.analyzer.push_stereo_sample(out_l, out_r);
+            self.telemetry.update_peaks(in_l, in_r, out_l, out_r, 0.0);
             if let Some(s0) = channel_samples.get_mut(0) {
                 *s0 = out_l;
             }
@@ -877,6 +1086,8 @@ impl Plugin for ForgeSubAndTapePlug {
                 *s1 = out_r;
             }
         }
+        self.telemetry
+            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &[0.0; 32]);
         ProcessStatus::Normal
     }
 }
@@ -911,11 +1122,15 @@ impl Vst3Plugin for ForgeSubAndTapePlug {
 
 pub struct ForgeMasterLimiterPlug {
     params: Arc<MasterLimiterParams>,
+    telemetry: Arc<GuiTelemetry>,
+    analyzer: RealtimeSpectrumAnalyzer32,
     dsp: RealtimeMasterLimiter,
 }
 
 #[derive(Params)]
 pub struct MasterLimiterParams {
+    #[persist = "editor-state"]
+    pub editor_state: Arc<EguiState>,
     #[id = "drive"]
     pub drive_db: FloatParam,
     #[id = "ceil"]
@@ -927,6 +1142,7 @@ pub struct MasterLimiterParams {
 impl Default for MasterLimiterParams {
     fn default() -> Self {
         Self {
+            editor_state: EguiState::from_size(680, 360),
             drive_db: FloatParam::new(
                 "Input Gain / Drive",
                 0.0,
@@ -963,6 +1179,8 @@ impl Default for ForgeMasterLimiterPlug {
     fn default() -> Self {
         Self {
             params: Arc::new(MasterLimiterParams::default()),
+            telemetry: Arc::new(GuiTelemetry::default()),
+            analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
             dsp: RealtimeMasterLimiter::new(48_000.0),
         }
     }
@@ -989,13 +1207,50 @@ impl Plugin for ForgeMasterLimiterPlug {
         self.params.clone()
     }
 
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        let params = self.params.clone();
+        let telemetry = self.telemetry.clone();
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            (),
+            |_, _| {},
+            move |egui_ctx, setter, _state| {
+                egui::CentralPanel::default().show(egui_ctx, |ui| {
+                    draw_forge_studio_header_and_spectrum(
+                        ui,
+                        "FORGE MASTER TRUE-PEAK BRICKWALL LIMITER",
+                        "Lookahead 4x Inter-Sample True-Peak Brickwall Limiter (-1.0 dBTP) & ITU-R BS.1770-4 Meter",
+                        &telemetry,
+                        None,
+                    );
+                    egui::Grid::new("limiter_grid")
+                        .num_columns(2)
+                        .spacing([16.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("Input Gain / Drive (dB)");
+                            ui.add(widgets::ParamSlider::for_param(&params.drive_db, setter));
+                            ui.end_row();
+                            ui.label("True-Peak Ceiling (dBTP)");
+                            ui.add(widgets::ParamSlider::for_param(&params.ceiling_dbtp, setter));
+                            ui.end_row();
+                            ui.label("Release Time (ms)");
+                            ui.add(widgets::ParamSlider::for_param(&params.release_ms, setter));
+                            ui.end_row();
+                        });
+                });
+            },
+        )
+    }
+
     fn initialize(
         &mut self,
         _audio_io_layout: &AudioIOLayout,
         buffer_config: &BufferConfig,
         context: &mut impl InitContext<Self>,
     ) -> bool {
-        self.dsp.reset(f64::from(buffer_config.sample_rate));
+        let sr = f64::from(buffer_config.sample_rate);
+        self.dsp.reset(sr);
+        self.analyzer.reset(sr);
         context.set_latency_samples(self.dsp.latency_samples());
         true
     }
@@ -1014,6 +1269,9 @@ impl Plugin for ForgeMasterLimiterPlug {
             let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
             let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
             let (out_l, out_r) = self.dsp.process_stereo_sample(in_l, in_r, drive, ceil, rel);
+            self.analyzer.push_stereo_sample(out_l, out_r);
+            let (_lufs, _dbtp, gr) = self.dsp.telemetry();
+            self.telemetry.update_peaks(in_l, in_r, out_l, out_r, -gr);
             if let Some(s0) = channel_samples.get_mut(0) {
                 *s0 = out_l;
             }
@@ -1021,6 +1279,9 @@ impl Plugin for ForgeMasterLimiterPlug {
                 *s1 = out_r;
             }
         }
+        let (_lufs, _dbtp, gr) = self.dsp.telemetry();
+        self.telemetry
+            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &[-gr; 32]);
         ProcessStatus::Normal
     }
 }
@@ -1055,11 +1316,15 @@ impl Vst3Plugin for ForgeMasterLimiterPlug {
 
 pub struct ForgeDrumTriggerPlug {
     params: Arc<DrumTriggerParams>,
+    telemetry: Arc<GuiTelemetry>,
+    analyzer: RealtimeSpectrumAnalyzer32,
     dsp: RealtimeDrumTrigger,
 }
 
 #[derive(Params)]
 pub struct DrumTriggerParams {
+    #[persist = "editor-state"]
+    pub editor_state: Arc<EguiState>,
     #[id = "thresh"]
     pub threshold_db: FloatParam,
     #[id = "neosoul"]
@@ -1069,6 +1334,7 @@ pub struct DrumTriggerParams {
 impl Default for DrumTriggerParams {
     fn default() -> Self {
         Self {
+            editor_state: EguiState::from_size(640, 340),
             threshold_db: FloatParam::new(
                 "Trigger Threshold",
                 -24.0,
@@ -1087,6 +1353,8 @@ impl Default for ForgeDrumTriggerPlug {
     fn default() -> Self {
         Self {
             params: Arc::new(DrumTriggerParams::default()),
+            telemetry: Arc::new(GuiTelemetry::default()),
+            analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
             dsp: RealtimeDrumTrigger::new(48_000.0),
         }
     }
@@ -1115,13 +1383,47 @@ impl Plugin for ForgeDrumTriggerPlug {
         self.params.clone()
     }
 
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        let params = self.params.clone();
+        let telemetry = self.telemetry.clone();
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            (),
+            |_, _| {},
+            move |egui_ctx, setter, _state| {
+                egui::CentralPanel::default().show(egui_ctx, |ui| {
+                    draw_forge_studio_header_and_spectrum(
+                        ui,
+                        "FORGE DRUM TRIGGER & THEORY MIDI",
+                        "Real-Time Audio-to-MIDI 3-Band Drum Transient Replacer (C1/D1/F#1) & Neo-Soul Chord Voicer",
+                        &telemetry,
+                        None,
+                    );
+                    egui::Grid::new("drum_trigger_grid")
+                        .num_columns(2)
+                        .spacing([16.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("Transient Trigger Threshold (dB)");
+                            ui.add(widgets::ParamSlider::for_param(&params.threshold_db, setter));
+                            ui.end_row();
+                            ui.label("1-Finger MIDI -> Neo-Soul 9th Voicing");
+                            ui.add(widgets::ParamSlider::for_param(&params.expand_midi_chords, setter));
+                            ui.end_row();
+                        });
+                });
+            },
+        )
+    }
+
     fn initialize(
         &mut self,
         _audio_io_layout: &AudioIOLayout,
         buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
-        self.dsp.reset(f64::from(buffer_config.sample_rate));
+        let sr = f64::from(buffer_config.sample_rate);
+        self.dsp.reset(sr);
+        self.analyzer.reset(sr);
         true
     }
 
@@ -1188,6 +1490,8 @@ impl Plugin for ForgeDrumTriggerPlug {
         for (sample_idx, mut channel_samples) in buffer.iter_samples().enumerate() {
             let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
             let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
+            self.analyzer.push_stereo_sample(in_l, in_r);
+            self.telemetry.update_peaks(in_l, in_r, in_l, in_r, 0.0);
 
             let triggers = self.dsp.process_stereo_sample(in_l, in_r, thresh);
             for trig in triggers.into_iter().flatten() {
@@ -1201,6 +1505,8 @@ impl Plugin for ForgeDrumTriggerPlug {
                 });
             }
         }
+        self.telemetry
+            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &[0.0; 32]);
 
         ProcessStatus::Normal
     }
@@ -1237,12 +1543,17 @@ impl Vst3Plugin for ForgeDrumTriggerPlug {
 
 pub struct ForgePhaseAndMatchPlug {
     params: Arc<PhaseAndMatchParams>,
+    telemetry: Arc<GuiTelemetry>,
+    analyzer: RealtimeSpectrumAnalyzer32,
+    auto_gain: AutoGainCompensator,
     phase_dsp: RealtimePhaseAligner,
     eq_dsp: RealtimeMasteringEq18,
 }
 
 #[derive(Params)]
 pub struct PhaseAndMatchParams {
+    #[persist = "editor-state"]
+    pub editor_state: Arc<EguiState>,
     #[id = "delay"]
     pub delay_samples: IntParam,
     #[id = "inv"]
@@ -1251,11 +1562,14 @@ pub struct PhaseAndMatchParams {
     pub ai_warmth_eq_amount: FloatParam,
     #[id = "genre"]
     pub genre_target_idx: IntParam,
+    #[id = "autogain"]
+    pub auto_gain_comp: BoolParam,
 }
 
 impl Default for PhaseAndMatchParams {
     fn default() -> Self {
         Self {
+            editor_state: EguiState::from_size(680, 390),
             delay_samples: IntParam::new(
                 "Phase Delay Offset",
                 0,
@@ -1273,6 +1587,7 @@ impl Default for PhaseAndMatchParams {
                 0,
                 IntRange::Linear { min: 0, max: 5 },
             ),
+            auto_gain_comp: BoolParam::new("ZLEqualizer Auto-Gain Compensation", true),
         }
     }
 }
@@ -1281,6 +1596,9 @@ impl Default for ForgePhaseAndMatchPlug {
     fn default() -> Self {
         Self {
             params: Arc::new(PhaseAndMatchParams::default()),
+            telemetry: Arc::new(GuiTelemetry::default()),
+            analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
+            auto_gain: AutoGainCompensator::default(),
             phase_dsp: RealtimePhaseAligner::new(48_000.0),
             eq_dsp: RealtimeMasteringEq18::new(48_000.0),
         }
@@ -1308,6 +1626,47 @@ impl Plugin for ForgePhaseAndMatchPlug {
         self.params.clone()
     }
 
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        let params = self.params.clone();
+        let telemetry = self.telemetry.clone();
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            (),
+            |_, _| {},
+            move |egui_ctx, setter, _state| {
+                egui::CentralPanel::default().show(egui_ctx, |ui| {
+                    draw_forge_studio_header_and_spectrum(
+                        ui,
+                        "FORGE PHASE-ALIGN & 18-BAND MASTERING EQ",
+                        "Sample-Accurate Phase Aligner, Nyquist De-Cramped 18-Band AI De-Harsh EQ, Bode Overlay & Auto-Gain",
+                        &telemetry,
+                        None,
+                    );
+                    egui::Grid::new("phase_eq_grid")
+                        .num_columns(2)
+                        .spacing([16.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("Phase Delay Offset (spl)");
+                            ui.add(widgets::ParamSlider::for_param(&params.delay_samples, setter));
+                            ui.end_row();
+                            ui.label("Invert Polarity (180 deg)");
+                            ui.add(widgets::ParamSlider::for_param(&params.invert_polarity, setter));
+                            ui.end_row();
+                            ui.label("18-Band AI De-Harsh & Genre Amount");
+                            ui.add(widgets::ParamSlider::for_param(&params.ai_warmth_eq_amount, setter));
+                            ui.end_row();
+                            ui.label("Genre Target (0=Pop..5=Jazz)");
+                            ui.add(widgets::ParamSlider::for_param(&params.genre_target_idx, setter));
+                            ui.end_row();
+                            ui.label("Auto-Gain Compensation (AGC)");
+                            ui.add(widgets::ParamSlider::for_param(&params.auto_gain_comp, setter));
+                            ui.end_row();
+                        });
+                });
+            },
+        )
+    }
+
     fn initialize(
         &mut self,
         _audio_io_layout: &AudioIOLayout,
@@ -1317,6 +1676,8 @@ impl Plugin for ForgePhaseAndMatchPlug {
         let sr = f64::from(buffer_config.sample_rate);
         self.phase_dsp = RealtimePhaseAligner::new(sr);
         self.eq_dsp = RealtimeMasteringEq18::new(sr);
+        self.analyzer.reset(sr);
+        self.auto_gain.reset();
         true
     }
 
@@ -1329,6 +1690,7 @@ impl Plugin for ForgePhaseAndMatchPlug {
         let delay = self.params.delay_samples.value().max(0) as usize;
         let inv = self.params.invert_polarity.value();
         let eq_amt = f64::from(self.params.ai_warmth_eq_amount.value());
+        let use_agc = self.params.auto_gain_comp.value();
         let genre = match self.params.genre_target_idx.value() {
             1 => GenreTonalTarget::HipHopTrap,
             2 => GenreTonalTarget::NeoSoulRnB,
@@ -1355,7 +1717,12 @@ impl Plugin for ForgePhaseAndMatchPlug {
             let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
             let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
             let (al_l, al_r) = self.phase_dsp.process_stereo_sample(in_l, in_r);
-            let (out_l, out_r) = self.eq_dsp.process_stereo_sample(al_l, al_r);
+            let (eq_l, eq_r) = self.eq_dsp.process_stereo_sample(al_l, al_r);
+            let (out_l, out_r) = self
+                .auto_gain
+                .process_stereo(in_l, in_r, eq_l, eq_r, use_agc);
+            self.analyzer.push_stereo_sample(out_l, out_r);
+            self.telemetry.update_peaks(in_l, in_r, out_l, out_r, 0.0);
             if let Some(s0) = channel_samples.get_mut(0) {
                 *s0 = out_l;
             }
@@ -1363,6 +1730,16 @@ impl Plugin for ForgePhaseAndMatchPlug {
                 *s1 = out_r;
             }
         }
+
+        // Interpolate 18-band EQ Bode response across 32 GUI curve points
+        let mut bode_32 = [0.0_f32; 32];
+        for (b, val) in bode_32.iter_mut().enumerate() {
+            let idx = (b * 17) / 31;
+            *val = (combined[idx] * eq_amt) as f32;
+        }
+        self.telemetry
+            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &bode_32);
+
         ProcessStatus::Normal
     }
 }
@@ -1399,6 +1776,7 @@ impl Vst3Plugin for ForgePhaseAndMatchPlug {
 pub struct ForgeSplitEqPlug {
     params: Arc<SplitEqParams>,
     telemetry: Arc<GuiTelemetry>,
+    analyzer: RealtimeSpectrumAnalyzer32,
     dsp: RealtimeTransientTonalSplit,
 }
 
@@ -1444,6 +1822,7 @@ impl Default for ForgeSplitEqPlug {
         Self {
             params: Arc::new(SplitEqParams::default()),
             telemetry: Arc::new(GuiTelemetry::default()),
+            analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
             dsp: RealtimeTransientTonalSplit::new(48_000.0),
         }
     }
@@ -1520,7 +1899,9 @@ impl Plugin for ForgeSplitEqPlug {
         buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
-        self.dsp.reset(f64::from(buffer_config.sample_rate));
+        let sr = f64::from(buffer_config.sample_rate);
+        self.dsp.reset(sr);
+        self.analyzer.reset(sr);
         true
     }
 
@@ -1530,6 +1911,8 @@ impl Plugin for ForgeSplitEqPlug {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        let mut last_tr = [0.0_f64; 3];
+        let mut last_tn = [0.0_f64; 3];
         for mut channel_samples in buffer.iter_samples() {
             let tr = [
                 f64::from(self.params.trans_low_db.smoothed.next()),
@@ -1541,9 +1924,12 @@ impl Plugin for ForgeSplitEqPlug {
                 f64::from(self.params.tonal_mid_db.smoothed.next()),
                 f64::from(self.params.tonal_high_db.smoothed.next()),
             ];
+            last_tr = tr;
+            last_tn = tn;
             let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
             let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
             let (out_l, out_r) = self.dsp.process_stereo_sample(in_l, in_r, tr, tn, 1.5, 0);
+            self.analyzer.push_stereo_sample(out_l, out_r);
             self.telemetry.update_peaks(in_l, in_r, out_l, out_r, 0.0);
             if let Some(s0) = channel_samples.get_mut(0) {
                 *s0 = out_l;
@@ -1552,6 +1938,19 @@ impl Plugin for ForgeSplitEqPlug {
                 *s1 = out_r;
             }
         }
+        let mut split_curve = [0.0_f32; 32];
+        for (b, val) in split_curve.iter_mut().enumerate() {
+            let band_idx = if b < 10 {
+                0
+            } else if b < 22 {
+                1
+            } else {
+                2
+            };
+            *val = (0.5 * (last_tr[band_idx] + last_tn[band_idx])) as f32;
+        }
+        self.telemetry
+            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &split_curve);
         ProcessStatus::Normal
     }
 }
@@ -1587,6 +1986,7 @@ impl Vst3Plugin for ForgeSplitEqPlug {
 pub struct ForgeDensityClipperPlug {
     params: Arc<DensityClipperParams>,
     telemetry: Arc<GuiTelemetry>,
+    analyzer: RealtimeSpectrumAnalyzer32,
     dsp: RealtimeDensityAndClipper,
 }
 
@@ -1634,6 +2034,7 @@ impl Default for ForgeDensityClipperPlug {
         Self {
             params: Arc::new(DensityClipperParams::default()),
             telemetry: Arc::new(GuiTelemetry::default()),
+            analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
             dsp: RealtimeDensityAndClipper::new(48_000.0),
         }
     }
@@ -1701,7 +2102,9 @@ impl Plugin for ForgeDensityClipperPlug {
         buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
-        self.dsp = RealtimeDensityAndClipper::new(f64::from(buffer_config.sample_rate));
+        let sr = f64::from(buffer_config.sample_rate);
+        self.dsp = RealtimeDensityAndClipper::new(sr);
+        self.analyzer.reset(sr);
         true
     }
 
@@ -1720,6 +2123,7 @@ impl Plugin for ForgeDensityClipperPlug {
             let (out_l, out_r) = self
                 .dsp
                 .process_stereo_sample(in_l, in_r, density, drive, ceil);
+            self.analyzer.push_stereo_sample(out_l, out_r);
             self.telemetry.update_peaks(in_l, in_r, out_l, out_r, 0.0);
             if let Some(s0) = channel_samples.get_mut(0) {
                 *s0 = out_l;
@@ -1728,6 +2132,8 @@ impl Plugin for ForgeDensityClipperPlug {
                 *s1 = out_r;
             }
         }
+        self.telemetry
+            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &[0.0; 32]);
         ProcessStatus::Normal
     }
 }
@@ -1765,6 +2171,7 @@ impl Vst3Plugin for ForgeDensityClipperPlug {
 pub struct ForgeSpaceVerbAndPreampPlug {
     params: Arc<SpaceVerbAndPreampParams>,
     telemetry: Arc<GuiTelemetry>,
+    analyzer: RealtimeSpectrumAnalyzer32,
     preamp_dsp: RealtimeNeuralPreamp,
     reverb_dsp: RealtimeFdnReverb,
 }
@@ -1838,6 +2245,7 @@ impl Default for ForgeSpaceVerbAndPreampPlug {
         Self {
             params: Arc::new(SpaceVerbAndPreampParams::default()),
             telemetry: Arc::new(GuiTelemetry::default()),
+            analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
             preamp_dsp: RealtimeNeuralPreamp::new(AnalogHardwareModel::Neve1073ClassA),
             reverb_dsp: RealtimeFdnReverb::new(48_000.0),
         }
@@ -1877,7 +2285,7 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
                     draw_forge_studio_header_and_spectrum(
                         ui,
                         "FORGE SPACEVERB FDN & NEURAL WAVENET PREAMP",
-                        "Dilated Causal WaveNet Preamp (1073/1176/V76/A800) + 8x8 Hadamard FDN Reverb w/ Ducking & Shimmer",
+                        "Dilated Causal WaveNet Preamp (.nam Ready) + Moorer ER / Allpass Diffuser / 8x8 Hadamard FDN Reverb",
                         &telemetry,
                         None,
                     );
@@ -1921,6 +2329,7 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
         let sr = f64::from(buffer_config.sample_rate);
         self.preamp_dsp = RealtimeNeuralPreamp::new(AnalogHardwareModel::Neve1073ClassA);
         self.reverb_dsp.reset(sr);
+        self.analyzer.reset(sr);
         true
     }
 
@@ -1953,6 +2362,7 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
             let (out_l, out_r) =
                 self.reverb_dsp
                     .process_stereo_sample(pr_l, pr_r, decay, damp, shimmer, duck, mix);
+            self.analyzer.push_stereo_sample(out_l, out_r);
             self.telemetry.update_peaks(in_l, in_r, out_l, out_r, 0.0);
             if let Some(s0) = channel_samples.get_mut(0) {
                 *s0 = out_l;
@@ -1961,6 +2371,8 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
                 *s1 = out_r;
             }
         }
+        self.telemetry
+            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &[0.0; 32]);
         ProcessStatus::Normal
     }
 }

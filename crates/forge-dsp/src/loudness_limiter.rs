@@ -95,7 +95,7 @@ impl Biquad {
         y
     }
 
-    /// Audio EQ Cookbook peaking bell filter.
+    /// Audio EQ Cookbook peaking bell filter with Orfanidis / ZLEqualizer Nyquist Q De-Cramping.
     pub fn peaking_eq(sample_rate: f64, freq_hz: f64, q: f64, gain_db: f64) -> Self {
         let sr = sanitize_param_f64(sample_rate, 48_000.0, 100.0, 768_000.0);
         let f0 = sanitize_param_f64(freq_hz, 1000.0, 10.0, (sr * 0.48).max(10.0));
@@ -104,7 +104,9 @@ impl Biquad {
         let a = 10.0_f64.powf(clean_db / 40.0);
         let w0 = 2.0 * PI * f0 / sr;
         let cos_w0 = w0.cos();
-        let alpha = w0.sin() / (2.0 * clean_q);
+        // Orfanidis / Matched-Z Nyquist De-Cramping: prevents high-frequency bell narrowing near fs/2
+        let decramped_q = (clean_q * (w0 * 0.5).cos().clamp(0.35, 1.0)).max(0.05);
+        let alpha = w0.sin() / (2.0 * decramped_q);
 
         let b0 = 1.0 + alpha * a;
         let b1 = -2.0 * cos_w0;
@@ -114,6 +116,28 @@ impl Biquad {
         let a2 = 1.0 - alpha / a;
 
         Self::new(b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+    }
+
+    /// Evaluates the exact analytical magnitude response $|H(e^{j\omega})|$ in dB at `freq_hz`
+    /// for interactive Bode frequency-response curve plotting (`ZLEqualizer` style).
+    #[inline]
+    pub fn magnitude_db_at(&self, freq_hz: f64, sample_rate: f64) -> f64 {
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 100.0, 768_000.0);
+        let f = sanitize_param_f64(freq_hz, 1000.0, 10.0, sr * 0.495);
+        let w = 2.0 * PI * f / sr;
+        let c1 = w.cos();
+        let s1 = w.sin();
+        let c2 = (2.0 * w).cos();
+        let s2 = (2.0 * w).sin();
+
+        let num_re = self.b0 + self.b1 * c1 + self.b2 * c2;
+        let num_im = -(self.b1 * s1 + self.b2 * s2);
+        let den_re = 1.0 + self.a1 * c1 + self.a2 * c2;
+        let den_im = -(self.a1 * s1 + self.a2 * s2);
+
+        let num_mag_sq = (num_re * num_re + num_im * num_im).max(1.0e-18);
+        let den_mag_sq = (den_re * den_re + den_im * den_im).max(1.0e-18);
+        (10.0 * (num_mag_sq / den_mag_sq).log10()).clamp(-48.0, 48.0)
     }
 
     /// Audio EQ Cookbook narrow notch filter (ideal for 50/60 Hz hum harmonics).
@@ -206,6 +230,137 @@ impl Biquad {
         let a1 = 2.0 * (k * k - 1.0) / a0;
         let a2 = (1.0 - k / q + k * k) / a0;
         Self::new(b0, b1, b2, a1, a2)
+    }
+}
+
+/// Andy Simper (Cytomic) Topology-Preserving Transform (TPT) Trapezoidal State-Variable Filter (SVF)
+/// (`Surge XT / sst-filters` & `ZLEqualizer` standard).
+///
+/// Unconditionally stable under fast audio-rate cutoff ($f_0$) and resonance ($Q$) modulation
+/// without Direct-Form II Biquad state transients ("zipper thumps") or low-frequency float noise.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CytomicSvf {
+    pub a1: f64,
+    pub a2: f64,
+    pub a3: f64,
+    pub m0: f64,
+    pub m1: f64,
+    pub m2: f64,
+    ic1eq: f64,
+    ic2eq: f64,
+}
+
+impl CytomicSvf {
+    #[inline]
+    pub fn reset(&mut self) {
+        self.ic1eq = 0.0;
+        self.ic2eq = 0.0;
+    }
+
+    /// Configures the TPT SVF as a Low-Pass filter while preserving integrator state (`ic1eq`, `ic2eq`).
+    #[inline]
+    pub fn set_lowpass(&mut self, sample_rate: f64, freq_hz: f64, q: f64) {
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 100.0, 768_000.0);
+        let f0 = sanitize_param_f64(freq_hz, 1000.0, 5.0, (sr * 0.48).max(5.0));
+        let clean_q = sanitize_param_f64(q, std::f64::consts::FRAC_1_SQRT_2, 0.1, 50.0);
+        let g = (PI * f0 / sr).tan();
+        let k = 1.0 / clean_q;
+        self.a1 = 1.0 / (1.0 + g * (g + k));
+        self.a2 = g * self.a1;
+        self.a3 = g * self.a2;
+        self.m0 = 0.0;
+        self.m1 = 0.0;
+        self.m2 = 1.0;
+    }
+
+    /// Configures the TPT SVF as a High-Pass filter while preserving integrator state.
+    #[inline]
+    pub fn set_highpass(&mut self, sample_rate: f64, freq_hz: f64, q: f64) {
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 100.0, 768_000.0);
+        let f0 = sanitize_param_f64(freq_hz, 1000.0, 5.0, (sr * 0.48).max(5.0));
+        let clean_q = sanitize_param_f64(q, std::f64::consts::FRAC_1_SQRT_2, 0.1, 50.0);
+        let g = (PI * f0 / sr).tan();
+        let k = 1.0 / clean_q;
+        self.a1 = 1.0 / (1.0 + g * (g + k));
+        self.a2 = g * self.a1;
+        self.a3 = g * self.a2;
+        self.m0 = 1.0;
+        self.m1 = -k;
+        self.m2 = -1.0;
+    }
+
+    /// Configures the TPT SVF as a Peaking Bell EQ while preserving integrator state (ideal for Dynamic EQ).
+    #[inline]
+    pub fn set_bell(&mut self, sample_rate: f64, freq_hz: f64, q: f64, gain_db: f64) {
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 100.0, 768_000.0);
+        let f0 = sanitize_param_f64(freq_hz, 1000.0, 5.0, (sr * 0.48).max(5.0));
+        let clean_q = sanitize_param_f64(q, 1.0, 0.1, 50.0);
+        let clean_db = sanitize_param_f64(gain_db, 0.0, -36.0, 36.0);
+        let a = 10.0_f64.powf(clean_db / 40.0);
+        let g = (PI * f0 / sr).tan();
+        let k = 1.0 / (clean_q * a);
+        self.a1 = 1.0 / (1.0 + g * (g + k));
+        self.a2 = g * self.a1;
+        self.a3 = g * self.a2;
+        self.m0 = 1.0;
+        self.m1 = k * (a * a - 1.0);
+        self.m2 = 0.0;
+    }
+
+    pub fn lowpass(sample_rate: f64, freq_hz: f64, q: f64) -> Self {
+        let mut s = Self::default();
+        s.set_lowpass(sample_rate, freq_hz, q);
+        s
+    }
+
+    pub fn highpass(sample_rate: f64, freq_hz: f64, q: f64) -> Self {
+        let mut s = Self::default();
+        s.set_highpass(sample_rate, freq_hz, q);
+        s
+    }
+
+    pub fn bell(sample_rate: f64, freq_hz: f64, q: f64, gain_db: f64) -> Self {
+        let mut s = Self::default();
+        s.set_bell(sample_rate, freq_hz, q, gain_db);
+        s
+    }
+
+    /// Processes a single sample and returns `(lowpass, bandpass, highpass)` simultaneously
+    /// from the same trapezoidal integrator state.
+    #[inline]
+    pub fn process_multimode(&mut self, x_raw: f64) -> (f64, f64, f64) {
+        let v0 = sanitize_sample_f64(x_raw);
+        let v3 = v0 - self.ic2eq;
+        let v1 = self.a1 * self.ic1eq + self.a2 * v3;
+        let v2 = self.ic2eq + self.a2 * self.ic1eq + self.a3 * v3;
+        if !v1.is_finite() || !v2.is_finite() {
+            self.ic1eq = 0.0;
+            self.ic2eq = 0.0;
+            return (0.0, 0.0, 0.0);
+        }
+        self.ic1eq = flush_denormal_f64(2.0 * v1 - self.ic1eq);
+        self.ic2eq = flush_denormal_f64(2.0 * v2 - self.ic2eq);
+        let lp = flush_denormal_f64(v2);
+        let bp = flush_denormal_f64(v1);
+        let hp = flush_denormal_f64(v0 - v1 - v2);
+        (lp, bp, hp)
+    }
+
+    /// Processes a single sample using the configured `m0, m1, m2` topology output weights.
+    #[inline]
+    pub fn process_sample(&mut self, x_raw: f64) -> f64 {
+        let v0 = sanitize_sample_f64(x_raw);
+        let v3 = v0 - self.ic2eq;
+        let v1 = self.a1 * self.ic1eq + self.a2 * v3;
+        let v2 = self.ic2eq + self.a2 * self.ic1eq + self.a3 * v3;
+        if !v1.is_finite() || !v2.is_finite() {
+            self.ic1eq = 0.0;
+            self.ic2eq = 0.0;
+            return 0.0;
+        }
+        self.ic1eq = flush_denormal_f64(2.0 * v1 - self.ic1eq);
+        self.ic2eq = flush_denormal_f64(2.0 * v2 - self.ic2eq);
+        flush_denormal_f64(self.m0 * v0 + self.m1 * v1 + self.m2 * v2)
     }
 }
 

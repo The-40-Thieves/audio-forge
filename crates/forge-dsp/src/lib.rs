@@ -10,12 +10,14 @@ pub mod spectral_unmask;
 
 pub use elite_dsp::{
     compute_genre_tonal_balance_eq, publish_shared_spectrum, read_shared_spectrum, AdaaSin,
-    AdaaTanh, AnalogHardwareModel, GenreTonalTarget, Oversampler2x, RealtimeDensityAndClipper,
-    RealtimeFdnReverb, RealtimeNeuralPreamp, RealtimeTransientTonalSplit, SHARED_SPECTRUM_SLOTS,
+    AdaaTanh, AllpassDisperser, AnalogHardwareModel, AutoGainCompensator, GenreTonalTarget,
+    JilesAthertonHysteresis, NamWaveNetProfile, Oversampler2x, RealtimeDensityAndClipper,
+    RealtimeFdnReverb, RealtimeNeuralPreamp, RealtimeSpectrumAnalyzer32,
+    RealtimeTransientTonalSplit, SHARED_SPECTRUM_SLOTS,
 };
 pub use loudness_limiter::{
     audit_audio, compute_true_peak, flush_denormal_f64, normalize_and_limit, sanitize_param_f64,
-    sanitize_sample_f32, sanitize_sample_f64, Biquad,
+    sanitize_sample_f32, sanitize_sample_f64, Biquad, CytomicSvf,
 };
 pub use phase_align::{
     align_phase_gcc_phat, align_vocal_double_dtw, PhaseAlignmentResult, StretchMarker,

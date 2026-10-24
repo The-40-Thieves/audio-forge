@@ -10,8 +10,9 @@ use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 use std::sync::Arc;
 
+use crate::elite_dsp::{AllpassDisperser, JilesAthertonHysteresis};
 use crate::loudness_limiter::{
-    flush_denormal_f64, sanitize_param_f64, sanitize_sample_f32, Biquad,
+    flush_denormal_f64, sanitize_param_f64, sanitize_sample_f32, Biquad, CytomicSvf,
 };
 use crate::restoration::MASTERING_18_BANDS_HZ;
 
@@ -83,6 +84,8 @@ pub struct RealtimeOpenSoothe {
     smoothed_gains_l: Vec<f64>,
     smoothed_gains_r: Vec<f64>,
     last_gr_db: f32,
+    last_spectrum_db: [f32; 32],
+    last_band_gr_db: [f32; 32],
 }
 
 impl RealtimeOpenSoothe {
@@ -119,6 +122,8 @@ impl RealtimeOpenSoothe {
             smoothed_gains_l: vec![1.0; half_bins],
             smoothed_gains_r: vec![1.0; half_bins],
             last_gr_db: 0.0,
+            last_spectrum_db: [-90.0; 32],
+            last_band_gr_db: [0.0; 32],
         };
         proc.update_band_weights(1.35, 1.15);
         proc
@@ -140,6 +145,8 @@ impl RealtimeOpenSoothe {
         self.ring_pos = 0;
         self.hop_counter = 0;
         self.last_gr_db = 0.0;
+        self.last_spectrum_db = [-90.0; 32];
+        self.last_band_gr_db = [0.0; 32];
         self.update_band_weights(1.35, 1.15);
     }
 
@@ -163,6 +170,14 @@ impl RealtimeOpenSoothe {
 
     pub fn last_gain_reduction_db(&self) -> f32 {
         self.last_gr_db
+    }
+
+    pub fn last_spectrum_32_db(&self) -> [f32; 32] {
+        self.last_spectrum_db
+    }
+
+    pub fn last_band_gr_32_db(&self) -> [f32; 32] {
+        self.last_band_gr_db
     }
 
     #[inline]
@@ -325,6 +340,29 @@ impl RealtimeOpenSoothe {
         }
 
         self.last_gr_db = (-20.0 * min_g_seen.max(1e-6).log10()) as f32;
+
+        // Extract true 32-band log-spaced FFT magnitude spectrum & dynamic Gain Reduction curve
+        let bin_hz = self.sample_rate / (self.fft_size as f64);
+        for band_idx in 0..32 {
+            let f_lo = 25.0 * (740.0_f64).powf((band_idx as f64) / 32.0);
+            let f_hi = 25.0 * (740.0_f64).powf(((band_idx + 1) as f64) / 32.0);
+            let b0 = ((f_lo / bin_hz).floor() as usize).clamp(1, self.half_bins - 2);
+            let b1 = ((f_hi / bin_hz).ceil() as usize).clamp(b0 + 1, self.half_bins - 1);
+            let mut sum_mag = 0.0_f64;
+            let mut min_band_g = 1.0_f64;
+            for b in b0..=b1 {
+                sum_mag += self.mags_scratch[b] * inv_n;
+                let g_lr = 0.5 * (self.smoothed_gains_l[b] + self.smoothed_gains_r[b]);
+                if g_lr < min_band_g {
+                    min_band_g = g_lr;
+                }
+            }
+            let avg_mag = (sum_mag / ((b1 - b0 + 1) as f64)).max(1.0e-9);
+            self.last_spectrum_db[band_idx] =
+                (20.0 * avg_mag.log10() as f32 + 12.0).clamp(-90.0, 6.0);
+            self.last_band_gr_db[band_idx] =
+                (20.0 * min_band_g.max(1.0e-4).log10() as f32).clamp(-24.0, 0.0);
+        }
     }
 }
 
@@ -664,16 +702,22 @@ impl RealtimeVocalSurgical {
     }
 }
 
-/// Real-Time Zero-Latency **Sub-Bass Mono-Maker, Harmonic Reinforcer & Console8/ChowTape Warmth Bus**.
+/// Real-Time Zero-Latency **Sub-Bass Mono-Maker, Allpass Phase Disperser & ChowTape Jiles-Atherton Bus**.
 pub struct RealtimeSubAndTapeBus {
     sample_rate: f64,
     side_hp1: Biquad,
     side_hp2: Biquad,
     sub_lp: Biquad,
-    head_bump_l: Biquad,
-    head_bump_r: Biquad,
-    hyst_l: f64,
-    hyst_r: f64,
+    head_bump_l: CytomicSvf,
+    head_bump_r: CytomicSvf,
+    disperser_l: AllpassDisperser,
+    disperser_r: AllpassDisperser,
+    ja_hyst_l: JilesAthertonHysteresis,
+    ja_hyst_r: JilesAthertonHysteresis,
+    flutter_buf_l: [f64; 64],
+    flutter_buf_r: [f64; 64],
+    flutter_pos: usize,
+    flutter_phase: f64,
     sub_phase_flip: f64,
     prev_sub_sample: f64,
 }
@@ -687,10 +731,16 @@ impl RealtimeSubAndTapeBus {
             side_hp1: Biquad::highpass(sr, cutoff, FRAC_1_SQRT_2),
             side_hp2: Biquad::highpass(sr, cutoff, FRAC_1_SQRT_2),
             sub_lp: Biquad::lowpass(sr, 95.0, FRAC_1_SQRT_2),
-            head_bump_l: Biquad::peaking_eq(sr, 62.0, 0.9, 0.8),
-            head_bump_r: Biquad::peaking_eq(sr, 62.0, 0.9, 0.8),
-            hyst_l: 0.0,
-            hyst_r: 0.0,
+            head_bump_l: CytomicSvf::bell(sr, 72.0, 1.15, 1.4),
+            head_bump_r: CytomicSvf::bell(sr, 72.0, 1.15, 1.4),
+            disperser_l: AllpassDisperser::default(),
+            disperser_r: AllpassDisperser::default(),
+            ja_hyst_l: JilesAthertonHysteresis::default(),
+            ja_hyst_r: JilesAthertonHysteresis::default(),
+            flutter_buf_l: [0.0; 64],
+            flutter_buf_r: [0.0; 64],
+            flutter_pos: 0,
+            flutter_phase: 0.0,
             sub_phase_flip: 1.0,
             prev_sub_sample: 0.0,
         }
@@ -725,7 +775,7 @@ impl RealtimeSubAndTapeBus {
             .process_sample(self.side_hp1.process_sample(side))
             * clean_width;
 
-        // 2. Sub-harmonic & 2nd-harmonic bass reinforcement on the Mono Mid channel
+        // 2. Sub-harmonic & 2nd-harmonic bass reinforcement + Allpass Phase Disperser (diopser punch)
         let sub_sig = self.sub_lp.process_sample(mid);
         if self.prev_sub_sample <= 0.0 && sub_sig > 0.0 {
             self.sub_phase_flip = -self.sub_phase_flip;
@@ -734,25 +784,43 @@ impl RealtimeSubAndTapeBus {
         let sub_oct = sub_sig.abs() * self.sub_phase_flip * 0.45 + (sub_sig * 1.6).tanh() * 0.55;
         let reinforced_mid = mid + sub_oct * clean_sub * 0.35;
 
-        let mut out_l = reinforced_mid + clean_side;
-        let mut out_r = reinforced_mid - clean_side;
+        let mut out_l = self.disperser_l.process_sample(
+            reinforced_mid + clean_side,
+            self.sample_rate,
+            135.0,
+            clean_sub * 0.45,
+        );
+        let mut out_r = self.disperser_r.process_sample(
+            reinforced_mid - clean_side,
+            self.sample_rate,
+            135.0,
+            clean_sub * 0.45,
+        );
 
-        // 3. Airwindows Console8 pure sine saturation + ChowTape hysteresis smoothing
+        // 3. ChowTapeModel Jiles-Atherton RK4 Ferromagnetic Hysteresis + 72Hz TPT Head Bump + Tape Flutter
         if amt > 0.001 {
             let xl = self.head_bump_l.process_sample(out_l);
             let xr = self.head_bump_r.process_sample(out_r);
 
-            let dl = (xl * (1.0 + 0.45 * amt)).clamp(-1.55, 1.55);
-            let dr = (xr * (1.0 + 0.45 * amt)).clamp(-1.55, 1.55);
+            let hyst_l = self.ja_hyst_l.process(xl, amt, 0.45 + 0.45 * amt);
+            let hyst_r = self.ja_hyst_r.process(xr, amt, 0.45 + 0.45 * amt);
 
-            let sat_l = (dl * (PI * 0.5 / 1.55)).sin();
-            let sat_r = (dr * (PI * 0.5 / 1.55)).sin();
+            // Subtle 5.8 Hz tape transport flutter fractional delay line
+            let w_pos = self.flutter_pos & 63;
+            self.flutter_buf_l[w_pos] = hyst_l;
+            self.flutter_buf_r[w_pos] = hyst_r;
+            self.flutter_phase = (self.flutter_phase + 5.8 / self.sample_rate).fract();
+            let delay_samps = 2.0 + 1.2 * amt * (2.0 * PI * self.flutter_phase).sin();
+            let d_int = delay_samps.floor() as usize;
+            let d_frac = delay_samps - (d_int as f64);
+            let r0 = (w_pos + 64 - d_int) & 63;
+            let r1 = (w_pos + 64 - (d_int + 1)) & 63;
+            let fl_l = self.flutter_buf_l[r0] * (1.0 - d_frac) + self.flutter_buf_l[r1] * d_frac;
+            let fl_r = self.flutter_buf_r[r0] * (1.0 - d_frac) + self.flutter_buf_r[r1] * d_frac;
+            self.flutter_pos = self.flutter_pos.wrapping_add(1);
 
-            self.hyst_l = flush_denormal_f64(0.88 * sat_l + 0.12 * self.hyst_l);
-            self.hyst_r = flush_denormal_f64(0.88 * sat_r + 0.12 * self.hyst_r);
-
-            out_l = (1.0 - amt * 0.55) * xl + (amt * 0.55) * self.hyst_l;
-            out_r = (1.0 - amt * 0.55) * xr + (amt * 0.55) * self.hyst_r;
+            out_l = (1.0 - amt * 0.60) * xl + (amt * 0.60) * fl_l;
+            out_r = (1.0 - amt * 0.60) * xr + (amt * 0.60) * fl_r;
         }
 
         (
