@@ -59,27 +59,38 @@ audio-forge/
 
 ## Quick Start
 
-### 1. Build the Rust Workspace & Bundle the 10 VST3 / CLAP Plugins
+### 1. Build, Bundle & Install Individual (or All 10) VST3 / CLAP Plugins
+
+Every plugin in ForgeAudio can be built, bundled, and installed **individually on its own** (under `plugins/forge-*`) or all together via `xtask`:
 
 ```bash
-# Build all CLI, MCP, and DSP crates
-cargo build --release --workspace
+# List all 10 standalone VST3 & CLAP plugins
+cargo run --package xtask -- list
 
-# Bundle `forge-plug.vst3` and `forge-plug.clap` (exports all 10 studio plugins)
-cargo run --package xtask -- bundle forge-plug --release
+# Bundle a single standalone VST3 & CLAP plugin (e.g., only Forge OpenSoothe or Forge SplitEQ)
+cargo run --package xtask -- bundle forge-opensoothe --release
+cargo run --package xtask -- bundle forge-spliteq --release
+
+# Bundle ALL 10 individual standalone VST3 & CLAP plugins into target/bundled/
+cargo run --package xtask -- bundle-all --release
+
+# Install a single plugin (or --all 10 standalone plugins) directly to your system VST3 & CLAP folders
+cargo run --package xtask -- install forge-opensoothe --release
+cargo run --package xtask -- install --all --release
 ```
 
-The compiled `target/bundled/forge-plug.vst3` and `target/bundled/forge-plug.clap` bundles expose **10 real-time zero-allocation plugins** to any DAW (REAPER, Ableton Live, FL Studio, Logic, Studio One, Bitwig):
-1. **Forge OpenSoothe De-Fizz** (2048-pt OLA STFT Dynamic Resonance & AI Fizz Suppressor with `1536`-sample PDC, `nih_plug_egui` 60 FPS Spectrum GUI & 8-Slot Shared Spectrum Bus)
-2. **Forge OpenSpacer Unmask** (4-Channel Sidechain Spectral Unmasker for Vocal $\rightarrow$ Music & Kick $\rightarrow$ Bass)
-3. **Forge Vocal Surgical Strip** (Zero-Latency Mouth De-Click, `<115 Hz` Plosive Suppressor, Split-Band De-Esser & Breath Gate)
-4. **Forge SubMono & Console Tape** (Linkwitz-Riley `<160 Hz` Sub Mono-Maker, Harmonic Bass Reinforcer & Console8/ChowTape Saturation)
-5. **Forge Master True-Peak Limiter** (Lookahead 4x Inter-Sample True-Peak `-1.0 dBTP` Brickwall Limiter & ITU-R BS.1770-4 Meter)
-6. **Forge Drum Trigger & Theory MIDI** (Real-Time Audio-to-MIDI 3-Band Drum Replacer `C1/D1/F#1` + 1-Finger MIDI-to-Neo-Soul Chord Voicer)
-7. **Forge PhaseAlign & 18-Band EQ** (Sample-Accurate Phase/Polarity Aligner, 18-Band AI De-Harsh EQ & Built-In Genre Tonal Balance Targets)
-8. **Forge SplitEQ Transient & Tonal** (Structural 3-Band Transient Attack vs. Tonal Sustain Equalizer & Shaper with 60 FPS `egui` GUI)
-9. **Forge Density & 3-Band ADAA Clipper** (Upward Low-Level Density Compressor + 3-Band 2x-Oversampled 1st-Order ADAA Soft Clipper with 60 FPS `egui` GUI)
-10. **Forge SpaceVerb FDN & Neural Preamp** (Dilated Causal WaveNet Hardware Preamp (`Neve 1073`, `1176 All-Buttons`, `V76 Triode`, `Studer A800`) + 8x8 Walsh-Hadamard FDN Reverb with Vocal Auto-Ducking & `+12 st` Octave Shimmer)
+| Standalone Package Name | Individual Bundles Generated | Studio Processor Description |
+| :--- | :--- | :--- |
+| **`forge-opensoothe`** | `forge-opensoothe.vst3` / `.clap` | **Forge OpenSoothe De-Fizz** — 2048-pt OLA STFT Dynamic Resonance & AI Fizz Suppressor (`1536`-sample PDC, `egui` 60 FPS GUI & 8-Slot Shared Spectrum Bus) |
+| **`forge-openspacer`** | `forge-openspacer.vst3` / `.clap` | **Forge OpenSpacer Unmask** — 4-Channel Sidechain Spectral Unmasker (Vocal $\rightarrow$ Music & Kick $\rightarrow$ Bass) |
+| **`forge-vocal-surgical`** | `forge-vocal-surgical.vst3` / `.clap` | **Forge Vocal Surgical Strip** — Zero-Latency Mouth De-Click, `<115 Hz` Plosive Suppressor, Split-Band De-Esser & Breath Gate |
+| **`forge-submono-tape`** | `forge-submono-tape.vst3` / `.clap` | **Forge SubMono & Console Tape** — Linkwitz-Riley `<160 Hz` Sub Mono-Maker, Harmonic Bass Reinforcer & Console8/ChowTape Saturation |
+| **`forge-master-limiter`** | `forge-master-limiter.vst3` / `.clap` | **Forge Master True-Peak Limiter** — Lookahead 4x Inter-Sample True-Peak `-1.0 dBTP` Brickwall Limiter & ITU-R BS.1770-4 Meter |
+| **`forge-drum-trigger`** | `forge-drum-trigger.vst3` / `.clap` | **Forge Drum Trigger & Theory MIDI** — Real-Time Audio-to-MIDI 3-Band Drum Replacer (`C1/D1/F#1`) + 1-Finger MIDI-to-Neo-Soul Chord Voicer |
+| **`forge-phase-eq`** | `forge-phase-eq.vst3` / `.clap` | **Forge PhaseAlign & 18-Band EQ** — Sample-Accurate Phase/Polarity Aligner, 18-Band AI De-Harsh EQ & Built-In Genre Tonal Balance Targets |
+| **`forge-spliteq`** | `forge-spliteq.vst3` / `.clap` | **Forge SplitEQ Transient & Tonal** — Structural 3-Band Transient Attack vs. Tonal Sustain Equalizer & Shaper with 60 FPS `egui` GUI |
+| **`forge-density-clipper`** | `forge-density-clipper.vst3` / `.clap` | **Forge Density & 3-Band ADAA Clipper** — Upward Low-Level Density Compressor + 3-Band 2x-Oversampled 1st-Order ADAA Soft Clipper with 60 FPS `egui` GUI |
+| **`forge-spaceverb`** | `forge-spaceverb.vst3` / `.clap` | **Forge SpaceVerb FDN & Neural Preamp** — Dilated Causal WaveNet Hardware Preamp (`Neve 1073`, `1176`, `V76`, `Studer A800`) + 8x8 Walsh-Hadamard FDN Reverb w/ Ducking & `+12 st` Shimmer |
 
 ### 2. Run the Full End-to-End Pipeline (`forge ingest`)
 

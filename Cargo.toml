@@ -10,6 +10,16 @@ members = [
     "crates/forge-plug",
     "crates/forge-cli",
     "crates/forge-mcp",
+    "plugins/forge-opensoothe",
+    "plugins/forge-openspacer",
+    "plugins/forge-vocal-surgical",
+    "plugins/forge-submono-tape",
+    "plugins/forge-master-limiter",
+    "plugins/forge-drum-trigger",
+    "plugins/forge-phase-eq",
+    "plugins/forge-spliteq",
+    "plugins/forge-density-clipper",
+    "plugins/forge-spaceverb",
     "xtask",
 ]
 

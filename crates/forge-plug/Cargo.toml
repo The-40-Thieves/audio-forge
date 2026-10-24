@@ -8,6 +8,10 @@ description = "Native Real-Time VST3 & CLAP Plugin Suite for ForgeAudio (OpenSoo
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+all-in-one-export = []
+
 [dependencies]
 forge-core = { path = "../forge-core" }
 forge-dsp = { path = "../forge-dsp" }

@@ -279,24 +279,35 @@ cargo test --workspace
 cargo build --release --workspace
 ```
 
-### Step 2: Bundle & Install the 10 VST3 & CLAP Plugins (`forge-plug`)
-```bash
-# Build and package the multi-plugin VST3 & CLAP bundles
-cargo run --package xtask -- bundle forge-plug --release
-```
-This produces:
-- **VST3 Bundle:** `target/bundled/forge-plug.vst3`
-- **CLAP Bundle:** `target/bundled/forge-plug.clap`
+### Step 2: Bundle & Install Individual (or All 10) VST3 & CLAP Plugins (`plugins/forge-*`)
+Every plugin in ForgeAudio has its own standalone crate under `plugins/` so you can build, bundle, and install any single VST3/CLAP plugin on its own—or all 10 at once:
 
-**Install into your system DAW plugin directories:**
-- **Windows (PowerShell):**
-  ```powershell
-  Copy-Item -Recurse -Force .\target\bundled\forge-plug.vst3 "$env:CommonProgramFiles\VST3\forge-plug.vst3"
-  New-Item -ItemType Directory -Force "$env:CommonProgramFiles\CLAP" | Out-Null
-  Copy-Item -Force .\target\bundled\forge-plug.clap "$env:CommonProgramFiles\CLAP\forge-plug.clap"
-  ```
-- **macOS:** Copy to `~/Library/Audio/Plug-Ins/VST3/` and `~/Library/Audio/Plug-Ins/CLAP/`
-- **Linux:** Copy to `~/.vst3/` and `~/.clap/`
+```bash
+# List all 10 standalone VST3 & CLAP plugin packages
+cargo run --package xtask -- list
+
+# Bundle a single standalone plugin (e.g., only Forge OpenSoothe or Forge SplitEQ)
+cargo run --package xtask -- bundle forge-opensoothe --release
+cargo run --package xtask -- bundle forge-spliteq --release
+
+# Bundle all 10 standalone VST3 & CLAP plugins into target/bundled/
+cargo run --package xtask -- bundle-all --release
+
+# Install a single plugin (or --all 10 plugins) directly into your system VST3 & CLAP folders
+cargo run --package xtask -- install forge-opensoothe --release
+cargo run --package xtask -- install --all --release
+```
+This produces individual standalone `.vst3` and `.clap` bundles in `target/bundled/`:
+- `forge-opensoothe.vst3` / `forge-opensoothe.clap`
+- `forge-openspacer.vst3` / `forge-openspacer.clap`
+- `forge-vocal-surgical.vst3` / `forge-vocal-surgical.clap`
+- `forge-submono-tape.vst3` / `forge-submono-tape.clap`
+- `forge-master-limiter.vst3` / `forge-master-limiter.clap`
+- `forge-drum-trigger.vst3` / `forge-drum-trigger.clap`
+- `forge-phase-eq.vst3` / `forge-phase-eq.clap`
+- `forge-spliteq.vst3` / `forge-spliteq.clap`
+- `forge-density-clipper.vst3` / `forge-density-clipper.clap`
+- `forge-spaceverb.vst3` / `forge-spaceverb.clap`
 
 ### Step 3: Run the 1-Command End-to-End Studio Pipeline (`forge ingest`)
 ```bash

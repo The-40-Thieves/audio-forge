@@ -1,0 +1,13 @@
+[package]
+name = "forge-drum-trigger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone VST3 & CLAP Plugin: Forge Drum Trigger & Theory MIDI (Real-Time Audio-to-MIDI Drum Replacer C1/D1/F#1 + Neo-Soul Chord Voicer)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+forge-plug = { path = "../../crates/forge-plug" }
+nih_plug.workspace = true

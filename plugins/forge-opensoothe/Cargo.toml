@@ -1,0 +1,13 @@
+[package]
+name = "forge-opensoothe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone VST3 & CLAP Plugin: Forge OpenSoothe De-Fizz (2048-pt OLA STFT Dynamic Spectral Resonance & AI Fizz Suppressor)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+forge-plug = { path = "../../crates/forge-plug" }
+nih_plug.workspace = true

@@ -866,6 +866,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-density-clipper"
+version = "0.1.0"
+dependencies = [
+ "forge-plug",
+ "nih_plug",
+]
+
+[[package]]
+name = "forge-drum-trigger"
+version = "0.1.0"
+dependencies = [
+ "forge-plug",
+ "nih_plug",
+]
+
+[[package]]
 name = "forge-dsp"
 version = "0.1.0"
 dependencies = [
@@ -873,6 +889,14 @@ dependencies = [
  "rayon",
  "rustfft",
  "serde",
+]
+
+[[package]]
+name = "forge-master-limiter"
+version = "0.1.0"
+dependencies = [
+ "forge-plug",
+ "nih_plug",
 ]
 
 [[package]]
@@ -889,6 +913,30 @@ dependencies = [
  "serde_json",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "forge-opensoothe"
+version = "0.1.0"
+dependencies = [
+ "forge-plug",
+ "nih_plug",
+]
+
+[[package]]
+name = "forge-openspacer"
+version = "0.1.0"
+dependencies = [
+ "forge-plug",
+ "nih_plug",
+]
+
+[[package]]
+name = "forge-phase-eq"
+version = "0.1.0"
+dependencies = [
+ "forge-plug",
+ "nih_plug",
 ]
 
 [[package]]
@@ -915,6 +963,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-spaceverb"
+version = "0.1.0"
+dependencies = [
+ "forge-plug",
+ "nih_plug",
+]
+
+[[package]]
+name = "forge-spliteq"
+version = "0.1.0"
+dependencies = [
+ "forge-plug",
+ "nih_plug",
+]
+
+[[package]]
+name = "forge-submono-tape"
+version = "0.1.0"
+dependencies = [
+ "forge-plug",
+ "nih_plug",
+]
+
+[[package]]
 name = "forge-theory"
 version = "0.1.0"
 dependencies = [
@@ -931,6 +1003,14 @@ dependencies = [
  "forge-dsp",
  "forge-theory",
  "serde",
+]
+
+[[package]]
+name = "forge-vocal-surgical"
+version = "0.1.0"
+dependencies = [
+ "forge-plug",
+ "nih_plug",
 ]
 
 [[package]]

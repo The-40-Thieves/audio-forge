@@ -1,0 +1,13 @@
+[package]
+name = "forge-density-clipper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone VST3 & CLAP Plugin: Forge Density & 3-Band ADAA Clipper (Upward Low-Level Density Compressor + 2x Oversampled ADAA Soft Clipper)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+forge-plug = { path = "../../crates/forge-plug" }
+nih_plug.workspace = true

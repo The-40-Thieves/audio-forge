@@ -1,0 +1,13 @@
+[package]
+name = "forge-phase-eq"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone VST3 & CLAP Plugin: Forge PhaseAlign & 18-Band EQ (Sample-Accurate Phase Aligner, 18-Band AI De-Harsh EQ & Genre Tonal Balance)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+forge-plug = { path = "../../crates/forge-plug" }
+nih_plug.workspace = true

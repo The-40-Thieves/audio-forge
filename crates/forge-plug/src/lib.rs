@@ -1981,7 +1981,9 @@ impl Vst3Plugin for ForgeSpaceVerbAndPreampPlug {
     ];
 }
 
-// Export all 10 plugins into both the CLAP multi-plugin bundle and the VST3 multi-plugin bundle!
+// Export all 10 plugins into the all-in-one CLAP/VST3 bundle when `all-in-one-export` is enabled.
+// Individual standalone VST3/CLAP plugins live in `plugins/forge-*` and export one plugin per bundle.
+#[cfg(feature = "all-in-one-export")]
 nih_export_clap!(
     ForgeOpenSoothePlug,
     ForgeOpenSpacerPlug,
@@ -1994,6 +1996,7 @@ nih_export_clap!(
     ForgeDensityClipperPlug,
     ForgeSpaceVerbAndPreampPlug
 );
+#[cfg(feature = "all-in-one-export")]
 nih_export_vst3!(
     ForgeOpenSoothePlug,
     ForgeOpenSpacerPlug,

@@ -1,0 +1,13 @@
+[package]
+name = "forge-spaceverb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone VST3 & CLAP Plugin: Forge SpaceVerb FDN & Neural Preamp (Dilated WaveNet Preamp 1073/1176/V76/A800 + 8x8 Hadamard FDN Shimmer/Ducking Reverb)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+forge-plug = { path = "../../crates/forge-plug" }
+nih_plug.workspace = true

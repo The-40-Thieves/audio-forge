@@ -1,0 +1,13 @@
+[package]
+name = "forge-master-limiter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone VST3 & CLAP Plugin: Forge Master True-Peak Limiter (4x Inter-Sample True-Peak -1.0 dBTP Lookahead Brickwall Limiter)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+forge-plug = { path = "../../crates/forge-plug" }
+nih_plug.workspace = true

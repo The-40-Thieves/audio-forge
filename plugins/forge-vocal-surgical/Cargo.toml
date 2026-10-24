@@ -1,0 +1,13 @@
+[package]
+name = "forge-vocal-surgical"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone VST3 & CLAP Plugin: Forge Vocal Surgical Strip (Zero-Latency Mouth De-Click, Plosive Duck, De-Esser & Breath Gate)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+forge-plug = { path = "../../crates/forge-plug" }
+nih_plug.workspace = true
