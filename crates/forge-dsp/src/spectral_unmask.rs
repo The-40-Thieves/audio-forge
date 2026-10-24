@@ -69,7 +69,7 @@ pub fn apply_spectral_unmask(
     let half_bins = fft_size / 2 + 1;
     let bin_hz = sr / (fft_size as f64);
 
-    let b_low = ((config.low_cut_hz / bin_hz).floor() as usize).clamp(1, half_bins - 2);
+    let b_low = ((config.low_cut_hz / bin_hz).floor() as usize).clamp(1, half_bins - 3);
     let b_high = ((config.high_cut_hz / bin_hz).ceil() as usize).clamp(b_low + 1, half_bins - 2);
     let min_gain = 10.0_f64.powf(-config.max_reduction_db.clamp(0.5, 20.0) / 20.0);
 

@@ -10,3 +10,6 @@ forge-core = { path = "../forge-core" }
 rustfft.workspace = true
 rayon.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

@@ -10,7 +10,9 @@ use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 use std::sync::Arc;
 
-use crate::loudness_limiter::Biquad;
+use crate::loudness_limiter::{
+    flush_denormal_f64, sanitize_param_f64, sanitize_sample_f32, Biquad,
+};
 use crate::restoration::MASTERING_18_BANDS_HZ;
 
 /// Exponential one-pole parameter smoother to eliminate zipper noise during real-time knob automation.
@@ -23,29 +25,35 @@ pub struct ParamSmoother {
 
 impl ParamSmoother {
     pub fn new(initial: f64, sample_rate: f64, smoothing_ms: f64) -> Self {
-        let tau = (smoothing_ms * 0.001).max(0.0005);
-        let coeff = (-1.0 / (tau * sample_rate.max(8000.0))).exp();
+        let init = if initial.is_finite() { initial } else { 0.0 };
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
+        let tau = sanitize_param_f64(smoothing_ms * 0.001, 0.010, 0.0005, 10.0);
+        let coeff = (-1.0 / (tau * sr)).exp();
         Self {
-            current: initial,
-            target: initial,
+            current: init,
+            target: init,
             coeff,
         }
     }
 
     #[inline]
     pub fn set_sample_rate(&mut self, sample_rate: f64, smoothing_ms: f64) {
-        let tau = (smoothing_ms * 0.001).max(0.0005);
-        self.coeff = (-1.0 / (tau * sample_rate.max(8000.0))).exp();
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
+        let tau = sanitize_param_f64(smoothing_ms * 0.001, 0.010, 0.0005, 10.0);
+        self.coeff = (-1.0 / (tau * sr)).exp();
     }
 
     #[inline]
     pub fn set_target(&mut self, target: f64) {
-        self.target = target;
+        if target.is_finite() {
+            self.target = target;
+        }
     }
 
     #[inline]
     pub fn next_val(&mut self) -> f64 {
-        self.current = self.coeff * self.current + (1.0 - self.coeff) * self.target;
+        self.current =
+            flush_denormal_f64(self.coeff * self.current + (1.0 - self.coeff) * self.target);
         self.current
     }
 }
@@ -170,13 +178,13 @@ impl RealtimeOpenSoothe {
         let mask_in = self.fft_size - 1;
         let mask_out = self.fft_size * 2 - 1;
 
-        self.in_ring_l[self.ring_pos & mask_in] = f64::from(in_l);
-        self.in_ring_r[self.ring_pos & mask_in] = f64::from(in_r);
+        self.in_ring_l[self.ring_pos & mask_in] = sanitize_sample_f32(in_l);
+        self.in_ring_r[self.ring_pos & mask_in] = sanitize_sample_f32(in_r);
 
         let read_idx = self.ring_pos & mask_out;
         let denom = self.norm_ring[read_idx].max(1e-9);
-        let out_l = (self.out_ring_l[read_idx] / denom) as f32;
-        let out_r = (self.out_ring_r[read_idx] / denom) as f32;
+        let out_l = flush_denormal_f64(self.out_ring_l[read_idx] / denom) as f32;
+        let out_r = flush_denormal_f64(self.out_ring_r[read_idx] / denom) as f32;
 
         // Clear consumed output slot for future overlap-add
         self.out_ring_l[read_idx] = 0.0;
@@ -188,7 +196,9 @@ impl RealtimeOpenSoothe {
 
         if self.hop_counter >= self.hop_size {
             self.hop_counter = 0;
-            self.process_stft_hop(sensitivity_db, max_depth_db, sharpness_bins, delta_listen);
+            let clean_sens = sanitize_param_f64(sensitivity_db, 3.5, 0.5, 24.0);
+            let clean_depth = sanitize_param_f64(max_depth_db, 9.0, 0.5, 24.0);
+            self.process_stft_hop(clean_sens, clean_depth, sharpness_bins, delta_listen);
         }
 
         (out_l, out_r)
@@ -419,14 +429,15 @@ impl RealtimeOpenSpacer {
         let mask_in = self.fft_size - 1;
         let mask_out = self.fft_size * 2 - 1;
 
-        self.tgt_ring_l[self.ring_pos & mask_in] = f64::from(tgt_l);
-        self.tgt_ring_r[self.ring_pos & mask_in] = f64::from(tgt_r);
-        self.sc_ring[self.ring_pos & mask_in] = 0.5 * f64::from(sc_l + sc_r);
+        self.tgt_ring_l[self.ring_pos & mask_in] = sanitize_sample_f32(tgt_l);
+        self.tgt_ring_r[self.ring_pos & mask_in] = sanitize_sample_f32(tgt_r);
+        self.sc_ring[self.ring_pos & mask_in] =
+            0.5 * (sanitize_sample_f32(sc_l) + sanitize_sample_f32(sc_r));
 
         let read_idx = self.ring_pos & mask_out;
         let denom = self.norm_ring[read_idx].max(1e-9);
-        let out_l = (self.out_ring_l[read_idx] / denom) as f32;
-        let out_r = (self.out_ring_r[read_idx] / denom) as f32;
+        let out_l = flush_denormal_f64(self.out_ring_l[read_idx] / denom) as f32;
+        let out_r = flush_denormal_f64(self.out_ring_r[read_idx] / denom) as f32;
 
         self.out_ring_l[read_idx] = 0.0;
         self.out_ring_r[read_idx] = 0.0;
@@ -437,7 +448,11 @@ impl RealtimeOpenSpacer {
 
         if self.hop_counter >= self.hop_size {
             self.hop_counter = 0;
-            self.process_unmask_hop(low_hz, high_hz, amount, max_cut_db);
+            let clean_low = sanitize_param_f64(low_hz, 180.0, 20.0, 20_000.0);
+            let clean_high = sanitize_param_f64(high_hz, 8_000.0, clean_low + 10.0, 22_000.0);
+            let clean_amt = sanitize_param_f64(amount, 0.5, 0.0, 1.0);
+            let clean_cut = sanitize_param_f64(max_cut_db, 6.0, 0.5, 24.0);
+            self.process_unmask_hop(clean_low, clean_high, clean_amt, clean_cut);
         }
 
         (out_l, out_r)
@@ -571,29 +586,35 @@ impl RealtimeVocalSurgical {
         deess_threshold_db: f64,
         breath_gate_db: f64,
     ) -> (f32, f32) {
-        let mut l = f64::from(in_l);
-        let mut r = f64::from(in_r);
+        let mut l = sanitize_sample_f32(in_l);
+        let mut r = sanitize_sample_f32(in_r);
+        let clean_declick = sanitize_param_f64(declick_sensitivity, 0.5, 0.0, 1.0);
+        let clean_deplosive = sanitize_param_f64(deplosive_strength, 0.5, 0.0, 1.0);
+        let clean_deess_db = sanitize_param_f64(deess_threshold_db, -20.0, -60.0, 0.0);
+        let clean_gate_db = sanitize_param_f64(breath_gate_db, -55.0, -90.0, -10.0);
 
         // 1. Real-Time Slew-Rate Mouth De-Clicker
-        if declick_sensitivity > 0.01 {
+        if clean_declick > 0.01 {
             let slew_l = (l - self.prev_l).abs();
             let slew_r = (r - self.prev_r).abs();
-            let thresh_mult = 12.0 - 7.5 * declick_sensitivity.clamp(0.0, 1.0);
+            let thresh_mult = 12.0 - 7.5 * clean_declick;
             if slew_l > self.slew_env_l * thresh_mult && slew_l > 0.015 {
                 l = 0.5 * (self.prev_l + self.prev2_l);
             } else {
-                self.slew_env_l = 0.992 * self.slew_env_l + 0.008 * slew_l.max(1e-5);
+                self.slew_env_l =
+                    flush_denormal_f64(0.992 * self.slew_env_l + 0.008 * slew_l.max(1e-5)).max(1e-5);
             }
             if slew_r > self.slew_env_r * thresh_mult && slew_r > 0.015 {
                 r = 0.5 * (self.prev_r + self.prev2_r);
             } else {
-                self.slew_env_r = 0.992 * self.slew_env_r + 0.008 * slew_r.max(1e-5);
+                self.slew_env_r =
+                    flush_denormal_f64(0.992 * self.slew_env_r + 0.008 * slew_r.max(1e-5)).max(1e-5);
             }
         }
-        self.prev2_l = self.prev_l;
-        self.prev_l = l;
-        self.prev2_r = self.prev_r;
-        self.prev_r = r;
+        self.prev2_l = flush_denormal_f64(self.prev_l);
+        self.prev_l = flush_denormal_f64(l);
+        self.prev2_r = flush_denormal_f64(self.prev_r);
+        self.prev_r = flush_denormal_f64(r);
 
         // 2. Dynamic <115 Hz Plosive Suppressor
         let lo_l = self.plosive_lp_l.process_sample(l);
@@ -603,13 +624,13 @@ impl RealtimeVocalSurgical {
 
         let lo_mag = 0.5 * (lo_l.abs() + lo_r.abs());
         let hi_mag = 0.5 * (hi_l.abs() + hi_r.abs());
-        self.low_env = 0.985 * self.low_env + 0.015 * lo_mag;
-        self.mid_env = 0.985 * self.mid_env + 0.015 * hi_mag + 1e-7;
+        self.low_env = flush_denormal_f64(0.985 * self.low_env + 0.015 * lo_mag);
+        self.mid_env = flush_denormal_f64(0.985 * self.mid_env + 0.015 * hi_mag) + 1e-7;
 
         let plosive_ratio = self.low_env / self.mid_env;
         let low_gain = if plosive_ratio > 2.2 {
             let raw_g = (2.2 / plosive_ratio).clamp(0.12, 1.0);
-            1.0 - deplosive_strength.clamp(0.0, 1.0) * (1.0 - raw_g)
+            1.0 - clean_deplosive * (1.0 - raw_g)
         } else {
             1.0
         };
@@ -620,8 +641,8 @@ impl RealtimeVocalSurgical {
         let sib_l = self.sib_bp_l.process_sample(l) - l;
         let sib_r = self.sib_bp_r.process_sample(r) - r;
         let sib_lvl = 0.5 * (sib_l.abs() + sib_r.abs());
-        self.sib_env = 0.95 * self.sib_env + 0.05 * sib_lvl;
-        let sib_thresh = 10.0_f64.powf(deess_threshold_db / 20.0);
+        self.sib_env = flush_denormal_f64(0.95 * self.sib_env + 0.05 * sib_lvl);
+        let sib_thresh = 10.0_f64.powf(clean_deess_db / 20.0);
         if self.sib_env > sib_thresh {
             let cut = (sib_thresh / self.sib_env).clamp(0.25, 1.0);
             l -= sib_l * (1.0 - cut);
@@ -630,8 +651,8 @@ impl RealtimeVocalSurgical {
 
         // 4. Soft-Knee Breath & Room Gate
         let abs_lvl = 0.5 * (l.abs() + r.abs());
-        self.gate_env = 0.995 * self.gate_env + 0.005 * abs_lvl;
-        let gate_thresh = 10.0_f64.powf(breath_gate_db / 20.0);
+        self.gate_env = flush_denormal_f64(0.995 * self.gate_env + 0.005 * abs_lvl);
+        let gate_thresh = 10.0_f64.powf(clean_gate_db / 20.0);
         if self.gate_env < gate_thresh {
             let ratio = (self.gate_env / gate_thresh.max(1e-9)).clamp(0.0, 1.0);
             let g = ratio * ratio;
@@ -639,7 +660,7 @@ impl RealtimeVocalSurgical {
             r *= g;
         }
 
-        (l as f32, r as f32)
+        (flush_denormal_f64(l) as f32, flush_denormal_f64(r) as f32)
     }
 }
 
@@ -690,8 +711,11 @@ impl RealtimeSubAndTapeBus {
         stereo_width: f64,
         tape_drive: f64,
     ) -> (f32, f32) {
-        let l = f64::from(in_l);
-        let r = f64::from(in_r);
+        let l = sanitize_sample_f32(in_l);
+        let r = sanitize_sample_f32(in_r);
+        let clean_sub = sanitize_param_f64(sub_reinforce, 0.25, 0.0, 1.0);
+        let clean_width = sanitize_param_f64(stereo_width, 1.0, 0.0, 2.0);
+        let amt = sanitize_param_f64(tape_drive, 0.2, 0.0, 1.0);
 
         // 1. Mid/Side decomposition & 4th-order Linkwitz-Riley <cutoff Side high-pass (Sub Mono-Maker)
         let mid = 0.5 * (l + r);
@@ -699,22 +723,21 @@ impl RealtimeSubAndTapeBus {
         let clean_side = self
             .side_hp2
             .process_sample(self.side_hp1.process_sample(side))
-            * stereo_width.clamp(0.0, 2.0);
+            * clean_width;
 
         // 2. Sub-harmonic & 2nd-harmonic bass reinforcement on the Mono Mid channel
         let sub_sig = self.sub_lp.process_sample(mid);
         if self.prev_sub_sample <= 0.0 && sub_sig > 0.0 {
             self.sub_phase_flip = -self.sub_phase_flip;
         }
-        self.prev_sub_sample = sub_sig;
+        self.prev_sub_sample = flush_denormal_f64(sub_sig);
         let sub_oct = sub_sig.abs() * self.sub_phase_flip * 0.45 + (sub_sig * 1.6).tanh() * 0.55;
-        let reinforced_mid = mid + sub_oct * sub_reinforce.clamp(0.0, 1.0) * 0.35;
+        let reinforced_mid = mid + sub_oct * clean_sub * 0.35;
 
         let mut out_l = reinforced_mid + clean_side;
         let mut out_r = reinforced_mid - clean_side;
 
         // 3. Airwindows Console8 pure sine saturation + ChowTape hysteresis smoothing
-        let amt = tape_drive.clamp(0.0, 1.0);
         if amt > 0.001 {
             let xl = self.head_bump_l.process_sample(out_l);
             let xr = self.head_bump_r.process_sample(out_r);
@@ -725,14 +748,17 @@ impl RealtimeSubAndTapeBus {
             let sat_l = (dl * (PI * 0.5 / 1.55)).sin();
             let sat_r = (dr * (PI * 0.5 / 1.55)).sin();
 
-            self.hyst_l = 0.88 * sat_l + 0.12 * self.hyst_l;
-            self.hyst_r = 0.88 * sat_r + 0.12 * self.hyst_r;
+            self.hyst_l = flush_denormal_f64(0.88 * sat_l + 0.12 * self.hyst_l);
+            self.hyst_r = flush_denormal_f64(0.88 * sat_r + 0.12 * self.hyst_r);
 
             out_l = (1.0 - amt * 0.55) * xl + (amt * 0.55) * self.hyst_l;
             out_r = (1.0 - amt * 0.55) * xr + (amt * 0.55) * self.hyst_r;
         }
 
-        (out_l as f32, out_r as f32)
+        (
+            flush_denormal_f64(out_l) as f32,
+            flush_denormal_f64(out_r) as f32,
+        )
     }
 }
 
@@ -812,11 +838,14 @@ impl RealtimeMasterLimiter {
         ceiling_dbtp: f64,
         release_ms: f64,
     ) -> (f32, f32) {
-        let drive = 10.0_f64.powf(input_drive_db / 20.0);
-        let ceiling_lin = 10.0_f64.powf(ceiling_dbtp.clamp(-12.0, -0.05) / 20.0);
+        let clean_drive_db = sanitize_param_f64(input_drive_db, 0.0, -24.0, 24.0);
+        let clean_ceil_db = sanitize_param_f64(ceiling_dbtp, -1.0, -12.0, -0.05);
+        let clean_rel_ms = sanitize_param_f64(release_ms, 85.0, 10.0, 1000.0);
+        let drive = 10.0_f64.powf(clean_drive_db / 20.0);
+        let ceiling_lin = 10.0_f64.powf(clean_ceil_db / 20.0);
 
-        let dl = f64::from(in_l) * drive;
-        let dr = f64::from(in_r) * drive;
+        let dl = sanitize_sample_f32(in_l) * drive;
+        let dr = sanitize_sample_f32(in_r) * drive;
 
         // 4x inter-sample True Peak detector
         let tp_l = Self::estimate_4x_intersample_peak(&mut self.prev_l, dl);
@@ -830,14 +859,18 @@ impl RealtimeMasterLimiter {
         };
 
         let attack_coeff = (-1.0 / (0.0005 * self.sample_rate)).exp();
-        let release_coeff = (-1.0 / ((release_ms.max(10.0) * 0.001) * self.sample_rate)).exp();
+        let release_coeff = (-1.0 / ((clean_rel_ms * 0.001) * self.sample_rate)).exp();
 
         if required_gain < self.envelope_gain {
-            self.envelope_gain =
-                attack_coeff * self.envelope_gain + (1.0 - attack_coeff) * required_gain;
+            self.envelope_gain = flush_denormal_f64(
+                attack_coeff * self.envelope_gain + (1.0 - attack_coeff) * required_gain,
+            )
+            .clamp(1e-6, 1.0);
         } else {
-            self.envelope_gain =
-                release_coeff * self.envelope_gain + (1.0 - release_coeff) * required_gain;
+            self.envelope_gain = flush_denormal_f64(
+                release_coeff * self.envelope_gain + (1.0 - release_coeff) * required_gain,
+            )
+            .clamp(1e-6, 1.0);
         }
 
         let delayed_l = self.delay_l[self.write_pos];
@@ -859,14 +892,18 @@ impl RealtimeMasterLimiter {
         let sq_sum = kw_l * kw_l + kw_r * kw_r;
         let alpha_400ms = (-1.0 / (0.400 * self.sample_rate)).exp();
         self.momentary_energy =
-            alpha_400ms * self.momentary_energy + (1.0 - alpha_400ms) * sq_sum;
+            flush_denormal_f64(alpha_400ms * self.momentary_energy + (1.0 - alpha_400ms) * sq_sum)
+                .max(1e-12);
 
-        self.last_lufs = (-0.691 + 10.0 * self.momentary_energy.max(1e-12).log10()) as f32;
+        self.last_lufs = (-0.691 + 10.0 * self.momentary_energy.log10()) as f32;
         self.last_true_peak_dbtp =
             (20.0 * (tp * self.envelope_gain).min(ceiling_lin).max(1e-9).log10()) as f32;
         self.last_gr_db = (-20.0 * self.envelope_gain.max(1e-6).log10()) as f32;
 
-        (out_l as f32, out_r as f32)
+        (
+            flush_denormal_f64(out_l) as f32,
+            flush_denormal_f64(out_r) as f32,
+        )
     }
 }
 
@@ -880,7 +917,7 @@ pub struct RealtimeMasteringEq18 {
 
 impl RealtimeMasteringEq18 {
     pub fn new(sample_rate: f64) -> Self {
-        let sr = sample_rate.max(8000.0);
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
         let bands_l = std::array::from_fn(|i| Biquad::peaking_eq(sr, MASTERING_18_BANDS_HZ[i], 1.4, 0.0));
         let bands_r = std::array::from_fn(|i| Biquad::peaking_eq(sr, MASTERING_18_BANDS_HZ[i], 1.4, 0.0));
         Self {
@@ -892,9 +929,14 @@ impl RealtimeMasteringEq18 {
     }
 
     pub fn set_gains(&mut self, gains_db: &[f64; 18], amount: f64) {
-        let amt = amount.clamp(0.0, 2.0);
+        let amt = sanitize_param_f64(amount, 1.0, 0.0, 2.0);
         for i in 0..18 {
-            let g = (gains_db[i] * amt).clamp(-15.0, 15.0);
+            let g_in = if gains_db[i].is_finite() {
+                gains_db[i]
+            } else {
+                0.0
+            };
+            let g = (g_in * amt).clamp(-15.0, 15.0);
             if (g - self.current_gains_db[i]).abs() > 0.02 {
                 self.current_gains_db[i] = g;
                 self.bands_l[i] = Biquad::peaking_eq(self.sample_rate, MASTERING_18_BANDS_HZ[i], 1.4, g);
@@ -905,13 +947,13 @@ impl RealtimeMasteringEq18 {
 
     #[inline]
     pub fn process_stereo_sample(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
-        let mut l = f64::from(in_l);
-        let mut r = f64::from(in_r);
+        let mut l = sanitize_sample_f32(in_l);
+        let mut r = sanitize_sample_f32(in_r);
         for i in 0..18 {
             l = self.bands_l[i].process_sample(l);
             r = self.bands_r[i].process_sample(r);
         }
-        (l as f32, r as f32)
+        (flush_denormal_f64(l) as f32, flush_denormal_f64(r) as f32)
     }
 }
 
@@ -930,7 +972,8 @@ pub struct RealtimePhaseAligner {
 
 impl RealtimePhaseAligner {
     pub fn new(sample_rate: f64) -> Self {
-        let max_delay_samples = ((sample_rate.max(8000.0) * 0.050).round() as usize).clamp(512, 8192);
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
+        let max_delay_samples = ((sr * 0.050).round() as usize).clamp(512, 8192);
         Self {
             max_delay_samples,
             delay_line_l: vec![0.0; max_delay_samples],
@@ -948,8 +991,10 @@ impl RealtimePhaseAligner {
 
     #[inline]
     pub fn process_stereo_sample(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
-        self.delay_line_l[self.write_pos] = in_l;
-        self.delay_line_r[self.write_pos] = in_r;
+        let clean_l = sanitize_sample_f32(in_l) as f32;
+        let clean_r = sanitize_sample_f32(in_r) as f32;
+        self.delay_line_l[self.write_pos] = clean_l;
+        self.delay_line_r[self.write_pos] = clean_r;
 
         let read_pos = (self.write_pos + self.max_delay_samples - self.current_delay_samples)
             % self.max_delay_samples;
@@ -982,7 +1027,7 @@ pub struct RealtimeDrumTrigger {
 
 impl RealtimeDrumTrigger {
     pub fn new(sample_rate: f64) -> Self {
-        let sr = sample_rate.max(8000.0);
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
         Self {
             kick_lp: Biquad::lowpass(sr, 115.0, FRAC_1_SQRT_2),
             snare_bp: Biquad::peaking_eq(sr, 850.0, 0.8, 9.0),
@@ -1012,21 +1057,22 @@ impl RealtimeDrumTrigger {
         in_r: f32,
         threshold_db: f64,
     ) -> [Option<(u8, f32)>; 3] {
-        let mono = 0.5 * f64::from(in_l + in_r);
-        let min_amp = 10.0_f64.powf(threshold_db / 20.0);
+        let mono = 0.5 * (sanitize_sample_f32(in_l) + sanitize_sample_f32(in_r));
+        let clean_thresh_db = sanitize_param_f64(threshold_db, -24.0, -70.0, 0.0);
+        let min_amp = 10.0_f64.powf(clean_thresh_db / 20.0);
 
         let k_abs = self.kick_lp.process_sample(mono).abs();
         let s_abs = (self.snare_bp.process_sample(mono) - mono * 0.5).abs();
         let h_abs = self.hat_hp.process_sample(mono).abs();
 
-        self.kick_fast = 0.85 * self.kick_fast + 0.15 * k_abs;
-        self.kick_slow = 0.996 * self.kick_slow + 0.004 * k_abs + 1e-6;
+        self.kick_fast = flush_denormal_f64(0.85 * self.kick_fast + 0.15 * k_abs);
+        self.kick_slow = flush_denormal_f64(0.996 * self.kick_slow + 0.004 * k_abs) + 1e-6;
 
-        self.snare_fast = 0.85 * self.snare_fast + 0.15 * s_abs;
-        self.snare_slow = 0.996 * self.snare_slow + 0.004 * s_abs + 1e-6;
+        self.snare_fast = flush_denormal_f64(0.85 * self.snare_fast + 0.15 * s_abs);
+        self.snare_slow = flush_denormal_f64(0.996 * self.snare_slow + 0.004 * s_abs) + 1e-6;
 
-        self.hat_fast = 0.80 * self.hat_fast + 0.20 * h_abs;
-        self.hat_slow = 0.995 * self.hat_slow + 0.005 * h_abs + 1e-6;
+        self.hat_fast = flush_denormal_f64(0.80 * self.hat_fast + 0.20 * h_abs);
+        self.hat_slow = flush_denormal_f64(0.995 * self.hat_slow + 0.005 * h_abs) + 1e-6;
 
         self.kick_cooldown = self.kick_cooldown.saturating_sub(1);
         self.snare_cooldown = self.snare_cooldown.saturating_sub(1);

@@ -6,6 +6,48 @@ use std::f64::consts::PI;
 use forge_core::{AuditReport, AudioBuffer, ForgeError, Result};
 use rustfft::{num_complex::Complex, FftPlanner};
 
+/// Sanitizes an arbitrary `f64` audio sample: flushes `NaN`, `±Inf`, and subnormals (`|x| < 1e-30`)
+/// to `0.0`, and bounds extreme finite amplitudes to `[-1e6, 1e6]` (`+120 dBFS`) so squaring (`x * x`)
+/// can never overflow `f64::MAX`.
+#[inline]
+pub fn sanitize_sample_f64(x: f64) -> f64 {
+    if !x.is_finite() || x.abs() < 1e-30 {
+        0.0
+    } else {
+        x.clamp(-1.0e6, 1.0e6)
+    }
+}
+
+/// Promotes an `f32` audio sample to `f64` and sanitizes `NaN`, `±Inf`, and subnormals.
+#[inline]
+pub fn sanitize_sample_f32(x: f32) -> f64 {
+    sanitize_sample_f64(f64::from(x))
+}
+
+/// Flushes subnormal (`|x| < 1e-30`) or non-finite recursive filter state to `0.0`
+/// to prevent x86/ARM denormal CPU traps and permanent `NaN` state poisoning.
+#[inline]
+pub fn flush_denormal_f64(x: f64) -> f64 {
+    if !x.is_finite() || x.abs() < 1e-30 {
+        0.0
+    } else {
+        x
+    }
+}
+
+/// Safely clamps a parameter `val` into `[min, max]`, substituting `default` if `val` is `NaN`
+/// and ordering `(min, max)` so `min > max` can never panic.
+#[inline]
+pub fn sanitize_param_f64(val: f64, default: f64, min: f64, max: f64) -> f64 {
+    let lo = if min.is_finite() { min } else { default };
+    let hi = if max.is_finite() && max >= lo { max } else { lo };
+    if !val.is_finite() {
+        default.clamp(lo, hi)
+    } else {
+        val.clamp(lo, hi)
+    }
+}
+
 /// Second-order Direct Form II Transposed IIR Biquad filter.
 #[derive(Debug, Clone, Copy)]
 pub struct Biquad {
@@ -39,20 +81,30 @@ impl Biquad {
     }
 
     #[inline]
-    pub fn process_sample(&mut self, x: f64) -> f64 {
-        let y = self.b0 * x + self.z1;
-        self.z1 = self.b1 * x - self.a1 * y + self.z2;
-        self.z2 = self.b2 * x - self.a2 * y;
+    pub fn process_sample(&mut self, x_raw: f64) -> f64 {
+        let x = sanitize_sample_f64(x_raw);
+        let y_raw = self.b0 * x + self.z1;
+        if !y_raw.is_finite() {
+            self.z1 = 0.0;
+            self.z2 = 0.0;
+            return 0.0;
+        }
+        let y = flush_denormal_f64(y_raw);
+        self.z1 = flush_denormal_f64(self.b1 * x - self.a1 * y + self.z2);
+        self.z2 = flush_denormal_f64(self.b2 * x - self.a2 * y);
         y
     }
 
     /// Audio EQ Cookbook peaking bell filter.
     pub fn peaking_eq(sample_rate: f64, freq_hz: f64, q: f64, gain_db: f64) -> Self {
-        let f0 = freq_hz.clamp(10.0, sample_rate * 0.48);
-        let a = 10.0_f64.powf(gain_db / 40.0);
-        let w0 = 2.0 * PI * f0 / sample_rate;
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 100.0, 768_000.0);
+        let f0 = sanitize_param_f64(freq_hz, 1000.0, 10.0, (sr * 0.48).max(10.0));
+        let clean_db = sanitize_param_f64(gain_db, 0.0, -36.0, 36.0);
+        let clean_q = sanitize_param_f64(q, 1.0, 0.05, 100.0);
+        let a = 10.0_f64.powf(clean_db / 40.0);
+        let w0 = 2.0 * PI * f0 / sr;
         let cos_w0 = w0.cos();
-        let alpha = w0.sin() / (2.0 * q.max(0.05));
+        let alpha = w0.sin() / (2.0 * clean_q);
 
         let b0 = 1.0 + alpha * a;
         let b1 = -2.0 * cos_w0;
@@ -66,12 +118,14 @@ impl Biquad {
 
     /// Audio EQ Cookbook narrow notch filter (ideal for 50/60 Hz hum harmonics).
     pub fn notch(sample_rate: f64, freq_hz: f64, q: f64) -> Self {
-        if freq_hz >= sample_rate * 0.49 {
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 100.0, 768_000.0);
+        if !freq_hz.is_finite() || freq_hz <= 5.0 || freq_hz >= sr * 0.49 {
             return Self::new(1.0, 0.0, 0.0, 0.0, 0.0);
         }
-        let w0 = 2.0 * PI * freq_hz / sample_rate;
+        let clean_q = sanitize_param_f64(q, 10.0, 0.1, 200.0);
+        let w0 = 2.0 * PI * freq_hz / sr;
         let cos_w0 = w0.cos();
-        let alpha = w0.sin() / (2.0 * q.max(0.1));
+        let alpha = w0.sin() / (2.0 * clean_q);
 
         let b0 = 1.0;
         let b1 = -2.0 * cos_w0;
@@ -85,10 +139,12 @@ impl Biquad {
 
     /// Second-order Butterworth High-Pass Filter.
     pub fn highpass(sample_rate: f64, freq_hz: f64, q: f64) -> Self {
-        let f0 = freq_hz.clamp(5.0, sample_rate * 0.48);
-        let w0 = 2.0 * PI * f0 / sample_rate;
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 100.0, 768_000.0);
+        let f0 = sanitize_param_f64(freq_hz, 80.0, 5.0, (sr * 0.48).max(5.0));
+        let clean_q = sanitize_param_f64(q, 0.707, 0.1, 50.0);
+        let w0 = 2.0 * PI * f0 / sr;
         let cos_w0 = w0.cos();
-        let alpha = w0.sin() / (2.0 * q.max(0.1));
+        let alpha = w0.sin() / (2.0 * clean_q);
 
         let b0 = (1.0 + cos_w0) * 0.5;
         let b1 = -(1.0 + cos_w0);
@@ -102,10 +158,12 @@ impl Biquad {
 
     /// Second-order Butterworth Low-Pass Filter.
     pub fn lowpass(sample_rate: f64, freq_hz: f64, q: f64) -> Self {
-        let f0 = freq_hz.clamp(20.0, sample_rate * 0.48);
-        let w0 = 2.0 * PI * f0 / sample_rate;
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 100.0, 768_000.0);
+        let f0 = sanitize_param_f64(freq_hz, 1000.0, 20.0, (sr * 0.48).max(20.0));
+        let clean_q = sanitize_param_f64(q, 0.707, 0.1, 50.0);
+        let w0 = 2.0 * PI * f0 / sr;
         let cos_w0 = w0.cos();
-        let alpha = w0.sin() / (2.0 * q.max(0.1));
+        let alpha = w0.sin() / (2.0 * clean_q);
 
         let b0 = (1.0 - cos_w0) * 0.5;
         let b1 = 1.0 - cos_w0;
@@ -119,10 +177,11 @@ impl Biquad {
 
     /// ITU-R BS.1770-4 Stage 1 K-weighting high-shelf pre-filter (+4 dB at ~1681.97 Hz).
     pub fn k_weight_pre_shelf(sample_rate: f64) -> Self {
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
         let db = 3.999_843_853_973_347_f64;
-        let f0 = 1_681.974_450_955_533_f64;
+        let f0 = 1_681.974_450_955_533_f64.min(sr * 0.45);
         let q = 0.707_175_236_955_419_6_f64;
-        let k = (PI * f0 / sample_rate).tan();
+        let k = (PI * f0 / sr).tan();
         let vh = 10.0_f64.powf(db / 20.0);
         let vb = vh.powf(0.499_666_774_154_541_6);
         let a0 = 1.0 + k / q + k * k;
@@ -136,9 +195,10 @@ impl Biquad {
 
     /// ITU-R BS.1770-4 Stage 2 RLB high-pass filter (~38.135 Hz).
     pub fn k_weight_rlb_highpass(sample_rate: f64) -> Self {
-        let f0 = 38.135_470_876_024_44_f64;
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
+        let f0 = 38.135_470_876_024_44_f64.min(sr * 0.45);
         let q = 0.500_327_037_323_877_3_f64;
-        let k = (PI * f0 / sample_rate).tan();
+        let k = (PI * f0 / sr).tan();
         let a0 = 1.0 + k / q + k * k;
         let b0 = 1.0 / a0;
         let b1 = -2.0 / a0;
@@ -165,7 +225,8 @@ pub fn compute_true_peak(buffer: &AudioBuffer) -> (f64, f64, f64) {
     for ch in &buffer.channels {
         let n = ch.len();
         for i in 0..n {
-            let s_abs = ch[i].abs();
+            let s_curr = sanitize_sample_f64(ch[i]);
+            let s_abs = s_curr.abs();
             if s_abs > max_sample_abs {
                 max_sample_abs = s_abs;
             }
@@ -174,10 +235,10 @@ pub fn compute_true_peak(buffer: &AudioBuffer) -> (f64, f64, f64) {
                 peak_frame = i;
             }
             if i >= 1 && i + 2 < n {
-                let s0 = ch[i - 1];
-                let s1 = ch[i];
-                let s2 = ch[i + 1];
-                let s3 = ch[i + 2];
+                let s0 = sanitize_sample_f64(ch[i - 1]);
+                let s1 = s_curr;
+                let s2 = sanitize_sample_f64(ch[i + 1]);
+                let s3 = sanitize_sample_f64(ch[i + 2]);
                 for coeffs in &PHASES {
                     let interp =
                         (coeffs[0] * s0 + coeffs[1] * s1 + coeffs[2] * s2 + coeffs[3] * s3).abs();
@@ -316,7 +377,11 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
 
     // 3. True Peak, Sample Peak, DC Offset, Clipping & Crest Factor
     let (sample_peak_dbfs, true_peak_dbtp, true_peak_timestamp_secs) = compute_true_peak(buffer);
-    let mono = buffer.to_mono();
+    let mono: Vec<f64> = buffer
+        .to_mono()
+        .into_iter()
+        .map(sanitize_sample_f64)
+        .collect();
     let dc_offset = if mono.is_empty() {
         0.0
     } else {
@@ -335,7 +400,10 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
     let mut clipped_samples = 0_usize;
     for ch in &buffer.channels {
         for w in ch.windows(3) {
-            if w[0].abs() >= 0.999 && w[1].abs() >= 0.999 && w[2].abs() >= 0.999 {
+            if sanitize_sample_f64(w[0]).abs() >= 0.999
+                && sanitize_sample_f64(w[1]).abs() >= 0.999
+                && sanitize_sample_f64(w[2]).abs() >= 0.999
+            {
                 clipped_samples += 1;
             }
         }
@@ -355,7 +423,9 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
         let mut sub_l2 = 0.0;
         let mut sub_r2 = 0.0;
 
-        for (&lv, &rv) in l.iter().zip(r.iter()) {
+        for (&lv_raw, &rv_raw) in l.iter().zip(r.iter()) {
+            let lv = sanitize_sample_f64(lv_raw);
+            let rv = sanitize_sample_f64(rv_raw);
             sum_lr += lv * rv;
             sum_l2 += lv * lv;
             sum_r2 += rv * rv;
@@ -391,7 +461,7 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
     let mut frame_count = 0_usize;
 
     let bin_hz = sr / (fft_size as f64);
-    let b_2k = ((2000.0 / bin_hz).round() as usize).clamp(2, fft_size / 2 - 4);
+    let b_2k = ((2000.0 / bin_hz).round() as usize).clamp(2, fft_size / 2 - 5);
     let b_6k = ((6000.0 / bin_hz).round() as usize).clamp(b_2k + 1, fft_size / 2 - 4);
 
     if mono.len() >= fft_size {
@@ -534,11 +604,12 @@ pub fn normalize_and_limit(
     target_lufs: f64,
     ceiling_dbtp: f64,
 ) -> Result<AudioBuffer> {
-    if !(-40.0..=-4.0).contains(&target_lufs) {
+    if !target_lufs.is_finite() || !(-40.0..=-4.0).contains(&target_lufs) {
         return Err(ForgeError::InvalidParameter(format!(
             "target_lufs ({target_lufs}) must be between -40.0 and -4.0 LUFS"
         )));
     }
+    let clean_ceiling_dbtp = sanitize_param_f64(ceiling_dbtp, -1.0, -24.0, 0.0);
     let initial = audit_audio(buffer);
     let makeup_db = if initial.integrated_lufs <= -65.0 {
         0.0
@@ -546,7 +617,7 @@ pub fn normalize_and_limit(
         (target_lufs - initial.integrated_lufs).clamp(-24.0, 24.0)
     };
     let makeup_gain = 10.0_f64.powf(makeup_db / 20.0);
-    let ceiling_lin = 10.0_f64.powf((ceiling_dbtp - 0.04) / 20.0);
+    let ceiling_lin = 10.0_f64.powf((clean_ceiling_dbtp - 0.04) / 20.0);
 
     let mut out = buffer.clone();
     let frames = out.num_frames();
@@ -555,10 +626,10 @@ pub fn normalize_and_limit(
         return Ok(out);
     }
 
-    // Apply initial makeup gain
+    // Apply initial makeup gain (sanitizing any non-finite samples)
     for ch in &mut out.channels {
         for s in ch.iter_mut() {
-            *s *= makeup_gain;
+            *s = sanitize_sample_f64(*s) * makeup_gain;
         }
     }
 
@@ -619,10 +690,10 @@ pub fn normalize_and_limit(
         }
     }
 
-    // Final safety trim if 4x true-peak slightly exceeds ceiling_dbtp
+    // Final safety trim if 4x true-peak slightly exceeds clean_ceiling_dbtp
     let (_, post_tp_db, _) = compute_true_peak(&out);
-    if post_tp_db > ceiling_dbtp {
-        let trim = 10.0_f64.powf((ceiling_dbtp - post_tp_db - 0.02) / 20.0);
+    if post_tp_db > clean_ceiling_dbtp {
+        let trim = 10.0_f64.powf((clean_ceiling_dbtp - post_tp_db - 0.02) / 20.0);
         for ch in &mut out.channels {
             for s in ch.iter_mut() {
                 *s *= trim;

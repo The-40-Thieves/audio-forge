@@ -209,11 +209,13 @@ pub fn estimate_lpc_formant_tilt_db(frame: &[f64]) -> f64 {
     for lag in 0..=ORDER {
         let mut sum = 0.0;
         for i in 0..(frame.len() - lag) {
-            sum += frame[i] * frame[i + lag];
+            let x0 = forge_dsp::sanitize_sample_f64(frame[i]);
+            let x1 = forge_dsp::sanitize_sample_f64(frame[i + lag]);
+            sum += x0 * x1;
         }
         r[lag] = sum / (frame.len() as f64);
     }
-    if r[0] < 1e-10 {
+    if !r[0].is_finite() || r[0] < 1e-10 {
         return 0.0;
     }
     // Levinson-Durbin recursion for LPC reflection coefficients
@@ -224,7 +226,10 @@ pub fn estimate_lpc_formant_tilt_db(frame: &[f64]) -> f64 {
         for j in 1..i {
             acc += a[j] * r[i - j];
         }
-        let k = (-acc / e.max(1e-12)).clamp(-0.99, 0.99);
+        if !acc.is_finite() || !e.is_finite() || e <= 1e-12 {
+            break;
+        }
+        let k = (-acc / e).clamp(-0.99, 0.99);
         let prev_a = a;
         a[i] = k;
         for j in 1..i {
@@ -236,7 +241,11 @@ pub fn estimate_lpc_formant_tilt_db(frame: &[f64]) -> f64 {
         }
     }
     // First reflection coefficient (-r[1]/r[0]) encodes spectral tilt between F1 (<800Hz) and F2/F3 (2-4kHz)
-    let r1_norm = (r[1] / r[0]).clamp(-0.99, 0.99);
+    let r1_norm = if (r[1] / r[0]).is_finite() {
+        (r[1] / r[0]).clamp(-0.99, 0.99)
+    } else {
+        0.0
+    };
     20.0 * ((1.0 - r1_norm) / (1.0 + r1_norm)).max(1e-6).log10() * 0.35
 }
 
