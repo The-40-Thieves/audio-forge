@@ -12,4 +12,9 @@ forge-theory = { path = "../forge-theory" }
 serde.workspace = true
 
 [dev-dependencies]
+divan = { version = "6.0.0", package = "codspeed-divan-compat" }
 proptest.workspace = true
+
+[[bench]]
+name = "vocal"
+harness = false
