@@ -1,0 +1,16 @@
+[package]
+name = "forge-plug"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native Real-Time VST3 & CLAP Plugin Suite for ForgeAudio (OpenSoothe, OpenSpacer, Vocal Surgical, SubMono/Tape, Master Limiter, Drum Trigger & Theory)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+forge-core = { path = "../forge-core" }
+forge-dsp = { path = "../forge-dsp" }
+forge-vocal = { path = "../forge-vocal" }
+forge-theory = { path = "../forge-theory" }
+nih_plug.workspace = true

@@ -2,6 +2,7 @@
 
 pub mod loudness_limiter;
 pub mod phase_align;
+pub mod realtime;
 pub mod restoration;
 pub mod spectral_defizz;
 pub mod spectral_unmask;
@@ -9,6 +10,11 @@ pub mod spectral_unmask;
 pub use loudness_limiter::{audit_audio, compute_true_peak, normalize_and_limit, Biquad};
 pub use phase_align::{
     align_phase_gcc_phat, align_vocal_double_dtw, PhaseAlignmentResult, StretchMarker,
+};
+pub use realtime::{
+    ParamSmoother, RealtimeDrumTrigger, RealtimeMasterLimiter, RealtimeMasteringEq18,
+    RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSubAndTapeBus,
+    RealtimeVocalSurgical,
 };
 pub use restoration::{
     apply_18_band_eq, apply_analog_console_and_tape, apply_hum_notch_cascade,
@@ -94,6 +100,41 @@ mod tests {
         let (_aligned, res) = align_phase_gcc_phat(&ref_buf, &tgt_buf, 20.0).expect("aligned");
         assert_eq!(res.delay_samples, delay);
         assert!(res.invert_polarity);
+    }
+
+    #[test]
+    fn test_realtime_zero_alloc_streaming_processors() {
+        let sr = 48_000.0;
+        let mut soothe = RealtimeOpenSoothe::new(sr);
+        assert_eq!(soothe.latency_samples(), 1536);
+
+        let mut limiter = RealtimeMasterLimiter::new(sr);
+        let mut vocal_strip = RealtimeVocalSurgical::new(sr);
+        let mut sub_tape = RealtimeSubAndTapeBus::new(sr, 160.0);
+        let mut drum_trig = RealtimeDrumTrigger::new(sr);
+
+        let mut triggered_kick = false;
+        for i in 0..4096 {
+            let t = (i as f64) / sr;
+            // Kick burst at sample 500 + harsh 4.2kHz sine
+            let kick = if (500..750).contains(&i) {
+                0.85 * (2.0 * PI * 68.0 * t).sin()
+            } else {
+                0.0
+            };
+            let s = (kick + 0.3 * (2.0 * PI * 4200.0 * t).sin()) as f32;
+            let (v_l, v_r) = vocal_strip.process_stereo_sample(s, s, 0.7, 0.7, -20.0, -50.0);
+            let (d_l, d_r) = soothe.process_stereo_sample(v_l, v_r, 3.5, 9.0, 8, false);
+            let (b_l, b_r) = sub_tape.process_stereo_sample(d_l, d_r, 0.3, 1.05, 0.25);
+            let (out_l, out_r) = limiter.process_stereo_sample(b_l, b_r, 3.0, -1.0, 85.0);
+            assert!(out_l.abs() <= 0.90 && out_r.abs() <= 0.90);
+
+            let notes = drum_trig.process_stereo_sample(s, s, -24.0);
+            if notes[0].is_some() {
+                triggered_kick = true;
+            }
+        }
+        assert!(triggered_kick, "Expected real-time kick trigger on C1");
     }
 }
 

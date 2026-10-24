@@ -4,9 +4,10 @@
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-2021%20Edition-orange.svg)](Cargo.toml)
+[![VST3 / CLAP](https://img.shields.io/badge/Plugins-VST3%20%7C%20CLAP%20%7C%20JSFX-purple.svg)](crates/forge-plug/)
 [![REAPER](https://img.shields.io/badge/REAPER-7.82%2B%20Native%20JSFX%20%26%20RPP-green.svg)](reaper-jsfx/)
 
-ForgeAudio (`forge` CLI + `forge-mcp` Model Context Protocol server + native REAPER `JSFX` DSP plugins) is a zero-bloat **Rust + REAPER 7.82 + Hybrid GPU Worker** audio engineering ecosystem built for **both live studio musicians and AI/hybrid producers** (Suno, Udio, YuE2-3B, ACE-Step 1.5, Google Lyria 3.5).
+ForgeAudio (`forge` CLI + `forge-mcp` Model Context Protocol server + `forge-plug` native **VST3 / CLAP** plugin suite + native REAPER `JSFX` DSP plugins) is a zero-bloat **Rust + REAPER 7.82 + Hybrid GPU Worker** audio engineering ecosystem built for **both live studio musicians and AI/hybrid producers** (Suno, Udio, YuE2-3B, ACE-Step 1.5, Google Lyria 3.5).
 
 ---
 
@@ -32,13 +33,15 @@ audio-forge/
 ├── Cargo.toml                  # Rust workspace (7 crates)
 ├── crates/
 │   ├── forge-core/             # 64-bit planar AudioBuffer, 16/24/32f WAV & FFmpeg I/O, TPDF dither
-│   ├── forge-dsp/              # BS.1770-4 LUFS, 4x True Peak, OpenSoothe, OpenSpacer, GCC-PHAT, FastDTW, 18-Band EQ
+│   ├── forge-dsp/              # BS.1770-4 LUFS, 4x True Peak, OpenSoothe, OpenSpacer, GCC-PHAT, FastDTW, 18-Band EQ & Real-Time Zero-Alloc Kernels
+│   ├── forge-plug/             # 7 Native Cross-DAW VST3 & CLAP Real-Time Plugins (`nih-plug`, zero audio-thread heap allocations)
 │   ├── forge-theory/           # Voice-leading solver, Neo-Soul reharmonizer, Dilla/MPC groove, Drum-to-MIDI, ABC
 │   ├── forge-vocal/            # YIN F0 pitch tracker, formant-preserving shifter, 3-part harmonies, REAPER <PITCHENV
 │   ├── forge-reaper/           # Programmatic REAPER 7.82 .RPP AST builder, UDP OSC controller, ISO 3901 ISRC tagger
 │   ├── forge-worker/           # Hybrid GPU dispatcher (Local RTX 3080 uv worker + Colab A100 + Gemini Lyria 3.5 API)
 │   ├── forge-cli/              # `forge` CLI binary (<5ms startup)
 │   └── forge-mcp/              # `forge-mcp` JSON-RPC 2.0 stdio server for AI agents
+├── xtask/                      # `cargo xtask bundle forge-plug --release` VST3 & CLAP bundler
 ├── reaper-jsfx/                # Native REAPER EEL2 JSFX real-time plugins
 │   ├── Forge_OpenSoothe_DeFizz.jsfx
 │   ├── Forge_OpenSpacer_Unmask.jsfx
@@ -53,11 +56,24 @@ audio-forge/
 
 ## Quick Start
 
-### 1. Build the Rust Workspace
+### 1. Build the Rust Workspace & Bundle the 7 VST3 / CLAP Plugins
 
 ```bash
+# Build all CLI, MCP, and DSP crates
 cargo build --release --workspace
+
+# Bundle `forge-plug.vst3` and `forge-plug.clap` (exports all 7 studio plugins)
+cargo xtask bundle forge-plug --release
 ```
+
+The compiled `target/bundled/forge-plug.vst3` and `target/bundled/forge-plug.clap` bundles expose **7 real-time zero-allocation plugins** to any DAW (REAPER, Ableton Live, FL Studio, Logic, Studio One, Bitwig):
+1. **Forge OpenSoothe De-Fizz** (2048-pt OLA STFT Dynamic Resonance & AI Fizz Suppressor with `1536`-sample PDC)
+2. **Forge OpenSpacer Unmask** (4-Channel Sidechain Spectral Unmasker for Vocal $\rightarrow$ Music & Kick $\rightarrow$ Bass)
+3. **Forge Vocal Surgical Strip** (Zero-Latency Mouth De-Click, `<115 Hz` Plosive Suppressor, Split-Band De-Esser & Breath Gate)
+4. **Forge SubMono & Console Tape** (Linkwitz-Riley `<160 Hz` Sub Mono-Maker, Harmonic Bass Reinforcer & Console8/ChowTape Saturation)
+5. **Forge Master True-Peak Limiter** (Lookahead 4x Inter-Sample True-Peak `-1.0 dBTP` Brickwall Limiter & ITU-R BS.1770-4 Meter)
+6. **Forge Drum Trigger & Theory MIDI** (Real-Time Audio-to-MIDI 3-Band Drum Replacer `C1/D1/F#1` + 1-Finger MIDI-to-Neo-Soul Chord Voicer)
+7. **Forge PhaseAlign & 18-Band EQ** (Sample-Accurate Phase/Polarity Aligner & 18-Band AI De-Harsh / Mastering Equalizer)
 
 ### 2. Run the Full End-to-End Pipeline (`forge ingest`)
 

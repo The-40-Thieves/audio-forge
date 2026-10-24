@@ -7,8 +7,10 @@ members = [
     "crates/forge-theory",
     "crates/forge-reaper",
     "crates/forge-worker",
+    "crates/forge-plug",
     "crates/forge-cli",
     "crates/forge-mcp",
+    "xtask",
 ]
 
 [workspace.package]
@@ -36,6 +38,8 @@ rosc = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3.14"
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_process_allocs"] }
+nih_plug_xtask = { git = "https://github.com/robbert-vdh/nih-plug.git" }
 
 [profile.release]
 opt-level = 3
