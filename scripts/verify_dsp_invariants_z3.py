@@ -12,8 +12,8 @@ Verifies:
 from __future__ import annotations
 
 import json
-import math
 import sys
+
 import z3
 
 
