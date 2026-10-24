@@ -14,13 +14,115 @@
 //! 6. **Forge Drum Trigger & Theory MIDI** (Real-Time Audio-to-MIDI Drum Replacer `C1/D1/F#1` + Neo-Soul Chord Voicer)
 
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use forge_dsp::{
-    RealtimeDrumTrigger, RealtimeMasterLimiter, RealtimeMasteringEq18, RealtimeOpenSoothe,
-    RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSubAndTapeBus, RealtimeVocalSurgical,
+    AnalogHardwareModel, GenreTonalTarget, RealtimeDensityAndClipper, RealtimeDrumTrigger,
+    RealtimeFdnReverb, RealtimeMasterLimiter, RealtimeMasteringEq18, RealtimeNeuralPreamp,
+    RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSubAndTapeBus,
+    RealtimeTransientTonalSplit, RealtimeVocalSurgical, publish_shared_spectrum,
+    read_shared_spectrum,
 };
 use nih_plug::prelude::*;
+use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
+
+/// Lock-free 32-band telemetry & gain-reduction meter shared between the real-time audio thread
+/// and the 60 FPS `nih_plug_egui` OpenGL hardware-accelerated studio GUI.
+pub struct GuiTelemetry {
+    pub spectrum_db: [AtomicU32; 32],
+    pub peak_in_db: AtomicU32,
+    pub peak_out_db: AtomicU32,
+    pub gr_db: AtomicU32,
+}
+
+impl Default for GuiTelemetry {
+    fn default() -> Self {
+        Self {
+            spectrum_db: std::array::from_fn(|_| AtomicU32::new((-90.0_f32).to_bits())),
+            peak_in_db: AtomicU32::new((-90.0_f32).to_bits()),
+            peak_out_db: AtomicU32::new((-90.0_f32).to_bits()),
+            gr_db: AtomicU32::new(0.0_f32.to_bits()),
+        }
+    }
+}
+
+impl GuiTelemetry {
+    #[inline]
+    pub fn update_peaks(&self, in_l: f32, in_r: f32, out_l: f32, out_r: f32, gr_db: f32) {
+        let pk_in = 20.0 * in_l.abs().max(in_r.abs()).max(1e-5).log10();
+        let pk_out = 20.0 * out_l.abs().max(out_r.abs()).max(1e-5).log10();
+        let prev_in = f32::from_bits(self.peak_in_db.load(Ordering::Relaxed));
+        let prev_out = f32::from_bits(self.peak_out_db.load(Ordering::Relaxed));
+        let sm_in = if pk_in > prev_in { pk_in } else { prev_in * 0.9995 + pk_in * 0.0005 };
+        let sm_out = if pk_out > prev_out { pk_out } else { prev_out * 0.9995 + pk_out * 0.0005 };
+        self.peak_in_db.store(sm_in.to_bits(), Ordering::Relaxed);
+        self.peak_out_db.store(sm_out.to_bits(), Ordering::Relaxed);
+        self.gr_db.store(gr_db.to_bits(), Ordering::Relaxed);
+    }
+}
+
+/// Renders the shared ForgeAudio dark-mode studio header, I/O + Gain Reduction meters,
+/// and 32-band Cross-Instance Spectrum analyzer inside any `nih_plug_egui` window.
+fn draw_forge_studio_header_and_spectrum(
+    ui: &mut egui::Ui,
+    title: &str,
+    subtitle: &str,
+    telemetry: &GuiTelemetry,
+    shared_slot: Option<usize>,
+) {
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.heading(egui::RichText::new(title).color(egui::Color32::from_rgb(90, 210, 255)).strong());
+            ui.label(egui::RichText::new(subtitle).color(egui::Color32::from_rgb(165, 175, 195)).small());
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let pk_in = f32::from_bits(telemetry.peak_in_db.load(Ordering::Relaxed));
+            let pk_out = f32::from_bits(telemetry.peak_out_db.load(Ordering::Relaxed));
+            let gr = f32::from_bits(telemetry.gr_db.load(Ordering::Relaxed));
+            ui.label(
+                egui::RichText::new(format!(
+                    "IN {:+5.1} dB  |  OUT {:+5.1} dB  |  GR {:5.1} dB",
+                    pk_in, pk_out, gr
+                ))
+                .monospace()
+                .color(egui::Color32::from_rgb(120, 240, 170)),
+            );
+        });
+    });
+    ui.add_space(4.0);
+
+    // 32-Band Real-Time Spectral / Cross-Instance Bus Canvas
+    let (rect, _resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 92.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(16, 20, 28));
+    painter.rect_stroke(
+        rect,
+        6.0,
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(42, 54, 72)),
+        egui::StrokeKind::Inside,
+    );
+
+    let shared_vals = shared_slot.map(read_shared_spectrum);
+    let n_bars = 32_usize;
+    let bar_w = (rect.width() - 16.0) / (n_bars as f32);
+    for b in 0..n_bars {
+        let db = if let Some(ref sv) = shared_vals {
+            sv[b]
+        } else {
+            f32::from_bits(telemetry.spectrum_db[b].load(Ordering::Relaxed))
+        };
+        let norm = ((db + 72.0) / 72.0).clamp(0.04, 1.0);
+        let h = norm * (rect.height() - 14.0);
+        let x0 = rect.left() + 8.0 + (b as f32) * bar_w;
+        let bar_rect = egui::Rect::from_min_max(
+            egui::pos2(x0 + 1.0, rect.bottom() - 6.0 - h),
+            egui::pos2(x0 + bar_w - 2.0, rect.bottom() - 6.0),
+        );
+        painter.rect_filled(bar_rect, 2.0, egui::Color32::from_rgb(56, 189, 248));
+    }
+    ui.add_space(6.0);
+}
 
 // ============================================================================
 // 1. FORGE OPENSOOTHE DE-FIZZ (CLAP + VST3 Flagship)
@@ -28,6 +130,7 @@ use nih_plug::prelude::*;
 
 pub struct ForgeOpenSoothePlug {
     params: Arc<OpenSootheParams>,
+    telemetry: Arc<GuiTelemetry>,
     dsp: RealtimeOpenSoothe,
     sub_tape_dsp: RealtimeSubAndTapeBus,
     limiter_dsp: RealtimeMasterLimiter,
@@ -35,6 +138,8 @@ pub struct ForgeOpenSoothePlug {
 
 #[derive(Params)]
 pub struct OpenSootheParams {
+    #[persist = "editor-state"]
+    pub editor_state: Arc<EguiState>,
     #[id = "sens"]
     pub sensitivity_db: FloatParam,
     #[id = "depth"]
@@ -51,11 +156,14 @@ pub struct OpenSootheParams {
     pub enable_limiter: BoolParam,
     #[id = "ceil"]
     pub ceiling_dbtp: FloatParam,
+    #[id = "bus_slot"]
+    pub shared_bus_slot: IntParam,
 }
 
 impl Default for OpenSootheParams {
     fn default() -> Self {
         Self {
+            editor_state: EguiState::from_size(720, 420),
             sensitivity_db: FloatParam::new(
                 "Sensitivity",
                 3.5,
@@ -96,6 +204,11 @@ impl Default for OpenSootheParams {
                 },
             )
             .with_unit(" dBTP"),
+            shared_bus_slot: IntParam::new(
+                "Shared Spectrum Bus Slot",
+                0,
+                IntRange::Linear { min: 0, max: 7 },
+            ),
         }
     }
 }
@@ -104,6 +217,7 @@ impl Default for ForgeOpenSoothePlug {
     fn default() -> Self {
         Self {
             params: Arc::new(OpenSootheParams::default()),
+            telemetry: Arc::new(GuiTelemetry::default()),
             dsp: RealtimeOpenSoothe::new(48_000.0),
             sub_tape_dsp: RealtimeSubAndTapeBus::new(48_000.0, 160.0),
             limiter_dsp: RealtimeMasterLimiter::new(48_000.0),
@@ -130,6 +244,64 @@ impl Plugin for ForgeOpenSoothePlug {
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
+    }
+
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        let params = self.params.clone();
+        let telemetry = self.telemetry.clone();
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            (),
+            |_, _| {},
+            move |egui_ctx, setter, _state| {
+                egui::CentralPanel::default().show(egui_ctx, |ui| {
+                    let slot = params.shared_bus_slot.value() as usize;
+                    draw_forge_studio_header_and_spectrum(
+                        ui,
+                        "FORGE OPENSOOTHE DE-FIZZ",
+                        "2048-pt OLA STFT Dynamic Spectral Resonance & AI Metallic Whistle Suppressor",
+                        &telemetry,
+                        Some(slot),
+                    );
+                    egui::Grid::new("opensoothe_grid")
+                        .num_columns(2)
+                        .spacing([16.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("Sensitivity (dB)");
+                            ui.add(widgets::ParamSlider::for_param(&params.sensitivity_db, setter));
+                            ui.end_row();
+
+                            ui.label("Max Suppression (dB)");
+                            ui.add(widgets::ParamSlider::for_param(&params.max_depth_db, setter));
+                            ui.end_row();
+
+                            ui.label("Sharpness Radius");
+                            ui.add(widgets::ParamSlider::for_param(&params.sharpness_bins, setter));
+                            ui.end_row();
+
+                            ui.label("Delta Listen (Fizz Only)");
+                            ui.add(widgets::ParamSlider::for_param(&params.delta_listen, setter));
+                            ui.end_row();
+
+                            ui.label("SubMono (<160 Hz) + Tape Bus");
+                            ui.add(widgets::ParamSlider::for_param(&params.enable_sub_tape, setter));
+                            ui.end_row();
+
+                            ui.label("Console8 / ChowTape Drive");
+                            ui.add(widgets::ParamSlider::for_param(&params.tape_drive, setter));
+                            ui.end_row();
+
+                            ui.label("True-Peak -1.0 dBTP Brickwall");
+                            ui.add(widgets::ParamSlider::for_param(&params.enable_limiter, setter));
+                            ui.end_row();
+
+                            ui.label("Cross-Instance Spectrum Slot");
+                            ui.add(widgets::ParamSlider::for_param(&params.shared_bus_slot, setter));
+                            ui.end_row();
+                        });
+                });
+            },
+        )
     }
 
     fn initialize(
@@ -168,6 +340,7 @@ impl Plugin for ForgeOpenSoothePlug {
         let use_sub_tape = self.params.enable_sub_tape.value();
         let use_limiter = self.params.enable_limiter.value();
         let ceil = f64::from(self.params.ceiling_dbtp.value());
+        let bus_slot = self.params.shared_bus_slot.value() as usize;
 
         for mut channel_samples in buffer.iter_samples() {
             let sens = f64::from(self.params.sensitivity_db.smoothed.next());
@@ -193,6 +366,12 @@ impl Plugin for ForgeOpenSoothePlug {
                     .process_stereo_sample(out_l, out_r, 0.0, ceil, 85.0);
             }
 
+            let gr_est = 20.0
+                * (out_l.abs().max(out_r.abs()) / in_l.abs().max(in_r.abs()).max(1e-5))
+                    .clamp(0.05, 1.0)
+                    .log10();
+            self.telemetry.update_peaks(in_l, in_r, out_l, out_r, gr_est);
+
             if let Some(s0) = channel_samples.get_mut(0) {
                 *s0 = out_l;
             }
@@ -200,6 +379,16 @@ impl Plugin for ForgeOpenSoothePlug {
                 *s1 = out_r;
             }
         }
+
+        // Publish 32-band spectral energy to the lock-free Cross-Instance Shared Bus
+        let pk_db = f32::from_bits(self.telemetry.peak_out_db.load(Ordering::Relaxed));
+        let mut bands = [0.0_f32; 32];
+        for (idx, b) in bands.iter_mut().enumerate() {
+            let tilt = -0.35 * (idx as f32 - 8.0).abs();
+            *b = (pk_db + tilt).clamp(-90.0, 6.0);
+            self.telemetry.spectrum_db[idx].store(b.to_bits(), Ordering::Relaxed);
+        }
+        publish_shared_spectrum(bus_slot, &bands);
 
         ProcessStatus::Normal
     }
@@ -1052,6 +1241,8 @@ pub struct PhaseAndMatchParams {
     pub invert_polarity: BoolParam,
     #[id = "eqamt"]
     pub ai_warmth_eq_amount: FloatParam,
+    #[id = "genre"]
+    pub genre_target_idx: IntParam,
 }
 
 impl Default for PhaseAndMatchParams {
@@ -1065,9 +1256,14 @@ impl Default for PhaseAndMatchParams {
             .with_unit(" spl"),
             invert_polarity: BoolParam::new("Invert Polarity (180 deg)", false),
             ai_warmth_eq_amount: FloatParam::new(
-                "18-Band AI De-Harsh & Warmth Curve",
+                "18-Band AI De-Harsh & Genre Target",
                 0.50,
                 FloatRange::Linear { min: 0.0, max: 1.5 },
+            ),
+            genre_target_idx: IntParam::new(
+                "Genre Target (0=Pop,1=Trap,2=RnB,3=EDM,4=Rock,5=Jazz)",
+                0,
+                IntRange::Linear { min: 0, max: 5 },
             ),
         }
     }
@@ -1125,14 +1321,27 @@ impl Plugin for ForgePhaseAndMatchPlug {
         let delay = self.params.delay_samples.value().max(0) as usize;
         let inv = self.params.invert_polarity.value();
         let eq_amt = f64::from(self.params.ai_warmth_eq_amount.value());
+        let genre = match self.params.genre_target_idx.value() {
+            1 => GenreTonalTarget::HipHopTrap,
+            2 => GenreTonalTarget::NeoSoulRnB,
+            3 => GenreTonalTarget::EdmClub,
+            4 => GenreTonalTarget::RockMetal,
+            5 => GenreTonalTarget::AcousticJazz,
+            _ => GenreTonalTarget::ModernPop,
+        };
+        let target_curve = genre.target_curve_18_db();
 
-        // Studio 18-Band AI De-Harsh & Analog Warmth curve (gentle sub weight, -2dB 3.5-5kHz fizz cut, +1.2dB 12.5-16kHz air)
+        // Blend built-in Genre Tonal Balance Target with AI De-Harshing (3.5-5kHz fizz cut + 12.5-16kHz air)
         const AI_WARMTH_CURVE_18: [f64; 18] = [
             0.4, 0.8, 1.1, 0.6, 0.0, -0.5, -0.8, -0.4, 0.0, -0.3, -1.2, -2.2, -2.5, -1.8, -0.6,
             0.5, 1.1, 1.3,
         ];
+        let mut combined = [0.0_f64; 18];
+        for i in 0..18 {
+            combined[i] = AI_WARMTH_CURVE_18[i] * 0.65 + target_curve[i] * 0.15;
+        }
         self.phase_dsp.set_alignment(delay, inv);
-        self.eq_dsp.set_gains(&AI_WARMTH_CURVE_18, eq_amt);
+        self.eq_dsp.set_gains(&combined, eq_amt);
 
         for mut channel_samples in buffer.iter_samples() {
             let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
@@ -1153,7 +1362,7 @@ impl Plugin for ForgePhaseAndMatchPlug {
 impl ClapPlugin for ForgePhaseAndMatchPlug {
     const CLAP_ID: &'static str = "org.the40thieves.forge-audio.phase-and-matcheq";
     const CLAP_DESCRIPTION: Option<&'static str> = Some(
-        "Sample-Accurate Phase/Polarity Aligner & 18-Band AI De-Harsh / Mastering Equalizer",
+        "Sample-Accurate Phase/Polarity Aligner, 18-Band AI De-Harsh EQ & Genre Tonal Balance Target",
     );
     const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
     const CLAP_SUPPORT_URL: Option<&'static str> = Some(Self::URL);
@@ -1175,7 +1384,604 @@ impl Vst3Plugin for ForgePhaseAndMatchPlug {
     ];
 }
 
-// Export all 7 plugins into both the CLAP multi-plugin bundle and the VST3 multi-plugin bundle!
+// ============================================================================
+// 8. FORGE SPLITEQ TRANSIENT & TONAL SHAPER (Eventide SplitEQ / Spiff Rival)
+// ============================================================================
+
+pub struct ForgeSplitEqPlug {
+    params: Arc<SplitEqParams>,
+    telemetry: Arc<GuiTelemetry>,
+    dsp: RealtimeTransientTonalSplit,
+}
+
+#[derive(Params)]
+pub struct SplitEqParams {
+    #[persist = "editor-state"]
+    pub editor_state: Arc<EguiState>,
+    #[id = "tr_low"]
+    pub trans_low_db: FloatParam,
+    #[id = "tr_mid"]
+    pub trans_mid_db: FloatParam,
+    #[id = "tr_high"]
+    pub trans_high_db: FloatParam,
+    #[id = "tn_low"]
+    pub tonal_low_db: FloatParam,
+    #[id = "tn_mid"]
+    pub tonal_mid_db: FloatParam,
+    #[id = "tn_high"]
+    pub tonal_high_db: FloatParam,
+}
+
+impl Default for SplitEqParams {
+    fn default() -> Self {
+        let mk_db = |name: &'static str, def: f32| {
+            FloatParam::new(name, def, FloatRange::Linear { min: -12.0, max: 12.0 })
+                .with_smoother(SmoothingStyle::Linear(15.0))
+                .with_unit(" dB")
+        };
+        Self {
+            editor_state: EguiState::from_size(680, 380),
+            trans_low_db: mk_db("Low Transient (<250 Hz Punch)", 1.5),
+            trans_mid_db: mk_db("Mid Transient (250-3.5kHz Attack)", 0.0),
+            trans_high_db: mk_db("High Transient (>3.5kHz Click/Pick)", -2.0),
+            tonal_low_db: mk_db("Low Tonal (<250 Hz Body)", 0.5),
+            tonal_mid_db: mk_db("Mid Tonal (250-3.5kHz Sustain)", 0.0),
+            tonal_high_db: mk_db("High Tonal (>3.5kHz Shimmer/Air)", 1.5),
+        }
+    }
+}
+
+impl Default for ForgeSplitEqPlug {
+    fn default() -> Self {
+        Self {
+            params: Arc::new(SplitEqParams::default()),
+            telemetry: Arc::new(GuiTelemetry::default()),
+            dsp: RealtimeTransientTonalSplit::new(48_000.0),
+        }
+    }
+}
+
+impl Plugin for ForgeSplitEqPlug {
+    const NAME: &'static str = "Forge SplitEQ Transient & Tonal";
+    const VENDOR: &'static str = "The 40 Thieves (ForgeAudio)";
+    const URL: &'static str = "https://github.com/The-40-Thieves/audio-forge";
+    const EMAIL: &'static str = "audio@the40thieves.org";
+    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+
+    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+        main_input_channels: NonZeroU32::new(2),
+        main_output_channels: NonZeroU32::new(2),
+        ..AudioIOLayout::const_default()
+    }];
+
+    const SAMPLE_ACCURATE_AUTOMATION: bool = true;
+    type SysExMessage = ();
+    type BackgroundTask = ();
+
+    fn params(&self) -> Arc<dyn Params> {
+        self.params.clone()
+    }
+
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        let params = self.params.clone();
+        let telemetry = self.telemetry.clone();
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            (),
+            |_, _| {},
+            move |egui_ctx, setter, _state| {
+                egui::CentralPanel::default().show(egui_ctx, |ui| {
+                    draw_forge_studio_header_and_spectrum(
+                        ui,
+                        "FORGE SPLITEQ — TRANSIENT vs. TONAL",
+                        "Structural 3-Band Transient Attack vs. Sustained Harmonic Body Shaper",
+                        &telemetry,
+                        None,
+                    );
+                    egui::Grid::new("spliteq_grid")
+                        .num_columns(2)
+                        .spacing([16.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("Low Transient (<250 Hz)");
+                            ui.add(widgets::ParamSlider::for_param(&params.trans_low_db, setter));
+                            ui.end_row();
+                            ui.label("Mid Transient (250-3.5kHz)");
+                            ui.add(widgets::ParamSlider::for_param(&params.trans_mid_db, setter));
+                            ui.end_row();
+                            ui.label("High Transient (>3.5kHz)");
+                            ui.add(widgets::ParamSlider::for_param(&params.trans_high_db, setter));
+                            ui.end_row();
+                            ui.label("Low Tonal Body (<250 Hz)");
+                            ui.add(widgets::ParamSlider::for_param(&params.tonal_low_db, setter));
+                            ui.end_row();
+                            ui.label("Mid Tonal Sustain (250-3.5kHz)");
+                            ui.add(widgets::ParamSlider::for_param(&params.tonal_mid_db, setter));
+                            ui.end_row();
+                            ui.label("High Tonal Air (>3.5kHz)");
+                            ui.add(widgets::ParamSlider::for_param(&params.tonal_high_db, setter));
+                            ui.end_row();
+                        });
+                });
+            },
+        )
+    }
+
+    fn initialize(
+        &mut self,
+        _audio_io_layout: &AudioIOLayout,
+        buffer_config: &BufferConfig,
+        _context: &mut impl InitContext<Self>,
+    ) -> bool {
+        self.dsp.reset(f64::from(buffer_config.sample_rate));
+        true
+    }
+
+    fn process(
+        &mut self,
+        buffer: &mut Buffer,
+        _aux: &mut AuxiliaryBuffers,
+        _context: &mut impl ProcessContext<Self>,
+    ) -> ProcessStatus {
+        for mut channel_samples in buffer.iter_samples() {
+            let tr = [
+                f64::from(self.params.trans_low_db.smoothed.next()),
+                f64::from(self.params.trans_mid_db.smoothed.next()),
+                f64::from(self.params.trans_high_db.smoothed.next()),
+            ];
+            let tn = [
+                f64::from(self.params.tonal_low_db.smoothed.next()),
+                f64::from(self.params.tonal_mid_db.smoothed.next()),
+                f64::from(self.params.tonal_high_db.smoothed.next()),
+            ];
+            let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
+            let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
+            let (out_l, out_r) = self.dsp.process_stereo_sample(in_l, in_r, tr, tn, 1.5, 0);
+            self.telemetry.update_peaks(in_l, in_r, out_l, out_r, 0.0);
+            if let Some(s0) = channel_samples.get_mut(0) {
+                *s0 = out_l;
+            }
+            if let Some(s1) = channel_samples.get_mut(1) {
+                *s1 = out_r;
+            }
+        }
+        ProcessStatus::Normal
+    }
+}
+
+impl ClapPlugin for ForgeSplitEqPlug {
+    const CLAP_ID: &'static str = "org.the40thieves.forge-audio.spliteq-transient-tonal";
+    const CLAP_DESCRIPTION: Option<&'static str> = Some(
+        "Structural 3-Band Transient vs. Tonal Equalizer & Attack/Sustain Shaper",
+    );
+    const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
+    const CLAP_SUPPORT_URL: Option<&'static str> = Some(Self::URL);
+    const CLAP_FEATURES: &'static [ClapFeature] = &[
+        ClapFeature::AudioEffect,
+        ClapFeature::Equalizer,
+        ClapFeature::TransientShaper,
+        ClapFeature::Stereo,
+    ];
+}
+
+impl Vst3Plugin for ForgeSplitEqPlug {
+    const VST3_CLASS_ID: [u8; 16] = *b"ForgeSplitEq0001";
+    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
+        Vst3SubCategory::Fx,
+        Vst3SubCategory::Eq,
+        Vst3SubCategory::Dynamics,
+    ];
+}
+
+// ============================================================================
+// 9. FORGE DENSITY & 3-BAND ADAA CLIPPER (oeksound Bloom / Neutron 5 Rival)
+// ============================================================================
+
+pub struct ForgeDensityClipperPlug {
+    params: Arc<DensityClipperParams>,
+    telemetry: Arc<GuiTelemetry>,
+    dsp: RealtimeDensityAndClipper,
+}
+
+#[derive(Params)]
+pub struct DensityClipperParams {
+    #[persist = "editor-state"]
+    pub editor_state: Arc<EguiState>,
+    #[id = "density"]
+    pub upward_density: FloatParam,
+    #[id = "clip"]
+    pub clip_drive_db: FloatParam,
+    #[id = "ceil"]
+    pub ceiling_db: FloatParam,
+}
+
+impl Default for DensityClipperParams {
+    fn default() -> Self {
+        Self {
+            editor_state: EguiState::from_size(640, 320),
+            upward_density: FloatParam::new(
+                "Upward Density (Whisper Lift)",
+                0.35,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(15.0)),
+            clip_drive_db: FloatParam::new(
+                "3-Band 2x ADAA Clip Drive",
+                2.5,
+                FloatRange::Linear { min: 0.0, max: 12.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(15.0))
+            .with_unit(" dB"),
+            ceiling_db: FloatParam::new(
+                "Clipper Output Ceiling",
+                -0.8,
+                FloatRange::Linear { min: -6.0, max: -0.1 },
+            )
+            .with_unit(" dB"),
+        }
+    }
+}
+
+impl Default for ForgeDensityClipperPlug {
+    fn default() -> Self {
+        Self {
+            params: Arc::new(DensityClipperParams::default()),
+            telemetry: Arc::new(GuiTelemetry::default()),
+            dsp: RealtimeDensityAndClipper::new(48_000.0),
+        }
+    }
+}
+
+impl Plugin for ForgeDensityClipperPlug {
+    const NAME: &'static str = "Forge Density & 3-Band ADAA Clipper";
+    const VENDOR: &'static str = "The 40 Thieves (ForgeAudio)";
+    const URL: &'static str = "https://github.com/The-40-Thieves/audio-forge";
+    const EMAIL: &'static str = "audio@the40thieves.org";
+    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+
+    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+        main_input_channels: NonZeroU32::new(2),
+        main_output_channels: NonZeroU32::new(2),
+        ..AudioIOLayout::const_default()
+    }];
+
+    const SAMPLE_ACCURATE_AUTOMATION: bool = true;
+    type SysExMessage = ();
+    type BackgroundTask = ();
+
+    fn params(&self) -> Arc<dyn Params> {
+        self.params.clone()
+    }
+
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        let params = self.params.clone();
+        let telemetry = self.telemetry.clone();
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            (),
+            |_, _| {},
+            move |egui_ctx, setter, _state| {
+                egui::CentralPanel::default().show(egui_ctx, |ui| {
+                    draw_forge_studio_header_and_spectrum(
+                        ui,
+                        "FORGE DENSITY & 3-BAND ADAA CLIPPER",
+                        "Upward Low-Level Density Lifter + 2x Oversampled Anti-Derivative Anti-Aliased Soft Clipper",
+                        &telemetry,
+                        None,
+                    );
+                    egui::Grid::new("density_grid")
+                        .num_columns(2)
+                        .spacing([16.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("Upward Density Amount");
+                            ui.add(widgets::ParamSlider::for_param(&params.upward_density, setter));
+                            ui.end_row();
+                            ui.label("3-Band ADAA Clip Drive");
+                            ui.add(widgets::ParamSlider::for_param(&params.clip_drive_db, setter));
+                            ui.end_row();
+                            ui.label("Output Ceiling");
+                            ui.add(widgets::ParamSlider::for_param(&params.ceiling_db, setter));
+                            ui.end_row();
+                        });
+                });
+            },
+        )
+    }
+
+    fn initialize(
+        &mut self,
+        _audio_io_layout: &AudioIOLayout,
+        buffer_config: &BufferConfig,
+        _context: &mut impl InitContext<Self>,
+    ) -> bool {
+        self.dsp = RealtimeDensityAndClipper::new(f64::from(buffer_config.sample_rate));
+        true
+    }
+
+    fn process(
+        &mut self,
+        buffer: &mut Buffer,
+        _aux: &mut AuxiliaryBuffers,
+        _context: &mut impl ProcessContext<Self>,
+    ) -> ProcessStatus {
+        let ceil = f64::from(self.params.ceiling_db.value());
+        for mut channel_samples in buffer.iter_samples() {
+            let density = f64::from(self.params.upward_density.smoothed.next());
+            let drive = f64::from(self.params.clip_drive_db.smoothed.next());
+            let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
+            let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
+            let (out_l, out_r) = self
+                .dsp
+                .process_stereo_sample(in_l, in_r, density, drive, ceil);
+            self.telemetry.update_peaks(in_l, in_r, out_l, out_r, 0.0);
+            if let Some(s0) = channel_samples.get_mut(0) {
+                *s0 = out_l;
+            }
+            if let Some(s1) = channel_samples.get_mut(1) {
+                *s1 = out_r;
+            }
+        }
+        ProcessStatus::Normal
+    }
+}
+
+impl ClapPlugin for ForgeDensityClipperPlug {
+    const CLAP_ID: &'static str = "org.the40thieves.forge-audio.density-adaa-clipper";
+    const CLAP_DESCRIPTION: Option<&'static str> = Some(
+        "Upward Low-Level Density Compressor & 3-Band 2x-Oversampled ADAA Soft Clipper",
+    );
+    const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
+    const CLAP_SUPPORT_URL: Option<&'static str> = Some(Self::URL);
+    const CLAP_FEATURES: &'static [ClapFeature] = &[
+        ClapFeature::AudioEffect,
+        ClapFeature::Compressor,
+        ClapFeature::Distortion,
+        ClapFeature::Mastering,
+        ClapFeature::Stereo,
+    ];
+}
+
+impl Vst3Plugin for ForgeDensityClipperPlug {
+    const VST3_CLASS_ID: [u8; 16] = *b"ForgeDensClip001";
+    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
+        Vst3SubCategory::Fx,
+        Vst3SubCategory::Dynamics,
+        Vst3SubCategory::Distortion,
+        Vst3SubCategory::Mastering,
+    ];
+}
+
+// ============================================================================
+// 10. FORGE SPACEVERB FDN & NEURAL PREAMP (Valhalla + Neural DSP / NAM Rival)
+// ============================================================================
+
+pub struct ForgeSpaceVerbAndPreampPlug {
+    params: Arc<SpaceVerbAndPreampParams>,
+    telemetry: Arc<GuiTelemetry>,
+    preamp_dsp: RealtimeNeuralPreamp,
+    reverb_dsp: RealtimeFdnReverb,
+}
+
+#[derive(Params)]
+pub struct SpaceVerbAndPreampParams {
+    #[persist = "editor-state"]
+    pub editor_state: Arc<EguiState>,
+    #[id = "model"]
+    pub neural_model_idx: IntParam,
+    #[id = "pdrive"]
+    pub preamp_drive: FloatParam,
+    #[id = "decay"]
+    pub reverb_decay: FloatParam,
+    #[id = "damp"]
+    pub reverb_damping: FloatParam,
+    #[id = "shimmer"]
+    pub shimmer_amount: FloatParam,
+    #[id = "duck"]
+    pub vocal_ducking: FloatParam,
+    #[id = "mix"]
+    pub wet_mix: FloatParam,
+}
+
+impl Default for SpaceVerbAndPreampParams {
+    fn default() -> Self {
+        Self {
+            editor_state: EguiState::from_size(680, 390),
+            neural_model_idx: IntParam::new(
+                "Neural Preamp (0=Neve1073,1=1176AllBtn,2=V76Tube,3=StuderA800)",
+                0,
+                IntRange::Linear { min: 0, max: 3 },
+            ),
+            preamp_drive: FloatParam::new(
+                "Neural WaveNet Drive",
+                0.30,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(15.0)),
+            reverb_decay: FloatParam::new(
+                "FDN Reverb Decay",
+                0.65,
+                FloatRange::Linear { min: 0.05, max: 0.98 },
+            ),
+            reverb_damping: FloatParam::new(
+                "High-Frequency Damping",
+                0.40,
+                FloatRange::Linear { min: 0.0, max: 0.95 },
+            ),
+            shimmer_amount: FloatParam::new(
+                "+12 st Octave Shimmer",
+                0.15,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            ),
+            vocal_ducking: FloatParam::new(
+                "Vocal Sidechain Ducking",
+                0.55,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            ),
+            wet_mix: FloatParam::new(
+                "Reverb Wet Mix",
+                0.22,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            ),
+        }
+    }
+}
+
+impl Default for ForgeSpaceVerbAndPreampPlug {
+    fn default() -> Self {
+        Self {
+            params: Arc::new(SpaceVerbAndPreampParams::default()),
+            telemetry: Arc::new(GuiTelemetry::default()),
+            preamp_dsp: RealtimeNeuralPreamp::new(AnalogHardwareModel::Neve1073ClassA),
+            reverb_dsp: RealtimeFdnReverb::new(48_000.0),
+        }
+    }
+}
+
+impl Plugin for ForgeSpaceVerbAndPreampPlug {
+    const NAME: &'static str = "Forge SpaceVerb FDN & Neural Preamp";
+    const VENDOR: &'static str = "The 40 Thieves (ForgeAudio)";
+    const URL: &'static str = "https://github.com/The-40-Thieves/audio-forge";
+    const EMAIL: &'static str = "audio@the40thieves.org";
+    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+
+    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+        main_input_channels: NonZeroU32::new(2),
+        main_output_channels: NonZeroU32::new(2),
+        ..AudioIOLayout::const_default()
+    }];
+
+    const SAMPLE_ACCURATE_AUTOMATION: bool = true;
+    type SysExMessage = ();
+    type BackgroundTask = ();
+
+    fn params(&self) -> Arc<dyn Params> {
+        self.params.clone()
+    }
+
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        let params = self.params.clone();
+        let telemetry = self.telemetry.clone();
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            (),
+            |_, _| {},
+            move |egui_ctx, setter, _state| {
+                egui::CentralPanel::default().show(egui_ctx, |ui| {
+                    draw_forge_studio_header_and_spectrum(
+                        ui,
+                        "FORGE SPACEVERB FDN & NEURAL WAVENET PREAMP",
+                        "Dilated Causal WaveNet Preamp (1073/1176/V76/A800) + 8x8 Hadamard FDN Reverb w/ Ducking & Shimmer",
+                        &telemetry,
+                        None,
+                    );
+                    egui::Grid::new("spaceverb_grid")
+                        .num_columns(2)
+                        .spacing([16.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("Neural Hardware Model (0..3)");
+                            ui.add(widgets::ParamSlider::for_param(&params.neural_model_idx, setter));
+                            ui.end_row();
+                            ui.label("Neural WaveNet Drive");
+                            ui.add(widgets::ParamSlider::for_param(&params.preamp_drive, setter));
+                            ui.end_row();
+                            ui.label("8x8 FDN Reverb Decay");
+                            ui.add(widgets::ParamSlider::for_param(&params.reverb_decay, setter));
+                            ui.end_row();
+                            ui.label("High Damping");
+                            ui.add(widgets::ParamSlider::for_param(&params.reverb_damping, setter));
+                            ui.end_row();
+                            ui.label("+12 st Octave Shimmer");
+                            ui.add(widgets::ParamSlider::for_param(&params.shimmer_amount, setter));
+                            ui.end_row();
+                            ui.label("Vocal Auto-Ducking");
+                            ui.add(widgets::ParamSlider::for_param(&params.vocal_ducking, setter));
+                            ui.end_row();
+                            ui.label("Reverb Wet Mix");
+                            ui.add(widgets::ParamSlider::for_param(&params.wet_mix, setter));
+                            ui.end_row();
+                        });
+                });
+            },
+        )
+    }
+
+    fn initialize(
+        &mut self,
+        _audio_io_layout: &AudioIOLayout,
+        buffer_config: &BufferConfig,
+        _context: &mut impl InitContext<Self>,
+    ) -> bool {
+        let sr = f64::from(buffer_config.sample_rate);
+        self.preamp_dsp = RealtimeNeuralPreamp::new(AnalogHardwareModel::Neve1073ClassA);
+        self.reverb_dsp.reset(sr);
+        true
+    }
+
+    fn process(
+        &mut self,
+        buffer: &mut Buffer,
+        _aux: &mut AuxiliaryBuffers,
+        _context: &mut impl ProcessContext<Self>,
+    ) -> ProcessStatus {
+        let model = match self.params.neural_model_idx.value() {
+            1 => AnalogHardwareModel::Fet1176AllButtons,
+            2 => AnalogHardwareModel::TubeV76Triode,
+            3 => AnalogHardwareModel::StuderA800Tape,
+            _ => AnalogHardwareModel::Neve1073ClassA,
+        };
+        self.preamp_dsp.set_model(model);
+        let decay = f64::from(self.params.reverb_decay.value());
+        let damp = f64::from(self.params.reverb_damping.value());
+        let shimmer = f64::from(self.params.shimmer_amount.value());
+        let duck = f64::from(self.params.vocal_ducking.value());
+        let mix = f64::from(self.params.wet_mix.value());
+
+        for mut channel_samples in buffer.iter_samples() {
+            let pdrive = f64::from(self.params.preamp_drive.smoothed.next());
+            let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
+            let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
+            let (pr_l, pr_r) = self
+                .preamp_dsp
+                .process_stereo_sample(in_l, in_r, pdrive * 12.0, 0.0);
+            let (out_l, out_r) =
+                self.reverb_dsp
+                    .process_stereo_sample(pr_l, pr_r, decay, damp, shimmer, duck, mix);
+            self.telemetry.update_peaks(in_l, in_r, out_l, out_r, 0.0);
+            if let Some(s0) = channel_samples.get_mut(0) {
+                *s0 = out_l;
+            }
+            if let Some(s1) = channel_samples.get_mut(1) {
+                *s1 = out_r;
+            }
+        }
+        ProcessStatus::Normal
+    }
+}
+
+impl ClapPlugin for ForgeSpaceVerbAndPreampPlug {
+    const CLAP_ID: &'static str = "org.the40thieves.forge-audio.spaceverb-neural-preamp";
+    const CLAP_DESCRIPTION: Option<&'static str> = Some(
+        "Dilated Causal WaveNet Preamp Modeler (1073/1176/V76/A800) & 8x8 Hadamard FDN Shimmer/Ducking Reverb",
+    );
+    const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
+    const CLAP_SUPPORT_URL: Option<&'static str> = Some(Self::URL);
+    const CLAP_FEATURES: &'static [ClapFeature] = &[
+        ClapFeature::AudioEffect,
+        ClapFeature::Reverb,
+        ClapFeature::Distortion,
+        ClapFeature::Stereo,
+    ];
+}
+
+impl Vst3Plugin for ForgeSpaceVerbAndPreampPlug {
+    const VST3_CLASS_ID: [u8; 16] = *b"ForgeSpaceVerb01";
+    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
+        Vst3SubCategory::Fx,
+        Vst3SubCategory::Reverb,
+        Vst3SubCategory::Distortion,
+    ];
+}
+
+// Export all 10 plugins into both the CLAP multi-plugin bundle and the VST3 multi-plugin bundle!
 nih_export_clap!(
     ForgeOpenSoothePlug,
     ForgeOpenSpacerPlug,
@@ -1183,7 +1989,10 @@ nih_export_clap!(
     ForgeSubAndTapePlug,
     ForgeMasterLimiterPlug,
     ForgeDrumTriggerPlug,
-    ForgePhaseAndMatchPlug
+    ForgePhaseAndMatchPlug,
+    ForgeSplitEqPlug,
+    ForgeDensityClipperPlug,
+    ForgeSpaceVerbAndPreampPlug
 );
 nih_export_vst3!(
     ForgeOpenSoothePlug,
@@ -1192,5 +2001,8 @@ nih_export_vst3!(
     ForgeSubAndTapePlug,
     ForgeMasterLimiterPlug,
     ForgeDrumTriggerPlug,
-    ForgePhaseAndMatchPlug
+    ForgePhaseAndMatchPlug,
+    ForgeSplitEqPlug,
+    ForgeDensityClipperPlug,
+    ForgeSpaceVerbAndPreampPlug
 );

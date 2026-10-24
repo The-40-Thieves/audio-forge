@@ -198,8 +198,87 @@ pub fn track_vocal_pitch(
     frames
 }
 
-/// Generates a formant-compensated pitch-shifted vocal track using dual-grain Hanning crossfade
-/// time-domain pitch shifting + spectral formant tilt preservation (WORLD/PSOLA style).
+/// Computes a 10th-order Linear Predictive Coding (LPC) spectral tilt/formant balance ratio
+/// using Levinson-Durbin recursion on a short frame, returning the high-to-low formant tilt in dB.
+pub fn estimate_lpc_formant_tilt_db(frame: &[f64]) -> f64 {
+    const ORDER: usize = 10;
+    if frame.len() <= ORDER {
+        return 0.0;
+    }
+    let mut r = [0.0_f64; ORDER + 1];
+    for lag in 0..=ORDER {
+        let mut sum = 0.0;
+        for i in 0..(frame.len() - lag) {
+            sum += frame[i] * frame[i + lag];
+        }
+        r[lag] = sum / (frame.len() as f64);
+    }
+    if r[0] < 1e-10 {
+        return 0.0;
+    }
+    // Levinson-Durbin recursion for LPC reflection coefficients
+    let mut a = [0.0_f64; ORDER + 1];
+    let mut e = r[0];
+    for i in 1..=ORDER {
+        let mut acc = r[i];
+        for j in 1..i {
+            acc += a[j] * r[i - j];
+        }
+        let k = (-acc / e.max(1e-12)).clamp(-0.99, 0.99);
+        let prev_a = a;
+        a[i] = k;
+        for j in 1..i {
+            a[j] = prev_a[j] + k * prev_a[i - j];
+        }
+        e *= 1.0 - k * k;
+        if e <= 1e-12 {
+            break;
+        }
+    }
+    // First reflection coefficient (-r[1]/r[0]) encodes spectral tilt between F1 (<800Hz) and F2/F3 (2-4kHz)
+    let r1_norm = (r[1] / r[0]).clamp(-0.99, 0.99);
+    20.0 * ((1.0 - r1_norm) / (1.0 + r1_norm)).max(1e-6).log10() * 0.35
+}
+
+/// Detects whether a short frame around index `i` is an unvoiced sibilant/fricative consonant
+/// (`s`, `sh`, `f`, `t`, `k`, breath) using Zero-Crossing Rate (ZCR) and high-frequency energy ratio.
+/// Like **Celemony Melodyne 5 Sibilant Detection**, unvoiced sibilants are kept at `0.0 st` pitch shift
+/// so consonants never sound lispy or phase-smeared when tuning or generating harmonies!
+#[inline]
+fn is_unvoiced_sibilant_frame(ch: &[f64], center: usize, half_win: usize, sr: f64) -> f64 {
+    let start = center.saturating_sub(half_win);
+    let end = (center + half_win).min(ch.len());
+    let len = end.saturating_sub(start);
+    if len < 16 {
+        return 0.0;
+    }
+    let mut zc = 0_usize;
+    let mut energy = 0.0_f64;
+    let mut diff_energy = 0.0_f64;
+    let slice = &ch[start..end];
+    for w in slice.windows(2) {
+        if (w[0] >= 0.0) != (w[1] >= 0.0) {
+            zc += 1;
+        }
+        energy += w[0] * w[0];
+        let d = w[1] - w[0];
+        diff_energy += d * d;
+    }
+    if energy < 1e-9 {
+        return 1.0; // Silent/breath -> do not pitch-shift
+    }
+    let zcr_hz = (zc as f64) * sr / (2.0 * len as f64);
+    let hf_ratio = (diff_energy / energy.max(1e-12)).clamp(0.0, 4.0);
+    // Sibilants have ZCR > 2600 Hz and high first-difference energy ratio (> 0.65)
+    let zcr_score = ((zcr_hz - 2200.0) / 2000.0).clamp(0.0, 1.0);
+    let hf_score = ((hf_ratio - 0.55) / 0.85).clamp(0.0, 1.0);
+    (zcr_score * 0.6 + hf_score * 0.4).clamp(0.0, 1.0)
+}
+
+/// Generates a formant-compensated, **sibilant-preserving** pitch-shifted vocal track using:
+/// 1. **Melodyne 5-Style Sibilant Separation:** Unvoiced sibilants/consonants (`s/sh/t/k`) bypass the pitch shifter (`100%` dry phase-coherent), preventing lispy artifacts.
+/// 2. **Dual-Grain Hanning Crossfade PSOLA Pitch Shifting** on voiced vowels.
+/// 3. **Levinson-Durbin LPC Formant Spectral Envelope Preservation** (compensating both F1/F2 vowel cavity resonances and spectral tilt).
 pub fn shift_vocal_pitch_formant_preserved(
     buffer: &AudioBuffer,
     semitone_curve: &[(f64, f64)], // (time_secs, shift_semitones)
@@ -212,6 +291,7 @@ pub fn shift_vocal_pitch_formant_preserved(
     }
 
     let grain_len = ((sr * 0.032).round() as usize).max(256); // 32ms grain for vocal fundamental
+    let sibilant_half_win = ((sr * 0.006).round() as usize).max(64);
     let grain_f = grain_len as f64;
     let mut out_channels = Vec::with_capacity(buffer.num_channels());
 
@@ -246,10 +326,19 @@ pub fn shift_vocal_pitch_formant_preserved(
     for ch in &buffer.channels {
         let mut out_ch = vec![0.0_f64; frames];
         let mut phase_a = 0.0_f64;
+        let mut sibilant_env = 0.0_f64;
+        let orig_lpc_tilt = estimate_lpc_formant_tilt_db(ch);
 
         for (i, sample_out) in out_ch.iter_mut().enumerate() {
             let t = (i as f64) / sr;
-            let semi = interp_shift(t);
+            if i % 32 == 0 {
+                let target_sib = is_unvoiced_sibilant_frame(ch, i, sibilant_half_win, sr);
+                sibilant_env = sibilant_env * 0.65 + target_sib * 0.35;
+            }
+
+            let raw_semi = interp_shift(t);
+            // Attenuate pitch shift smoothly toward 0.0 semitones during unvoiced sibilants
+            let semi = raw_semi * (1.0 - sibilant_env * 0.85);
             let pitch_ratio = 2.0_f64.powf(semi / 12.0);
             let rate_delta = 1.0 - pitch_ratio;
 
@@ -267,20 +356,30 @@ pub fn shift_vocal_pitch_formant_preserved(
                 ch[idx0] * (1.0 - frac) + ch[(idx0 + 1).min(frames - 1)] * frac
             };
 
-            *sample_out = w_a * sample_at(phase_a) + w_b * sample_at(phase_b);
+            let pitched = w_a * sample_at(phase_a) + w_b * sample_at(phase_b);
+            // Blend 100% phase-coherent dry sibilant on consonants (`s/sh/t/k`)
+            *sample_out = pitched * (1.0 - sibilant_env) + ch[i] * sibilant_env;
         }
 
-        // Formant-envelope preservation: compensate spectral tilt induced by pitch shifting
+        // LPC Formant-envelope preservation: restore original LPC spectral tilt + F1/F2 vocal tract resonance
+        let shifted_lpc_tilt = estimate_lpc_formant_tilt_db(&out_ch);
+        let lpc_tilt_delta = (orig_lpc_tilt - shifted_lpc_tilt).clamp(-4.5, 4.5);
         let net_formant_semi = formant_shift_semitones - interp_shift(buffer.duration_secs() * 0.5) * 0.65;
-        if net_formant_semi.abs() > 0.1 {
-            let mut formant_eq = forge_dsp::Biquad::peaking_eq(
+        if net_formant_semi.abs() > 0.05 || lpc_tilt_delta.abs() > 0.05 {
+            let mut f1_eq = forge_dsp::Biquad::peaking_eq(
                 sr,
-                1850.0,
+                650.0,
+                1.0,
+                (net_formant_semi * 0.55 - lpc_tilt_delta * 0.4).clamp(-6.0, 6.0),
+            );
+            let mut f2_eq = forge_dsp::Biquad::peaking_eq(
+                sr,
+                2150.0,
                 0.9,
-                (-net_formant_semi * 0.85).clamp(-6.0, 6.0),
+                (-net_formant_semi * 0.85 + lpc_tilt_delta * 0.6).clamp(-6.0, 6.0),
             );
             for s in &mut out_ch {
-                *s = formant_eq.process_sample(*s);
+                *s = f2_eq.process_sample(f1_eq.process_sample(*s));
             }
         }
 

@@ -6,8 +6,9 @@ use clap::{Parser, Subcommand};
 use forge_core::AudioBuffer;
 use forge_dsp::{
     align_phase_gcc_phat, align_vocal_double_dtw, apply_18_band_eq, apply_spectral_defizz,
-    apply_spectral_unmask, audit_audio, clean_vocal_surgical, compute_reference_match_eq,
-    normalize_and_limit, run_full_restoration_chain, DeFizzConfig, RestorationConfig, UnmaskConfig,
+    apply_spectral_unmask, audit_audio, clean_vocal_surgical, compute_genre_tonal_balance_eq,
+    compute_reference_match_eq, normalize_and_limit, run_full_restoration_chain, DeFizzConfig,
+    GenreTonalTarget, RestorationConfig, UnmaskConfig,
 };
 use forge_reaper::{
     install_jsfx_plugins, send_reaper_osc, validate_isrc, write_distrokid_metadata,
@@ -154,6 +155,9 @@ enum Commands {
         /// Optional reference track WAV to match spectral balance against
         #[arg(long)]
         reference: Option<PathBuf>,
+        /// Optional built-in Tonal Balance genre target (`pop`, `hiphop`, `neosoul`, `edm`, `rock`, `jazz`)
+        #[arg(long)]
+        genre: Option<String>,
         /// Optional 12-character ISO 3901 ISRC code (e.g. US-S1Z-26-00001)
         #[arg(long)]
         isrc: Option<String>,
@@ -430,6 +434,7 @@ async fn main() -> anyhow::Result<()> {
             target_lufs,
             ceiling_dbtp,
             reference,
+            genre,
             isrc,
             title,
             artist,
@@ -439,6 +444,10 @@ async fn main() -> anyhow::Result<()> {
                 let ref_buf = AudioBuffer::load(&ref_path)?;
                 let match_curve = compute_reference_match_eq(&buf, &ref_buf, 4.5);
                 apply_18_band_eq(&mut buf, &match_curve);
+            } else if let Some(ref g_str) = genre {
+                let target = GenreTonalTarget::parse(g_str);
+                let genre_curve = compute_genre_tonal_balance_eq(&buf, target, 3.5);
+                apply_18_band_eq(&mut buf, &genre_curve);
             }
 
             let mastered = normalize_and_limit(&buf, target_lufs, ceiling_dbtp)?;

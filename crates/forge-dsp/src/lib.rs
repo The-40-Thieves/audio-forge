@@ -1,5 +1,6 @@
 //! `forge-dsp` — Studio DSP, Restoration, Spectral Suppression, Unmasking, Alignment & Mastering.
 
+pub mod elite_dsp;
 pub mod loudness_limiter;
 pub mod phase_align;
 pub mod realtime;
@@ -7,6 +8,11 @@ pub mod restoration;
 pub mod spectral_defizz;
 pub mod spectral_unmask;
 
+pub use elite_dsp::{
+    compute_genre_tonal_balance_eq, publish_shared_spectrum, read_shared_spectrum, AdaaSin,
+    AdaaTanh, AnalogHardwareModel, GenreTonalTarget, Oversampler2x, RealtimeDensityAndClipper,
+    RealtimeFdnReverb, RealtimeNeuralPreamp, RealtimeTransientTonalSplit, SHARED_SPECTRUM_SLOTS,
+};
 pub use loudness_limiter::{audit_audio, compute_true_peak, normalize_and_limit, Biquad};
 pub use phase_align::{
     align_phase_gcc_phat, align_vocal_double_dtw, PhaseAlignmentResult, StretchMarker,
@@ -135,6 +141,42 @@ mod tests {
             }
         }
         assert!(triggered_kick, "Expected real-time kick trigger on C1");
+    }
+
+    #[test]
+    fn test_elite_dsp_spliteq_density_adaa_spaceverb_neural_and_shared_bus() {
+        let sr = 48_000.0;
+        let mut split_eq = RealtimeTransientTonalSplit::new(sr);
+        let mut density_clip = RealtimeDensityAndClipper::new(sr);
+        let mut spaceverb = RealtimeFdnReverb::new(sr);
+        let mut preamp = RealtimeNeuralPreamp::new(AnalogHardwareModel::Neve1073ClassA);
+
+        let mut energy_out = 0.0_f32;
+        for i in 0..2048 {
+            let t = (i as f64) / sr;
+            let s = (0.4 * (2.0 * PI * 220.0 * t).sin() + 0.2 * (2.0 * PI * 3200.0 * t).cos()) as f32;
+            let (sp_l, sp_r) = split_eq.process_stereo_sample(
+                s,
+                s,
+                [2.0, 0.0, -2.0],
+                [0.5, 0.0, 1.5],
+                1.5,
+                0,
+            );
+            let (dn_l, dn_r) = density_clip.process_stereo_sample(sp_l, sp_r, 0.4, 3.0, -0.8);
+            let (pr_l, pr_r) = preamp.process_stereo_sample(dn_l, dn_r, 4.0, 0.0);
+            let (rv_l, rv_r) = spaceverb.process_stereo_sample(pr_l, pr_r, 0.65, 0.4, 0.15, 0.5, 0.25);
+            assert!(rv_l.is_finite() && rv_r.is_finite());
+            energy_out += rv_l * rv_l + rv_r * rv_r;
+        }
+        assert!(energy_out > 1.0);
+
+        // Verify Cross-Instance Shared Spectrum Bus
+        let mut test_bands = [0.0_f32; 32];
+        test_bands[5] = -12.5;
+        publish_shared_spectrum(2, &test_bands);
+        let read_back = read_shared_spectrum(2);
+        assert!((read_back[5] - (-12.5)).abs() < 1e-4);
     }
 }
 

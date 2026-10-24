@@ -14,3 +14,4 @@ forge-dsp = { path = "../forge-dsp" }
 forge-vocal = { path = "../forge-vocal" }
 forge-theory = { path = "../forge-theory" }
 nih_plug.workspace = true
+nih_plug_egui.workspace = true

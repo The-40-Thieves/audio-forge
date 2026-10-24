@@ -19,10 +19,13 @@ ForgeAudio (`forge` CLI + `forge-mcp` Model Context Protocol server + `forge-plu
 | **Wavesfactory Trackspacer** | \$59 | `forge-dsp::spectral_unmask` + `Forge_OpenSpacer_Unmask.jsfx` (32-band / STFT sidechain dynamic frequency carving: Vocal→Music, Kick→Bass) | Pure Rust + REAPER 4-channel sidechain JSFX |
 | **Sound Radix Auto-Align 2** | \$199 | `forge-dsp::align_phase_gcc_phat` (Sub-sample Generalized Cross-Correlation Phase Transform delay + polarity solver) | Pure Rust (`<50 ms` per stem pair) |
 | **Synchro Arts VocAlign Pro** | \$349 | `forge-dsp::align_vocal_double_dtw` (MFCC + FastDTW time-warping solver emitting non-destructive REAPER `SM` Stretch Markers) | Pure Rust + Native REAPER `.RPP` Stretch Markers |
-| **Melodyne 5 / Auto-Tune Pro** | \$249–\$699 | `forge-vocal` (YIN F0 pitch tracker, scale quantizer, formant-preserving dual-grain pitch shifter, 3-part harmony generator & REAPER `<PITCHENV` compiler) | Pure Rust + Native REAPER Take Pitch Envelopes |
+| **Melodyne 5 / Auto-Tune Pro** | \$249–\$699 | `forge-vocal` (YIN F0 pitch tracker, **sibilant-aware unvoiced consonant bypass**, **Levinson-Durbin LPC formant envelope preservation**, 3-part harmony generator & REAPER `<PITCHENV` compiler) | Pure Rust + Native REAPER Take Pitch Envelopes |
+| **Eventide SplitEQ / oeksound Spiff** | \$179–\$199 | `forge-dsp::RealtimeTransientTonalSplit` + **Forge SplitEQ** VST3/CLAP (3-band structural Transient attack vs. Tonal sustain splitter & shaper) | Pure Rust (`0` audio-thread allocs) |
+| **oeksound Bloom / Neutron 5 Density** | \$199–\$249 | `forge-dsp::RealtimeDensityAndClipper` + **Forge Density & ADAA Clipper** VST3/CLAP (Upward low-level density compressor + 3-band 2x-oversampled 1st-order ADAA `tanh` soft clipper) | Pure Rust (`2x` polyphase oversampled ADAA) |
+| **Valhalla VintageVerb / Shimmer + Neural DSP** | \$50–\$199 | `forge-dsp::RealtimeFdnReverb` + `RealtimeNeuralPreamp` + **Forge SpaceVerb & Neural Preamp** VST3/CLAP (Dilated causal WaveNet `1073/1176/V76/A800` preamp + 8x8 Walsh-Hadamard FDN reverb with vocal ducking & `+12 st` octave shimmer) | Pure Rust (`O(N log N)` Hadamard + ADAA WaveNet) |
 | **Scaler 2 + Slate Trigger 2** | \$59 + \$149 | `forge-theory` (Neo-Soul/Jazz/Cinematic voice-leading solver, Dilla/MPC micro-timing humanizer, sub-sample drum transient-to-MIDI replacer, ABC notation) | Pure Rust (`midly`) |
 | **iZotope RX 11 Advanced** | \$1,199 | `forge-dsp::restoration` (DC, cubic Hermite de-clip, 50/60 Hz 10-harmonic hum notch, vocal de-click/de-plosive) + `forge-worker` (`Mel-Band-RoFormer` + `Apollo` HF bandwidth restoration) | Rust DSP + Local RTX 3080 / Colab A100 Worker |
-| **FabFilter Pro-L2 / Ozone 11** | \$199–\$499 | `forge-dsp::loudness_limiter` (ITU-R BS.1770-4 K-weighted LUFS, 4x polyphase FIR True Peak `-1.0 dBTP` brickwall limiter, 18-band Mastering EQ, Reference Match EQ, Console8/ChowTape hysteresis saturation) | Pure Rust (`f64` headroom) |
+| **FabFilter Pro-Q 4 / Pro-L 2 / Ozone 11 / Tonal Balance 2** | \$199–\$499 | `forge-dsp::loudness_limiter` + `elite_dsp` (ITU-R BS.1770-4 LUFS, 4x True Peak `-1.0 dBTP` brickwall limiter, 18-band Mastering EQ, built-in **Genre Tonal Balance Targets**, **8-Slot Lock-Free Cross-Instance Spectrum Bus**, `nih_plug_egui` 60 FPS OpenGL GUI) | Pure Rust (`f64` headroom + `egui` OpenGL) |
 
 ---
 
@@ -30,18 +33,18 @@ ForgeAudio (`forge` CLI + `forge-mcp` Model Context Protocol server + `forge-plu
 
 ```
 audio-forge/
-├── Cargo.toml                  # Rust workspace (7 crates)
+├── Cargo.toml                  # Rust workspace (9 crates)
 ├── crates/
 │   ├── forge-core/             # 64-bit planar AudioBuffer, 16/24/32f WAV & FFmpeg I/O, TPDF dither
-│   ├── forge-dsp/              # BS.1770-4 LUFS, 4x True Peak, OpenSoothe, OpenSpacer, GCC-PHAT, FastDTW, 18-Band EQ & Real-Time Zero-Alloc Kernels
-│   ├── forge-plug/             # 7 Native Cross-DAW VST3 & CLAP Real-Time Plugins (`nih-plug`, zero audio-thread heap allocations)
+│   ├── forge-dsp/              # BS.1770-4 LUFS, 4x True Peak, OpenSoothe, OpenSpacer, SplitEQ, ADAA Clipper, 8x8 FDN SpaceVerb, Neural WaveNet Preamp, GCC-PHAT, FastDTW
+│   ├── forge-plug/             # 10 Native Cross-DAW VST3 & CLAP Real-Time Plugins (`nih-plug` + `nih_plug_egui` 60 FPS OpenGL GUI + Lock-Free Cross-Instance Spectrum Bus)
 │   ├── forge-theory/           # Voice-leading solver, Neo-Soul reharmonizer, Dilla/MPC groove, Drum-to-MIDI, ABC
-│   ├── forge-vocal/            # YIN F0 pitch tracker, formant-preserving shifter, 3-part harmonies, REAPER <PITCHENV
+│   ├── forge-vocal/            # YIN F0 pitch tracker, sibilant-aware LPC formant-preserving shifter, 3-part harmonies, REAPER <PITCHENV
 │   ├── forge-reaper/           # Programmatic REAPER 7.82 .RPP AST builder, UDP OSC controller, ISO 3901 ISRC tagger
 │   ├── forge-worker/           # Hybrid GPU dispatcher (Local RTX 3080 uv worker + Colab A100 + Gemini Lyria 3.5 API)
 │   ├── forge-cli/              # `forge` CLI binary (<5ms startup)
 │   └── forge-mcp/              # `forge-mcp` JSON-RPC 2.0 stdio server for AI agents
-├── xtask/                      # `cargo xtask bundle forge-plug --release` VST3 & CLAP bundler
+├── xtask/                      # `cargo run --package xtask -- bundle forge-plug` VST3 & CLAP bundler
 ├── reaper-jsfx/                # Native REAPER EEL2 JSFX real-time plugins
 │   ├── Forge_OpenSoothe_DeFizz.jsfx
 │   ├── Forge_OpenSpacer_Unmask.jsfx
@@ -56,24 +59,27 @@ audio-forge/
 
 ## Quick Start
 
-### 1. Build the Rust Workspace & Bundle the 7 VST3 / CLAP Plugins
+### 1. Build the Rust Workspace & Bundle the 10 VST3 / CLAP Plugins
 
 ```bash
 # Build all CLI, MCP, and DSP crates
 cargo build --release --workspace
 
-# Bundle `forge-plug.vst3` and `forge-plug.clap` (exports all 7 studio plugins)
-cargo xtask bundle forge-plug --release
+# Bundle `forge-plug.vst3` and `forge-plug.clap` (exports all 10 studio plugins)
+cargo run --package xtask -- bundle forge-plug --release
 ```
 
-The compiled `target/bundled/forge-plug.vst3` and `target/bundled/forge-plug.clap` bundles expose **7 real-time zero-allocation plugins** to any DAW (REAPER, Ableton Live, FL Studio, Logic, Studio One, Bitwig):
-1. **Forge OpenSoothe De-Fizz** (2048-pt OLA STFT Dynamic Resonance & AI Fizz Suppressor with `1536`-sample PDC)
+The compiled `target/bundled/forge-plug.vst3` and `target/bundled/forge-plug.clap` bundles expose **10 real-time zero-allocation plugins** to any DAW (REAPER, Ableton Live, FL Studio, Logic, Studio One, Bitwig):
+1. **Forge OpenSoothe De-Fizz** (2048-pt OLA STFT Dynamic Resonance & AI Fizz Suppressor with `1536`-sample PDC, `nih_plug_egui` 60 FPS Spectrum GUI & 8-Slot Shared Spectrum Bus)
 2. **Forge OpenSpacer Unmask** (4-Channel Sidechain Spectral Unmasker for Vocal $\rightarrow$ Music & Kick $\rightarrow$ Bass)
 3. **Forge Vocal Surgical Strip** (Zero-Latency Mouth De-Click, `<115 Hz` Plosive Suppressor, Split-Band De-Esser & Breath Gate)
 4. **Forge SubMono & Console Tape** (Linkwitz-Riley `<160 Hz` Sub Mono-Maker, Harmonic Bass Reinforcer & Console8/ChowTape Saturation)
 5. **Forge Master True-Peak Limiter** (Lookahead 4x Inter-Sample True-Peak `-1.0 dBTP` Brickwall Limiter & ITU-R BS.1770-4 Meter)
 6. **Forge Drum Trigger & Theory MIDI** (Real-Time Audio-to-MIDI 3-Band Drum Replacer `C1/D1/F#1` + 1-Finger MIDI-to-Neo-Soul Chord Voicer)
-7. **Forge PhaseAlign & 18-Band EQ** (Sample-Accurate Phase/Polarity Aligner & 18-Band AI De-Harsh / Mastering Equalizer)
+7. **Forge PhaseAlign & 18-Band EQ** (Sample-Accurate Phase/Polarity Aligner, 18-Band AI De-Harsh EQ & Built-In Genre Tonal Balance Targets)
+8. **Forge SplitEQ Transient & Tonal** (Structural 3-Band Transient Attack vs. Tonal Sustain Equalizer & Shaper with 60 FPS `egui` GUI)
+9. **Forge Density & 3-Band ADAA Clipper** (Upward Low-Level Density Compressor + 3-Band 2x-Oversampled 1st-Order ADAA Soft Clipper with 60 FPS `egui` GUI)
+10. **Forge SpaceVerb FDN & Neural Preamp** (Dilated Causal WaveNet Hardware Preamp (`Neve 1073`, `1176 All-Buttons`, `V76 Triode`, `Studer A800`) + 8x8 Walsh-Hadamard FDN Reverb with Vocal Auto-Ducking & `+12 st` Octave Shimmer)
 
 ### 2. Run the Full End-to-End Pipeline (`forge ingest`)
 
