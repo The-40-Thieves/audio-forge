@@ -74,7 +74,8 @@ pub fn align_phase_gcc_phat(
     }
     fft_inv.process(&mut cross);
 
-    let max_lag = (((sr * max_search_ms / 1000.0).round() as isize).max(1) as usize)
+    let clean_search_ms = crate::loudness_limiter::sanitize_param_f64(max_search_ms, 20.0, 0.5, 500.0);
+    let max_lag = (((sr * clean_search_ms / 1000.0).round() as isize).max(1) as usize)
         .min(fft_len / 2 - 1);
 
     let mut best_lag: isize = 0;
@@ -182,7 +183,8 @@ pub fn align_vocal_double_dtw(
     let g_feats = extract_features(&g_mono);
     let d_feats = extract_features(&d_mono);
 
-    let band = (((max_warp_ms / 10.0).round() as usize).max(2)).min(num_steps / 2);
+    let clean_warp_ms = crate::loudness_limiter::sanitize_param_f64(max_warp_ms, 60.0, 10.0, 1000.0);
+    let band = (((clean_warp_ms / 10.0).round() as usize).max(2)).min(num_steps / 2);
     let mut cost = vec![vec![f64::INFINITY; num_steps]; num_steps];
     let mut back = vec![vec![(0_usize, 0_usize); num_steps]; num_steps];
     cost[0][0] = 0.0;

@@ -161,14 +161,16 @@ pub fn solve_voice_leading(
         ));
     }
 
-    let chord_dur = ticks_per_beat * beats_per_chord;
+    let safe_tpb = ticks_per_beat.clamp(24, 19_200);
+    let safe_bpc = beats_per_chord.clamp(1, 64);
+    let chord_dur = safe_tpb.saturating_mul(safe_bpc);
     let mut chord_events = Vec::new();
     let mut bass_events = Vec::new();
     let mut prev_voicing: Vec<u8> = Vec::new();
 
     for (idx, sym) in chord_symbols.iter().enumerate() {
         let (root_pc, intervals) = parse_chord_symbol(sym)?;
-        let base_start_tick = (idx as u32) * chord_dur;
+        let base_start_tick = (idx as u32).saturating_mul(chord_dur);
 
         // 1. Dedicated phase-pure Sub-Bass root note in C2..B2 (MIDI 36..47)
         let bass_note = 36 + root_pc;
@@ -180,7 +182,7 @@ pub fn solve_voice_leading(
             midi_note: bass_note,
             velocity: 102,
             start_tick: base_start_tick + bass_offset,
-            duration_ticks: chord_dur.saturating_sub(bass_offset + 15),
+            duration_ticks: chord_dur.saturating_sub(bass_offset + 15).max(1),
             channel: 1,
         });
 
@@ -230,7 +232,7 @@ pub fn solve_voice_leading(
             VoicingStyle::CinematicSpread if current_voicing.len() >= 3 => {
                 current_voicing[0] = current_voicing[0].saturating_sub(12).max(48);
                 if let Some(last) = current_voicing.last_mut() {
-                    *last = (*last + 12).min(84);
+                    *last = last.saturating_add(12).min(84);
                 }
                 current_voicing.sort_unstable();
             }
@@ -255,7 +257,7 @@ pub fn solve_voice_leading(
                 midi_note,
                 velocity,
                 start_tick: base_start_tick + strum_ticks,
-                duration_ticks: chord_dur.saturating_sub(strum_ticks + 20),
+                duration_ticks: chord_dur.saturating_sub(strum_ticks + 20).max(1),
                 channel: 0,
             });
         }
@@ -278,7 +280,13 @@ pub fn extract_drum_midi_triggers(
         return (Vec::new(), Vec::new(), Vec::new());
     }
 
-    let ticks_per_sec = (bpm.max(40.0) / 60.0) * f64::from(ticks_per_beat);
+    let clean_bpm = if bpm.is_finite() {
+        bpm.clamp(40.0, 300.0)
+    } else {
+        120.0
+    };
+    let safe_tpb = ticks_per_beat.clamp(24, 19_200);
+    let ticks_per_sec = (clean_bpm / 60.0) * f64::from(safe_tpb);
     let win = ((sr * 0.012).round() as usize).max(32); // 12ms transient analysis window
     let min_retrigger_samples = ((sr * 0.075).round() as usize).max(128); // 75ms debounce
 
@@ -418,7 +426,7 @@ pub fn parse_abc_score(abc: &str, ticks_per_beat: u32) -> (Vec<String>, Vec<Note
                         mult = u32::from(bytes[i] - b'0').max(1);
                         i += 1;
                     }
-                    let dur = eighth_ticks * mult;
+                    let dur = eighth_ticks.saturating_mul(mult);
                     melody.push(NoteEvent {
                         midi_note: midi.clamp(24, 108) as u8,
                         velocity: 92,
@@ -426,7 +434,7 @@ pub fn parse_abc_score(abc: &str, ticks_per_beat: u32) -> (Vec<String>, Vec<Note
                         duration_ticks: dur.saturating_sub(10).max(20),
                         channel: 0,
                     });
-                    current_tick += dur;
+                    current_tick = current_tick.saturating_add(dur);
                     continue;
                 }
             } else if ch == b'z' || ch == b'Z' {
@@ -436,7 +444,7 @@ pub fn parse_abc_score(abc: &str, ticks_per_beat: u32) -> (Vec<String>, Vec<Note
                     mult = u32::from(bytes[i] - b'0').max(1);
                     i += 1;
                 }
-                current_tick += eighth_ticks * mult;
+                current_tick = current_tick.saturating_add(eighth_ticks.saturating_mul(mult));
                 continue;
             }
             i += 1;
@@ -478,7 +486,12 @@ pub fn write_midi_file<P: AsRef<Path>>(
         }
     }
 
-    let us_per_qn = (60_000_000.0 / bpm.clamp(30.0, 300.0)).round() as u32;
+    let clean_bpm = if bpm.is_finite() {
+        bpm.clamp(30.0, 300.0)
+    } else {
+        120.0
+    };
+    let us_per_qn = (60_000_000.0 / clean_bpm).round() as u32;
     let mut smf_tracks: Vec<Vec<TrackEvent<'static>>> = Vec::new();
 
     // Tempo & conductor track
@@ -498,9 +511,11 @@ pub fn write_midi_file<P: AsRef<Path>>(
         // Convert NoteEvents into sorted (tick, is_on, channel, note, vel) events
         let mut raw_events: Vec<(u32, bool, u8, u8, u8)> = Vec::with_capacity(notes.len() * 2);
         for n in notes {
-            raw_events.push((n.start_tick, true, n.channel & 0x0F, n.midi_note & 0x7F, n.velocity & 0x7F));
+            let start = n.start_tick.min(0x0FFF_0000);
+            let end = start.saturating_add(n.duration_ticks.max(1)).min(0x0FFF_FFFE);
+            raw_events.push((start, true, n.channel & 0x0F, n.midi_note & 0x7F, n.velocity & 0x7F));
             raw_events.push((
-                n.start_tick + n.duration_ticks.max(1),
+                end,
                 false,
                 n.channel & 0x0F,
                 n.midi_note & 0x7F,
@@ -543,7 +558,7 @@ pub fn write_midi_file<P: AsRef<Path>>(
     let smf = Smf {
         header: Header {
             format: Format::Parallel,
-            timing: Timing::Metrical(u15::new(ticks_per_beat.min(0x7FFF))),
+            timing: Timing::Metrical(u15::new(ticks_per_beat.clamp(1, 0x7FFF))),
         },
         tracks: smf_tracks,
     };
@@ -556,6 +571,7 @@ pub fn write_midi_file<P: AsRef<Path>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn test_voice_leading_and_neosoul_reharmonizer() {
@@ -579,5 +595,68 @@ mod tests {
         assert!(!chords.is_empty());
         assert_eq!(bass.len(), 4);
     }
+
+    proptest! {
+        #[test]
+        fn prop_chord_parser_voice_leading_and_midi_compiler_totality(
+            sym_a in ".*",
+            sym_b in "[A-G][#b]?(m7|maj7|9|13|dim|aug|sus4)?",
+            style_idx in 0usize..5,
+            groove_idx in 0usize..5,
+            ticks_per_beat in 0u32..100_000,
+            beats_per_chord in 0u32..64,
+            bpm in prop::num::f64::ANY,
+        ) {
+            let _ = parse_chord_symbol(&sym_a);
+            let parsed = parse_chord_symbol(&sym_b).unwrap();
+            prop_assert!(parsed.0 < 12);
+            prop_assert!(!parsed.1.is_empty());
+
+            let style = match style_idx % 4 {
+                0 => VoicingStyle::Close,
+                1 => VoicingStyle::Drop2,
+                2 => VoicingStyle::NeoSoulRootless,
+                _ => VoicingStyle::CinematicSpread,
+            };
+            let groove = match groove_idx % 4 {
+                0 => GrooveStyle::Straight,
+                1 => GrooveStyle::NeoSoulDilla,
+                2 => GrooveStyle::MpcSwing58,
+                _ => GrooveStyle::AcousticStrum,
+            };
+
+            let prog = vec![sym_b.clone(), "G7".to_string(), "Cmaj9".to_string()];
+            let reharm = reharmonize_progression(&prog, style);
+            let (chord_notes, bass_notes) =
+                solve_voice_leading(&reharm, style, groove, ticks_per_beat, beats_per_chord).unwrap();
+            prop_assert!(!chord_notes.is_empty());
+            prop_assert_eq!(bass_notes.len(), 3);
+            for n in chord_notes.iter().chain(bass_notes.iter()) {
+                prop_assert!((36..=88).contains(&n.midi_note));
+                prop_assert!((1..=127).contains(&n.velocity));
+                prop_assert!(n.duration_ticks >= 1);
+            }
+
+            let abc = export_abc_score("PropTest", "C", 120, &reharm);
+            let (abc_chords, abc_melody) = parse_abc_score(&abc, ticks_per_beat);
+            prop_assert_eq!(abc_chords.len(), 3);
+            prop_assert!(!abc_melody.is_empty());
+
+            // Verify Standard MIDI File (.mid) round-trip parsing via midly::Smf::parse
+            let dir = tempfile::tempdir().unwrap();
+            let mid_path = dir.path().join("out.mid");
+            write_midi_file(
+                &mid_path,
+                bpm,
+                ticks_per_beat as u16,
+                &[("Chords", &chord_notes), ("Bass", &bass_notes), ("Melody", &abc_melody)],
+            )
+            .unwrap();
+            let raw_bytes = std::fs::read(&mid_path).unwrap();
+            let parsed_smf = midly::Smf::parse(&raw_bytes).unwrap();
+            prop_assert_eq!(parsed_smf.tracks.len(), 4);
+        }
+    }
 }
+
 

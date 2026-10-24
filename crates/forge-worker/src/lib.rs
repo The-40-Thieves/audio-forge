@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use forge_core::{AudioBuffer, ForgeError, Result, StemBundle};
-use forge_dsp::Biquad;
+use forge_dsp::{Biquad, sanitize_sample_f64};
 use serde::{Deserialize, Serialize};
 
 /// Execution backend selection for neural separation, restoration, and generation.
@@ -64,8 +64,8 @@ pub fn separate_stems(
     let mut env_slow = 0.0_f64;
 
     for i in 0..frames {
-        let l = buf.channels[0][i];
-        let r = buf.channels[1][i];
+        let l = sanitize_sample_f64(buf.channels[0][i]);
+        let r = sanitize_sample_f64(buf.channels[1][i]);
         let mid = 0.5 * (l + r);
         let side = 0.5 * (l - r);
 
@@ -263,7 +263,7 @@ pub fn index_drum_sample_library(folder: &Path) -> Result<Vec<DrumSampleDescript
                 let mut peak = 1e-12_f64;
 
                 for i in 0..mono.len() {
-                    let x = mono[i];
+                    let x = sanitize_sample_f64(mono[i]);
                     total_e += x * x;
                     let lo = lp.process_sample(x);
                     sub_e += lo * lo;
@@ -303,3 +303,55 @@ pub fn index_drum_sample_library(folder: &Path) -> Result<Vec<DrumSampleDescript
 
     Ok(samples)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
+        #[test]
+        fn prop_pure_rust_stem_separator_and_drum_indexer_totality(
+            frames in 256usize..2048,
+            sub_amp in 0.0f64..0.8,
+            voc_amp in 0.0f64..0.8,
+            hat_amp in 0.0f64..0.8,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let input_wav = dir.path().join("mix.wav");
+            let stems_dir = dir.path().join("stems");
+
+            let sr = 48_000;
+            let mut l = vec![0.0_f64; frames];
+            let mut r = vec![0.0_f64; frames];
+            for i in 0..frames {
+                let t = (i as f64) / (sr as f64);
+                let sub = sub_amp * (2.0 * std::f64::consts::PI * 55.0 * t).sin();
+                let voc = voc_amp * (2.0 * std::f64::consts::PI * 440.0 * t).sin();
+                let hat = hat_amp * (2.0 * std::f64::consts::PI * 8000.0 * t).sin();
+                l[i] = sub + voc + hat;
+                r[i] = sub + voc - hat;
+            }
+            let buf = AudioBuffer::from_channels(vec![l, r], sr).unwrap();
+            buf.save_wav(&input_wav, 24).unwrap();
+
+            let bundle = separate_stems(&input_wav, &stems_dir, &WorkerBackend::PureRustDsp).unwrap();
+            prop_assert!(bundle.vocals.as_ref().unwrap().exists());
+            prop_assert!(bundle.drums.as_ref().unwrap().exists());
+            prop_assert!(bundle.bass.as_ref().unwrap().exists());
+            prop_assert!(bundle.other.as_ref().unwrap().exists());
+
+            let indexed = index_drum_sample_library(&stems_dir).unwrap();
+            prop_assert_eq!(indexed.len(), 4);
+            for desc in &indexed {
+                prop_assert!(desc.spectral_centroid_hz.is_finite() && desc.spectral_centroid_hz >= 0.0);
+                prop_assert!(desc.sub_120hz_ratio.is_finite() && (0.0..=1.0).contains(&desc.sub_120hz_ratio));
+                prop_assert!(desc.crest_factor_db.is_finite());
+                prop_assert!(["Kick", "Snare", "HiHat"].contains(&desc.category.as_str()));
+            }
+        }
+    }
+}
+

@@ -77,8 +77,10 @@ pub fn apply_spectral_defizz(buffer: &AudioBuffer, config: &DeFizzConfig) -> Res
         })
         .collect();
 
-    let thresh_ratio = 10.0_f64.powf(config.sensitivity_db.max(0.5) / 20.0);
-    let min_gain = 10.0_f64.powf(-config.max_depth_db.clamp(0.5, 24.0) / 20.0);
+    let clean_sens_db = crate::loudness_limiter::sanitize_param_f64(config.sensitivity_db, 3.5, 0.5, 24.0);
+    let clean_depth_db = crate::loudness_limiter::sanitize_param_f64(config.max_depth_db, 9.0, 0.5, 24.0);
+    let thresh_ratio = 10.0_f64.powf(clean_sens_db / 20.0);
+    let min_gain = 10.0_f64.powf(-clean_depth_db / 20.0);
     let radius = config.sharpness_bins.clamp(2, 24);
 
     let processed_channels: Vec<Vec<f64>> = buffer
@@ -87,7 +89,9 @@ pub fn apply_spectral_defizz(buffer: &AudioBuffer, config: &DeFizzConfig) -> Res
         .map(|ch| {
             let padded_len = frames + fft_size * 2;
             let mut padded = vec![0.0_f64; padded_len];
-            padded[fft_size..fft_size + frames].copy_from_slice(ch);
+            for (dst, &src) in padded[fft_size..fft_size + frames].iter_mut().zip(ch.iter()) {
+                *dst = crate::loudness_limiter::sanitize_sample_f64(src);
+            }
 
             let mut out_accum = vec![0.0_f64; padded_len];
             let mut norm_accum = vec![0.0_f64; padded_len];

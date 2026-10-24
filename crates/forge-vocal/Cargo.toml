@@ -10,3 +10,6 @@ forge-core = { path = "../forge-core" }
 forge-dsp = { path = "../forge-dsp" }
 forge-theory = { path = "../forge-theory" }
 serde.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

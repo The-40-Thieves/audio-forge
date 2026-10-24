@@ -50,15 +50,23 @@ impl Default for GuiTelemetry {
 impl GuiTelemetry {
     #[inline]
     pub fn update_peaks(&self, in_l: f32, in_r: f32, out_l: f32, out_r: f32, gr_db: f32) {
-        let pk_in = 20.0 * in_l.abs().max(in_r.abs()).max(1e-5).log10();
-        let pk_out = 20.0 * out_l.abs().max(out_r.abs()).max(1e-5).log10();
-        let prev_in = f32::from_bits(self.peak_in_db.load(Ordering::Relaxed));
-        let prev_out = f32::from_bits(self.peak_out_db.load(Ordering::Relaxed));
+        let il = if in_l.is_finite() { in_l.abs().min(100.0) } else { 0.0 };
+        let ir = if in_r.is_finite() { in_r.abs().min(100.0) } else { 0.0 };
+        let ol = if out_l.is_finite() { out_l.abs().min(100.0) } else { 0.0 };
+        let or_ = if out_r.is_finite() { out_r.abs().min(100.0) } else { 0.0 };
+        let gr = if gr_db.is_finite() { gr_db.clamp(-90.0, 24.0) } else { 0.0 };
+
+        let pk_in = 20.0 * il.max(ir).max(1e-5).log10();
+        let pk_out = 20.0 * ol.max(or_).max(1e-5).log10();
+        let raw_prev_in = f32::from_bits(self.peak_in_db.load(Ordering::Relaxed));
+        let raw_prev_out = f32::from_bits(self.peak_out_db.load(Ordering::Relaxed));
+        let prev_in = if raw_prev_in.is_finite() { raw_prev_in.clamp(-100.0, 40.0) } else { -90.0 };
+        let prev_out = if raw_prev_out.is_finite() { raw_prev_out.clamp(-100.0, 40.0) } else { -90.0 };
         let sm_in = if pk_in > prev_in { pk_in } else { prev_in * 0.9995 + pk_in * 0.0005 };
         let sm_out = if pk_out > prev_out { pk_out } else { prev_out * 0.9995 + pk_out * 0.0005 };
         self.peak_in_db.store(sm_in.to_bits(), Ordering::Relaxed);
         self.peak_out_db.store(sm_out.to_bits(), Ordering::Relaxed);
-        self.gr_db.store(gr_db.to_bits(), Ordering::Relaxed);
+        self.gr_db.store(gr.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -2009,3 +2017,62 @@ nih_export_vst3!(
     ForgeDensityClipperPlug,
     ForgeSpaceVerbAndPreampPlug
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn prop_gui_telemetry_atomic_meters_self_heal_from_nan_inf(
+            in_l in prop::num::f32::ANY,
+            in_r in prop::num::f32::ANY,
+            out_l in prop::num::f32::ANY,
+            out_r in prop::num::f32::ANY,
+            gr_db in prop::num::f32::ANY,
+        ) {
+            let tel = GuiTelemetry::default();
+            // Poison atomic slots first
+            tel.peak_in_db.store(f32::NAN.to_bits(), Ordering::Relaxed);
+            tel.peak_out_db.store(f32::INFINITY.to_bits(), Ordering::Relaxed);
+            tel.gr_db.store(f32::NEG_INFINITY.to_bits(), Ordering::Relaxed);
+
+            tel.update_peaks(in_l, in_r, out_l, out_r, gr_db);
+
+            let pk_in = f32::from_bits(tel.peak_in_db.load(Ordering::Relaxed));
+            let pk_out = f32::from_bits(tel.peak_out_db.load(Ordering::Relaxed));
+            let gr = f32::from_bits(tel.gr_db.load(Ordering::Relaxed));
+
+            prop_assert!(pk_in.is_finite() && (-100.0..=40.0).contains(&pk_in));
+            prop_assert!(pk_out.is_finite() && (-100.0..=40.0).contains(&pk_out));
+            prop_assert!(gr.is_finite() && (-90.0..=24.0).contains(&gr));
+        }
+    }
+
+    #[test]
+    fn test_all_10_plugins_instantiate_and_expose_valid_metadata() {
+        let p1 = ForgeOpenSoothePlug::default();
+        let p2 = ForgeOpenSpacerPlug::default();
+        let p3 = ForgeVocalSurgicalPlug::default();
+        let p4 = ForgeSubAndTapePlug::default();
+        let p5 = ForgeMasterLimiterPlug::default();
+        let p6 = ForgeDrumTriggerPlug::default();
+        let p7 = ForgePhaseAndMatchPlug::default();
+        let p8 = ForgeSplitEqPlug::default();
+        let p9 = ForgeDensityClipperPlug::default();
+        let p10 = ForgeSpaceVerbAndPreampPlug::default();
+
+        assert!(!p1.params().param_map().is_empty());
+        assert!(!p2.params().param_map().is_empty());
+        assert!(!p3.params().param_map().is_empty());
+        assert!(!p4.params().param_map().is_empty());
+        assert!(!p5.params().param_map().is_empty());
+        assert!(!p6.params().param_map().is_empty());
+        assert!(!p7.params().param_map().is_empty());
+        assert!(!p8.params().param_map().is_empty());
+        assert!(!p9.params().param_map().is_empty());
+        assert!(!p10.params().param_map().is_empty());
+    }
+}
+

@@ -11,3 +11,6 @@ forge-dsp = { path = "../forge-dsp" }
 forge-vocal = { path = "../forge-vocal" }
 rosc.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

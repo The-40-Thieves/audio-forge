@@ -914,6 +914,7 @@ name = "forge-core"
 version = "0.1.0"
 dependencies = [
  "hound",
+ "proptest",
  "serde",
  "serde_json",
  "tempfile",
@@ -1005,6 +1006,7 @@ dependencies = [
  "forge-vocal",
  "nih_plug",
  "nih_plug_egui",
+ "proptest",
 ]
 
 [[package]]
@@ -1014,6 +1016,7 @@ dependencies = [
  "forge-core",
  "forge-dsp",
  "forge-vocal",
+ "proptest",
  "rosc",
  "serde",
 ]
@@ -1048,7 +1051,9 @@ version = "0.1.0"
 dependencies = [
  "forge-core",
  "midly",
+ "proptest",
  "serde",
+ "tempfile",
 ]
 
 [[package]]
@@ -1058,6 +1063,7 @@ dependencies = [
  "forge-core",
  "forge-dsp",
  "forge-theory",
+ "proptest",
  "serde",
 ]
 
@@ -1076,9 +1082,11 @@ dependencies = [
  "base64 0.22.1",
  "forge-core",
  "forge-dsp",
+ "proptest",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

@@ -37,17 +37,36 @@ impl VocalScale {
         let root_token = parts.first().copied().unwrap_or("C");
         let (root_pc, _) = parse_pitch_class(root_token)?;
         let mode_str = parts.get(1).copied().unwrap_or("major").to_ascii_lowercase();
-        let is_minor = mode_str.contains("min") || mode_str == "m" || mode_str.contains("aeolian");
-
-        let intervals: [u8; 7] = if is_minor {
-            [0, 2, 3, 5, 7, 8, 10]
-        } else {
-            [0, 2, 4, 5, 7, 9, 11]
-        };
+        let is_minor = mode_str.contains("min")
+            || mode_str == "m"
+            || mode_str.contains("aeolian")
+            || mode_str.contains("dorian");
 
         let mut allowed_pcs = [false; 12];
-        for &iv in &intervals {
-            allowed_pcs[((root_pc + iv) % 12) as usize] = true;
+        if mode_str.contains("chrom") {
+            allowed_pcs = [true; 12];
+        } else if mode_str.contains("dorian") {
+            for &iv in &[0_u8, 2, 3, 5, 7, 9, 10] {
+                allowed_pcs[((root_pc + iv) % 12) as usize] = true;
+            }
+        } else if mode_str.contains("pent") {
+            let pent: [u8; 5] = if is_minor {
+                [0, 3, 5, 7, 10]
+            } else {
+                [0, 2, 4, 7, 9]
+            };
+            for &iv in &pent {
+                allowed_pcs[((root_pc + iv) % 12) as usize] = true;
+            }
+        } else {
+            let intervals: [u8; 7] = if is_minor {
+                [0, 2, 3, 5, 7, 8, 10]
+            } else {
+                [0, 2, 4, 5, 7, 9, 11]
+            };
+            for &iv in &intervals {
+                allowed_pcs[((root_pc + iv) % 12) as usize] = true;
+            }
         }
 
         Ok(Self {
@@ -59,26 +78,29 @@ impl VocalScale {
 
     /// Snaps a continuous MIDI note (`e.g. 62.38`) to the nearest pitch in the scale.
     pub fn snap_midi(&self, midi_pitch: f64, retune_strength: f64) -> f64 {
-        let rounded = midi_pitch.round() as i32;
+        let clean_pitch = forge_dsp::sanitize_param_f64(midi_pitch, 60.0, 0.0, 127.0);
+        let rounded = clean_pitch.round() as i32;
         let mut best_note = rounded;
         let mut best_dist = 999.0_f64;
 
-        for candidate in (rounded - 2)..=(rounded + 2) {
+        for candidate in (rounded - 2).max(0)..=(rounded + 2).min(127) {
             let pc = candidate.rem_euclid(12) as usize;
             if self.allowed_pcs[pc] {
-                let dist = (f64::from(candidate) - midi_pitch).abs();
+                let dist = (f64::from(candidate) - clean_pitch).abs();
                 if dist < best_dist {
                     best_dist = dist;
                     best_note = candidate;
                 }
             }
         }
-        let s = retune_strength.clamp(0.0, 1.0);
-        midi_pitch * (1.0 - s) + f64::from(best_note) * s
+        let s = forge_dsp::sanitize_param_f64(retune_strength, 1.0, 0.0, 1.0);
+        (clean_pitch * (1.0 - s) + f64::from(best_note) * s).clamp(0.0, 127.0)
     }
 
     /// Computes a diatonic scale degree offset (e.g., `+2` = diatonic 3rd above, `-2` = 3rd below).
     pub fn diatonic_shift_semitones(&self, midi_note: i32, degree_steps: i32) -> f64 {
+        let clamped_note = midi_note.clamp(0, 127);
+        let clamped_steps = degree_steps.clamp(-28, 28);
         let mut scale_notes = Vec::with_capacity(64);
         for n in 36_i32..=96 {
             if self.allowed_pcs[n.rem_euclid(12) as usize] {
@@ -86,20 +108,22 @@ impl VocalScale {
             }
         }
         if scale_notes.is_empty() {
-            return f64::from(degree_steps * 2);
+            return f64::from(clamped_steps * 2);
         }
         // Find nearest scale index
         let mut best_idx = 0_usize;
-        let mut best_diff = i32::MAX;
+        let mut best_diff = i64::MAX;
         for (idx, &sn) in scale_notes.iter().enumerate() {
-            let d = (sn - midi_note).abs();
+            let d = (i64::from(sn) - i64::from(clamped_note)).abs();
             if d < best_diff {
                 best_diff = d;
                 best_idx = idx;
             }
         }
-        let target_idx = (best_idx as i32 + degree_steps).clamp(0, (scale_notes.len() - 1) as i32) as usize;
-        f64::from(scale_notes[target_idx] - midi_note)
+        let target_idx = (best_idx as i32)
+            .saturating_add(clamped_steps)
+            .clamp(0, (scale_notes.len() - 1) as i32) as usize;
+        f64::from(scale_notes[target_idx] - clamped_note)
     }
 }
 
@@ -345,7 +369,7 @@ pub fn shift_vocal_pitch_formant_preserved(
                 sibilant_env = sibilant_env * 0.65 + target_sib * 0.35;
             }
 
-            let raw_semi = interp_shift(t);
+            let raw_semi = forge_dsp::sanitize_param_f64(interp_shift(t), 0.0, -24.0, 24.0);
             // Attenuate pitch shift smoothly toward 0.0 semitones during unvoiced sibilants
             let semi = raw_semi * (1.0 - sibilant_env * 0.85);
             let pitch_ratio = 2.0_f64.powf(semi / 12.0);
@@ -362,18 +386,29 @@ pub fn shift_vocal_pitch_formant_preserved(
                 let pos = (i as f64 - delay).clamp(0.0, (frames - 1) as f64);
                 let idx0 = pos.floor() as usize;
                 let frac = pos - (idx0 as f64);
-                ch[idx0] * (1.0 - frac) + ch[(idx0 + 1).min(frames - 1)] * frac
+                let s0 = forge_dsp::sanitize_sample_f64(ch[idx0]);
+                let s1 = forge_dsp::sanitize_sample_f64(ch[(idx0 + 1).min(frames - 1)]);
+                s0 * (1.0 - frac) + s1 * frac
             };
 
             let pitched = w_a * sample_at(phase_a) + w_b * sample_at(phase_b);
             // Blend 100% phase-coherent dry sibilant on consonants (`s/sh/t/k`)
-            *sample_out = pitched * (1.0 - sibilant_env) + ch[i] * sibilant_env;
+            let dry_s = forge_dsp::sanitize_sample_f64(ch[i]);
+            *sample_out = pitched * (1.0 - sibilant_env) + dry_s * sibilant_env;
         }
 
         // LPC Formant-envelope preservation: restore original LPC spectral tilt + F1/F2 vocal tract resonance
         let shifted_lpc_tilt = estimate_lpc_formant_tilt_db(&out_ch);
         let lpc_tilt_delta = (orig_lpc_tilt - shifted_lpc_tilt).clamp(-4.5, 4.5);
-        let net_formant_semi = formant_shift_semitones - interp_shift(buffer.duration_secs() * 0.5) * 0.65;
+        let clean_formant_semi =
+            forge_dsp::sanitize_param_f64(formant_shift_semitones, 0.0, -12.0, 12.0);
+        let mid_shift = forge_dsp::sanitize_param_f64(
+            interp_shift(buffer.duration_secs() * 0.5),
+            0.0,
+            -24.0,
+            24.0,
+        );
+        let net_formant_semi = clean_formant_semi - mid_shift * 0.65;
         if net_formant_semi.abs() > 0.05 || lpc_tilt_delta.abs() > 0.05 {
             let mut f1_eq = forge_dsp::Biquad::peaking_eq(
                 sr,
@@ -461,6 +496,7 @@ pub fn compile_reaper_take_pitch_envelope(frames: &[PitchFrame]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::f64::consts::PI;
 
     #[test]
@@ -481,5 +517,62 @@ mod tests {
         assert!(env.contains("<PITCHENV"));
         assert!(env.contains("PT "));
     }
+
+    proptest! {
+        #[test]
+        fn prop_vocal_scale_snap_and_diatonic_shift_totality(
+            arb_str in ".*",
+            valid_key in "[A-G][#b]? (major|minor|dorian|pentatonic|chromatic)",
+            midi_pitch in prop::num::f64::ANY,
+            amount in prop::num::f64::ANY,
+            midi_note in i32::MIN..=i32::MAX,
+            degree_steps in i32::MIN..=i32::MAX,
+        ) {
+            // Arbitrary string must never panic (returns Ok or Err cleanly)
+            let _ = VocalScale::parse(&arb_str);
+
+            let scale = VocalScale::parse(&valid_key).unwrap();
+            let snapped = scale.snap_midi(midi_pitch, amount);
+            prop_assert!(snapped.is_finite() && (0.0..=127.0).contains(&snapped));
+
+            // Idempotence when amount == 1.0: snapping an already-snapped pitch changes nothing
+            let full_snap = scale.snap_midi(midi_pitch, 1.0);
+            let resnapped = scale.snap_midi(full_snap, 1.0);
+            prop_assert!((full_snap - resnapped).abs() < 1e-9);
+
+            // Diatonic shift totality across full i32::MIN..=i32::MAX range
+            let shift = scale.diatonic_shift_semitones(midi_note, degree_steps);
+            prop_assert!(shift.is_finite() && (-127.0..=127.0).contains(&shift));
+        }
+
+        #[test]
+        fn prop_lpc_formant_tilt_and_sibilant_pitch_shifter_totality(
+            frames in 128usize..1024,
+            semi_shift in prop::num::f64::ANY,
+            formant_shift in prop::num::f64::ANY,
+        ) {
+            let sr = 48_000_u32;
+            let mut ch = vec![0.0_f64; frames];
+            for (i, s) in ch.iter_mut().enumerate() {
+                let t = (i as f64) / (sr as f64);
+                *s = if i % 67 == 0 {
+                    f64::NAN
+                } else {
+                    0.4 * (2.0 * PI * 330.0 * t).sin() + 0.1 * (2.0 * PI * 7500.0 * t).cos()
+                };
+            }
+            let tilt = estimate_lpc_formant_tilt_db(&ch);
+            prop_assert!(tilt.is_finite());
+
+            let buf = AudioBuffer::from_channels(vec![ch], sr).unwrap();
+            let curve = vec![(0.0, semi_shift), (0.01, -semi_shift)];
+            let shifted = shift_vocal_pitch_formant_preserved(&buf, &curve, formant_shift).unwrap();
+            prop_assert_eq!(shifted.num_frames(), frames);
+            for &y in &shifted.channels[0] {
+                prop_assert!(y.is_finite() && y.abs() <= 16.0);
+            }
+        }
+    }
 }
+
 

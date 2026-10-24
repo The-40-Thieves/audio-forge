@@ -9,3 +9,7 @@ description = "Music theory, minimal-motion Tonnetz voice-leading solver, reharm
 forge-core = { path = "../forge-core" }
 midly.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true

@@ -11,7 +11,7 @@ use std::f64::consts::PI;
 use forge_core::{AudioBuffer, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::loudness_limiter::Biquad;
+use crate::loudness_limiter::{sanitize_param_f64, sanitize_sample_f64, Biquad};
 
 /// Canonical 18-band ISO center frequencies (Hz) matching studio mastering consoles.
 pub const MASTERING_18_BANDS_HZ: [f64; 18] = [
@@ -52,6 +52,9 @@ pub fn remove_dc_and_declip(buffer: &mut AudioBuffer, declip: bool) {
     for ch in &mut buffer.channels {
         if ch.is_empty() {
             continue;
+        }
+        for s in ch.iter_mut() {
+            *s = sanitize_sample_f64(*s);
         }
         let mean = ch.iter().sum::<f64>() / (ch.len() as f64);
         for s in ch.iter_mut() {
@@ -231,7 +234,7 @@ pub fn compute_reference_match_eq(
 
     let src_mean = src_bands.iter().sum::<f64>() / 18.0;
     let ref_mean = ref_bands.iter().sum::<f64>() / 18.0;
-    let limit = max_boost_cut_db.clamp(0.5, 12.0);
+    let limit = sanitize_param_f64(max_boost_cut_db, 4.5, 0.5, 12.0);
 
     let mut delta = [0.0_f64; 18];
     for i in 0..18 {

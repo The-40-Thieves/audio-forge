@@ -204,12 +204,20 @@ pub struct ReaperProjectBuilder {
     pub tracks: Vec<ReaperTrackSpec>,
 }
 
+#[inline]
+fn sanitize_rpp_string(s: &str) -> String {
+    s.chars()
+        .filter(|&c| c != '"' && c != '\r' && c != '\n' && c != '\0')
+        .collect()
+}
+
 impl ReaperProjectBuilder {
     pub fn new(title: &str, bpm: f64, sample_rate: u32) -> Self {
+        let clean_bpm = forge_dsp::sanitize_param_f64(bpm, 120.0, 40.0, 260.0);
         Self {
-            title: title.to_string(),
-            bpm: bpm.clamp(40.0, 260.0),
-            sample_rate,
+            title: sanitize_rpp_string(title),
+            bpm: clean_bpm,
+            sample_rate: sample_rate.clamp(8_000, 768_000),
             isrc: None,
             markers: Vec::new(),
             tracks: Vec::new(),
@@ -217,7 +225,8 @@ impl ReaperProjectBuilder {
     }
 
     pub fn add_default_song_structure_markers(&mut self) {
-        let bar_secs = (60.0 / self.bpm) * 4.0;
+        let clean_bpm = forge_dsp::sanitize_param_f64(self.bpm, 120.0, 40.0, 260.0);
+        let bar_secs = (60.0 / clean_bpm) * 4.0;
         let sections = [
             (1, 0.0, "[Intro]", 0x01FF_AA44),
             (2, bar_secs * 4.0, "[Verse 1]", 0x0144_CC88),
@@ -241,24 +250,30 @@ impl ReaperProjectBuilder {
 
     /// Compiles the complete REAPER 7.82 `.RPP` project text.
     pub fn build_rpp_string(&self) -> String {
+        let clean_bpm = forge_dsp::sanitize_param_f64(self.bpm, 120.0, 40.0, 260.0);
+        let clean_sr = self.sample_rate.clamp(8_000, 768_000);
+        let clean_title = sanitize_rpp_string(&self.title);
         let mut rpp = String::with_capacity(16384);
         rpp.push_str(&format!(
             "<REAPER_PROJECT 0.1 \"7.82/win64\" 1761280000\n  RIPPLE 0\n  GROUPOVERRIDE 0 0 0\n  AUTOXFADE 129\n  ENVATTACH 3\n  SAMPLERATE {} 0 0\n  TEMPO {:.4} 4 4\n",
-            self.sample_rate, self.bpm
+            clean_sr, clean_bpm
         ));
 
         if let Some(ref isrc) = self.isrc {
+            let safe_isrc = sanitize_rpp_string(isrc);
             rpp.push_str("  <RENDER_METADATA\n");
-            rpp.push_str(&format!("    TAG \"ISRC\" \"{isrc}\"\n"));
-            rpp.push_str(&format!("    TAG \"ID3:TSRC\" \"{isrc}\"\n"));
-            rpp.push_str(&format!("    TAG \"ID3:TIT2\" \"{}\"\n", self.title));
+            rpp.push_str(&format!("    TAG \"ISRC\" \"{safe_isrc}\"\n"));
+            rpp.push_str(&format!("    TAG \"ID3:TSRC\" \"{safe_isrc}\"\n"));
+            rpp.push_str(&format!("    TAG \"ID3:TIT2\" \"{clean_title}\"\n"));
             rpp.push_str("  >\n");
         }
 
         for m in &self.markers {
+            let safe_t = forge_dsp::sanitize_param_f64(m.time_secs, 0.0, 0.0, 86_400.0);
+            let safe_name = sanitize_rpp_string(&m.name);
             rpp.push_str(&format!(
                 "  MARKER {} {:.4} \"{}\" 0 {} 1 R\n",
-                m.id, m.time_secs, m.name, m.color
+                m.id, safe_t, safe_name, m.color
             ));
         }
 
@@ -267,13 +282,16 @@ impl ReaperProjectBuilder {
 
         for (idx, tr) in self.tracks.iter().enumerate() {
             let nchan = if tr.sidechain_from_track.is_some() { 4 } else { 2 };
+            let safe_tr_name = sanitize_rpp_string(&tr.name);
+            let safe_vol = forge_dsp::sanitize_param_f64(tr.volume_lin, 1.0, 0.0, 4.0);
+            let safe_pan = forge_dsp::sanitize_param_f64(tr.pan, 0.0, -1.0, 1.0);
             rpp.push_str(&format!(
                 "  <TRACK {{FORGE-TRACK-{:04}}}\n    NAME \"{}\"\n    PEAKCOL {}\n    VOLPAN {:.4} {:.4} -1 -1 1\n    MUTESOLO 0 0 0\n    IPHASE 0\n    NCHAN {}\n",
                 idx + 1,
-                tr.name,
+                safe_tr_name,
                 tr.color,
-                tr.volume_lin,
-                tr.pan,
+                safe_vol,
+                safe_pan,
                 nchan
             ));
 
@@ -287,19 +305,21 @@ impl ReaperProjectBuilder {
             if !tr.jsfx_inserts.is_empty() {
                 rpp.push_str("    <FXCHAIN\n      SHOW 0\n      LASTSEL 0\n      DOCKED 0\n");
                 for jsfx in &tr.jsfx_inserts {
-                    rpp.push_str(&format!("      <JS ForgeAudio/{jsfx} \"\"\n      >\n"));
+                    let safe_jsfx = sanitize_rpp_string(jsfx);
+                    rpp.push_str(&format!("      <JS ForgeAudio/{safe_jsfx} \"\"\n      >\n"));
                 }
                 rpp.push_str("    >\n");
             }
 
             if let Some(ref path) = tr.file_path {
-                let norm_path = path.to_string_lossy().replace('\\', "/");
+                let norm_path = sanitize_rpp_string(&path.to_string_lossy().replace('\\', "/"));
                 let src_type = if tr.is_midi { "MIDI" } else { "WAVE" };
+                let safe_dur = forge_dsp::sanitize_param_f64(tr.duration_secs, 1.0, 1.0, 86_400.0);
                 // PLAYRATE 1 1 0 229376 0 -> 229376 selects elastique 3.3.3 Pro pitch-preserving engine
                 rpp.push_str(&format!(
                     "    <ITEM\n      POSITION 0.0000\n      LENGTH {:.4}\n      LOOP 0\n      ALLTAKES 0\n      FADEIN 1 0.005 0 1 0 0 0\n      FADEOUT 1 0.010 0 1 0 0 0\n      NAME \"{}\"\n      VOLPAN 1.0 0.0 1.0 -1.0\n      PLAYRATE 1.0 1 0.0 229376 0 0.0025\n",
-                    tr.duration_secs.max(1.0),
-                    tr.name
+                    safe_dur,
+                    safe_tr_name
                 ));
 
                 if !tr.stretch_markers.is_empty() {
@@ -365,6 +385,7 @@ pub fn send_reaper_osc(host_port: &str, address: &str, value: Option<f32>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn test_iso3901_isrc_validation() {
@@ -397,5 +418,72 @@ mod tests {
         assert!(text.contains("AUXRECV 0 0 1.0 0.0 0 0 0 0 1024"));
         assert!(text.contains("Forge_OpenSoothe_DeFizz.jsfx"));
     }
+
+    proptest! {
+        #[test]
+        fn prop_iso3901_isrc_validator_bijection_and_rejection(
+            cc in "[A-Za-z]{2}",
+            reg in "[A-Za-z0-9]{3}",
+            yr in "[0-9]{2}",
+            desig in "[0-9]{5}",
+            arb in ".*",
+        ) {
+            let formatted = format!("{cc}-{reg}-{yr}-{desig}");
+            let clean = validate_isrc(&formatted).unwrap();
+            prop_assert_eq!(clean.len(), 12);
+            prop_assert!(clean.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()));
+
+            // Arbitrary string: if validate_isrc succeeds, it must satisfy ISO 3901 invariants
+            if let Ok(ok_code) = validate_isrc(&arb) {
+                prop_assert_eq!(ok_code.len(), 12);
+                prop_assert!(ok_code[0..2].chars().all(|c| c.is_ascii_uppercase()));
+                prop_assert!(ok_code[2..5].chars().all(|c| c.is_ascii_alphanumeric()));
+                prop_assert!(ok_code[5..12].chars().all(|c| c.is_ascii_digit()));
+            }
+        }
+
+        #[test]
+        fn prop_reaper_rpp_builder_injection_immunity_and_structural_validity(
+            title in ".*",
+            track_name in ".*",
+            bpm in prop::num::f64::ANY,
+            sr in 0u32..1_000_000,
+            vol in prop::num::f64::ANY,
+            pan in prop::num::f64::ANY,
+            dur in prop::num::f64::ANY,
+        ) {
+            let mut rpp = ReaperProjectBuilder::new(&title, bpm, sr);
+            rpp.isrc = Some(title.clone());
+            rpp.add_default_song_structure_markers();
+            rpp.tracks.push(ReaperTrackSpec {
+                name: track_name,
+                file_path: Some(PathBuf::from("C:\\temp\\weird\"file\nname.wav")),
+                is_midi: false,
+                duration_secs: dur,
+                volume_lin: vol,
+                pan,
+                color: 0x0155_88FF,
+                jsfx_inserts: vec!["Forge\"Inject\n.jsfx".to_string()],
+                sidechain_from_track: Some(0),
+                stretch_markers: vec![StretchMarker {
+                    timeline_pos_secs: 1.0,
+                    source_pos_secs: 1.0,
+                }],
+                pitch_envelope: Vec::new(),
+            });
+            let out = rpp.build_rpp_string();
+
+            // Must never emit NaN or Inf into the .RPP file
+            prop_assert!(!out.contains("NaN"));
+            prop_assert!(!out.contains("inf"));
+            prop_assert!(!out.contains("Inf"));
+
+            // Every `<` chunk header line must have a matching `>` closing line
+            let open_chunks = out.lines().filter(|l| l.trim_start().starts_with('<')).count();
+            let close_chunks = out.lines().filter(|l| l.trim() == ">").count();
+            prop_assert_eq!(open_chunks, close_chunks);
+        }
+    }
 }
+
 

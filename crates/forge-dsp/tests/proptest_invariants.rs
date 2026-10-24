@@ -19,12 +19,14 @@ use std::time::Instant;
 
 use forge_core::AudioBuffer;
 use forge_dsp::{
-    apply_spectral_unmask, audit_audio, normalize_and_limit, publish_shared_spectrum,
-    read_shared_spectrum, AdaaSin, AdaaTanh, AnalogHardwareModel, Biquad,
+    apply_spectral_defizz, apply_spectral_unmask, audit_audio, align_phase_gcc_phat,
+    align_vocal_double_dtw, compute_reference_match_eq, normalize_and_limit,
+    publish_shared_spectrum, read_shared_spectrum, remove_dc_and_declip,
+    run_full_restoration_chain, AdaaSin, AdaaTanh, AnalogHardwareModel, Biquad, DeFizzConfig,
     RealtimeDensityAndClipper, RealtimeDrumTrigger, RealtimeFdnReverb, RealtimeMasterLimiter,
     RealtimeMasteringEq18, RealtimeNeuralPreamp, RealtimeOpenSoothe, RealtimeOpenSpacer,
     RealtimePhaseAligner, RealtimeSubAndTapeBus, RealtimeTransientTonalSplit,
-    RealtimeVocalSurgical, UnmaskConfig,
+    RealtimeVocalSurgical, RestorationConfig, UnmaskConfig,
 };
 use proptest::prelude::*;
 
@@ -144,38 +146,63 @@ proptest! {
         ];
 
         for flt in &mut filters {
-            // Excite filter with 64 samples of bounded signal, then 512 samples of silence
-            let mut active_energy = 0.0_f64;
-            for i in 0..64 {
+            // 3A. Exact Schur-Cohn / Jury Stability Criterion for 2nd-order IIR denominator 1 + a1*z^-1 + a2*z^-2:
+            // Both complex poles lie strictly inside (or on, for degenerate bypass) the unit disk iff:
+            //   |a2| <= 1.0  AND  |a1| <= 1.0 + a2 + 1e-12
+            prop_assert!(
+                flt.b0.is_finite()
+                    && flt.b1.is_finite()
+                    && flt.b2.is_finite()
+                    && flt.a1.is_finite()
+                    && flt.a2.is_finite()
+            );
+            prop_assert!(
+                flt.a2.abs() <= 1.0 + 1.0e-12 && flt.a1.abs() <= 1.0 + flt.a2 + 1.0e-9,
+                "Biquad violated Schur-Cohn stability triangle: a1={}, a2={}",
+                flt.a1,
+                flt.a2
+            );
+
+            // 3B. Totality across 256 samples on arbitrary parameters
+            for i in 0..256 {
                 let s = (0.5 * (i as f64 * 0.37).sin()) + (0.25 * (i as f64 * 1.13).cos());
                 let y = flt.process_sample(s);
                 prop_assert!(y.is_finite());
-                active_energy += y * y;
             }
-            let mut tail_early = 0.0_f64;
-            for _ in 0..64 {
-                let y = flt.process_sample(0.0);
-                prop_assert!(y.is_finite());
-                tail_early += y * y;
-            }
-            for _ in 0..1024 {
-                let _ = flt.process_sample(0.0);
-            }
-            let mut tail_late = 0.0_f64;
-            for _ in 0..64 {
-                let y = flt.process_sample(0.0);
-                prop_assert!(y.is_finite());
-                tail_late += y * y;
-            }
-            // Asymptotic passive decay: late tail energy must be strictly smaller than early excitation/tail
-            prop_assert!(
-                tail_late <= (active_energy + tail_early) * 0.5 + 1.0e-18,
-                "Biquad failed Lyapunov decay: active={}, early={}, late={}",
-                active_energy,
-                tail_early,
-                tail_late
-            );
         }
+
+        // 3C. Time-domain Lyapunov asymptotic decay on audio-band biquad where tau << 1024 samples
+        let eff_sr = sr.clamp(8_000.0, 192_000.0);
+        let eff_fc = freq.clamp(250.0, eff_sr * 0.40);
+        let eff_q = q.clamp(0.5, 12.0);
+        let mut decay_flt = Biquad::peaking_eq(eff_sr, eff_fc, eff_q, gain_db);
+        let mut active_energy = 0.0_f64;
+        for i in 0..64 {
+            let s = (0.5 * (i as f64 * 0.37).sin()) + (0.25 * (i as f64 * 1.13).cos());
+            let y = decay_flt.process_sample(s);
+            active_energy += y * y;
+        }
+        let mut tail_early = 0.0_f64;
+        for _ in 0..64 {
+            let y = decay_flt.process_sample(0.0);
+            tail_early += y * y;
+        }
+        let settle_samples = ((eff_sr / eff_fc) * eff_q * 8.0).round() as usize;
+        for _ in 0..settle_samples.clamp(512, 16_384) {
+            let _ = decay_flt.process_sample(0.0);
+        }
+        let mut tail_late = 0.0_f64;
+        for _ in 0..64 {
+            let y = decay_flt.process_sample(0.0);
+            tail_late += y * y;
+        }
+        prop_assert!(
+            tail_late <= (active_energy + tail_early) * 0.1 + 1.0e-18,
+            "Biquad failed Lyapunov decay: active={}, early={}, late={}",
+            active_energy,
+            tail_early,
+            tail_late
+        );
     }
 
     // ========================================================================
@@ -318,6 +345,83 @@ proptest! {
         } else {
             // Out-of-bounds slot >= 8 must safely return all zeros
             prop_assert!(read_back.iter().all(|&x| x == 0.0));
+        }
+    }
+
+    // ========================================================================
+    // 7B. RESTORATION, SPECTRAL DE-FIZZ & GCC-PHAT / DTW PHASE ALIGNMENT
+    // ========================================================================
+    #[test]
+    fn prop_restoration_defizz_and_phase_align_totality(
+        len in 256usize..768,
+        dc_offset in -0.5f64..0.5,
+        sensitivity_db in prop::num::f64::ANY,
+        max_reduction_db in prop::num::f64::ANY,
+    ) {
+        let sr = 48_000_u32;
+        let mut l = vec![0.0_f64; len];
+        let mut r = vec![0.0_f64; len];
+        for i in 0..len {
+            let t = (i as f64) / (sr as f64);
+            l[i] = dc_offset + 0.5 * (2.0 * PI * 440.0 * t).sin();
+            r[i] = dc_offset + 0.5 * (2.0 * PI * 440.0 * t).sin();
+        }
+        // Inject adversarial NaN and hard-clipped plateau
+        l[0] = f64::NAN;
+        r[0] = f64::INFINITY;
+        for s in l.iter_mut().take(16).skip(10) {
+            *s = 1.05;
+        }
+
+        let mut buf = AudioBuffer::from_channels(vec![l, r], sr).unwrap();
+        remove_dc_and_declip(&mut buf, true);
+        for ch in &buf.channels {
+            for &s in ch {
+                prop_assert!(s.is_finite());
+            }
+        }
+
+        let rest_cfg = RestorationConfig::default();
+        buf = run_full_restoration_chain(&buf, &rest_cfg).unwrap();
+        for ch in &buf.channels {
+            for &s in ch {
+                prop_assert!(s.is_finite());
+            }
+        }
+
+        let gains = compute_reference_match_eq(&buf, &buf, f64::NAN);
+        for &g in &gains {
+            prop_assert!(g.is_finite() && (-9.0..=9.0).contains(&g));
+        }
+
+        let cfg = DeFizzConfig {
+            sensitivity_db,
+            max_depth_db: max_reduction_db,
+            ..DeFizzConfig::default()
+        };
+        let defizzed = apply_spectral_defizz(&buf, &cfg).unwrap();
+        for ch in &defizzed.channels {
+            for &s in ch {
+                prop_assert!(s.is_finite());
+            }
+        }
+
+        let (aligned, res) = align_phase_gcc_phat(&buf, &defizzed, 20.0).unwrap();
+        prop_assert!(res.correlation_peak.is_finite());
+        for ch in &aligned.channels {
+            for &s in ch {
+                prop_assert!(s.is_finite());
+            }
+        }
+
+        let (dtw_buf, markers) = align_vocal_double_dtw(&buf, &defizzed, 12.0).unwrap();
+        for ch in &dtw_buf.channels {
+            for &s in ch {
+                prop_assert!(s.is_finite());
+            }
+        }
+        for m in markers {
+            prop_assert!(m.timeline_pos_secs.is_finite() && m.source_pos_secs.is_finite());
         }
     }
 }
