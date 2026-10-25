@@ -11,5 +11,10 @@ midly.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+divan = { version = "6.0.0", package = "codspeed-divan-compat" }
 proptest.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "theory"
+harness = false
