@@ -109,7 +109,9 @@ fn parse_key(value: &str) -> Parse<[i8; 7]> {
             tokens.next();
             key_signature(tonic, &mut tokens)?
         }
-        Some(_) => [0; 7],
+        // No tonic: only clef words, `exp`, settings or explicit accidentals may follow `K:`.
+        Some(first) if apply_key_token(&mut [0; 7], first).is_ok() => [0; 7],
+        Some(first) => return Err(format!("unknown key root '{first}'")),
     };
     for token in tokens {
         apply_key_token(&mut key, token)?;

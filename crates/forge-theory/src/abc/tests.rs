@@ -46,6 +46,28 @@ fn test_key_signatures_modes_and_key_changes() {
 }
 
 #[test]
+fn test_unknown_key_roots_are_rejected() {
+    // A `K:` field without a tonic may still carry a clef, settings or explicit accidentals.
+    let cases: &[(&str, &[u8])] = &[
+        ("K:bass\nB,", &[59]),
+        ("K:clef=treble\nF", &[65]),
+        ("K:^f ^c\nF C", &[66, 61]),
+    ];
+    for &(abc, expected) in cases {
+        assert_eq!(pitches(abc), expected, "{abc}");
+    }
+    let cases = [
+        ("K:H\nC", "ABC line 1: unknown key root 'H'"),
+        ("K:g\nC", "ABC line 1: unknown key root 'g'"),
+        ("K:C\nC [K:Xm] D", "ABC line 2: unknown key root 'Xm'"),
+    ];
+    for (abc, needle) in cases {
+        let err = parse_abc_score(abc, TPB).expect_err(abc).to_string();
+        assert!(err.contains(needle), "{abc:?}: {err}");
+    }
+}
+
+#[test]
 fn test_accidentals_last_until_the_bar_line() {
     let cases: &[(&str, &[u8])] = &[
         ("K:C\n^F F | F", &[66, 66, 65]),
@@ -147,7 +169,6 @@ fn test_unknown_body_characters_are_rejected() {
 fn test_malformed_abc_is_rejected_with_the_line_number() {
     let cases = [
         ("C\n\"Dm9 C", "ABC line 2: unterminated quoted chord symbol"),
-        ("K:H\nC", "ABC line 1: unrecognised key signature token 'H'"),
         ("K:G#\nC", "more than 7 sharps or flats"),
         ("K:C foo\nC", "unrecognised key signature token 'foo'"),
         ("K:Cxyz\nC", "unknown key mode 'xyz'"),
