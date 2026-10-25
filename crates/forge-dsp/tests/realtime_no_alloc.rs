@@ -28,20 +28,21 @@ fn record() {
     });
 }
 
+// SAFETY: every method forwards unchanged to `System`, which upholds the `GlobalAlloc`
+// contract; counting adds no allocation of its own (the thread-locals are `const`-initialised).
+// `alloc_zeroed` and `realloc` keep their default implementations, which allocate through
+// `alloc` below, so they are counted too.
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         record();
+        // SAFETY: the caller guarantees `layout` has non-zero size, as `GlobalAlloc::alloc`
+        // requires; it is passed to `System` as is.
         unsafe { System.alloc(layout) }
     }
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        record();
-        unsafe { System.alloc_zeroed(layout) }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        record();
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
+
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: `ptr` was returned by `alloc` above, i.e. by `System`, with this same
+        // `layout`, as `GlobalAlloc::dealloc` requires of the caller.
         unsafe { System.dealloc(ptr, layout) }
     }
 }
