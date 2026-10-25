@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::loudness_limiter::{
-    flush_denormal_f64, sanitize_param_f64, sanitize_sample_f32, sanitize_sample_f64, Biquad,
+    Biquad, flush_denormal_f64, sanitize_param_f64, sanitize_sample_f32, sanitize_sample_f64,
 };
 use crate::restoration::MASTERING_18_BANDS_HZ;
 use forge_core::AudioBuffer;

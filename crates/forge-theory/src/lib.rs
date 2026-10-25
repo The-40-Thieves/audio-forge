@@ -5,8 +5,8 @@ use std::path::Path;
 
 use forge_core::{AudioBuffer, ForgeError, Result};
 use midly::{
-    num::{u15, u24, u28, u4, u7},
     Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind,
+    num::{u4, u7, u15, u24, u28},
 };
 use serde::{Deserialize, Serialize};
 
@@ -64,7 +64,7 @@ pub fn parse_pitch_class(token: &str) -> Result<(u8, &str)> {
         _ => {
             return Err(ForgeError::TheoryError(format!(
                 "Invalid root note in chord '{s}'"
-            )))
+            )));
         }
     };
     if bytes.len() >= 2 {
@@ -376,15 +376,15 @@ pub fn parse_abc_score(abc: &str, ticks_per_beat: u32) -> (Vec<String>, Vec<Note
         let mut i = 0;
         while i < bytes.len() {
             // Chord symbol inside double quotes: "Dm9"
-            if bytes[i] == b'"' {
-                if let Some(end_q) = trimmed[i + 1..].find('"') {
-                    let sym = trimmed[i + 1..i + 1 + end_q].trim();
-                    if !sym.is_empty() {
-                        chords.push(sym.to_string());
-                    }
-                    i += end_q + 2;
-                    continue;
+            if bytes[i] == b'"'
+                && let Some(end_q) = trimmed[i + 1..].find('"')
+            {
+                let sym = trimmed[i + 1..i + 1 + end_q].trim();
+                if !sym.is_empty() {
+                    chords.push(sym.to_string());
                 }
+                i += end_q + 2;
+                continue;
             }
 
             // Parse ABC note letters (C..B in octave 4, c..b in octave 5)
@@ -480,10 +480,10 @@ pub fn write_midi_file<P: AsRef<Path>>(
     tracks_notes: &[(&str, &[NoteEvent])],
 ) -> Result<()> {
     let path_ref = path.as_ref();
-    if let Some(parent) = path_ref.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path_ref.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
 
     let clean_bpm = if bpm.is_finite() {

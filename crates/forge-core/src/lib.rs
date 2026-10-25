@@ -175,10 +175,10 @@ impl AudioBuffer {
             .unwrap_or("")
             .to_ascii_lowercase();
 
-        if ext == "wav" {
-            if let Ok(buf) = Self::load_wav(path_ref) {
-                return Ok(buf);
-            }
+        if ext == "wav"
+            && let Ok(buf) = Self::load_wav(path_ref)
+        {
+            return Ok(buf);
         }
 
         // Fallback to FFmpeg decoding into a temporary 32-bit float WAV
@@ -258,10 +258,10 @@ impl AudioBuffer {
     /// Writes the `AudioBuffer` as a 24-bit PCM WAV file with TPDF dithering or 32-bit float WAV.
     pub fn save_wav<P: AsRef<Path>>(&self, path: P, bits_per_sample: u16) -> Result<()> {
         let path_ref = path.as_ref();
-        if let Some(parent) = path_ref.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path_ref.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let ch_count = self.num_channels();
         let frames = self.num_frames();

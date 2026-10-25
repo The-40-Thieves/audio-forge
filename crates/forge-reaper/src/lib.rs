@@ -7,8 +7,8 @@ use std::process::Command;
 
 use forge_core::{ForgeError, Result};
 use forge_dsp::StretchMarker;
-use forge_vocal::{compile_reaper_take_pitch_envelope, PitchFrame};
-use rosc::{encoder, OscMessage, OscPacket, OscType};
+use forge_vocal::{PitchFrame, compile_reaper_take_pitch_envelope};
+use rosc::{OscMessage, OscPacket, OscType, encoder};
 use serde::{Deserialize, Serialize};
 
 /// Embedded JSFX plugin source files for zero-dependency 1-command installation into REAPER.
@@ -106,10 +106,10 @@ pub fn write_distrokid_metadata<P: AsRef<Path>>(
     let in_ref = input_path.as_ref();
     let out_ref = output_path.as_ref();
 
-    if let Some(parent) = out_ref.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = out_ref.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
 
     let mut args = vec![
@@ -360,10 +360,10 @@ impl ReaperProjectBuilder {
     /// Writes the `.RPP` project to disk.
     pub fn save_rpp<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
         let p = path.as_ref();
-        if let Some(parent) = p.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = p.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         std::fs::write(p, self.build_rpp_string())?;
         Ok(p.to_path_buf())

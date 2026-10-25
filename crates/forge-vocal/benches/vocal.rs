@@ -2,11 +2,11 @@
 
 use std::f64::consts::PI;
 
-use divan::{black_box, Bencher};
+use divan::{Bencher, black_box};
 use forge_core::AudioBuffer;
 use forge_vocal::{
-    compile_reaper_take_pitch_envelope, estimate_lpc_formant_tilt_db, generate_vocal_harmony_stack,
-    shift_vocal_pitch_formant_preserved, track_vocal_pitch, VocalScale,
+    VocalScale, compile_reaper_take_pitch_envelope, estimate_lpc_formant_tilt_db,
+    generate_vocal_harmony_stack, shift_vocal_pitch_formant_preserved, track_vocal_pitch,
 };
 
 const SR: u32 = 48_000;

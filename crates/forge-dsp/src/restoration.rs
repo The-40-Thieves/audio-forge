@@ -11,7 +11,7 @@ use std::f64::consts::PI;
 use forge_core::{AudioBuffer, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::loudness_limiter::{sanitize_param_f64, sanitize_sample_f64, Biquad};
+use crate::loudness_limiter::{Biquad, sanitize_param_f64, sanitize_sample_f64};
 
 /// Canonical 18-band ISO center frequencies (Hz) matching studio mastering consoles.
 pub const MASTERING_18_BANDS_HZ: [f64; 18] = [
@@ -179,7 +179,7 @@ pub fn apply_18_band_eq(buffer: &mut AudioBuffer, gains_db: &[f64; 18]) {
         let mut filters: Vec<Biquad> = MASTERING_18_BANDS_HZ
             .iter()
             .zip(gains_db.iter())
-            .filter(|(&f, &g)| f < sr * 0.48 && g.abs() > 0.05)
+            .filter(|&(&f, &g)| f < sr * 0.48 && g.abs() > 0.05)
             .map(|(&f, &g)| Biquad::peaking_eq(sr, f, 2.2, g))
             .collect();
 

@@ -2,11 +2,11 @@
 
 use std::f64::consts::PI;
 
-use divan::{black_box, Bencher};
+use divan::{Bencher, black_box};
 use forge_core::AudioBuffer;
 use forge_theory::{
-    export_abc_score, extract_drum_midi_triggers, parse_abc_score, parse_chord_symbol,
-    reharmonize_progression, solve_voice_leading, GrooveStyle, VoicingStyle,
+    GrooveStyle, VoicingStyle, export_abc_score, extract_drum_midi_triggers, parse_abc_score,
+    parse_chord_symbol, reharmonize_progression, solve_voice_leading,
 };
 
 fn main() {
