@@ -1,6 +1,7 @@
 //! `forge-theory` — Symbolic Music Theory, Minimal-Motion Voice Leading, Reharmonization,
 //! Pocket/Groove Humanization, Drum Transient-to-MIDI Triggering, ABC Notation & `.mid` Compiler.
 
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use forge_core::{AudioBuffer, ForgeError, Result};
@@ -473,6 +474,7 @@ pub fn export_abc_score(title: &str, key: &str, bpm: u32, chords: &[String]) -> 
 }
 
 /// Writes one or more `NoteEvent` tracks to a Standard MIDI File (`.mid`) with tempo metadata.
+/// Creates `path` (and its parent directories) and delegates to [`write_midi_to_writer`].
 pub fn write_midi_file<P: AsRef<Path>>(
     path: P,
     bpm: f64,
@@ -485,17 +487,43 @@ pub fn write_midi_file<P: AsRef<Path>>(
     {
         std::fs::create_dir_all(parent)?;
     }
+    let file = std::fs::File::create(path_ref)
+        .map_err(|e| ForgeError::TheoryError(format!("Failed to write MIDI file: {e}")))?;
+    write_midi_to_writer(BufWriter::new(file), bpm, ticks_per_beat, tracks_notes)
+}
 
+/// Encodes `NoteEvent` tracks as a Standard MIDI File into `writer` (flushed before
+/// returning). The tempo is clamped to 30-300 BPM; a non-finite tempo becomes 120 BPM.
+pub fn write_midi_to_writer<W: Write>(
+    mut writer: W,
+    bpm: f64,
+    ticks_per_beat: u16,
+    tracks_notes: &[(&str, &[NoteEvent])],
+) -> Result<()> {
+    let midi_err =
+        |e: std::io::Error| ForgeError::TheoryError(format!("Failed to write MIDI file: {e}"));
+    let mut smf_tracks = vec![tempo_track(bpm)];
+    smf_tracks.extend(tracks_notes.iter().map(|&(_name, notes)| note_track(notes)));
+    let smf = Smf {
+        header: Header {
+            format: Format::Parallel,
+            timing: Timing::Metrical(u15::new(ticks_per_beat.clamp(1, 0x7FFF))),
+        },
+        tracks: smf_tracks,
+    };
+    smf.write_std(&mut writer).map_err(midi_err)?;
+    writer.flush().map_err(midi_err)
+}
+
+/// The conductor track: one tempo event, then end of track.
+fn tempo_track(bpm: f64) -> Vec<TrackEvent<'static>> {
     let clean_bpm = if bpm.is_finite() {
         bpm.clamp(30.0, 300.0)
     } else {
         120.0
     };
     let us_per_qn = (60_000_000.0 / clean_bpm).round() as u32;
-    let mut smf_tracks: Vec<Vec<TrackEvent<'static>>> = Vec::new();
-
-    // Tempo & conductor track
-    let tempo_track = vec![
+    vec![
         TrackEvent {
             delta: u28::new(0),
             kind: TrackEventKind::Meta(MetaMessage::Tempo(u24::new(us_per_qn.min(0x00FF_FFFF)))),
@@ -504,70 +532,62 @@ pub fn write_midi_file<P: AsRef<Path>>(
             delta: u28::new(0),
             kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
         },
-    ];
-    smf_tracks.push(tempo_track);
+    ]
+}
 
-    for &(_name, notes) in tracks_notes {
-        // Convert NoteEvents into sorted (tick, is_on, channel, note, vel) events
-        let mut raw_events: Vec<(u32, bool, u8, u8, u8)> = Vec::with_capacity(notes.len() * 2);
-        for n in notes {
-            let start = n.start_tick.min(0x0FFF_0000);
-            let end = start
-                .saturating_add(n.duration_ticks.max(1))
-                .min(0x0FFF_FFFE);
-            raw_events.push((
-                start,
-                true,
-                n.channel & 0x0F,
-                n.midi_note & 0x7F,
-                n.velocity & 0x7F,
-            ));
-            raw_events.push((end, false, n.channel & 0x0F, n.midi_note & 0x7F, 0));
-        }
-        raw_events.sort_by_key(|&(tick, is_on, _, note, _)| (tick, is_on, note));
-
-        let mut track = Vec::with_capacity(raw_events.len() + 1);
-        let mut last_tick = 0_u32;
-        for (tick, is_on, ch, note, vel) in raw_events {
-            let delta = tick.saturating_sub(last_tick);
-            last_tick = tick;
-            let message = if is_on {
-                MidiMessage::NoteOn {
-                    key: u7::new(note),
-                    vel: u7::new(vel),
-                }
-            } else {
-                MidiMessage::NoteOff {
-                    key: u7::new(note),
-                    vel: u7::new(0),
-                }
-            };
-            track.push(TrackEvent {
-                delta: u28::new(delta),
-                kind: TrackEventKind::Midi {
-                    channel: u4::new(ch),
-                    message,
-                },
-            });
-        }
-        track.push(TrackEvent {
-            delta: u28::new(0),
-            kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
-        });
-        smf_tracks.push(track);
+/// Converts notes into sorted (tick, is_on, channel, note, velocity) on/off events.
+fn note_events(notes: &[NoteEvent]) -> Vec<(u32, bool, u8, u8, u8)> {
+    let mut raw_events: Vec<(u32, bool, u8, u8, u8)> = Vec::with_capacity(notes.len() * 2);
+    for n in notes {
+        let start = n.start_tick.min(0x0FFF_0000);
+        let end = start
+            .saturating_add(n.duration_ticks.max(1))
+            .min(0x0FFF_FFFE);
+        raw_events.push((
+            start,
+            true,
+            n.channel & 0x0F,
+            n.midi_note & 0x7F,
+            n.velocity & 0x7F,
+        ));
+        raw_events.push((end, false, n.channel & 0x0F, n.midi_note & 0x7F, 0));
     }
+    raw_events.sort_by_key(|&(tick, is_on, _, note, _)| (tick, is_on, note));
+    raw_events
+}
 
-    let smf = Smf {
-        header: Header {
-            format: Format::Parallel,
-            timing: Timing::Metrical(u15::new(ticks_per_beat.clamp(1, 0x7FFF))),
-        },
-        tracks: smf_tracks,
-    };
-
-    smf.save(path_ref)
-        .map_err(|e| ForgeError::TheoryError(format!("Failed to write MIDI file: {e}")))?;
-    Ok(())
+/// One note track: delta-timed note on/off messages, then end of track.
+fn note_track(notes: &[NoteEvent]) -> Vec<TrackEvent<'static>> {
+    let raw_events = note_events(notes);
+    let mut track = Vec::with_capacity(raw_events.len() + 1);
+    let mut last_tick = 0_u32;
+    for (tick, is_on, ch, note, vel) in raw_events {
+        let delta = tick.saturating_sub(last_tick);
+        last_tick = tick;
+        let message = if is_on {
+            MidiMessage::NoteOn {
+                key: u7::new(note),
+                vel: u7::new(vel),
+            }
+        } else {
+            MidiMessage::NoteOff {
+                key: u7::new(note),
+                vel: u7::new(0),
+            }
+        };
+        track.push(TrackEvent {
+            delta: u28::new(delta),
+            kind: TrackEventKind::Midi {
+                channel: u4::new(ch),
+                message,
+            },
+        });
+    }
+    track.push(TrackEvent {
+        delta: u28::new(0),
+        kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+    });
+    track
 }
 
 #[cfg(test)]
@@ -658,5 +678,48 @@ mod tests {
             let parsed_smf = midly::Smf::parse(&raw_bytes).unwrap();
             prop_assert_eq!(parsed_smf.tracks.len(), 4);
         }
+    }
+
+    #[test]
+    fn midi_writer_round_trips_and_matches_the_path_version() {
+        let notes = [
+            NoteEvent {
+                midi_note: 60,
+                velocity: 100,
+                start_tick: 0,
+                duration_ticks: 480,
+                channel: 0,
+            },
+            NoteEvent {
+                midi_note: 64,
+                velocity: 90,
+                start_tick: 240,
+                duration_ticks: 480,
+                channel: 1,
+            },
+        ];
+        let tracks: [(&str, &[NoteEvent]); 1] = [("Chords", &notes)];
+        let mut bytes = Vec::new();
+        write_midi_to_writer(&mut bytes, 92.0, 480, &tracks).expect("encode");
+        let smf = midly::Smf::parse(&bytes).expect("parse");
+        assert_eq!(smf.tracks.len(), 2);
+        let note_ons = smf.tracks[1]
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    TrackEventKind::Midi {
+                        message: MidiMessage::NoteOn { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(note_ons, 2);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join("chords.mid");
+        write_midi_file(&path, 92.0, 480, &tracks).expect("write");
+        assert_eq!(std::fs::read(&path).expect("read"), bytes);
     }
 }
