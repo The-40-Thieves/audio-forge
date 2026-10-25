@@ -187,11 +187,12 @@ impl RealtimeTransientTonalSplit {
 
         for b in 0..3 {
             let mag = 0.5 * (bands_l[b].abs() + bands_r[b].abs());
-            self.fast_env[b] =
-                flush_denormal_f64(fast_alphas[b] * self.fast_env[b] + (1.0 - fast_alphas[b]) * mag);
-            self.slow_env[b] =
-                flush_denormal_f64(slow_alphas[b] * self.slow_env[b] + (1.0 - slow_alphas[b]) * mag)
-                    + 1e-7;
+            self.fast_env[b] = flush_denormal_f64(
+                fast_alphas[b] * self.fast_env[b] + (1.0 - fast_alphas[b]) * mag,
+            );
+            self.slow_env[b] = flush_denormal_f64(
+                slow_alphas[b] * self.slow_env[b] + (1.0 - slow_alphas[b]) * mag,
+            ) + 1e-7;
 
             let ratio = (self.fast_env[b] / self.slow_env[b] - 1.05).max(0.0);
             let trans_mask = (1.0 - (-ratio * 2.2 * sharp).exp()).clamp(0.0, 1.0);
@@ -365,12 +366,10 @@ impl RealtimeFdnReverb {
         let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
         let pre_len = ((sr * 0.045).round() as usize).max(256);
         let er_taps_samples: [usize; 8] = std::array::from_fn(|i| {
-            ((Self::MOORER_ER_MS[i] * 0.001 * sr).round() as usize)
-                .clamp(1, pre_len - 2)
+            ((Self::MOORER_ER_MS[i] * 0.001 * sr).round() as usize).clamp(1, pre_len - 2)
         });
-        let diff_lens: [usize; 4] = std::array::from_fn(|i| {
-            ((Self::DIFFUSER_MS[i] * 0.001 * sr).round() as usize).max(16)
-        });
+        let diff_lens: [usize; 4] =
+            std::array::from_fn(|i| ((Self::DIFFUSER_MS[i] * 0.001 * sr).round() as usize).max(16));
         let diff_bufs: [Vec<f64>; 4] = std::array::from_fn(|i| vec![0.0; diff_lens[i]]);
         let delay_lens: [usize; 8] = std::array::from_fn(|i| {
             ((Self::BASE_DELAYS_MS[i] * 0.001 * sr).round() as usize + 64).max(128)
@@ -496,7 +495,8 @@ impl RealtimeFdnReverb {
         self.shimmer_phase = (self.shimmer_phase - 1.0).rem_euclid(shim_f);
         let phase_b = (self.shimmer_phase + shim_f * 0.5).rem_euclid(shim_f);
         let w_a = 0.5 * (1.0 - (2.0 * PI * self.shimmer_phase / shim_f).cos());
-        let idx_a = (self.shimmer_write + shim_len - (self.shimmer_phase as usize).min(shim_len - 1))
+        let idx_a = (self.shimmer_write + shim_len
+            - (self.shimmer_phase as usize).min(shim_len - 1))
             % shim_len;
         let idx_b =
             (self.shimmer_write + shim_len - (phase_b as usize).min(shim_len - 1)) % shim_len;
@@ -512,7 +512,9 @@ impl RealtimeFdnReverb {
             let mod_offset =
                 ((2.0 * PI * (self.lfo_phase + (i as f64) * 0.125)).sin() * 6.0).round() as isize;
             let base_delay = (len - 16) as isize + mod_offset;
-            let read_idx = (self.write_pos[i] + len - (base_delay.clamp(1, (len - 2) as isize) as usize)) % len;
+            let read_idx = (self.write_pos[i] + len
+                - (base_delay.clamp(1, (len - 2) as isize) as usize))
+                % len;
             *out_val = flush_denormal_f64(self.delay_lines[i][read_idx]);
         }
 
@@ -790,8 +792,8 @@ impl GenreTonalTarget {
         // Bands: [31.5, 45, 63, 90, 125, 180, 250, 355, 500, 710, 1k, 1.4k, 2k, 2.8k, 4k, 5.6k, 8k, 12.5k]
         match self {
             Self::ModernPop => [
-                1.5, 3.2, 4.0, 3.0, 1.8, 0.6, -0.4, -0.8, -0.4, 0.0, 0.0, 0.4, 0.8, 0.5, -0.2,
-                0.6, 1.8, 2.5,
+                1.5, 3.2, 4.0, 3.0, 1.8, 0.6, -0.4, -0.8, -0.4, 0.0, 0.0, 0.4, 0.8, 0.5, -0.2, 0.6,
+                1.8, 2.5,
             ],
             Self::HipHopTrap => [
                 4.5, 6.2, 6.5, 4.2, 1.5, -0.5, -1.5, -1.2, -0.5, 0.0, 0.0, 0.2, 0.6, 0.2, -0.5,
@@ -802,8 +804,8 @@ impl GenreTonalTarget {
                 -0.4, 1.0, 1.8,
             ],
             Self::EdmClub => [
-                3.8, 5.8, 6.0, 4.0, 1.8, 0.0, -1.2, -1.0, -0.4, 0.0, 0.0, 0.5, 1.2, 1.0, 0.4,
-                1.2, 2.5, 3.2,
+                3.8, 5.8, 6.0, 4.0, 1.8, 0.0, -1.2, -1.0, -0.4, 0.0, 0.0, 0.5, 1.2, 1.0, 0.4, 1.2,
+                2.5, 3.2,
             ],
             Self::RockMetal => [
                 0.0, 1.8, 3.0, 3.2, 2.4, 1.2, 0.0, -0.6, 0.0, 0.5, 0.0, 1.0, 1.8, 1.5, 0.8, 0.2,
@@ -962,7 +964,8 @@ impl JilesAthertonHysteresis {
         // Pinning direction gate: irreversible motion only when field pushes toward anhysteretic curve
         let irr_active = if diff * delta > 0.0 { diff } else { 0.0 };
         let denom = (1.0 - c_rev * ALPHA * dm_an_dh_e).max(0.25);
-        let dm_dh = ((1.0 - c_rev) * irr_active / (k_pin * delta - ALPHA * irr_active).abs().max(0.15)
+        let dm_dh = ((1.0 - c_rev) * irr_active
+            / (k_pin * delta - ALPHA * irr_active).abs().max(0.15)
             + c_rev * dm_an_dh_e)
             / denom;
         dm_dh.clamp(0.0, 2.5) * dh
@@ -1001,14 +1004,7 @@ impl JilesAthertonHysteresis {
             k_pin,
             c_rev,
         );
-        let k4 = Self::dm_dt(
-            (m0 + k3).clamp(-1.0, 1.0),
-            h_in,
-            dh,
-            a_shape,
-            k_pin,
-            c_rev,
-        );
+        let k4 = Self::dm_dt((m0 + k3).clamp(-1.0, 1.0), h_in, dh, a_shape, k_pin, c_rev);
 
         let m_next = m0 + (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0;
         // Soft relaxation toward anhysteretic equilibrium prevents DC drift while preserving hysteresis loop
@@ -1043,7 +1039,13 @@ impl AllpassDisperser {
     }
 
     #[inline]
-    pub fn process_sample(&mut self, x_raw: f64, sample_rate: f64, pinch_hz: f64, amount: f64) -> f64 {
+    pub fn process_sample(
+        &mut self,
+        x_raw: f64,
+        sample_rate: f64,
+        pinch_hz: f64,
+        amount: f64,
+    ) -> f64 {
         let amt = sanitize_param_f64(amount, 0.0, 0.0, 1.0);
         let x0 = sanitize_sample_f64(x_raw);
         if amt <= 1.0e-4 {
@@ -1123,7 +1125,8 @@ impl AutoGainCompensator {
         } else {
             1.0
         };
-        self.gain_lin = flush_denormal_f64(0.999 * self.gain_lin + 0.001 * target_gain).clamp(0.25, 4.0);
+        self.gain_lin =
+            flush_denormal_f64(0.999 * self.gain_lin + 0.001 * target_gain).clamp(0.25, 4.0);
         (
             flush_denormal_f64(ol * self.gain_lin) as f32,
             flush_denormal_f64(or_ * self.gain_lin) as f32,

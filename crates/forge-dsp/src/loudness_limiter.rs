@@ -3,7 +3,7 @@
 
 use std::f64::consts::PI;
 
-use forge_core::{AuditReport, AudioBuffer, ForgeError, Result};
+use forge_core::{AudioBuffer, AuditReport, ForgeError, Result};
 use rustfft::{num_complex::Complex, FftPlanner};
 
 /// Sanitizes an arbitrary `f64` audio sample: flushes `NaN`, `±Inf`, and subnormals (`|x| < 1e-30`)
@@ -40,7 +40,11 @@ pub fn flush_denormal_f64(x: f64) -> f64 {
 #[inline]
 pub fn sanitize_param_f64(val: f64, default: f64, min: f64, max: f64) -> f64 {
     let lo = if min.is_finite() { min } else { default };
-    let hi = if max.is_finite() && max >= lo { max } else { lo };
+    let hi = if max.is_finite() && max >= lo {
+        max
+    } else {
+        lo
+    };
     if !val.is_finite() {
         default.clamp(lo, hi)
     } else {
@@ -549,10 +553,7 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
         let mean_abs = gated_abs.iter().sum::<f64>() / (gated_abs.len() as f64);
         let rel_gate_lufs = -0.691 + 10.0 * mean_abs.log10() - 10.0;
         let rel_gate_e = 10.0_f64.powf((rel_gate_lufs + 0.691) / 10.0);
-        let gated_rel: Vec<f64> = gated_abs
-            .into_iter()
-            .filter(|&e| e > rel_gate_e)
-            .collect();
+        let gated_rel: Vec<f64> = gated_abs.into_iter().filter(|&e| e > rel_gate_e).collect();
         if gated_rel.is_empty() {
             -70.0
         } else {
@@ -742,8 +743,9 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
     let sub_smear_score = ((0.85 - sub_160hz_correlation) * 30.0).clamp(0.0, 15.0);
     let ai_fizz_index = (whistle_score + harsh_score + sub_smear_score).clamp(0.0, 100.0);
 
-    let distrokid_ready =
-        (-16.5..=-7.5).contains(&integrated_lufs) && true_peak_dbtp <= -0.95 && clipped_samples == 0;
+    let distrokid_ready = (-16.5..=-7.5).contains(&integrated_lufs)
+        && true_peak_dbtp <= -0.95
+        && clipped_samples == 0;
 
     let mut recommendations = Vec::new();
     if true_peak_dbtp > -1.0 {
@@ -843,9 +845,7 @@ pub fn normalize_and_limit(
         for i in 0..frames {
             let mut pk = ch[i].abs();
             if i >= 1 && i + 2 < frames {
-                let interp = (-0.0625 * ch[i - 1]
-                    + 0.5625 * ch[i]
-                    + 0.5625 * ch[i + 1]
+                let interp = (-0.0625 * ch[i - 1] + 0.5625 * ch[i] + 0.5625 * ch[i + 1]
                     - 0.0625 * ch[i + 2])
                     .abs();
                 if interp > pk {

@@ -77,7 +77,11 @@ fn main() {
                         message: format!("Parse error: {e}"),
                     }),
                 };
-                let _ = writeln!(stdout, "{}", serde_json::to_string(&resp).unwrap_or_default());
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::to_string(&resp).unwrap_or_default()
+                );
                 let _ = stdout.flush();
                 continue;
             }
@@ -125,7 +129,10 @@ fn handle_request(id: Value, method: &str, params: &Value) -> JsonRpcResponse {
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let args = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
 
             match dispatch_tool(tool_name, &args) {
                 Ok(val) => JsonRpcResponse {
@@ -620,10 +627,7 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<Value, ForgeError> {
                 &chords_midi_path,
                 bpm,
                 480,
-                &[
-                    ("Voiced_Chords", &chord_notes),
-                    ("Sub_Bass", &bass_notes),
-                ],
+                &[("Voiced_Chords", &chord_notes), ("Sub_Bass", &bass_notes)],
             )?;
 
             let full_mix = AudioBuffer::load(&input)?;
@@ -681,6 +685,8 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<Value, ForgeError> {
                 "ai_fizz_index": master_report.ai_fizz_index
             }))
         }
-        _ => Err(ForgeError::InvalidParameter(format!("Unknown tool: {name}"))),
+        _ => Err(ForgeError::InvalidParameter(format!(
+            "Unknown tool: {name}"
+        ))),
     }
 }

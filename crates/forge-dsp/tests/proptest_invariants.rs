@@ -19,15 +19,15 @@ use std::time::Instant;
 
 use forge_core::AudioBuffer;
 use forge_dsp::{
-    apply_spectral_defizz, apply_spectral_unmask, audit_audio, align_phase_gcc_phat,
-    align_vocal_double_dtw, compute_reference_match_eq, normalize_and_limit,
-    publish_shared_spectrum, read_shared_spectrum, remove_dc_and_declip,
-    run_full_restoration_chain, AdaaSin, AdaaTanh, AllpassDisperser, AnalogHardwareModel,
-    AutoGainCompensator, Biquad, CytomicSvf, DeFizzConfig, JilesAthertonHysteresis,
-    NamWaveNetProfile, RealtimeDensityAndClipper, RealtimeDrumTrigger, RealtimeFdnReverb,
-    RealtimeMasterLimiter, RealtimeMasteringEq18, RealtimeNeuralPreamp, RealtimeOpenSoothe,
-    RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus,
-    RealtimeTransientTonalSplit, RealtimeVocalSurgical, RestorationConfig, UnmaskConfig,
+    align_phase_gcc_phat, align_vocal_double_dtw, apply_spectral_defizz, apply_spectral_unmask,
+    audit_audio, compute_reference_match_eq, normalize_and_limit, publish_shared_spectrum,
+    read_shared_spectrum, remove_dc_and_declip, run_full_restoration_chain, AdaaSin, AdaaTanh,
+    AllpassDisperser, AnalogHardwareModel, AutoGainCompensator, Biquad, CytomicSvf, DeFizzConfig,
+    JilesAthertonHysteresis, NamWaveNetProfile, RealtimeDensityAndClipper, RealtimeDrumTrigger,
+    RealtimeFdnReverb, RealtimeMasterLimiter, RealtimeMasteringEq18, RealtimeNeuralPreamp,
+    RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSpectrumAnalyzer32,
+    RealtimeSubAndTapeBus, RealtimeTransientTonalSplit, RealtimeVocalSurgical, RestorationConfig,
+    UnmaskConfig,
 };
 use proptest::prelude::*;
 
@@ -562,7 +562,7 @@ fn test_adversarial_nan_inf_denormal_poisoning_and_self_healing_across_all_12_pr
         f32::INFINITY,
         f32::NEG_INFINITY,
         -0.0_f32,
-        f32::from_bits(1),         // positive subnormal ~1.4e-45
+        f32::from_bits(1),           // positive subnormal ~1.4e-45
         f32::from_bits(0x8000_0001), // negative subnormal
         f32::MAX,
         f32::MIN,
@@ -601,24 +601,15 @@ fn test_adversarial_nan_inf_denormal_poisoning_and_self_healing_across_all_12_pr
         );
         assert!(is_clean_audio_f32(o3_l) && is_clean_audio_f32(o3_r));
 
-        let (o4_l, o4_r) =
-            neural_preamp.process_stereo_sample(p, q, f64::NAN, f64::INFINITY);
+        let (o4_l, o4_r) = neural_preamp.process_stereo_sample(p, q, f64::NAN, f64::INFINITY);
         assert!(is_clean_audio_f32(o4_l) && is_clean_audio_f32(o4_r));
 
         let (o5_l, o5_r) =
             soothe.process_stereo_sample(p, q, f64::NAN, f64::INFINITY, usize::MAX, false);
         assert!(is_clean_audio_f32(o5_l) && is_clean_audio_f32(o5_r));
 
-        let (o6_l, o6_r) = spacer.process_sample(
-            p,
-            q,
-            p,
-            q,
-            f64::NAN,
-            f64::INFINITY,
-            f64::NAN,
-            f64::INFINITY,
-        );
+        let (o6_l, o6_r) =
+            spacer.process_sample(p, q, p, q, f64::NAN, f64::INFINITY, f64::NAN, f64::INFINITY);
         assert!(is_clean_audio_f32(o6_l) && is_clean_audio_f32(o6_r));
 
         let (o7_l, o7_r) = vocal_surg.process_stereo_sample(
@@ -631,12 +622,10 @@ fn test_adversarial_nan_inf_denormal_poisoning_and_self_healing_across_all_12_pr
         );
         assert!(is_clean_audio_f32(o7_l) && is_clean_audio_f32(o7_r));
 
-        let (o8_l, o8_r) =
-            sub_tape.process_stereo_sample(p, q, f64::NAN, f64::INFINITY, f64::NAN);
+        let (o8_l, o8_r) = sub_tape.process_stereo_sample(p, q, f64::NAN, f64::INFINITY, f64::NAN);
         assert!(is_clean_audio_f32(o8_l) && is_clean_audio_f32(o8_r));
 
-        let (o9_l, o9_r) =
-            limiter.process_stereo_sample(p, q, f64::NAN, f64::INFINITY, f64::NAN);
+        let (o9_l, o9_r) = limiter.process_stereo_sample(p, q, f64::NAN, f64::INFINITY, f64::NAN);
         assert!(is_clean_audio_f32(o9_l) && is_clean_audio_f32(o9_r));
 
         let (o10_l, o10_r) = eq18.process_stereo_sample(p, q);
@@ -663,8 +652,7 @@ fn test_adversarial_nan_inf_denormal_poisoning_and_self_healing_across_all_12_pr
         let t = (i as f64) / sr;
         let s = (0.4 * (2.0 * PI * 440.0 * t).sin() + 0.2 * (2.0 * PI * 1760.0 * t).cos()) as f32;
 
-        let (o1_l, o1_r) =
-            split_eq.process_stereo_sample(s, s, [1.5, 0.0, 1.5], [0.0; 3], 1.5, 0);
+        let (o1_l, o1_r) = split_eq.process_stereo_sample(s, s, [1.5, 0.0, 1.5], [0.0; 3], 1.5, 0);
         let (o2_l, o2_r) = density_clip.process_stereo_sample(s, s, 0.35, 2.0, -0.5);
         let (o3_l, o3_r) = spaceverb.process_stereo_sample(s, s, 1.8, 0.35, 0.15, 0.25, 0.35);
         let (o4_l, o4_r) = neural_preamp.process_stereo_sample(s, s, 3.0, 0.0);
@@ -860,4 +848,3 @@ fn test_deterministic_dsp_telemetry_and_numerical_precision_report() {
         );
     }
 }
-

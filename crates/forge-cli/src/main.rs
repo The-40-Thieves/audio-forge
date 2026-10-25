@@ -22,7 +22,9 @@ use forge_vocal::{
     generate_vocal_harmony_stack, shift_vocal_pitch_formant_preserved, track_vocal_pitch,
     VocalScale,
 };
-use forge_worker::{generate_music_lyria, index_drum_sample_library, separate_stems, WorkerBackend};
+use forge_worker::{
+    generate_music_lyria, index_drum_sample_library, separate_stems, WorkerBackend,
+};
 
 #[derive(Parser)]
 #[command(
@@ -237,14 +239,23 @@ async fn main() -> anyhow::Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!("=== ForgeAudio Studio Telemetry Audit: {} ===", input.display());
+                println!(
+                    "=== ForgeAudio Studio Telemetry Audit: {} ===",
+                    input.display()
+                );
                 println!(
                     "Format        : {} Hz | {} ch | {:.2} s",
                     report.sample_rate, report.channels, report.duration_secs
                 );
                 println!("Integrated    : {:.2} LUFS", report.integrated_lufs);
-                println!("Short-Term Max: {:.2} LUFS | Momentary Max: {:.2} LUFS", report.short_term_max_lufs, report.momentary_max_lufs);
-                println!("Loudness Range: {:.2} LU   | Crest Factor : {:.2} dB", report.loudness_range_lu, report.crest_factor_db);
+                println!(
+                    "Short-Term Max: {:.2} LUFS | Momentary Max: {:.2} LUFS",
+                    report.short_term_max_lufs, report.momentary_max_lufs
+                );
+                println!(
+                    "Loudness Range: {:.2} LU   | Crest Factor : {:.2} dB",
+                    report.loudness_range_lu, report.crest_factor_db
+                );
                 println!(
                     "True Peak     : {:.2} dBTP @ {:.2}s (Sample Peak: {:.2} dBFS)",
                     report.true_peak_dbtp, report.true_peak_timestamp_secs, report.sample_peak_dbfs
@@ -354,18 +365,25 @@ async fn main() -> anyhow::Result<()> {
                 .iter()
                 .map(|f| (f.time_secs, f.correction_semitones))
                 .collect();
-            let mut tuned = shift_vocal_pitch_formant_preserved(&surgically_clean, &corr_curve, 0.0)?;
+            let mut tuned =
+                shift_vocal_pitch_formant_preserved(&surgically_clean, &corr_curve, 0.0)?;
 
             if let Some(guide_path) = align_to {
                 let guide_buf = AudioBuffer::load(&guide_path)?;
                 let (warped, markers) = align_vocal_double_dtw(&guide_buf, &tuned, 120.0)?;
                 tuned = warped;
-                println!("FastDTW aligned vocal to guide ({} REAPER stretch markers generated)", markers.len());
+                println!(
+                    "FastDTW aligned vocal to guide ({} REAPER stretch markers generated)",
+                    markers.len()
+                );
             }
 
             let lead_out = output_dir.join("Vocal_Lead_Tuned_Clean.wav");
             tuned.save_wav(&lead_out, 24)?;
-            println!("Tuned & cleaned lead vocal written to {}", lead_out.display());
+            println!(
+                "Tuned & cleaned lead vocal written to {}",
+                lead_out.display()
+            );
 
             if harmonize {
                 let (h_up, h_down, h_dbl) = generate_vocal_harmony_stack(&tuned, &parsed_scale)?;
@@ -405,7 +423,8 @@ async fn main() -> anyhow::Result<()> {
                 _ => GrooveStyle::NeoSoulDilla,
             };
 
-            let raw_chords: Vec<String> = chords.split_whitespace().map(ToString::to_string).collect();
+            let raw_chords: Vec<String> =
+                chords.split_whitespace().map(ToString::to_string).collect();
             let reharm = reharmonize_progression(&raw_chords, v_style);
             let (chord_notes, bass_notes) = solve_voice_leading(&reharm, v_style, g_style, 480, 4)?;
 
@@ -422,7 +441,8 @@ async fn main() -> anyhow::Result<()> {
             );
 
             if let Some(abc_path) = output_abc {
-                let abc_str = export_abc_score("ForgeAudio Progression", "C", bpm.round() as u32, &reharm);
+                let abc_str =
+                    export_abc_score("ForgeAudio Progression", "C", bpm.round() as u32, &reharm);
                 std::fs::write(&abc_path, abc_str)?;
                 println!("ABC lead sheet written to {}", abc_path.display());
             }
@@ -466,7 +486,10 @@ async fn main() -> anyhow::Result<()> {
                 };
                 write_distrokid_metadata(&tmp, &output, &meta)?;
                 let _ = std::fs::remove_file(&tmp);
-                println!("Mastered & tagged with ISRC {canonical} -> {}", output.display());
+                println!(
+                    "Mastered & tagged with ISRC {canonical} -> {}",
+                    output.display()
+                );
             } else {
                 mastered.save_wav(&output, 24)?;
             }
@@ -510,7 +533,8 @@ async fn main() -> anyhow::Result<()> {
             let drum_src = bundle.drums.as_ref().unwrap_or(&input);
             let drum_buf = AudioBuffer::load(drum_src)?;
             let duration_secs = drum_buf.duration_secs();
-            let (kick_notes, snare_notes, hat_notes) = extract_drum_midi_triggers(&drum_buf, bpm, 480);
+            let (kick_notes, snare_notes, hat_notes) =
+                extract_drum_midi_triggers(&drum_buf, bpm, 480);
 
             let drum_midi_path = midi_dir.join("01_Drum_Triggers.mid");
             write_midi_file(
@@ -525,7 +549,8 @@ async fn main() -> anyhow::Result<()> {
             )?;
 
             // 4. Solve Voice-Led Chords & Phase-Locked Sub-Bass MIDI
-            let raw_chords: Vec<String> = chords.split_whitespace().map(ToString::to_string).collect();
+            let raw_chords: Vec<String> =
+                chords.split_whitespace().map(ToString::to_string).collect();
             let reharm = reharmonize_progression(&raw_chords, VoicingStyle::NeoSoulRootless);
             let (chord_notes, bass_notes) = solve_voice_leading(
                 &reharm,
@@ -537,13 +562,23 @@ async fn main() -> anyhow::Result<()> {
 
             let chords_midi_path = midi_dir.join("02_Voiced_Chords.mid");
             let bass_midi_path = midi_dir.join("03_Sub_Bass_Reinforce.mid");
-            write_midi_file(&chords_midi_path, bpm, 480, &[("Voiced_Chords", &chord_notes)])?;
+            write_midi_file(
+                &chords_midi_path,
+                bpm,
+                480,
+                &[("Voiced_Chords", &chord_notes)],
+            )?;
             write_midi_file(&bass_midi_path, bpm, 480, &[("Sub_Bass", &bass_notes)])?;
 
             let abc_path = output_dir.join("Lead_Sheet.abc");
             std::fs::write(
                 &abc_path,
-                export_abc_score("ForgeAudio Studio Session", &scale, bpm.round() as u32, &reharm),
+                export_abc_score(
+                    "ForgeAudio Studio Session",
+                    &scale,
+                    bpm.round() as u32,
+                    &reharm,
+                ),
             )?;
 
             // 5. Render DistroKid-Ready Master (-14.0 LUFS, -1.0 dBTP)

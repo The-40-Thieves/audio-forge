@@ -47,12 +47,16 @@ def prove_clamp_hazards_and_fixes() -> dict[str, str]:
     sr_f = z3.Real("sr_f")
     s_fix.add(sr_f > 0.0)
     bin_hz_f = sr_f / 2048.0
-    b_2k_fixed = z3_clamp(z3.ToInt(2000.0 / bin_hz_f + 0.5), z3.IntVal(2), z3.IntVal(1019))
+    b_2k_fixed = z3_clamp(
+        z3.ToInt(2000.0 / bin_hz_f + 0.5), z3.IntVal(2), z3.IntVal(1019)
+    )
     # Negate invariant: can (b_2k_fixed + 1) > 1020 ever hold?
     s_fix.add(b_2k_fixed + 1 > 1020)
     chk = s_fix.check()
     assert chk == z3.unsat, f"Expected UNSAT for fixed b_2k/b_6k clamp, got {chk}"
-    results["hardened_audit_b6k_clamp_proof"] = "UNSAT (Mathematically Proven Panic-Free for all sr > 0)"
+    results["hardened_audit_b6k_clamp_proof"] = (
+        "UNSAT (Mathematically Proven Panic-Free for all sr > 0)"
+    )
 
     # 1C. Prove hardened spectral_unmask b_low/b_high clamp is panic-free for all low_cut_hz, high_cut_hz, sr > 0
     s_unmask = z3.Solver()
@@ -69,7 +73,9 @@ def prove_clamp_hazards_and_fixes() -> dict[str, str]:
     s_unmask.add(b_low_fixed + 1 > half_bins - 2)
     chk_u = s_unmask.check()
     assert chk_u == z3.unsat
-    results["hardened_unmask_clamp_proof"] = "UNSAT (Mathematically Proven Panic-Free for all frequencies & sample rates)"
+    results["hardened_unmask_clamp_proof"] = (
+        "UNSAT (Mathematically Proven Panic-Free for all frequencies & sample rates)"
+    )
 
     return results
 
@@ -208,7 +214,9 @@ def prove_repo_wide_vocal_theory_and_core_invariants() -> dict[str, str]:
     shaped_24 = raw_unit * 8388607.0 - 0.5 * err_prev_24
     q16 = z3_clamp(shaped_16 + tpdf, z3.RealVal(-32768.0), z3.RealVal(32767.0))
     q24 = z3_clamp(shaped_24 + tpdf, z3.RealVal(-8388608.0), z3.RealVal(8388607.0))
-    s_dither.add(z3.Or(q16 < -32768.0, q16 > 32767.0, q24 < -8388608.0, q24 > 8388607.0))
+    s_dither.add(
+        z3.Or(q16 < -32768.0, q16 > 32767.0, q24 < -8388608.0, q24 > 8388607.0)
+    )
     assert s_dither.check() == z3.unsat
     results["forge_core_noise_shaped_tpdf_dither_bounds_proof"] = (
         "UNSAT (Proven 1st-order error-feedback noise-shaped 16-bit & 24-bit TPDF dither strictly stays within i16/i24 limits)"
@@ -279,7 +287,9 @@ def prove_repo_wide_vocal_theory_and_core_invariants() -> dict[str, str]:
     u28_max = 0x0FFF_FFFF
     clamped_start = z3.If(start_tick > 0x0FFF_0000, 0x0FFF_0000, start_tick)
     eff_dur = z3.If(dur_tick < 1, 1, dur_tick)
-    clamped_end = z3.If(clamped_start + eff_dur > 0x0FFF_FFFE, 0x0FFF_FFFE, clamped_start + eff_dur)
+    clamped_end = z3.If(
+        clamped_start + eff_dur > 0x0FFF_FFFE, 0x0FFF_FFFE, clamped_start + eff_dur
+    )
     delta = clamped_end - clamped_start
 
     s_midi.add(

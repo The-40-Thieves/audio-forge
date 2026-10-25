@@ -20,7 +20,9 @@ import sys
 from pathlib import Path
 
 
-def run_separate(input_path: Path, output_dir: Path, dereverb: bool = True) -> dict[str, str | None]:
+def run_separate(
+    input_path: Path, output_dir: Path, dereverb: bool = True
+) -> dict[str, str | None]:
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
         from audio_separator.separator import Separator
@@ -35,15 +37,23 @@ def run_separate(input_path: Path, output_dir: Path, dereverb: bool = True) -> d
     sep.load_model(model_filename="model_mel_band_roformer_kim_vocals.ckpt")
     primary_files = sep.separate(str(input_path))
 
-    vocal_file = next((Path(output_dir) / f for f in primary_files if "Vocal" in f), None)
-    inst_file = next((Path(output_dir) / f for f in primary_files if "Instrumental" in f), None)
+    vocal_file = next(
+        (Path(output_dir) / f for f in primary_files if "Vocal" in f), None
+    )
+    inst_file = next(
+        (Path(output_dir) / f for f in primary_files if "Instrumental" in f), None
+    )
 
     # 2. Optional BS-RoFormer De-Reverb on isolated vocal stem
     if dereverb and vocal_file and vocal_file.exists():
         sep.load_model(model_filename="deverb_bs_roformer_8_384dim_10depth.ckpt")
         deverb_files = sep.separate(str(vocal_file))
         dry_vocal = next(
-            (Path(output_dir) / f for f in deverb_files if "No Reverb" in f or "dry" in f.lower()),
+            (
+                Path(output_dir) / f
+                for f in deverb_files
+                if "No Reverb" in f or "dry" in f.lower()
+            ),
             vocal_file,
         )
         vocal_file = dry_vocal
@@ -89,15 +99,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="ForgeAudio Ephemeral GPU Worker")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sep_p = sub.add_parser("separate", help="Run Mel-Band-RoFormer + BS-RoFormer De-Reverb")
+    sep_p = sub.add_parser(
+        "separate", help="Run Mel-Band-RoFormer + BS-RoFormer De-Reverb"
+    )
     sep_p.add_argument("--input", type=Path, required=True)
     sep_p.add_argument("--output-dir", type=Path, required=True)
     sep_p.add_argument("--no-dereverb", action="store_true")
 
-    yue_p = sub.add_parser("yue2-remote", help="Generate song + ABC score via YuE2-3B endpoint")
+    yue_p = sub.add_parser(
+        "yue2-remote", help="Generate song + ABC score via YuE2-3B endpoint"
+    )
     yue_p.add_argument("--style", required=True)
     yue_p.add_argument("--lyrics", required=True)
-    yue_p.add_argument("--planning-mode", default="full", choices=["full", "melody", "off"])
+    yue_p.add_argument(
+        "--planning-mode", default="full", choices=["full", "melody", "off"]
+    )
     yue_p.add_argument("--ode-steps", type=int, default=32, choices=[16, 32])
     yue_p.add_argument("--seed", type=int, default=42)
     yue_p.add_argument("--space", default="mrfakename/yue2-3b")
@@ -105,7 +121,9 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command == "separate":
-            res = run_separate(args.input, args.output_dir, dereverb=not args.no_dereverb)
+            res = run_separate(
+                args.input, args.output_dir, dereverb=not args.no_dereverb
+            )
             print(json.dumps(res))
         elif args.command == "yue2-remote":
             res = run_yue2_remote(
