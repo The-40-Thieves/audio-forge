@@ -2486,13 +2486,17 @@ pub fn reverb_decay_knob_to_rt60_secs(knob: f32) -> f64 {
 }
 
 /// Inverse of [`reverb_decay_knob_to_rt60_secs`]; RT60 values outside the range are clamped.
+///
+/// Zero, negative and NaN inputs map to the bottom of the knob and positive infinity to the
+/// top, so the logarithm never sees a value it cannot take.
 pub fn rt60_secs_to_reverb_decay_knob(rt60_secs: f64) -> f32 {
-    let ratio = REVERB_RT60_MAX_SECS / REVERB_RT60_MIN_SECS;
-    let pos = (rt60_secs / REVERB_RT60_MIN_SECS).ln() / ratio.ln();
-    let pos = if pos.is_nan() {
+    let pos = if rt60_secs.is_nan() || rt60_secs <= REVERB_RT60_MIN_SECS {
         0.0
+    } else if rt60_secs >= REVERB_RT60_MAX_SECS {
+        1.0
     } else {
-        pos.clamp(0.0, 1.0)
+        let ratio = REVERB_RT60_MAX_SECS / REVERB_RT60_MIN_SECS;
+        (rt60_secs / REVERB_RT60_MIN_SECS).ln() / ratio.ln()
     };
     let span = f64::from(REVERB_DECAY_KNOB_MAX - REVERB_DECAY_KNOB_MIN);
     (f64::from(REVERB_DECAY_KNOB_MIN) + pos * span) as f32
@@ -2508,7 +2512,7 @@ fn string_to_reverb_decay_knob(text: &str) -> Option<f32> {
     let trimmed = text.trim();
     let number = trimmed
         .strip_suffix("sec")
-        .or_else(|| trimmed.strip_suffix('s'))
+        .or_else(|| trimmed.strip_suffix("s"))
         .unwrap_or(trimmed)
         .trim();
     let secs: f64 = number.parse().ok()?;
@@ -2933,6 +2937,33 @@ mod tests {
         for id in ["model", "pdrive", "decay", "damp", "shimmer", "duck", "mix"] {
             assert!(ids.iter().any(|i| i == id), "parameter id {id} is missing");
         }
+    }
+
+    #[test]
+    fn reverb_decay_mapping_round_trips_and_clamps_bad_inputs() {
+        let bottom = REVERB_DECAY_KNOB_MIN;
+        let top = REVERB_DECAY_KNOB_MAX;
+        for bad in [0.0, -1.0, f64::NEG_INFINITY, f64::NAN, 0.1] {
+            let knob = rt60_secs_to_reverb_decay_knob(bad);
+            assert!(
+                knob.is_finite() && knob == bottom,
+                "{bad} s mapped to {knob}"
+            );
+        }
+        for big in [20.0, 1e9, f64::INFINITY] {
+            assert_eq!(rt60_secs_to_reverb_decay_knob(big), top, "{big} s");
+        }
+        assert!((reverb_decay_knob_to_rt60_secs(bottom) - REVERB_RT60_MIN_SECS).abs() < 1e-6);
+        assert!((reverb_decay_knob_to_rt60_secs(top) - REVERB_RT60_MAX_SECS).abs() < 1e-4);
+        for secs in [0.25, 1.0, 2.0, 5.0, 12.5, 19.0] {
+            let back = reverb_decay_knob_to_rt60_secs(rt60_secs_to_reverb_decay_knob(secs));
+            assert!(
+                (back / secs - 1.0).abs() < 1e-4,
+                "{secs} s round-tripped to {back} s"
+            );
+        }
+        assert_eq!(string_to_reverb_decay_knob("0 s"), Some(bottom));
+        assert_eq!(string_to_reverb_decay_knob("inf"), None);
     }
 
     /// Reads one Vocal Surgical control out of a [`VocalSurgicalControls`] snapshot.
