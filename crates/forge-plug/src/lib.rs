@@ -2763,8 +2763,19 @@ mod tests {
         assert!(!p10.params().param_map().is_empty());
     }
 
+    /// The shared spectrum bus is process-wide and tests run on parallel threads, so every test
+    /// that publishes to or scans the bus holds this lock to keep the others out of its slots.
+    static SHARED_BUS_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_shared_bus() -> std::sync::MutexGuard<'static, ()> {
+        SHARED_BUS_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn open_soothe_bus_slot_zero_is_off_and_a_removed_instance_clears_its_slot() {
+        let _bus = lock_shared_bus();
         let silent = [forge_dsp::SPECTRUM_FLOOR_DB; 32];
         let bands = [-20.0_f32; 32];
         let mut plug = ForgeOpenSoothePlug::default();
@@ -2807,6 +2818,7 @@ mod tests {
     /// away or being dropped must leave B's frame; B dropping clears it.
     #[test]
     fn open_soothe_instances_sharing_a_slot_never_silence_each_other() {
+        let _bus = lock_shared_bus();
         const PARAM: usize = 6;
         const SLOT: usize = 5;
         let silent = [forge_dsp::SPECTRUM_FLOOR_DB; 32];
