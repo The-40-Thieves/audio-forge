@@ -75,13 +75,18 @@ Out of scope:
 
 We track these openly because no fix is available from this repository yet:
 
-- **nih-plug CLAP state loading.** The upstream `nih-plug` CLAP wrapper trusts the length
-  prefix of incoming plugin state, so a corrupt or malicious state blob can abort the host
-  process. CI excludes the affected `clap-validator` test until our dependency is patched.
 - **RUSTSEC-2021-0145 / GHSA-g98v-hv3f-hcfr (`atty`, low severity).** This is pulled in
   through `nih_plug → nih_log`, and no patched version exists. It only affects Windows builds
   that use a custom global allocator returning under-aligned memory, which ForgeAudio does not
   ship.
+
+Fixed here, pending upstream:
+
+- **nih-plug CLAP state loading.** The upstream `nih-plug` CLAP wrapper trusted the length
+  prefix of incoming plugin state, so a corrupt or malicious state blob could abort the host
+  process. ForgeAudio builds against a patched copy in [`vendor/nih-plug`](vendor/nih-plug/PATCHES.md)
+  that bounds the length, and CI runs the full `clap-validator` suite. The copy goes away once
+  [robbert-vdh/nih-plug#280](https://github.com/robbert-vdh/nih-plug/pull/280) is released.
 
 ## Security practices in this repository
 

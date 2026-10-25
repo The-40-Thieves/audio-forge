@@ -7,8 +7,9 @@
 use forge_core::{AudioBuffer, ForgeError};
 use forge_dsp::{
     align_phase_gcc_phat, align_vocal_double_dtw, apply_18_band_eq, apply_spectral_defizz,
-    apply_spectral_unmask, audit_audio, clean_vocal_surgical, compute_reference_match_eq,
-    normalize_and_limit, run_full_restoration_chain, DeFizzConfig, RestorationConfig, UnmaskConfig,
+    apply_spectral_unmask, audit_audio, clean_vocal_surgical, compute_reference_match_eq, deliver,
+    normalize_and_limit, run_full_restoration_chain, DeFizzConfig, DeliveryOptions, DeliveryTarget,
+    GenreTonalTarget, RestorationConfig, ToneMatch, UnmaskConfig,
 };
 use forge_reaper::{
     install_jsfx_plugins, validate_isrc, write_distrokid_metadata, ReaperProjectBuilder,
@@ -277,13 +278,36 @@ fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "forge_deliver",
+            "description": "Deliver a mix to a distribution target in one call: audit, repair (DC, clipping, hum), de-fizz, optional reference/genre tone match, loudness-normalize and true-peak limit, then re-audit. Returns before/after BS.1770-4 audits and explicit pass/fail checks (loudness within 1 LU, true peak under ceiling, no clipping, sample rate >= 44.1 kHz). Writes a 24-bit WAV and a .delivery.json report next to it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "input": { "type": "string", "description": "Input mix or stem (WAV)" },
+                    "output": { "type": "string", "description": "Output master WAV path" },
+                    "target": { "type": "string", "enum": delivery_target_names(), "default": "spotify" },
+                    "target_lufs": { "type": "number", "description": "Required when target is 'custom'" },
+                    "ceiling_dbtp": { "type": "number", "description": "Required when target is 'custom'" },
+                    "repair": { "type": "boolean", "default": true },
+                    "defizz": { "type": "boolean", "default": true },
+                    "vocal": { "type": "boolean", "default": false, "description": "Vocal clean-up; use on vocal stems only" },
+                    "reference": { "type": "string", "description": "Reference track WAV for 18-band tone match" },
+                    "genre": { "type": "string", "description": "Genre tonal-balance target (pop, hiphop, neosoul, edm, rock, jazz); ignored when reference is set" }
+                },
+                "required": ["input", "output"]
+            }
+        }),
+        json!({
             "name": "forge_ingest_to_reaper",
-            "description": "Full autonomous pipeline: separate stems, clean & de-fizz audio, extract drum MIDI, build voice-led chords, master to -14 LUFS, install JSFX plugins, and generate a REAPER 7.82 .RPP project.",
+            "description": "Full autonomous pipeline: separate stems, clean & de-fizz audio, extract drum MIDI, build voice-led chords, deliver a verified master for the chosen target, install JSFX plugins, and generate a REAPER 7.82 .RPP project.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "input": { "type": "string" },
                     "output_dir": { "type": "string" },
+                    "target": { "type": "string", "enum": delivery_target_names(), "default": "spotify" },
+                    "target_lufs": { "type": "number", "description": "Required when target is 'custom'" },
+                    "ceiling_dbtp": { "type": "number", "description": "Required when target is 'custom'" },
                     "bpm": { "type": "number", "default": 120.0 },
                     "scale": { "type": "string", "default": "D minor" },
                     "chords": { "type": "string", "default": "Dm9 Bbmaj7 Gm9 A7b13" }
@@ -294,8 +318,72 @@ fn tool_definitions() -> Vec<Value> {
     ]
 }
 
+fn delivery_target_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = DeliveryTarget::NAMED.iter().map(|t| t.name()).collect();
+    names.push("custom");
+    names
+}
+
+/// Reads `target` (default `spotify`), or `target_lufs` + `ceiling_dbtp` for `custom`.
+fn delivery_target_from_args(args: &Value) -> Result<DeliveryTarget, ForgeError> {
+    let raw = args
+        .get("target")
+        .and_then(Value::as_str)
+        .unwrap_or("spotify");
+    if !raw.eq_ignore_ascii_case("custom") {
+        return DeliveryTarget::parse(raw);
+    }
+    let lufs = args.get("target_lufs").and_then(Value::as_f64);
+    let ceiling = args.get("ceiling_dbtp").and_then(Value::as_f64);
+    match (lufs, ceiling) {
+        (Some(lufs), Some(ceiling)) => DeliveryTarget::custom(lufs, ceiling),
+        _ => Err(ForgeError::InvalidParameter(
+            "target 'custom' requires 'target_lufs' and 'ceiling_dbtp'".into(),
+        )),
+    }
+}
+
 fn dispatch_tool(name: &str, args: &Value) -> Result<Value, ForgeError> {
     match name {
+        "forge_deliver" => {
+            let input = args
+                .get("input")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ForgeError::InvalidParameter("Missing 'input'".into()))?;
+            let output = PathBuf::from(
+                args.get("output")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ForgeError::InvalidParameter("Missing 'output'".into()))?,
+            );
+            let flag = |key: &str, default: bool| {
+                args.get(key).and_then(Value::as_bool).unwrap_or(default)
+            };
+            let mut options = DeliveryOptions::for_target(delivery_target_from_args(args)?);
+            options.repair = flag("repair", true);
+            options.defizz = flag("defizz", true);
+            options.vocal = flag("vocal", false);
+            if let Some(reference) = args.get("reference").and_then(Value::as_str) {
+                options.tone_match = Some(ToneMatch::Reference(AudioBuffer::load(Path::new(
+                    reference,
+                ))?));
+            } else if let Some(genre) = args.get("genre").and_then(Value::as_str) {
+                options.tone_match = Some(ToneMatch::Genre(GenreTonalTarget::parse(genre)));
+            }
+
+            let buf = AudioBuffer::load(Path::new(input))?;
+            let (master, report) = deliver(&buf, &options)?;
+            if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent)?;
+            }
+            master.save_wav(&output, 24)?;
+            let report_path = output.with_extension("delivery.json");
+            std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
+            Ok(json!({
+                "output": output,
+                "report_path": report_path,
+                "report": report
+            }))
+        }
         "forge_audit_audio" => {
             let path = args
                 .get("path")
@@ -568,6 +656,7 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<Value, ForgeError> {
                     .and_then(Value::as_str)
                     .ok_or_else(|| ForgeError::InvalidParameter("Missing 'output_dir'".into()))?,
             );
+            let target = delivery_target_from_args(args)?;
             let bpm = args.get("bpm").and_then(Value::as_f64).unwrap_or(120.0);
             let scale_str = args
                 .get("scale")
@@ -631,12 +720,11 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<Value, ForgeError> {
             )?;
 
             let full_mix = AudioBuffer::load(&input)?;
-            let restored = run_full_restoration_chain(&full_mix, &RestorationConfig::default())?;
-            let defizzed = apply_spectral_defizz(&restored, &DeFizzConfig::default())?;
-            let mastered = normalize_and_limit(&defizzed, -14.0, -1.0)?;
-            let master_path = output_dir.join("Master_DistroKid_24bit_48kHz.wav");
+            let (mastered, delivery) = deliver(&full_mix, &DeliveryOptions::for_target(target))?;
+            let master_path = output_dir.join(format!("Master_{}_24bit.wav", target.name()));
             mastered.save_wav(&master_path, 24)?;
-            let master_report = audit_audio(&mastered);
+            let delivery_path = master_path.with_extension("delivery.json");
+            std::fs::write(&delivery_path, serde_json::to_string_pretty(&delivery)?)?;
 
             let jsfx_dir = output_dir.join("Effects");
             let _ = install_jsfx_plugins(Some(&jsfx_dir))?;
@@ -680,9 +768,13 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<Value, ForgeError> {
                 "rpp_project": rpp_path,
                 "master_wav": master_path,
                 "midi_file": chords_midi_path,
-                "master_lufs": master_report.integrated_lufs,
-                "master_true_peak_dbtp": master_report.true_peak_dbtp,
-                "ai_fizz_index": master_report.ai_fizz_index
+                "delivery_report": delivery_path,
+                "target": delivery.target,
+                "ready": delivery.ready,
+                "checks": delivery.checks,
+                "master_lufs": delivery.after.integrated_lufs,
+                "master_true_peak_dbtp": delivery.after.true_peak_dbtp,
+                "ai_fizz_index": delivery.after.ai_fizz_index
             }))
         }
         _ => Err(ForgeError::InvalidParameter(format!(

@@ -1,5 +1,6 @@
 //! `forge-dsp` — Studio DSP, Restoration, Spectral Suppression, Unmasking, Alignment & Mastering.
 
+pub mod delivery;
 pub mod elite_dsp;
 pub mod loudness_limiter;
 pub mod phase_align;
@@ -8,6 +9,10 @@ pub mod restoration;
 pub mod spectral_defizz;
 pub mod spectral_unmask;
 
+pub use delivery::{
+    deliver, delivery_checks, DeliveryCheck, DeliveryOptions, DeliveryReport, DeliveryTarget,
+    ToneMatch,
+};
 pub use elite_dsp::{
     compute_genre_tonal_balance_eq, publish_shared_spectrum, read_shared_spectrum, AdaaSin,
     AdaaTanh, AllpassDisperser, AnalogHardwareModel, AutoGainCompensator, GenreTonalTarget,
