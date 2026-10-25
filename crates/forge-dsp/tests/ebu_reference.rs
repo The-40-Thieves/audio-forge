@@ -255,3 +255,57 @@ fn tech3342_case4_lra_15() {
     ]));
     assert_within("3342 #4 LRA", r.loudness_range_lu, 15.0, LRA_TOL_LU);
 }
+
+// ---------------------------------------------------------------------------------------------
+// True-peak timestamp and filter-tail behaviour
+// ---------------------------------------------------------------------------------------------
+
+/// Mono half-band sinc pulse (band-limited to Fs/4) peaking at 1.0 at fractional frame `t0`.
+fn half_band_pulse(frames: usize, t0: f64) -> AudioBuffer {
+    let ch: Vec<f64> = (0..frames)
+        .map(|i| {
+            let x = (i as f64 - t0) * 0.5;
+            if x.abs() < 1e-12 {
+                1.0
+            } else {
+                (PI * x).sin() / (PI * x)
+            }
+        })
+        .collect();
+    AudioBuffer::from_channels(vec![ch], SR).expect("valid mono buffer")
+}
+
+#[test]
+fn true_peak_timestamp_resolves_inter_sample_position() {
+    // The Annex 2 prototype is symmetric about upsampled tap 23.5, so its 4x output grid sits at
+    // input positions k + 0.125 + m/4. Place the pulse on that grid to check the phase offset.
+    let t0 = 1000.375;
+    let (_, tp, ts) = compute_true_peak(&half_band_pulse(2048, t0));
+    let frames = ts * f64::from(SR);
+    assert!(
+        tp.abs() < 0.2,
+        "inter-sample pulse peak read {tp:.3} dBTP, expected ~0"
+    );
+    assert!(
+        (frames - t0).abs() <= 0.0625,
+        "peak frame {frames:.3}, expected {t0} +/- 0.0625"
+    );
+}
+
+#[test]
+fn true_peak_catches_inter_sample_peak_at_buffer_end() {
+    // Peak sits between the 4th- and 3rd-to-last samples: the interpolator only reaches it
+    // through the zero-padded filter tail.
+    let frames = 2048;
+    let t0 = frames as f64 - 3.5;
+    let (sp, tp, ts) = compute_true_peak(&half_band_pulse(frames, t0));
+    assert!(
+        tp > sp + 0.3,
+        "tail peak {tp:.3} dBTP not above sample peak {sp:.3} dBFS"
+    );
+    assert!(
+        (ts * f64::from(SR) - t0).abs() <= 0.25,
+        "tail peak frame {:.3}, expected {t0}",
+        ts * f64::from(SR)
+    );
+}
