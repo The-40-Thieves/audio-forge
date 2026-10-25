@@ -311,6 +311,21 @@ mod tests {
     }
 
     #[test]
+    fn all_together_with_a_plugin_name_is_an_error() {
+        assert!(parse_install_args(&args(&["--all", "forge-spliteq"])).is_err());
+        assert!(parse_install_args(&args(&["forge-spliteq", "--all"])).is_err());
+    }
+
+    #[test]
+    fn two_plugin_names_are_an_error() {
+        let err = parse_install_args(&args(&["forge-spliteq", "forge-opensoothe"])).unwrap_err();
+        assert!(
+            err.0.contains("forge-spliteq") && err.0.contains("forge-opensoothe"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn usage_error_fails_main_with_usage_text() {
         let err: nih_plug_xtask::Result<()> = run_install(&args(&["--bogus"]));
         let text = err.unwrap_err().to_string();
