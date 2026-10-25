@@ -54,7 +54,7 @@ pub(super) fn apply_tuplets(elements: &mut [Element]) -> Result<()> {
 
 /// Places the timed elements on the tick grid and merges tied notes.
 pub(super) fn render(
-    elements: &[Element],
+    elements: Vec<Element>,
     ticks_per_beat: u32,
 ) -> Result<(Vec<String>, Vec<NoteEvent>)> {
     let whole_note_ticks = 4.0 * f64::from(ticks_per_beat.max(1));
@@ -67,9 +67,9 @@ pub(super) fn render(
     let mut pos = 0.0_f64;
     for element in elements {
         match element {
-            Element::Chord(symbol) => chords.push(symbol.clone()),
+            Element::Chord(symbol) => chords.push(symbol),
             Element::Tie { line } if last.is_empty() => {
-                return Err(line_error(*line, "tie '-' must follow a note"));
+                return Err(line_error(line, "tie '-' must follow a note"));
             }
             Element::Tie { .. } => tied.clone_from(&last),
             Element::Rest { len } => {
@@ -77,9 +77,15 @@ pub(super) fn render(
                 last.clear();
                 tied.clear();
             }
+            Element::Note { pitch, len } => {
+                let (start, end) = (to_tick(pos), to_tick(pos + len));
+                emit_notes(&mut melody, &tied, &[pitch], (start, end), &mut last);
+                tied.clear();
+                pos += len;
+            }
             Element::Notes { pitches, len } => {
                 let (start, end) = (to_tick(pos), to_tick(pos + len));
-                last = emit_notes(&mut melody, &tied, pitches, start, end);
+                emit_notes(&mut melody, &tied, &pitches, (start, end), &mut last);
                 tied.clear();
                 pos += len;
             }
@@ -90,14 +96,15 @@ pub(super) fn render(
 }
 
 /// Emits one event per pitch, extending a tied event of the same pitch instead of restarting it.
+/// `indices` is refilled with the events this note or chord now ends with.
 fn emit_notes(
     melody: &mut Vec<NoteEvent>,
     tied: &[usize],
     pitches: &[u8],
-    start: u32,
-    end: u32,
-) -> Vec<usize> {
-    let mut indices = Vec::with_capacity(pitches.len());
+    (start, end): (u32, u32),
+    indices: &mut Vec<usize>,
+) {
+    indices.clear();
     for &pitch in pitches {
         if let Some(&idx) = tied.iter().find(|&&idx| melody[idx].midi_note == pitch) {
             let held = end.saturating_sub(melody[idx].start_tick);
@@ -114,7 +121,6 @@ fn emit_notes(
         });
         indices.push(melody.len() - 1);
     }
-    indices
 }
 
 /// Leaves a short release gap before the next note, never below 20 ticks.

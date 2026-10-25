@@ -13,8 +13,6 @@ mod fields;
 mod tests;
 mod timing;
 
-use std::collections::HashMap;
-
 use forge_core::{ForgeError, Result};
 
 use crate::NoteEvent;
@@ -29,7 +27,13 @@ type Parse<T> = std::result::Result<T, String>;
 
 #[derive(Debug, Clone)]
 enum Element {
-    /// One note, or a bracketed chord, with its length in whole notes.
+    /// One note with its length in whole notes. Kept apart from `Notes` so a plain note does
+    /// not allocate.
+    Note {
+        pitch: u8,
+        len: f64,
+    },
+    /// A bracketed chord with its length in whole notes.
     Notes {
         pitches: Vec<u8>,
         len: f64,
@@ -55,11 +59,14 @@ enum Element {
 
 impl Element {
     fn is_timed(&self) -> bool {
-        matches!(self, Self::Notes { .. } | Self::Rest { .. })
+        matches!(
+            self,
+            Self::Note { .. } | Self::Notes { .. } | Self::Rest { .. }
+        )
     }
 
     fn scale(&mut self, factor: f64) {
-        if let Self::Notes { len, .. } | Self::Rest { len } = self {
+        if let Self::Note { len, .. } | Self::Notes { len, .. } | Self::Rest { len } = self {
             *len *= factor;
         }
     }
@@ -77,7 +84,7 @@ struct Context {
     /// Key-signature accidental per letter (`C = 0`).
     key: [i8; 7],
     /// Accidentals written earlier in the bar, keyed by the natural MIDI pitch they alter.
-    bar: HashMap<i32, i8>,
+    bar: Vec<(i32, i8)>,
     first_voice: Option<String>,
     voice_active: bool,
 }
@@ -90,7 +97,7 @@ impl Default for Context {
             meter: Some(1.0),
             compound: false,
             key: [0; 7],
-            bar: HashMap::new(),
+            bar: Vec::new(),
             first_voice: None,
             voice_active: true,
         }
@@ -155,7 +162,7 @@ pub fn parse_abc_score(abc: &str, ticks_per_beat: u32) -> Result<(Vec<String>, V
     let mut elements = tokenize(abc)?;
     apply_broken_rhythm(&mut elements)?;
     apply_tuplets(&mut elements)?;
-    render(&elements, ticks_per_beat)
+    render(elements, ticks_per_beat)
 }
 
 fn line_error(line: usize, message: &str) -> ForgeError {

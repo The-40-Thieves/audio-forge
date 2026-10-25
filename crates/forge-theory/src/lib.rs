@@ -4,6 +4,7 @@
 mod abc;
 mod chord;
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use forge_core::{AudioBuffer, ForgeError, Result};
@@ -125,12 +126,16 @@ pub fn parse_chord(symbol: &str) -> Result<ParsedChord> {
 }
 
 /// Splits `quality/bass` and validates the bass note. The slash in `6/9` belongs to the quality.
-fn split_slash_bass(rest: &str, symbol: &str) -> Result<(String, Option<u8>)> {
+///
+/// The quality borrows from `rest` except for `6/9`, so the common case does not allocate.
+fn split_slash_bass<'a>(rest: &'a str, symbol: &str) -> Result<(Cow<'a, str>, Option<u8>)> {
     let Some((quality, bass)) = rest.split_once('/') else {
-        return Ok((rest.trim().to_string(), None));
+        return Ok((Cow::Borrowed(rest.trim()), None));
     };
     if quality.ends_with('6') && bass.starts_with('9') {
-        return split_slash_bass(&format!("{quality}{bass}"), symbol);
+        let joined = format!("{quality}{bass}");
+        let (quality, bass_pc) = split_slash_bass(&joined, symbol)?;
+        return Ok((Cow::Owned(quality.into_owned()), bass_pc));
     }
     let invalid = || {
         ForgeError::TheoryError(format!(
@@ -144,7 +149,7 @@ fn split_slash_bass(rest: &str, symbol: &str) -> Result<(String, Option<u8>)> {
         return Err(invalid());
     }
     match parse_pitch_class(bass) {
-        Ok((bass_pc, "")) => Ok((quality.trim().to_string(), Some(bass_pc))),
+        Ok((bass_pc, "")) => Ok((Cow::Borrowed(quality.trim()), Some(bass_pc))),
         _ => Err(invalid()),
     }
 }

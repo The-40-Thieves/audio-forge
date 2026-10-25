@@ -84,10 +84,7 @@ fn parse_note_or_rest(ctx: &mut Context, lx: &mut Lexer, out: &mut Vec<Element>)
         Some(b'^' | b'_' | b'=' | b'A'..=b'G' | b'a'..=b'g') => {
             let pitch = parse_pitch(ctx, lx)?;
             let len = parse_length(lx)? * ctx.unit;
-            out.push(Element::Notes {
-                pitches: vec![pitch],
-                len,
-            });
+            out.push(Element::Note { pitch, len });
         }
         Some(b'z' | b'x') => {
             lx.bump();
@@ -256,12 +253,19 @@ fn parse_pitch(ctx: &mut Context, lx: &mut Lexer) -> Parse<u8> {
         natural = natural.saturating_add(if mark == b'\'' { 12 } else { -12 });
         lx.bump();
     }
-    let shift = match accidental {
-        Some(shift) => {
-            ctx.bar.insert(natural, shift);
+    // A bar holds only a handful of accidentals, so a linear scan beats hashing every note.
+    let written = ctx.bar.iter_mut().find(|(pitch, _)| *pitch == natural);
+    let shift = match (accidental, written) {
+        (Some(shift), Some(entry)) => {
+            entry.1 = shift;
             shift
         }
-        None => ctx.bar.get(&natural).copied().unwrap_or(ctx.key[index]),
+        (Some(shift), None) => {
+            ctx.bar.push((natural, shift));
+            shift
+        }
+        (None, Some(&mut (_, shift))) => shift,
+        (None, None) => ctx.key[index],
     };
     u8::try_from(natural.saturating_add(i32::from(shift)))
         .ok()
