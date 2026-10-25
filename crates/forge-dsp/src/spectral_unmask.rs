@@ -7,7 +7,7 @@
 use std::f64::consts::PI;
 
 use forge_core::{AudioBuffer, ForgeError, Result};
-use rustfft::{num_complex::Complex, FftPlanner};
+use rustfft::{FftPlanner, num_complex::Complex};
 use serde::{Deserialize, Serialize};
 
 /// Configuration for OpenSpacer Sidechain Spectral Unmasking.

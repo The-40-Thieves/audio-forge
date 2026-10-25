@@ -14,18 +14,18 @@
 //! 6. **Forge Drum Trigger & Theory MIDI** (Real-Time Audio-to-MIDI Drum Replacer `C1/D1/F#1` + Neo-Soul Chord Voicer)
 
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use forge_dsp::{
-    publish_shared_spectrum, read_shared_spectrum, AnalogHardwareModel, AutoGainCompensator,
-    GenreTonalTarget, RealtimeDensityAndClipper, RealtimeDrumTrigger, RealtimeFdnReverb,
-    RealtimeMasterLimiter, RealtimeMasteringEq18, RealtimeNeuralPreamp, RealtimeOpenSoothe,
-    RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus,
-    RealtimeTransientTonalSplit, RealtimeVocalSurgical,
+    AnalogHardwareModel, AutoGainCompensator, GenreTonalTarget, RealtimeDensityAndClipper,
+    RealtimeDrumTrigger, RealtimeFdnReverb, RealtimeMasterLimiter, RealtimeMasteringEq18,
+    RealtimeNeuralPreamp, RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner,
+    RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus, RealtimeTransientTonalSplit,
+    RealtimeVocalSurgical, publish_shared_spectrum, read_shared_spectrum,
 };
 use nih_plug::prelude::*;
-use nih_plug_egui::{create_egui_editor, egui, widgets, EguiState};
+use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
 
 /// Lock-free 32-band telemetry, dynamic Gain-Reduction / Bode curve, and A/B snapshot indicator
 /// shared between the real-time audio thread and the 60 FPS `nih_plug_egui` OpenGL studio GUI.

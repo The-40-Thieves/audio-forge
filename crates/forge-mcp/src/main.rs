@@ -6,26 +6,26 @@
 
 use forge_core::{AudioBuffer, ForgeError};
 use forge_dsp::{
-    align_phase_gcc_phat, align_vocal_double_dtw, apply_18_band_eq, apply_spectral_defizz,
-    apply_spectral_unmask, audit_audio, clean_vocal_surgical, compute_reference_match_eq, deliver,
-    normalize_and_limit, run_full_restoration_chain, DeFizzConfig, DeliveryOptions, DeliveryTarget,
-    GenreTonalTarget, RestorationConfig, ToneMatch, UnmaskConfig,
+    DeFizzConfig, DeliveryOptions, DeliveryTarget, GenreTonalTarget, RestorationConfig, ToneMatch,
+    UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw, apply_18_band_eq,
+    apply_spectral_defizz, apply_spectral_unmask, audit_audio, clean_vocal_surgical,
+    compute_reference_match_eq, deliver, normalize_and_limit, run_full_restoration_chain,
 };
 use forge_reaper::{
-    install_jsfx_plugins, validate_isrc, write_distrokid_metadata, ReaperProjectBuilder,
-    ReaperTrackSpec, ReleaseMetadata,
+    ReaperProjectBuilder, ReaperTrackSpec, ReleaseMetadata, install_jsfx_plugins, validate_isrc,
+    write_distrokid_metadata,
 };
 use forge_theory::{
-    export_abc_score, extract_drum_midi_triggers, reharmonize_progression, solve_voice_leading,
-    write_midi_file, GrooveStyle, VoicingStyle,
+    GrooveStyle, VoicingStyle, export_abc_score, extract_drum_midi_triggers,
+    reharmonize_progression, solve_voice_leading, write_midi_file,
 };
 use forge_vocal::{
-    generate_vocal_harmony_stack, shift_vocal_pitch_formant_preserved, track_vocal_pitch,
-    VocalScale,
+    VocalScale, generate_vocal_harmony_stack, shift_vocal_pitch_formant_preserved,
+    track_vocal_pitch,
 };
-use forge_worker::{separate_stems, WorkerBackend};
+use forge_worker::{WorkerBackend, separate_stems};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 

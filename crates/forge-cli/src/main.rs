@@ -5,26 +5,26 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use forge_core::AudioBuffer;
 use forge_dsp::{
-    align_phase_gcc_phat, align_vocal_double_dtw, apply_18_band_eq, apply_spectral_defizz,
-    apply_spectral_unmask, audit_audio, clean_vocal_surgical, compute_genre_tonal_balance_eq,
-    compute_reference_match_eq, deliver, normalize_and_limit, run_full_restoration_chain,
     DeFizzConfig, DeliveryOptions, DeliveryTarget, GenreTonalTarget, RestorationConfig, ToneMatch,
-    UnmaskConfig,
+    UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw, apply_18_band_eq,
+    apply_spectral_defizz, apply_spectral_unmask, audit_audio, clean_vocal_surgical,
+    compute_genre_tonal_balance_eq, compute_reference_match_eq, deliver, normalize_and_limit,
+    run_full_restoration_chain,
 };
 use forge_reaper::{
-    install_jsfx_plugins, send_reaper_osc, validate_isrc, write_distrokid_metadata,
-    ReaperProjectBuilder, ReaperTrackSpec, ReleaseMetadata,
+    ReaperProjectBuilder, ReaperTrackSpec, ReleaseMetadata, install_jsfx_plugins, send_reaper_osc,
+    validate_isrc, write_distrokid_metadata,
 };
 use forge_theory::{
-    export_abc_score, extract_drum_midi_triggers, reharmonize_progression, solve_voice_leading,
-    write_midi_file, GrooveStyle, VoicingStyle,
+    GrooveStyle, VoicingStyle, export_abc_score, extract_drum_midi_triggers,
+    reharmonize_progression, solve_voice_leading, write_midi_file,
 };
 use forge_vocal::{
-    generate_vocal_harmony_stack, shift_vocal_pitch_formant_preserved, track_vocal_pitch,
-    VocalScale,
+    VocalScale, generate_vocal_harmony_stack, shift_vocal_pitch_formant_preserved,
+    track_vocal_pitch,
 };
 use forge_worker::{
-    generate_music_lyria, index_drum_sample_library, separate_stems, WorkerBackend,
+    WorkerBackend, generate_music_lyria, index_drum_sample_library, separate_stems,
 };
 
 #[derive(Parser)]
@@ -531,7 +531,10 @@ async fn main() -> anyhow::Result<()> {
             let audit = audit_audio(&mastered);
             println!(
                 "Final Master: {:.2} LUFS | {:.2} dBTP True Peak | LRA {:.2} LU | DistroKid Ready: {}",
-                audit.integrated_lufs, audit.true_peak_dbtp, audit.loudness_range_lu, audit.distrokid_ready
+                audit.integrated_lufs,
+                audit.true_peak_dbtp,
+                audit.loudness_range_lu,
+                audit.distrokid_ready
             );
         }
 

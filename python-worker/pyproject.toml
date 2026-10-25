@@ -6,8 +6,8 @@ readme = "../README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 dependencies = [
-    "audio-separator[gpu]>=0.28.0",
+    "audio-separator[gpu]>=0.47.1",
     "basic-pitch>=0.4.0",
-    "gradio_client>=1.5.0",
-    "soundfile>=0.12.1",
+    "gradio_client>=2.7.2",
+    "soundfile>=0.14.0",
 ]

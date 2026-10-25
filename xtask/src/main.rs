@@ -93,12 +93,16 @@ fn main() -> nih_plug_xtask::Result<()> {
                 STANDALONE_PLUGINS.iter().map(|&(p, _)| p).collect()
             } else if let Some(pkg_arg) = args.get(1) {
                 if pkg_arg.starts_with("--") {
-                    eprintln!("Usage: cargo run --package xtask -- install <plugin-name|--all> [--release] [--dest <dir>]");
+                    eprintln!(
+                        "Usage: cargo run --package xtask -- install <plugin-name|--all> [--release] [--dest <dir>]"
+                    );
                     return Ok(());
                 }
                 vec![pkg_arg.as_str()]
             } else {
-                eprintln!("Usage: cargo run --package xtask -- install <plugin-name|--all> [--release] [--dest <dir>]");
+                eprintln!(
+                    "Usage: cargo run --package xtask -- install <plugin-name|--all> [--release] [--dest <dir>]"
+                );
                 return Ok(());
             };
 

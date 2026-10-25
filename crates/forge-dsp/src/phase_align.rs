@@ -2,7 +2,7 @@
 //! FastDTW Vocal Double / Harmony Time-Aligner (VocAlign equivalent).
 
 use forge_core::{AudioBuffer, ForgeError, Result};
-use rustfft::{num_complex::Complex, FftPlanner};
+use rustfft::{FftPlanner, num_complex::Complex};
 use serde::{Deserialize, Serialize};
 
 /// Result of GCC-PHAT phase and delay analysis between a reference and target track.

@@ -2,15 +2,15 @@
 
 use std::f64::consts::PI;
 
-use divan::{black_box, Bencher};
+use divan::{Bencher, black_box};
 use forge_core::AudioBuffer;
 use forge_dsp::{
-    align_phase_gcc_phat, align_vocal_double_dtw, apply_18_band_eq, apply_spectral_defizz,
-    apply_spectral_unmask, audit_audio, clean_vocal_surgical, compute_true_peak,
-    normalize_and_limit, run_full_restoration_chain, AnalogHardwareModel, DeFizzConfig,
-    RealtimeDensityAndClipper, RealtimeFdnReverb, RealtimeMasterLimiter, RealtimeMasteringEq18,
-    RealtimeNeuralPreamp, RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimeSubAndTapeBus,
-    RealtimeTransientTonalSplit, RealtimeVocalSurgical, RestorationConfig, UnmaskConfig,
+    AnalogHardwareModel, DeFizzConfig, RealtimeDensityAndClipper, RealtimeFdnReverb,
+    RealtimeMasterLimiter, RealtimeMasteringEq18, RealtimeNeuralPreamp, RealtimeOpenSoothe,
+    RealtimeOpenSpacer, RealtimeSubAndTapeBus, RealtimeTransientTonalSplit, RealtimeVocalSurgical,
+    RestorationConfig, UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw,
+    apply_18_band_eq, apply_spectral_defizz, apply_spectral_unmask, audit_audio,
+    clean_vocal_surgical, compute_true_peak, normalize_and_limit, run_full_restoration_chain,
 };
 
 const SR: u32 = 48_000;

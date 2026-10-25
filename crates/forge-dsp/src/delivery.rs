@@ -11,13 +11,13 @@
 use forge_core::{AudioBuffer, AuditReport, ForgeError, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::elite_dsp::{compute_genre_tonal_balance_eq, GenreTonalTarget};
+use crate::elite_dsp::{GenreTonalTarget, compute_genre_tonal_balance_eq};
 use crate::loudness_limiter::{audit_audio, normalize_and_limit};
 use crate::restoration::{
-    apply_18_band_eq, clean_vocal_surgical, compute_reference_match_eq, run_full_restoration_chain,
-    RestorationConfig,
+    RestorationConfig, apply_18_band_eq, clean_vocal_surgical, compute_reference_match_eq,
+    run_full_restoration_chain,
 };
-use crate::spectral_defizz::{apply_spectral_defizz, DeFizzConfig};
+use crate::spectral_defizz::{DeFizzConfig, apply_spectral_defizz};
 
 /// Integrated loudness may land within this many LU of the target and still pass. The limiter
 /// can only reduce level, so dense material often lands slightly under the target.

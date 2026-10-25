@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use forge_core::{AudioBuffer, ForgeError, Result, StemBundle};
-use forge_dsp::{sanitize_sample_f64, Biquad};
+use forge_dsp::{Biquad, sanitize_sample_f64};
 use serde::{Deserialize, Serialize};
 
 /// Execution backend selection for neural separation, restoration, and generation.
@@ -37,10 +37,10 @@ pub fn separate_stems(
 ) -> Result<StemBundle> {
     std::fs::create_dir_all(output_dir)?;
 
-    if matches!(backend, WorkerBackend::LocalGpu) {
-        if let Ok(bundle) = invoke_local_python_separator(input_path, output_dir) {
-            return Ok(bundle);
-        }
+    if matches!(backend, WorkerBackend::LocalGpu)
+        && let Ok(bundle) = invoke_local_python_separator(input_path, output_dir)
+    {
+        return Ok(bundle);
     }
 
     // Pure-Rust deterministic Mid/Side + Linkwitz-Riley stem decomposition (runs in <80ms, 0 MB VRAM)
@@ -205,10 +205,10 @@ pub async fn generate_music_lyria(
         .decode(b64_audio)
         .map_err(|e| ForgeError::WorkerError(format!("Base64 audio decode failed: {e}")))?;
 
-    if let Some(parent) = output_audio_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = output_audio_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     std::fs::write(output_audio_path, &audio_bytes)?;
 
@@ -250,55 +250,54 @@ pub fn index_drum_sample_library(folder: &Path) -> Result<Vec<DrumSampleDescript
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+            && let Ok(buf) = AudioBuffer::load_wav(&path)
         {
-            if let Ok(buf) = AudioBuffer::load_wav(&path) {
-                let sr = f64::from(buf.sample_rate.max(1));
-                let mono = buf.to_mono();
-                if mono.is_empty() || buf.duration_secs() > 4.0 {
-                    continue;
-                }
-                let mut lp = Biquad::lowpass(sr, 120.0, std::f64::consts::FRAC_1_SQRT_2);
-                let mut total_e = 1e-12_f64;
-                let mut sub_e = 0.0_f64;
-                let mut zcr = 0_usize;
-                let mut peak = 1e-12_f64;
-
-                for i in 0..mono.len() {
-                    let x = sanitize_sample_f64(mono[i]);
-                    total_e += x * x;
-                    let lo = lp.process_sample(x);
-                    sub_e += lo * lo;
-                    if x.abs() > peak {
-                        peak = x.abs();
-                    }
-                    if i > 0 && (x >= 0.0) != (mono[i - 1] >= 0.0) {
-                        zcr += 1;
-                    }
-                }
-
-                let rms = (total_e / (mono.len() as f64)).sqrt().max(1e-12);
-                let crest_factor_db = 20.0 * (peak / rms).log10();
-                let sub_120hz_ratio = (sub_e / total_e).clamp(0.0, 1.0);
-                let spectral_centroid_hz = ((zcr as f64) / (mono.len() as f64)) * (sr * 0.5);
-
-                let category = if sub_120hz_ratio > 0.55 && spectral_centroid_hz < 900.0 {
-                    "Kick"
-                } else if spectral_centroid_hz > 3800.0 && sub_120hz_ratio < 0.15 {
-                    "HiHat"
-                } else {
-                    "Snare"
-                }
-                .to_string();
-
-                samples.push(DrumSampleDescriptor {
-                    path,
-                    category,
-                    spectral_centroid_hz,
-                    sub_120hz_ratio,
-                    crest_factor_db,
-                    duration_ms: buf.duration_secs() * 1000.0,
-                });
+            let sr = f64::from(buf.sample_rate.max(1));
+            let mono = buf.to_mono();
+            if mono.is_empty() || buf.duration_secs() > 4.0 {
+                continue;
             }
+            let mut lp = Biquad::lowpass(sr, 120.0, std::f64::consts::FRAC_1_SQRT_2);
+            let mut total_e = 1e-12_f64;
+            let mut sub_e = 0.0_f64;
+            let mut zcr = 0_usize;
+            let mut peak = 1e-12_f64;
+
+            for i in 0..mono.len() {
+                let x = sanitize_sample_f64(mono[i]);
+                total_e += x * x;
+                let lo = lp.process_sample(x);
+                sub_e += lo * lo;
+                if x.abs() > peak {
+                    peak = x.abs();
+                }
+                if i > 0 && (x >= 0.0) != (mono[i - 1] >= 0.0) {
+                    zcr += 1;
+                }
+            }
+
+            let rms = (total_e / (mono.len() as f64)).sqrt().max(1e-12);
+            let crest_factor_db = 20.0 * (peak / rms).log10();
+            let sub_120hz_ratio = (sub_e / total_e).clamp(0.0, 1.0);
+            let spectral_centroid_hz = ((zcr as f64) / (mono.len() as f64)) * (sr * 0.5);
+
+            let category = if sub_120hz_ratio > 0.55 && spectral_centroid_hz < 900.0 {
+                "Kick"
+            } else if spectral_centroid_hz > 3800.0 && sub_120hz_ratio < 0.15 {
+                "HiHat"
+            } else {
+                "Snare"
+            }
+            .to_string();
+
+            samples.push(DrumSampleDescriptor {
+                path,
+                category,
+                spectral_centroid_hz,
+                sub_120hz_ratio,
+                crest_factor_db,
+                duration_ms: buf.duration_secs() * 1000.0,
+            });
         }
     }
 

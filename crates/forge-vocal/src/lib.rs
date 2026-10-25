@@ -340,10 +340,10 @@ pub fn shift_vocal_pitch_formant_preserved(
         if t <= semitone_curve[0].0 {
             return semitone_curve[0].1;
         }
-        if let Some(last) = semitone_curve.last() {
-            if t >= last.0 {
-                return last.1;
-            }
+        if let Some(last) = semitone_curve.last()
+            && t >= last.0
+        {
+            return last.1;
         }
         let idx = semitone_curve.partition_point(|&(ts, _)| ts < t);
         if idx == 0 {
@@ -486,7 +486,9 @@ pub fn generate_vocal_harmony_stack(
 /// Compiles a `PitchFrame` contour into a native REAPER Take Pitch Envelope (`<PITCHENV`) chunk
 /// so producers can visually inspect and tweak every pitch node inside REAPER!
 pub fn compile_reaper_take_pitch_envelope(frames: &[PitchFrame]) -> String {
-    let mut out = String::from("      <PITCHENV\n        ACT 1 -1\n        VIS 1 1 1\n        LANEHEIGHT 0 0\n        ARM 0\n        DEFSHAPE 0 -1 -1\n");
+    let mut out = String::from(
+        "      <PITCHENV\n        ACT 1 -1\n        VIS 1 1 1\n        LANEHEIGHT 0 0\n        ARM 0\n        DEFSHAPE 0 -1 -1\n",
+    );
     for f in frames {
         if f.f0_hz > 0.0 && f.correction_semitones.abs() > 0.02 {
             out.push_str(&format!(

@@ -10,22 +10,22 @@ pub mod spectral_defizz;
 pub mod spectral_unmask;
 
 pub use delivery::{
-    deliver, delivery_checks, DeliveryCheck, DeliveryOptions, DeliveryReport, DeliveryTarget,
-    ToneMatch,
+    DeliveryCheck, DeliveryOptions, DeliveryReport, DeliveryTarget, ToneMatch, deliver,
+    delivery_checks,
 };
 pub use elite_dsp::{
-    compute_genre_tonal_balance_eq, publish_shared_spectrum, read_shared_spectrum, AdaaSin,
-    AdaaTanh, AllpassDisperser, AnalogHardwareModel, AutoGainCompensator, GenreTonalTarget,
-    JilesAthertonHysteresis, NamWaveNetProfile, Oversampler2x, RealtimeDensityAndClipper,
-    RealtimeFdnReverb, RealtimeNeuralPreamp, RealtimeSpectrumAnalyzer32,
-    RealtimeTransientTonalSplit, SHARED_SPECTRUM_SLOTS,
+    AdaaSin, AdaaTanh, AllpassDisperser, AnalogHardwareModel, AutoGainCompensator,
+    GenreTonalTarget, JilesAthertonHysteresis, NamWaveNetProfile, Oversampler2x,
+    RealtimeDensityAndClipper, RealtimeFdnReverb, RealtimeNeuralPreamp, RealtimeSpectrumAnalyzer32,
+    RealtimeTransientTonalSplit, SHARED_SPECTRUM_SLOTS, compute_genre_tonal_balance_eq,
+    publish_shared_spectrum, read_shared_spectrum,
 };
 pub use loudness_limiter::{
-    audit_audio, compute_true_peak, flush_denormal_f64, normalize_and_limit, sanitize_param_f64,
-    sanitize_sample_f32, sanitize_sample_f64, Biquad, CytomicSvf,
+    Biquad, CytomicSvf, audit_audio, compute_true_peak, flush_denormal_f64, normalize_and_limit,
+    sanitize_param_f64, sanitize_sample_f32, sanitize_sample_f64,
 };
 pub use phase_align::{
-    align_phase_gcc_phat, align_vocal_double_dtw, PhaseAlignmentResult, StretchMarker,
+    PhaseAlignmentResult, StretchMarker, align_phase_gcc_phat, align_vocal_double_dtw,
 };
 pub use realtime::{
     ParamSmoother, RealtimeDrumTrigger, RealtimeMasterLimiter, RealtimeMasteringEq18,
@@ -33,12 +33,12 @@ pub use realtime::{
     RealtimeVocalSurgical,
 };
 pub use restoration::{
-    apply_18_band_eq, apply_analog_console_and_tape, apply_hum_notch_cascade,
-    apply_mid_side_spatial_cleanup, clean_vocal_surgical, compute_reference_match_eq,
-    remove_dc_and_declip, run_full_restoration_chain, RestorationConfig, MASTERING_18_BANDS_HZ,
+    MASTERING_18_BANDS_HZ, RestorationConfig, apply_18_band_eq, apply_analog_console_and_tape,
+    apply_hum_notch_cascade, apply_mid_side_spatial_cleanup, clean_vocal_surgical,
+    compute_reference_match_eq, remove_dc_and_declip, run_full_restoration_chain,
 };
-pub use spectral_defizz::{apply_spectral_defizz, DeFizzConfig};
-pub use spectral_unmask::{apply_spectral_unmask, UnmaskConfig};
+pub use spectral_defizz::{DeFizzConfig, apply_spectral_defizz};
+pub use spectral_unmask::{UnmaskConfig, apply_spectral_unmask};
 
 #[cfg(test)]
 mod tests {

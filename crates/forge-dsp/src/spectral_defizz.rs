@@ -8,7 +8,7 @@ use std::f64::consts::PI;
 
 use forge_core::{AudioBuffer, Result};
 use rayon::prelude::*;
-use rustfft::{num_complex::Complex, FftPlanner};
+use rustfft::{FftPlanner, num_complex::Complex};
 use serde::{Deserialize, Serialize};
 
 /// Configuration for OpenSoothe Dynamic Spectral Resonance Suppression.
