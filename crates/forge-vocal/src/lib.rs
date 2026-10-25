@@ -178,98 +178,152 @@ fn canonical_scale_word(word: &str) -> Option<&'static str> {
     })
 }
 
-/// Extracts a 20ms-hop F0 pitch contour using normalized difference (YIN estimator) and computes
+/// YIN absolute threshold: the first dip of `d'(tau)` below it is taken as the period.
+const YIN_THRESHOLD: f64 = 0.15;
+/// A frame with no dip below the threshold is still voiced if its global minimum is below this.
+const YIN_VOICING_LIMIT: f64 = 0.35;
+const YIN_MIN_F0_HZ: f64 = 75.0;
+const YIN_MAX_F0_HZ: f64 = 900.0;
+/// Frames quieter than this RMS are treated as silence.
+const YIN_SILENCE_RMS: f64 = 0.012;
+
+/// Frame geometry and lag search range for one sample rate.
+struct Yin {
+    sr: f64,
+    hop: usize,
+    win: usize,
+    half: usize,
+    tau_min: usize,
+    tau_max: usize,
+}
+
+impl Yin {
+    fn new(sample_rate: u32) -> Self {
+        let sr = f64::from(sample_rate.max(1));
+        let hop = ((sr * 0.020).round() as usize).max(128);
+        let win = (hop * 2).max(512);
+        let half = win / 2;
+        Self {
+            sr,
+            hop,
+            win,
+            half,
+            tau_min: ((sr / YIN_MAX_F0_HZ).floor() as usize).max(8),
+            // `tau_max + 1` is still needed beside the integration window for interpolation.
+            tau_max: ((sr / YIN_MIN_F0_HZ).ceil() as usize).min(win - half - 1),
+        }
+    }
+
+    /// F0 of one window, or `None` when it is silent or unvoiced. `diff` and `cmnd` are scratch
+    /// buffers of length `tau_max + 2`.
+    fn estimate_f0(&self, slice: &[f64], diff: &mut [f64], cmnd: &mut [f64]) -> Option<f64> {
+        let rms = (slice.iter().map(|&x| x * x).sum::<f64>() / (slice.len() as f64)).sqrt();
+        if !rms.is_finite() || rms < YIN_SILENCE_RMS || self.tau_min >= self.tau_max {
+            return None;
+        }
+        centered_difference(slice, self.half, diff);
+        cumulative_mean_normalize(diff, cmnd);
+        let tau = pick_period(cmnd, self.tau_min, self.tau_max)?;
+        let refined = (tau as f64) + parabolic_offset(diff[tau - 1], diff[tau], diff[tau + 1]);
+        Some(self.sr / refined)
+    }
+}
+
+/// YIN difference function `d(tau)` for every lag in `1..diff.len()`. Each lag compares `half`
+/// sample pairs centred on the middle of `slice`, so every lag measures the same instant.
+fn centered_difference(slice: &[f64], half: usize, diff: &mut [f64]) {
+    diff[0] = 0.0;
+    for tau in 1..diff.len() {
+        let start = (slice.len() - half - tau) / 2;
+        let early = &slice[start..start + half];
+        let late = &slice[start + tau..start + tau + half];
+        diff[tau] = early.iter().zip(late).map(|(a, b)| (a - b) * (a - b)).sum();
+    }
+}
+
+/// YIN cumulative mean normalized difference `d'(tau)`, with `d'(0) = 1`.
+fn cumulative_mean_normalize(diff: &[f64], cmnd: &mut [f64]) {
+    cmnd[0] = 1.0;
+    let mut running_sum = 0.0_f64;
+    for tau in 1..diff.len() {
+        running_sum += diff[tau];
+        cmnd[tau] = if running_sum > 1e-12 {
+            diff[tau] * (tau as f64) / running_sum
+        } else {
+            1.0
+        };
+    }
+}
+
+/// The first lag whose `d'` dips below the threshold, followed down to the bottom of that dip.
+/// Without such a dip, the global minimum if it is low enough to call the frame voiced.
+fn pick_period(cmnd: &[f64], tau_min: usize, tau_max: usize) -> Option<usize> {
+    if let Some(mut tau) = (tau_min..=tau_max).find(|&t| cmnd[t] < YIN_THRESHOLD) {
+        while tau < tau_max && cmnd[tau + 1] < cmnd[tau] {
+            tau += 1;
+        }
+        return Some(tau);
+    }
+    let best = (tau_min..=tau_max).min_by(|&a, &b| cmnd[a].total_cmp(&cmnd[b]))?;
+    (cmnd[best] < YIN_VOICING_LIMIT).then_some(best)
+}
+
+/// Offset in lags of the vertex of the parabola through three evenly spaced points.
+fn parabolic_offset(left: f64, mid: f64, right: f64) -> f64 {
+    let curvature = left - 2.0 * mid + right;
+    if curvature > 0.0 {
+        (0.5 * (left - right) / curvature).clamp(-0.5, 0.5)
+    } else {
+        0.0
+    }
+}
+
+fn pitch_frame(time_secs: f64, f0_hz: f64, scale: &VocalScale, retune: f64) -> PitchFrame {
+    if f0_hz <= 0.0 {
+        return PitchFrame {
+            time_secs,
+            f0_hz: 0.0,
+            midi_pitch: 0.0,
+            target_midi_pitch: 0.0,
+            correction_semitones: 0.0,
+        };
+    }
+    let midi_pitch = 69.0 + 12.0 * (f0_hz / 440.0).log2();
+    let target_midi_pitch = scale.snap_midi(midi_pitch, retune);
+    PitchFrame {
+        time_secs,
+        f0_hz,
+        midi_pitch,
+        target_midi_pitch,
+        correction_semitones: (target_midi_pitch - midi_pitch).clamp(-6.0, 6.0),
+    }
+}
+
+/// Extracts a 20 ms-hop F0 contour (75 Hz to 900 Hz) with the YIN estimator and computes
 /// scale-locked pitch correction envelopes.
+///
+/// Each period is the first dip of the cumulative mean normalized difference below `0.15`,
+/// taken at the bottom of that dip and refined by parabolic interpolation, so the pitch is not
+/// quantized to whole-sample lags. `time_secs` is the centre of the analysis window, the instant
+/// every lag's comparisons are centred on. Silent and unvoiced frames have `f0_hz == 0.0`.
 pub fn track_vocal_pitch(
     buffer: &AudioBuffer,
     scale: &VocalScale,
     retune_strength: f64,
 ) -> Vec<PitchFrame> {
-    let sr = f64::from(buffer.sample_rate.max(1));
+    let yin = Yin::new(buffer.sample_rate);
     let mono = buffer.to_mono();
-    let n = mono.len();
-    let hop = ((sr * 0.020).round() as usize).max(128);
-    let win = (hop * 2).max(512);
-    let tau_min = ((sr / 900.0).floor() as usize).max(8); // Max F0 = 900 Hz
-    let tau_max = ((sr / 75.0).ceil() as usize).min(win / 2); // Min F0 = 75 Hz
-
+    let mut diff = vec![0.0_f64; yin.tau_max + 2];
+    let mut cmnd = vec![0.0_f64; yin.tau_max + 2];
     let mut frames = Vec::new();
     let mut pos = 0_usize;
-
-    while pos + win <= n {
-        let slice = &mono[pos..pos + win];
-        let time_secs = (pos as f64) / sr;
-        let rms = (slice.iter().map(|&x| x * x).sum::<f64>() / (win as f64)).sqrt();
-
-        if rms < 0.012 || tau_min >= tau_max {
-            frames.push(PitchFrame {
-                time_secs,
-                f0_hz: 0.0,
-                midi_pitch: 0.0,
-                target_midi_pitch: 0.0,
-                correction_semitones: 0.0,
-            });
-            pos += hop;
-            continue;
-        }
-
-        // YIN cumulative mean normalized difference function d'(tau)
-        let half = win / 2;
-        let mut d = vec![0.0_f64; tau_max + 1];
-        let mut running_sum = 0.0_f64;
-        for tau in 1..=tau_max {
-            let mut diff_sq = 0.0;
-            for i in 0..half {
-                let delta = slice[i] - slice[i + tau];
-                diff_sq += delta * delta;
-            }
-            running_sum += diff_sq;
-            d[tau] = if running_sum > 1e-12 {
-                diff_sq * (tau as f64) / running_sum
-            } else {
-                1.0
-            };
-        }
-
-        let mut best_tau = 0_usize;
-        let mut min_val = 1.0_f64;
-        for (tau, &d_val) in d.iter().enumerate().take(tau_max + 1).skip(tau_min) {
-            if d_val < min_val {
-                min_val = d_val;
-                best_tau = tau;
-            }
-            if d_val < 0.15 {
-                best_tau = tau;
-                min_val = d_val;
-                break;
-            }
-        }
-
-        if best_tau > 0 && min_val < 0.35 {
-            let f0_hz = sr / (best_tau as f64);
-            let midi_pitch = 69.0 + 12.0 * (f0_hz / 440.0).log2();
-            let target_midi_pitch = scale.snap_midi(midi_pitch, retune_strength);
-            let correction_semitones = (target_midi_pitch - midi_pitch).clamp(-6.0, 6.0);
-            frames.push(PitchFrame {
-                time_secs,
-                f0_hz,
-                midi_pitch,
-                target_midi_pitch,
-                correction_semitones,
-            });
-        } else {
-            frames.push(PitchFrame {
-                time_secs,
-                f0_hz: 0.0,
-                midi_pitch: 0.0,
-                target_midi_pitch: 0.0,
-                correction_semitones: 0.0,
-            });
-        }
-
-        pos += hop;
+    while pos + yin.win <= mono.len() {
+        let slice = &mono[pos..pos + yin.win];
+        let time_secs = ((pos as f64) + ((yin.win - 1) as f64) / 2.0) / yin.sr;
+        let f0_hz = yin.estimate_f0(slice, &mut diff, &mut cmnd).unwrap_or(0.0);
+        frames.push(pitch_frame(time_secs, f0_hz, scale, retune_strength));
+        pos += yin.hop;
     }
-
     frames
 }
 
@@ -571,6 +625,173 @@ mod tests {
         let env = compile_reaper_take_pitch_envelope(&contour);
         assert!(env.contains("<PITCHENV"));
         assert!(env.contains("PT "));
+    }
+
+    const RATES: [u32; 3] = [44_100, 48_000, 96_000];
+    const PITCHES: [f64; 7] = [82.41, 110.0, 196.0, 261.63, 445.0, 659.26, 880.0];
+
+    /// Sum of `amp * sin(k * phase)` partials over a phase track, as a mono buffer.
+    fn additive(sr: u32, phase: &[f64], partials: &[(f64, f64)]) -> AudioBuffer {
+        let ch = phase
+            .iter()
+            .map(|&p| partials.iter().map(|&(k, a)| a * (k * p).sin()).sum())
+            .collect();
+        AudioBuffer::from_channels(vec![ch], sr).expect("valid")
+    }
+
+    /// Phase of a steady tone at `f0` Hz lasting `secs` seconds.
+    fn steady_phase(sr: u32, secs: f64, f0: f64) -> Vec<f64> {
+        let n = (f64::from(sr) * secs) as usize;
+        (0..n)
+            .map(|i| 2.0 * PI * f0 * (i as f64) / f64::from(sr))
+            .collect()
+    }
+
+    /// Band-limited sawtooth partials (`1/k`, below 0.45 * sr), scaled to roughly 0.5 peak.
+    fn sawtooth_partials(sr: u32, f0: f64) -> Vec<(f64, f64)> {
+        let top = (0.45 * f64::from(sr) / f0).floor() as usize;
+        (1..=top.max(1))
+            .map(|k| (k as f64, 0.3 / (k as f64)))
+            .collect()
+    }
+
+    fn cents(measured: f64, truth: f64) -> f64 {
+        1200.0 * (measured / truth).log2()
+    }
+
+    /// Largest cents error over the contour; panics if any frame is unvoiced.
+    fn worst_cents(buf: &AudioBuffer, f0: f64) -> f64 {
+        let scale = VocalScale::parse("C chromatic").expect("scale");
+        let contour = track_vocal_pitch(buf, &scale, 0.0);
+        assert!(contour.len() >= 5, "too few frames");
+        contour
+            .iter()
+            .map(|f| {
+                assert!(
+                    f.f0_hz > 0.0,
+                    "unvoiced frame at {} s for {f0} Hz",
+                    f.time_secs
+                );
+                cents(f.f0_hz, f0).abs()
+            })
+            .fold(0.0, f64::max)
+    }
+
+    fn assert_tracks_within(label: &str, f0: f64, partials: impl Fn(u32) -> Vec<(f64, f64)>) {
+        for sr in RATES {
+            let buf = additive(sr, &steady_phase(sr, 0.3, f0), &partials(sr));
+            let err = worst_cents(&buf, f0);
+            assert!(err <= 3.0, "{label} {f0} Hz @ {sr} Hz: {err:.2} cents off");
+        }
+    }
+
+    /// M15: descending to the dip and interpolating it puts pure sines within 3 cents.
+    #[test]
+    fn test_yin_pure_sines_within_3_cents_m15() {
+        for f0 in PITCHES {
+            assert_tracks_within("sine", f0, |_| vec![(1.0, 0.5)]);
+        }
+    }
+
+    /// M15: harmonic-rich sawtooths track the fundamental within 3 cents at every rate.
+    #[test]
+    fn test_yin_sawtooth_within_3_cents_m15() {
+        for f0 in PITCHES {
+            assert_tracks_within("sawtooth", f0, |sr| sawtooth_partials(sr, f0));
+        }
+    }
+
+    /// A tone with no energy at f0 (partials 2 to 6) still reports f0, not 2 * f0.
+    #[test]
+    fn test_yin_missing_fundamental_m15() {
+        for f0 in [110.0, 196.0, 261.63] {
+            assert_tracks_within("missing fundamental", f0, |_| {
+                (2..=6).map(|k| (f64::from(k), 0.12)).collect()
+            });
+        }
+    }
+
+    /// Octave traps: a dominant 2nd partial and a low sawtooth, whose dips at 2T, 3T, ... are as
+    /// deep as the one at T, must not jump an octave either way.
+    #[test]
+    fn test_yin_octave_traps_m15() {
+        for f0 in [98.0, 146.83, 220.0] {
+            assert_tracks_within("strong 2nd partial", f0, |_| vec![(1.0, 0.25), (2.0, 0.5)]);
+            assert_tracks_within("low sawtooth", f0, |sr| sawtooth_partials(sr, f0));
+        }
+    }
+
+    /// Silence, sub-gate signals and white noise give unvoiced frames and no envelope points.
+    #[test]
+    fn test_yin_silence_and_noise_are_unvoiced_m15() {
+        let scale = VocalScale::parse("A minor").expect("scale");
+        for sr in RATES {
+            let n = (f64::from(sr) * 0.3) as usize;
+            let mut state = 0x2545_F491_u32;
+            let noise: Vec<f64> = (0..n)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    (f64::from(state) / f64::from(u32::MAX)) - 0.5
+                })
+                .collect();
+            let quiet = additive(sr, &steady_phase(sr, 0.3, 220.0), &[(1.0, 0.005)]);
+            for (label, ch) in [
+                ("silence", vec![0.0; n]),
+                ("noise", noise),
+                ("quiet", quiet.channels[0].clone()),
+            ] {
+                let buf = AudioBuffer::from_channels(vec![ch], sr).expect("valid");
+                let contour = track_vocal_pitch(&buf, &scale, 1.0);
+                assert!(!contour.is_empty(), "{label} @ {sr}");
+                for f in &contour {
+                    assert_eq!(
+                        f.f0_hz, 0.0,
+                        "{label} @ {sr} Hz voiced at {} s",
+                        f.time_secs
+                    );
+                    assert_eq!(f.midi_pitch, 0.0, "{label} @ {sr}");
+                    assert_eq!(f.correction_semitones, 0.0, "{label} @ {sr}");
+                }
+                assert!(
+                    !compile_reaper_take_pitch_envelope(&contour).contains("PT "),
+                    "{label}"
+                );
+            }
+        }
+    }
+
+    /// M15: each frame is stamped where its pitch was measured. On a 2 octave/s glide the pitch
+    /// read back from a frame names the moment it was sung, within 1 ms of `time_secs`.
+    #[test]
+    fn test_yin_timestamps_match_glide_m15() {
+        const RATE_OCT_PER_SEC: f64 = 2.0;
+        const START_HZ: f64 = 150.0;
+        let scale = VocalScale::parse("C chromatic").expect("scale");
+        for sr in RATES {
+            let n = (f64::from(sr) * 0.6) as usize;
+            let k = RATE_OCT_PER_SEC * std::f64::consts::LN_2;
+            let phase: Vec<f64> = (0..n)
+                .map(|i| {
+                    let t = (i as f64) / f64::from(sr);
+                    2.0 * PI * START_HZ * ((k * t).exp() - 1.0) / k
+                })
+                .collect();
+            let buf = additive(sr, &phase, &[(1.0, 0.5)]);
+            let contour = track_vocal_pitch(&buf, &scale, 0.0);
+            assert!(contour.len() >= 10, "@ {sr}");
+            for f in &contour {
+                assert!(f.f0_hz > 0.0, "unvoiced at {} s @ {sr}", f.time_secs);
+                let sung_at = (f.f0_hz / START_HZ).log2() / RATE_OCT_PER_SEC;
+                let err_ms = (sung_at - f.time_secs) * 1000.0;
+                assert!(
+                    err_ms.abs() <= 1.0,
+                    "@ {sr} Hz frame {} s: {err_ms:.2} ms off",
+                    f.time_secs
+                );
+            }
+        }
     }
 
     fn mask(root: u8, intervals: &[u8]) -> [bool; 12] {
