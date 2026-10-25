@@ -1,0 +1,7 @@
+# Default reviewers for everything in the repository.
+* @suavecito585
+
+# CI, release and security-sensitive configuration.
+/.github/      @suavecito585
+/SECURITY.md   @suavecito585
+/Cargo.lock    @suavecito585

@@ -1,0 +1,56 @@
+name: Bug report
+description: Something is broken or behaves incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! **Security problems** (crashes from malicious presets, memory corruption, leaked keys, etc.) must go through [private vulnerability reporting](https://github.com/The-40-Thieves/audio-forge/security/advisories/new), not this form.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - VST3 / CLAP plugin
+        - REAPER JSFX
+        - forge CLI
+        - forge-mcp server
+        - DSP / analysis library
+        - GPU worker (Rust or Python)
+        - Build / CI / release
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: plugin
+    attributes:
+      label: Plugin and format (if applicable)
+      placeholder: e.g. Forge SplitEQ, CLAP
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you expected, what happened instead, and any error output.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps, settings, or input files. Attach audio or presets if you can.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: ForgeAudio version or commit
+      placeholder: e.g. v0.1.0 or 0532122
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: OS, and DAW/host with version
+      placeholder: e.g. Windows 11, REAPER 7.82
+    validations:
+      required: true
