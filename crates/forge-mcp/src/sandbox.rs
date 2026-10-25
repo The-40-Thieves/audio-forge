@@ -19,11 +19,13 @@ pub struct PathSandbox {
 }
 
 impl PathSandbox {
-    /// Creates a sandbox over `roots`. Each root must exist; it is canonicalized.
+    /// Creates a sandbox over `roots`. Each root must exist; it is canonicalized and stored
+    /// without the Windows verbatim prefix, so joined client paths are still parsed normally
+    /// (inside a `\\?\` path, `..` and `/` are literal).
     pub fn new<I: IntoIterator<Item = PathBuf>>(roots: I) -> io::Result<Self> {
         let roots = roots
             .into_iter()
-            .map(|r| r.canonicalize())
+            .map(|r| r.canonicalize().map(simplify))
             .collect::<io::Result<Vec<_>>>()?;
         if roots.is_empty() {
             return Err(io::Error::new(
@@ -65,33 +67,40 @@ impl PathSandbox {
             return Err(ForgeError::InvalidParameter("Empty path".into()));
         }
         let requested = Path::new(raw);
-        if requested
-            .components()
-            .any(|c| matches!(c, Component::ParentDir))
-        {
+        if has_parent_dir(requested) {
             return Err(self.denied(raw, "'..' components are not allowed"));
         }
-
         let joined = if requested.is_absolute() {
             requested.to_path_buf()
         } else {
             self.roots[0].join(requested)
         };
-        let resolved = canonicalize_existing_prefix(&joined).map_err(ForgeError::Io)?;
+        self.confine(&joined, raw)
+    }
 
+    /// Re-validates a path the server derived from an already-resolved one (a sidecar
+    /// report, a file inside an output directory). Each concrete destination must be
+    /// checked: an in-root symlink at the derived name could otherwise point outside.
+    pub fn check(&self, path: &Path) -> Result<PathBuf, ForgeError> {
+        self.confine(path, &path.display().to_string())
+    }
+
+    fn confine(&self, path: &Path, raw: &str) -> Result<PathBuf, ForgeError> {
+        if has_parent_dir(path) {
+            return Err(self.denied(raw, "'..' components are not allowed"));
+        }
+        let resolved = canonicalize_existing_prefix(path)
+            .map(simplify)
+            .map_err(|e| self.denied(raw, &format!("cannot resolve it safely ({e})")))?;
         if self.roots.iter().any(|root| resolved.starts_with(root)) {
-            Ok(simplify(resolved))
+            Ok(resolved)
         } else {
             Err(self.denied(raw, "path is outside the allowed roots"))
         }
     }
 
     fn denied(&self, raw: &str, reason: &str) -> ForgeError {
-        let roots: Vec<String> = self
-            .roots
-            .iter()
-            .map(|r| simplify(r.clone()).display().to_string())
-            .collect();
+        let roots: Vec<String> = self.roots.iter().map(|r| r.display().to_string()).collect();
         ForgeError::InvalidParameter(format!(
             "Path '{raw}' rejected: {reason} (allowed roots: {}; set {ROOT_ENV} to change)",
             roots.join(", ")
@@ -99,11 +108,18 @@ impl PathSandbox {
     }
 }
 
+fn has_parent_dir(path: &Path) -> bool {
+    path.components().any(|c| matches!(c, Component::ParentDir))
+}
+
 /// Canonicalizes the longest existing ancestor of `path` and appends the rest unchanged.
 /// Output paths usually do not exist yet, so plain `canonicalize` cannot be used.
+///
+/// "Existing" uses `symlink_metadata`, so a dangling symlink counts as present: it is then
+/// canonicalized, which fails, and the path is rejected instead of being written through.
 fn canonicalize_existing_prefix(path: &Path) -> io::Result<PathBuf> {
     for ancestor in path.ancestors() {
-        if ancestor.as_os_str().is_empty() || !ancestor.exists() {
+        if ancestor.as_os_str().is_empty() || std::fs::symlink_metadata(ancestor).is_err() {
             continue;
         }
         let mut resolved = ancestor.canonicalize()?;
@@ -208,6 +224,19 @@ mod tests {
         assert_eq!(sb.roots().count(), 2);
     }
 
+    #[test]
+    fn derived_paths_are_checked_like_client_paths() {
+        let (dir, sb) = sandbox();
+        let output = sb.resolve("master.wav").expect("allowed");
+        assert!(sb.check(&output.with_extension("delivery.json")).is_ok());
+        let other = tempfile::tempdir().expect("tempdir");
+        assert!(sb.check(&other.path().join("x.json")).is_err());
+        assert!(
+            sb.check(&dir.path().join("a").join("..").join("b"))
+                .is_err()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlink_escaping_root_is_rejected() {
@@ -215,5 +244,29 @@ mod tests {
         let other = tempfile::tempdir().expect("tempdir");
         std::os::unix::fs::symlink(other.path(), dir.path().join("link")).expect("symlink");
         assert!(sb.resolve("link/victim.wav").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_to_outside_is_rejected() {
+        let (dir, sb) = sandbox();
+        let other = tempfile::tempdir().expect("tempdir");
+        let target = other.path().join("not-yet-created.wav");
+        std::os::unix::fs::symlink(&target, dir.path().join("out.wav")).expect("symlink");
+        assert!(sb.resolve("out.wav").is_err());
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_symlink_at_a_derived_name_is_rejected() {
+        let (dir, sb) = sandbox();
+        let other = tempfile::tempdir().expect("tempdir");
+        let victim = other.path().join("victim.json");
+        std::fs::write(&victim, "keep").expect("write");
+        std::os::unix::fs::symlink(&victim, dir.path().join("master.delivery.json"))
+            .expect("symlink");
+        let output = sb.resolve("master.wav").expect("allowed");
+        assert!(sb.check(&output.with_extension("delivery.json")).is_err());
     }
 }
