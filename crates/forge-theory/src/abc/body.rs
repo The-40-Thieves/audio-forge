@@ -10,6 +10,13 @@ const LETTER_SEMIS: [i32; 7] = [0, 2, 4, 5, 7, 9, 11];
 /// continuation `\`, the slur end `)`, and the one-letter decorations `.~HLMOPSTuv`.
 /// Any other unrecognised character is an error.
 const SKIPPED: &[u8] = b" \t`y\\).~HLMOPSTuv";
+/// Upper-case note letters in the order of `LETTER_SEMIS`.
+const NOTE_LETTERS: &[u8] = b"CDEFGAB";
+/// Accidental marks and their shifts, double marks first so `^^` wins over `^`.
+const ACCIDENTALS: [(&[u8], i8); 5] = [(b"^^", 2), (b"__", -2), (b"^", 1), (b"_", -1), (b"=", 0)];
+
+// Byte literals for letters, digits and `_` are avoided in this file: Codacy's Lizard reads such a
+// literal as a Rust lifetime, loses track of quotes and reports long stretches as one method.
 
 pub(super) fn parse_body_line(
     ctx: &mut Context,
@@ -18,37 +25,55 @@ pub(super) fn parse_body_line(
     out: &mut Vec<Element>,
 ) -> Parse<()> {
     let mut lx = Lexer { text, pos: 0 };
-    while let Some(byte) = lx.peek() {
-        if !ctx.voice_active {
+    while lx.peek().is_some() {
+        if ctx.voice_active {
+            parse_body_token(ctx, &mut lx, line, out)?;
+        } else {
             skip_inactive(ctx, &mut lx)?;
-            continue;
-        }
-        match byte {
-            b'%' => break,
-            b'"' => parse_quoted(&mut lx, out)?,
-            b'!' | b'+' => {
-                lx.bump();
-                lx.take_until(byte, "decoration")?;
-            }
-            b'{' => {
-                lx.bump();
-                lx.take_until(b'}', "grace notes")?;
-            }
-            b'[' => parse_bracket(ctx, &mut lx, out)?,
-            b'|' | b':' | b']' => parse_bar(ctx, &mut lx),
-            b'(' => parse_paren(ctx, &mut lx, line, out)?,
-            b'-' => {
-                lx.bump();
-                out.push(Element::Tie { line });
-            }
-            b'>' | b'<' => parse_broken(&mut lx, line, out)?,
-            b'&' => return Err("voice overlay '&' is not supported".to_string()),
-            b'0'..=b'9' | b'/' => {
-                return Err(format!("length '{}' does not follow a note", byte as char));
-            }
-            _ => parse_note_or_rest(ctx, &mut lx, out)?,
         }
     }
+    Ok(())
+}
+
+/// Reads one token of the voice being read.
+fn parse_body_token(
+    ctx: &mut Context,
+    lx: &mut Lexer,
+    line: usize,
+    out: &mut Vec<Element>,
+) -> Parse<()> {
+    let Some(byte) = lx.peek() else {
+        return Ok(());
+    };
+    match byte {
+        b'%' => lx.pos = lx.text.len(),
+        b'"' => parse_quoted(lx, out)?,
+        b'!' | b'+' | b'{' => skip_delimited(lx, byte)?,
+        b'[' => parse_bracket(ctx, lx, out)?,
+        b'|' | b':' | b']' => parse_bar(ctx, lx),
+        b'(' => parse_paren(ctx, lx, line, out)?,
+        b'-' => {
+            lx.bump();
+            out.push(Element::Tie { line });
+        }
+        b'>' | b'<' => parse_broken(lx, line, out)?,
+        b'&' => return Err("voice overlay '&' is not supported".to_string()),
+        _ if byte.is_ascii_digit() || byte == b'/' => {
+            return Err(format!("length '{}' does not follow a note", byte as char));
+        }
+        _ => parse_note_or_rest(ctx, lx, out)?,
+    }
+    Ok(())
+}
+
+/// Skips a `!decoration!`, `+decoration+` or `{grace notes}`.
+fn skip_delimited(lx: &mut Lexer, open: u8) -> Parse<()> {
+    let (close, what) = match open {
+        b'{' => (b'}', "grace notes"),
+        _ => (open, "decoration"),
+    };
+    lx.bump();
+    lx.take_until(close, what)?;
     Ok(())
 }
 
@@ -81,30 +106,34 @@ fn parse_inline_field(ctx: &mut Context, lx: &mut Lexer) -> Parse<()> {
 
 fn parse_note_or_rest(ctx: &mut Context, lx: &mut Lexer, out: &mut Vec<Element>) -> Parse<()> {
     match lx.peek() {
-        Some(b'^' | b'_' | b'=' | b'A'..=b'G' | b'a'..=b'g') => {
+        Some(byte) if starts_pitch(byte) => {
             let pitch = parse_pitch(ctx, lx)?;
             let len = parse_length(lx)? * ctx.unit;
             out.push(Element::Note { pitch, len });
         }
-        Some(b'z' | b'x') => {
+        Some(byte) if b"zx".contains(&byte) => {
             lx.bump();
             let len = parse_length(lx)? * ctx.unit;
             out.push(Element::Rest { len });
         }
-        Some(b'Z' | b'X') => {
-            lx.bump();
-            let bars = lx.number()?.unwrap_or(1);
-            let meter = ctx.meter.ok_or("multi-bar rest needs a meter (M:)")?;
-            if bars == 0 {
-                return Err("multi-bar rest cannot be zero bars".to_string());
-            }
-            out.push(Element::Rest {
-                len: f64::from(bars) * meter,
-            });
-        }
+        Some(byte) if b"ZX".contains(&byte) => parse_multi_bar_rest(ctx, lx, out)?,
         Some(byte) if SKIPPED.contains(&byte) => lx.bump(),
         _ => return Err(unexpected_character(lx)),
     }
+    Ok(())
+}
+
+/// `Z` or `X` with an optional bar count, as long as that many bars of the current meter.
+fn parse_multi_bar_rest(ctx: &Context, lx: &mut Lexer, out: &mut Vec<Element>) -> Parse<()> {
+    lx.bump();
+    let bars = lx.number()?.unwrap_or(1);
+    let meter = ctx.meter.ok_or("multi-bar rest needs a meter (M:)")?;
+    if bars == 0 {
+        return Err("multi-bar rest cannot be zero bars".to_string());
+    }
+    out.push(Element::Rest {
+        len: f64::from(bars) * meter,
+    });
     Ok(())
 }
 
@@ -118,7 +147,7 @@ fn parse_quoted(lx: &mut Lexer, out: &mut Vec<Element>) -> Parse<()> {
     lx.bump();
     let text = lx.take_until(b'"', "quoted chord symbol")?.trim();
     // `^_<>@` mark free-text annotations, not chord symbols.
-    let is_annotation = text.starts_with(['^', '_', '<', '>', '@']);
+    let is_annotation = text.starts_with(|c: char| "^_<>@".contains(c));
     if !text.is_empty() && !is_annotation {
         out.push(Element::Chord(text.to_string()));
     }
@@ -163,7 +192,7 @@ fn parse_chord_notes(ctx: &mut Context, lx: &mut Lexer, out: &mut Vec<Element>) 
             None => return Err("unterminated chord '['".to_string()),
             Some(b']') => break,
             Some(b' ' | b'-') => lx.bump(),
-            Some(b'^' | b'_' | b'=' | b'A'..=b'G' | b'a'..=b'g') => {
+            Some(byte) if starts_pitch(byte) => {
                 pitches.push(parse_pitch(ctx, lx)?);
                 let len = parse_length(lx)?;
                 first_len.get_or_insert(len);
@@ -242,12 +271,12 @@ fn parse_broken(lx: &mut Lexer, line: usize, out: &mut Vec<Element>) -> Parse<()
 fn parse_pitch(ctx: &mut Context, lx: &mut Lexer) -> Parse<u8> {
     let accidental = parse_accidental(lx)?;
     let letter = lx.peek().ok_or("accidental without a note")?;
-    let (index, mut natural) = match letter {
-        b'A'..=b'G' => (letter_index(letter), 60),
-        b'a'..=b'g' => (letter_index(letter.to_ascii_uppercase()), 72),
-        _ => return Err("accidental must be followed by a note letter".to_string()),
-    };
-    natural += LETTER_SEMIS[index];
+    if !is_note_letter(letter) {
+        return Err("accidental must be followed by a note letter".to_string());
+    }
+    let index = letter_index(letter.to_ascii_uppercase());
+    let octave = if letter.is_ascii_lowercase() { 72 } else { 60 };
+    let mut natural = octave + LETTER_SEMIS[index];
     lx.bump();
     while let Some(mark @ (b'\'' | b',')) = lx.peek() {
         natural = natural.saturating_add(if mark == b'\'' { 12 } else { -12 });
@@ -273,28 +302,27 @@ fn parse_pitch(ctx: &mut Context, lx: &mut Lexer) -> Parse<u8> {
         .ok_or_else(|| "note is outside the MIDI range 0-127".to_string())
 }
 
+/// Index of an upper-case note letter in `C D E F G A B`; anything else counts as `B`.
 pub(super) fn letter_index(upper: u8) -> usize {
-    match upper {
-        b'C' => 0,
-        b'D' => 1,
-        b'E' => 2,
-        b'F' => 3,
-        b'G' => 4,
-        b'A' => 5,
-        _ => 6,
-    }
+    NOTE_LETTERS.iter().position(|&l| l == upper).unwrap_or(6)
+}
+
+/// A note letter, upper case for the octave from middle C and lower case for the one above.
+fn is_note_letter(byte: u8) -> bool {
+    NOTE_LETTERS.contains(&byte.to_ascii_uppercase())
+}
+
+/// The first byte of a note: an accidental or a note letter.
+fn starts_pitch(byte: u8) -> bool {
+    b"^_=".contains(&byte) || is_note_letter(byte)
 }
 
 pub(super) fn parse_accidental(lx: &mut Lexer) -> Parse<Option<i8>> {
-    let shift = match (lx.peek(), lx.peek_at(1)) {
-        (Some(b'^'), Some(b'^')) => 2,
-        (Some(b'_'), Some(b'_')) => -2,
-        (Some(b'^'), _) => 1,
-        (Some(b'_'), _) => -1,
-        (Some(b'='), _) => 0,
-        _ => return Ok(None),
+    let rest = &lx.text.as_bytes()[lx.pos..];
+    let Some(&(mark, shift)) = ACCIDENTALS.iter().find(|(mark, _)| rest.starts_with(mark)) else {
+        return Ok(None);
     };
-    lx.pos += if shift == 2 || shift == -2 { 2 } else { 1 };
+    lx.pos += mark.len();
     if lx.peek().is_some_and(|b| b == b'/' || b.is_ascii_digit()) {
         return Err("microtonal accidentals are not supported".to_string());
     }

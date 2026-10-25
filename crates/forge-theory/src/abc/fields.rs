@@ -8,6 +8,8 @@ use super::{Context, Lexer, MAX_NUMBER, Parse};
 /// Letter indices (`C = 0`) in the order sharps and flats are added to a key signature.
 const SHARP_ORDER: [usize; 7] = [3, 0, 4, 1, 5, 2, 6];
 const FLAT_ORDER: [usize; 7] = [6, 2, 5, 1, 4, 0, 3];
+/// Circle-of-fifths position of the major key on each letter `C D E F G A B`.
+const LETTER_FIFTHS: [i32; 7] = [0, 2, 4, -1, 1, 3, 5];
 /// Clef and voice words that may follow the key in a `K:` field.
 const CLEF_WORDS: [&str; 12] = [
     "treble", "bass", "bass3", "baritone", "tenor", "alto", "alto1", "alto2", "mezzo", "soprano",
@@ -23,32 +25,50 @@ pub(super) fn field_line(text: &str) -> Option<(u8, &str)> {
     is_field.then(|| (bytes[0], &text[2..]))
 }
 
+/// Applies the fields that change how notes are read; every other field is ignored.
+///
+/// Matched as byte strings rather than byte literals so Codacy's Lizard keeps its place.
 pub(super) fn apply_field(ctx: &mut Context, letter: u8, value: &str) -> Parse<()> {
     let value = strip_comment(value);
-    match letter {
-        b'K' => {
-            ctx.key = parse_key(value)?;
-            ctx.bar.clear();
+    match &[letter] {
+        b"K" => apply_key(ctx, value),
+        b"L" => apply_unit(ctx, value),
+        b"M" => apply_meter(ctx, value),
+        b"V" => {
+            apply_voice(ctx, value);
+            Ok(())
         }
-        b'L' => {
-            ctx.unit = parse_fraction(value)?;
-            ctx.unit_set = true;
-        }
-        b'M' => {
-            (ctx.meter, ctx.compound) = parse_meter(value)?;
-            if !ctx.unit_set {
-                let short_meter = ctx.meter.is_some_and(|m| m < 0.75);
-                ctx.unit = if short_meter { 1.0 / 16.0 } else { 1.0 / 8.0 };
-            }
-        }
-        b'V' => {
-            let id = value.split_whitespace().next().unwrap_or("").to_string();
-            let first = ctx.first_voice.get_or_insert_with(|| id.clone());
-            ctx.voice_active = *first == id;
-        }
-        _ => {}
+        _ => Ok(()),
+    }
+}
+
+fn apply_key(ctx: &mut Context, value: &str) -> Parse<()> {
+    ctx.key = parse_key(value)?;
+    ctx.bar.clear();
+    Ok(())
+}
+
+fn apply_unit(ctx: &mut Context, value: &str) -> Parse<()> {
+    ctx.unit = parse_fraction(value)?;
+    ctx.unit_set = true;
+    Ok(())
+}
+
+/// Sets the meter and, unless `L:` was given, the meter-based default unit length.
+fn apply_meter(ctx: &mut Context, value: &str) -> Parse<()> {
+    (ctx.meter, ctx.compound) = parse_meter(value)?;
+    if !ctx.unit_set {
+        let short_meter = ctx.meter.is_some_and(|m| m < 0.75);
+        ctx.unit = if short_meter { 1.0 / 16.0 } else { 1.0 / 8.0 };
     }
     Ok(())
+}
+
+/// The first voice named in the score is the one read; any other voice switches reading off.
+fn apply_voice(ctx: &mut Context, value: &str) {
+    let id = value.split_whitespace().next().unwrap_or("").to_string();
+    let first = ctx.first_voice.get_or_insert_with(|| id.clone());
+    ctx.voice_active = *first == id;
 }
 
 /// Cuts a field value at a trailing `%` comment. A `%` inside double quotes or escaped as `\%`
@@ -122,7 +142,7 @@ fn parse_key(value: &str) -> Parse<[i8; 7]> {
             tokens.next();
             signature_from_fifths(2)
         }
-        Some(tonic) if tonic.starts_with(|c: char| ('A'..='G').contains(&c)) => {
+        Some(tonic) if tonic.starts_with(|c: char| "ABCDEFG".contains(c)) => {
             tokens.next();
             key_signature(tonic, &mut tokens)?
         }
@@ -140,20 +160,14 @@ fn key_signature<'a>(
     tonic: &'a str,
     tokens: &mut Peekable<impl Iterator<Item = &'a str>>,
 ) -> Parse<[i8; 7]> {
-    let bytes = tonic.as_bytes();
-    let letter_fifths = match bytes[0] {
-        b'C' => 0,
-        b'D' => 2,
-        b'E' => 4,
-        b'F' => -1,
-        b'G' => 1,
-        b'A' => 3,
-        _ => 5,
-    };
-    let (fifths, attached) = match bytes.get(1) {
-        Some(b'#') => (letter_fifths + 7, &tonic[2..]),
-        Some(b'b') => (letter_fifths - 7, &tonic[2..]),
-        _ => (letter_fifths, &tonic[1..]),
+    let letter_fifths = LETTER_FIFTHS[letter_index(tonic.as_bytes()[0])];
+    let after_letter = &tonic[1..];
+    let (fifths, attached) = if let Some(rest) = after_letter.strip_prefix("#") {
+        (letter_fifths + 7, rest)
+    } else if let Some(rest) = after_letter.strip_prefix("b") {
+        (letter_fifths - 7, rest)
+    } else {
+        (letter_fifths, after_letter)
     };
     let mode = if attached.is_empty() {
         tokens.next_if(|t| mode_offset(t).is_some()).unwrap_or("")
