@@ -18,11 +18,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use forge_dsp::{
-    AnalogHardwareModel, AutoGainCompensator, GenreTonalTarget, RealtimeDensityAndClipper,
-    RealtimeDrumTrigger, RealtimeFdnReverb, RealtimeMasterLimiter, RealtimeMasteringEq18,
-    RealtimeNeuralPreamp, RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner,
-    RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus, RealtimeTransientTonalSplit,
-    RealtimeVocalSurgical, publish_shared_spectrum, read_shared_spectrum,
+    AnalogHardwareModel, AutoGainCompensator, DrumTriggerNotes, GenreTonalTarget, NoteMsg,
+    RealtimeDensityAndClipper, RealtimeDrumTrigger, RealtimeFdnReverb, RealtimeMasterLimiter,
+    RealtimeMasteringEq18, RealtimeNeuralPreamp, RealtimeOpenSoothe, RealtimeOpenSpacer,
+    RealtimePhaseAligner, RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus,
+    RealtimeTransientTonalSplit, RealtimeVocalSurgical, publish_shared_spectrum,
+    read_shared_spectrum,
 };
 use nih_plug::prelude::*;
 use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
@@ -1404,6 +1405,11 @@ pub struct ForgeDrumTriggerPlug {
     telemetry: Arc<GuiTelemetry>,
     analyzer: RealtimeSpectrumAnalyzer32,
     dsp: RealtimeDrumTrigger,
+    /// Generated notes still sounding, so each gets its NoteOff.
+    notes: DrumTriggerNotes,
+    /// Set by `reset`; the next block starts by releasing every generated note.
+    release_pending: bool,
+    was_playing: bool,
 }
 
 #[derive(Params)]
@@ -1442,6 +1448,9 @@ impl Default for ForgeDrumTriggerPlug {
             telemetry: Arc::new(GuiTelemetry::default()),
             analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
             dsp: RealtimeDrumTrigger::new(48_000.0),
+            notes: DrumTriggerNotes::new(48_000.0),
+            release_pending: false,
+            was_playing: false,
         }
     }
 }
@@ -1510,7 +1519,13 @@ impl Plugin for ForgeDrumTriggerPlug {
         let sr = f64::from(buffer_config.sample_rate);
         self.dsp.reset(sr);
         self.analyzer.reset(sr);
+        self.notes.set_sample_rate(sr);
         true
+    }
+
+    /// Notes cannot be sent from here, so held notes are released at the start of the next block.
+    fn reset(&mut self) {
+        self.release_pending = true;
     }
 
     fn process(
@@ -1520,7 +1535,9 @@ impl Plugin for ForgeDrumTriggerPlug {
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         let thresh = f64::from(self.params.threshold_db.value());
-        let expand_chords = self.params.expand_midi_chords.value();
+        self.notes
+            .set_chord_expansion(self.params.expand_midi_chords.value());
+        self.release_on_reset_or_stop(context);
 
         // Output events must be in non-decreasing timing order, so incoming MIDI (1) is forwarded
         // in step with the audio-detected drum hits (2) rather than all up front.
@@ -1532,7 +1549,7 @@ impl Plugin for ForgeDrumTriggerPlug {
                 if event.timing() as usize > sample_idx {
                     break;
                 }
-                Self::forward_event(context, event, expand_chords);
+                self.forward_event(context, event);
                 pending = context.next_event();
             }
 
@@ -1540,22 +1557,11 @@ impl Plugin for ForgeDrumTriggerPlug {
             let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
             self.analyzer.push_stereo_sample(in_l, in_r);
             self.telemetry.update_peaks(in_l, in_r, in_l, in_r, 0.0);
-
-            let triggers = self.dsp.process_stereo_sample(in_l, in_r, thresh);
-            for trig in triggers.into_iter().flatten() {
-                let (midi_note, vel) = trig;
-                context.send_event(NoteEvent::NoteOn {
-                    timing: sample_idx as u32,
-                    voice_id: None,
-                    channel: 9, // General MIDI Drum Channel 10 (0-indexed = 9)
-                    note: midi_note,
-                    velocity: vel,
-                });
-            }
+            self.trigger_drums(context, sample_idx as u32, in_l, in_r, thresh);
         }
         // Events timed at or past the end of the block (should not happen, but never drop them).
         while let Some(event) = pending {
-            Self::forward_event(context, event, expand_chords);
+            self.forward_event(context, event);
             pending = context.next_event();
         }
         self.telemetry
@@ -1566,37 +1572,93 @@ impl Plugin for ForgeDrumTriggerPlug {
 }
 
 impl ForgeDrumTriggerPlug {
+    /// Converts a generated note to a host event. Generated notes carry no voice ID (see
+    /// [`NoteMsg`]), so they never share the ID of the root that started them.
+    fn note_event(msg: NoteMsg) -> PluginNoteEvent<Self> {
+        match msg {
+            NoteMsg::On {
+                timing,
+                channel,
+                note,
+                velocity,
+            } => NoteEvent::NoteOn {
+                timing,
+                voice_id: None,
+                channel,
+                note,
+                velocity,
+            },
+            NoteMsg::Off {
+                timing,
+                channel,
+                note,
+            } => NoteEvent::NoteOff {
+                timing,
+                voice_id: None,
+                channel,
+                note,
+                velocity: 0.0,
+            },
+        }
+    }
+
+    /// Releases every generated note at the start of the block after a reset, or when the
+    /// transport stops.
+    fn release_on_reset_or_stop(&mut self, context: &mut impl ProcessContext<Self>) {
+        let playing = context.transport().playing;
+        let stopped = self.was_playing && !playing;
+        self.was_playing = playing;
+        if std::mem::take(&mut self.release_pending) || stopped {
+            self.notes
+                .release_all(0, &mut |msg| context.send_event(Self::note_event(msg)));
+        }
+    }
+
     /// Step 1: forwards an incoming event and, when enabled, expands 1-finger MIDI notes into
-    /// rootless Neo-Soul 9th voicings (3, 7, 9, 13) at the same timing.
+    /// rootless Neo-Soul 9th voicings (3, 7, 9, 13) at the same timing. A root's NoteOff
+    /// releases the chord it started even if expansion was switched off in between.
     fn forward_event(
+        &mut self,
         context: &mut impl ProcessContext<Self>,
         event: PluginNoteEvent<Self>,
-        expand_chords: bool,
     ) {
         context.send_event(event);
-        if !expand_chords {
-            return;
+        let emit = &mut |msg| context.send_event(Self::note_event(msg));
+        match event {
+            NoteEvent::NoteOn {
+                timing,
+                channel,
+                note,
+                velocity,
+                ..
+            } => self.notes.root_on(timing, channel, note, velocity, emit),
+            NoteEvent::NoteOff {
+                timing,
+                channel,
+                note,
+                ..
+            } => self.notes.root_off(timing, channel, note, emit),
+            _ => {}
         }
-        let root = match event {
-            NoteEvent::NoteOn { note, .. } | NoteEvent::NoteOff { note, .. } => note,
-            _ => return,
-        };
-        for &interval in &[3_u8, 7, 10, 14] {
-            let harm = root.saturating_add(interval);
-            if harm > 120 {
-                continue;
+    }
+
+    /// Step 2: runs the transient detector for one frame and sends gated drum notes on GM
+    /// channel 10, each released a fixed length later.
+    fn trigger_drums(
+        &mut self,
+        context: &mut impl ProcessContext<Self>,
+        timing: u32,
+        in_l: f32,
+        in_r: f32,
+        thresh: f64,
+    ) {
+        let emit = &mut |msg| context.send_event(Self::note_event(msg));
+        self.notes.tick(timing, emit);
+        let triggers = self.dsp.process_stereo_sample(in_l, in_r, thresh);
+        for (slot, trig) in triggers.into_iter().enumerate() {
+            if let Some((midi_note, vel)) = trig {
+                self.notes.drum_hit(timing, slot, midi_note, vel, emit);
             }
-            // Copy of the incoming event re-pitched to the chord tone; note-ons are softened.
-            let mut voiced = event;
-            match &mut voiced {
-                NoteEvent::NoteOn { note, velocity, .. } => {
-                    *note = harm;
-                    *velocity = (*velocity * 0.82).clamp(0.1, 1.0);
-                }
-                NoteEvent::NoteOff { note, .. } => *note = harm,
-                _ => return,
-            }
-            context.send_event(voiced);
         }
     }
 }

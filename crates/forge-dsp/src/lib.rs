@@ -1,6 +1,7 @@
 //! `forge-dsp` — Studio DSP, Restoration, Spectral Suppression, Unmasking, Alignment & Mastering.
 
 pub mod delivery;
+pub mod drum_midi;
 pub mod elite_dsp;
 pub mod loudness_limiter;
 pub mod phase_align;
@@ -13,6 +14,7 @@ pub use delivery::{
     DeliveryCheck, DeliveryOptions, DeliveryReport, DeliveryTarget, ToneMatch, deliver,
     delivery_checks,
 };
+pub use drum_midi::{DrumTriggerNotes, NoteMsg};
 pub use elite_dsp::{
     AdaaSin, AdaaTanh, AllpassDisperser, AnalogHardwareModel, AutoGainCompensator,
     GenreTonalTarget, JilesAthertonHysteresis, NamWaveNetProfile, Oversampler2x,

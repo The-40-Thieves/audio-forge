@@ -11,8 +11,9 @@
 
 use assert_no_alloc::{AllocDisabler, assert_no_alloc, reset_violation_count, violation_count};
 use forge_dsp::{
-    RealtimeDrumTrigger, RealtimeMasterLimiter, RealtimeMasteringEq18, RealtimeOpenSoothe,
-    RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSubAndTapeBus, RealtimeVocalSurgical,
+    DrumTriggerNotes, NoteMsg, RealtimeDrumTrigger, RealtimeMasterLimiter, RealtimeMasteringEq18,
+    RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSubAndTapeBus,
+    RealtimeVocalSurgical,
 };
 
 #[global_allocator]
@@ -132,4 +133,37 @@ fn retuning_and_bypass_paths_do_not_allocate() {
         }
         tape.reset(96_000.0);
     });
+}
+
+#[test]
+fn drum_trigger_note_tracking_does_not_allocate() {
+    let mut drums = RealtimeDrumTrigger::new(48_000.0);
+    let mut notes = DrumTriggerNotes::new(48_000.0);
+    let mut sent = 0_usize;
+    assert_no_allocs("drum trigger note tracking", || {
+        let emit = &mut |msg: NoteMsg| {
+            std::hint::black_box(msg);
+            sent += 1;
+        };
+        for i in 0..FRAMES {
+            let timing = (i % 512) as u32;
+            if timing == 0 {
+                notes.root_on(0, 0, 60, 0.9, emit);
+                notes.set_chord_expansion(i % 1024 == 0);
+                notes.root_off(0, 0, 60, emit);
+            }
+            notes.tick(timing, emit);
+            let (l, r) = signal(i);
+            let hits = drums.process_stereo_sample(l, r, -30.0);
+            for (slot, hit) in hits.into_iter().enumerate() {
+                if let Some((note, velocity)) = hit {
+                    notes.drum_hit(timing, slot, note, velocity, emit);
+                }
+            }
+        }
+        notes.root_on(0, 1, 48, 0.5, emit);
+        notes.set_sample_rate(96_000.0);
+        notes.release_all(0, emit);
+    });
+    std::hint::black_box(sent);
 }
