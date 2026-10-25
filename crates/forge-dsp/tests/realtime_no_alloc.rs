@@ -148,9 +148,9 @@ fn drum_trigger_note_tracking_does_not_allocate() {
         for i in 0..FRAMES {
             let timing = (i % 512) as u32;
             if timing == 0 {
-                notes.root_on(0, 0, 60, 0.9, emit);
+                notes.root_on(0, 0, 60, 0.9, None, emit);
                 notes.set_chord_expansion(i % 1024 == 0);
-                notes.root_off(0, 0, 60, emit);
+                notes.root_off(0, 0, 60, None, emit);
             }
             notes.tick(timing, emit);
             let (l, r) = signal(i);
@@ -161,9 +161,39 @@ fn drum_trigger_note_tracking_does_not_allocate() {
                 }
             }
         }
-        notes.root_on(0, 1, 48, 0.5, emit);
+        notes.root_on(0, 1, 48, 0.5, None, emit);
         notes.set_sample_rate(96_000.0);
         notes.release_all(0, emit);
+    });
+    std::hint::black_box(sent);
+}
+
+#[test]
+fn drum_trigger_shared_keys_and_voice_ids_do_not_allocate() {
+    let mut notes = DrumTriggerNotes::new(48_000.0);
+    let mut sent = 0_usize;
+    assert_no_allocs("drum trigger voice tracking", || {
+        let emit = &mut |msg: NoteMsg| {
+            std::hint::black_box(msg);
+            sent += 1;
+        };
+        // Overlapping voices on one key, a root sharing a key with a chord tone, and a wildcard.
+        notes.root_on(0, 0, 60, 0.9, Some(1), emit);
+        notes.root_on(1, 0, 60, 0.9, Some(2), emit);
+        notes.root_on(2, 0, 57, 0.9, Some(3), emit);
+        notes.root_off(3, 0, 60, Some(1), emit);
+        notes.root_off(4, 0, 57, Some(3), emit);
+        notes.root_off(5, 0, 60, None, emit);
+        // Fill the root table past its size so the oldest instances are released early.
+        for voice in 0..200_u8 {
+            let (channel, root) = (voice % 16, 36 + voice % 48);
+            notes.root_on(6, channel, root, 0.7, Some(i32::from(voice)), emit);
+        }
+        for voice in 0..200_u8 {
+            let (channel, root) = (voice % 16, 36 + voice % 48);
+            notes.root_off(7, channel, root, Some(i32::from(voice)), emit);
+        }
+        notes.release_all(8, emit);
     });
     std::hint::black_box(sent);
 }
