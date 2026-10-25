@@ -784,6 +784,9 @@ pub struct RealtimeSubAndTapeBus {
     flutter_phase: f64,
     tape_mix: f64,
     tape_mix_step: f64,
+    /// False until the first sample sets `tape_mix` from the drive, so a bus that starts with
+    /// tape off is dry from its first sample and one that starts with tape on is fully wet.
+    tape_mix_primed: bool,
     sub_phase_flip: f64,
     prev_sub_sample: f64,
 }
@@ -811,9 +814,9 @@ impl RealtimeSubAndTapeBus {
             flutter_buf_r: [0.0; 64],
             flutter_pos: 0,
             flutter_phase: 0.0,
-            // Starts fully wet so a freshly built bus behaves as before when the drive is on.
-            tape_mix: 1.0,
+            tape_mix: 0.0,
             tape_mix_step: 1.0 / (TAPE_CROSSFADE_MS * 0.001 * sr).max(1.0),
+            tape_mix_primed: false,
             sub_phase_flip: 1.0,
             prev_sub_sample: 0.0,
         }
@@ -926,6 +929,11 @@ impl RealtimeSubAndTapeBus {
     #[inline]
     fn tape_crossfade(&mut self, dry_l: f64, dry_r: f64, amt: f64) -> (f64, f64) {
         let engaged = amt > TAPE_BYPASS_DRIVE;
+        if !self.tape_mix_primed {
+            // The first sample picks the starting side; fades apply only to later transitions.
+            self.tape_mix_primed = true;
+            self.tape_mix = if engaged { 1.0 } else { 0.0 };
+        }
         if !engaged && self.tape_mix <= 0.0 {
             return (dry_l, dry_r);
         }
@@ -1612,6 +1620,28 @@ mod sliding_min_tests {
             (519, 519),
         ] {
             check(cap, window, &values);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tape_mix_tests {
+    use super::RealtimeSubAndTapeBus;
+
+    #[test]
+    fn tape_mix_starts_from_the_first_drive_value() {
+        for drive in [0.0, 0.5] {
+            let mut bus = RealtimeSubAndTapeBus::new(48_000.0, 160.0);
+            for _ in 0..2 {
+                bus.process_stereo_sample(0.5, 0.5, 0.0, 1.0, drive);
+                let want = if drive > 0.0 { 1.0 } else { 0.0 };
+                assert_eq!(
+                    bus.tape_mix, want,
+                    "drive {drive}: tape mix after first samples"
+                );
+                // A reset re-primes from the next drive value.
+                bus.reset(48_000.0);
+            }
         }
     }
 }
