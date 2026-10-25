@@ -18,7 +18,7 @@ mod dsp_split;
 mod local_gpu;
 mod routing;
 
-pub use local_gpu::{LocalWorkerCommand, resolve_worker_script};
+pub use local_gpu::{BUILD_SOURCE_ROOT, LocalWorkerCommand, resolve_worker_script};
 pub use routing::{
     BackendUsed, SeparationConfig, SeparationReport, WorkerBackend, parse_backend, separate_stems,
 };
