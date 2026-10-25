@@ -1,6 +1,9 @@
 //! `forge-theory` — Symbolic Music Theory, Minimal-Motion Voice Leading, Reharmonization,
 //! Pocket/Groove Humanization, Drum Transient-to-MIDI Triggering, ABC Notation & `.mid` Compiler.
 
+mod abc;
+mod chord;
+
 use std::path::Path;
 
 use forge_core::{AudioBuffer, ForgeError, Result};
@@ -9,6 +12,8 @@ use midly::{
     num::{u4, u7, u15, u24, u28},
 };
 use serde::{Deserialize, Serialize};
+
+pub use abc::parse_abc_score;
 
 /// A discrete MIDI note event with micro-timing in ticks (or seconds) and velocity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,11 +82,75 @@ pub fn parse_pitch_class(token: &str) -> Result<(u8, &str)> {
     Ok((base, &s[1..]))
 }
 
-/// Parses a chord symbol (e.g., `Dm9`, `G13`, `Cmaj9`, `A7b13`, `F#m7b5`) into `(root_pc, intervals)`.
-pub fn parse_chord_symbol(symbol: &str) -> Result<(u8, Vec<u8>)> {
-    let (root, qual_raw) = parse_pitch_class(symbol)?;
-    let qual = qual_raw.split('/').next().unwrap_or(qual_raw).trim();
+/// A parsed chord symbol: root, intervals above the root, and an optional slash bass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParsedChord {
+    pub root_pc: u8,
+    /// Semitone intervals above the root, starting with `0`.
+    pub intervals: Vec<u8>,
+    /// Pitch class after a slash (`C/E` gives `Some(4)`), `None` for root-position symbols.
+    pub bass_pc: Option<u8>,
+}
 
+/// Parses a chord symbol (e.g., `Dm9`, `G13`, `Cmaj9`, `A7b13`, `F#m7b5`) into `(root_pc, intervals)`.
+///
+/// Any slash bass is validated and then dropped; use [`parse_chord`] to keep it.
+pub fn parse_chord_symbol(symbol: &str) -> Result<(u8, Vec<u8>)> {
+    let chord = parse_chord(symbol)?;
+    Ok((chord.root_pc, chord.intervals))
+}
+
+/// Parses a chord symbol, including slash chords (`C/E`, `Am7/G`) and `6/9` chords.
+///
+/// Qualities outside the common table are read as `[family][extension][modifiers]`
+/// (`maj7#11`, `7b5`, `9sus4`, `13b9`, `m11b5`, `7(b9,#11)`). An unrecognised quality or
+/// slash bass is an error.
+pub fn parse_chord(symbol: &str) -> Result<ParsedChord> {
+    let (root_pc, rest) = parse_pitch_class(symbol)?;
+    let (quality, bass_pc) = split_slash_bass(rest, symbol)?;
+    let intervals = match common_quality(&quality) {
+        Some(intervals) => intervals,
+        None => chord::parse_quality(&quality).map_err(|why| {
+            ForgeError::TheoryError(format!(
+                "Unknown chord quality '{quality}' in '{}': {why}",
+                symbol.trim()
+            ))
+        })?,
+    };
+    Ok(ParsedChord {
+        root_pc,
+        intervals,
+        bass_pc,
+    })
+}
+
+/// Splits `quality/bass` and validates the bass note. The slash in `6/9` belongs to the quality.
+fn split_slash_bass(rest: &str, symbol: &str) -> Result<(String, Option<u8>)> {
+    let Some((quality, bass)) = rest.split_once('/') else {
+        return Ok((rest.trim().to_string(), None));
+    };
+    if quality.ends_with('6') && bass.starts_with('9') {
+        return split_slash_bass(&format!("{quality}{bass}"), symbol);
+    }
+    let invalid = || {
+        ForgeError::TheoryError(format!(
+            "Invalid slash bass '{}' in chord '{}'",
+            bass.trim(),
+            symbol.trim()
+        ))
+    };
+    let bass = bass.trim();
+    if bass.is_empty() {
+        return Err(invalid());
+    }
+    match parse_pitch_class(bass) {
+        Ok((bass_pc, "")) => Ok((quality.trim().to_string(), Some(bass_pc))),
+        _ => Err(invalid()),
+    }
+}
+
+/// Exact-match table for the common qualities, kept for their established voicings.
+fn common_quality(qual: &str) -> Option<Vec<u8>> {
     let intervals = match qual {
         "" | "M" | "maj" => vec![0, 4, 7],
         "m" | "min" | "-" => vec![0, 3, 7],
@@ -101,23 +170,16 @@ pub fn parse_chord_symbol(symbol: &str) -> Result<(u8, Vec<u8>)> {
         "9" | "dom9" => vec![0, 4, 7, 10, 14],
         "maj9" | "M9" => vec![0, 4, 7, 11, 14],
         "m9" | "min9" | "-9" => vec![0, 3, 7, 10, 14],
-        "11" | "m11" | "min11" => vec![0, 3, 7, 10, 14, 17],
+        "m11" | "min11" => vec![0, 3, 7, 10, 14, 17],
         "13" | "dom13" => vec![0, 4, 10, 14, 21],
         "maj13" | "M13" => vec![0, 4, 7, 11, 14, 21],
         "7b9" => vec![0, 4, 7, 10, 13],
         "7#9" => vec![0, 4, 7, 10, 15],
         "7b13" | "7alt" => vec![0, 4, 10, 13, 20],
         "add9" => vec![0, 4, 7, 14],
-        _ => {
-            if qual.starts_with('m') {
-                vec![0, 3, 7, 10]
-            } else {
-                vec![0, 4, 7, 11]
-            }
-        }
+        _ => return None,
     };
-
-    Ok((root, intervals))
+    Some(intervals)
 }
 
 /// Reharmonizes a sequence of chord symbols with Neo-Soul / Jazz extensions, secondary dominants,
@@ -351,111 +413,6 @@ pub fn extract_drum_midi_triggers(
     (kick_events, snare_events, hat_events)
 }
 
-/// Parses a symbolic ABC score (from `YuE2-3B` or `SheetSage2`) into chord symbols and melody `NoteEvent`s.
-pub fn parse_abc_score(abc: &str, ticks_per_beat: u32) -> (Vec<String>, Vec<NoteEvent>) {
-    let mut chords = Vec::new();
-    let mut melody = Vec::new();
-    let mut current_tick = 0_u32;
-    let eighth_ticks = (ticks_per_beat / 2).max(1);
-
-    for line in abc.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty()
-            || trimmed.starts_with("X:")
-            || trimmed.starts_with("T:")
-            || trimmed.starts_with("M:")
-            || trimmed.starts_with("L:")
-            || trimmed.starts_with("Q:")
-            || trimmed.starts_with("K:")
-            || trimmed.starts_with('%')
-        {
-            continue;
-        }
-
-        let bytes = trimmed.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            // Chord symbol inside double quotes: "Dm9"
-            if bytes[i] == b'"'
-                && let Some(end_q) = trimmed[i + 1..].find('"')
-            {
-                let sym = trimmed[i + 1..i + 1 + end_q].trim();
-                if !sym.is_empty() {
-                    chords.push(sym.to_string());
-                }
-                i += end_q + 2;
-                continue;
-            }
-
-            // Parse ABC note letters (C..B in octave 4, c..b in octave 5)
-            let ch = bytes[i];
-            if ch.is_ascii_alphabetic() && ch != b'z' && ch != b'Z' && ch != b'x' {
-                let pc = match ch.to_ascii_uppercase() {
-                    b'C' => Some(0_i16),
-                    b'D' => Some(2),
-                    b'E' => Some(4),
-                    b'F' => Some(5),
-                    b'G' => Some(7),
-                    b'A' => Some(9),
-                    b'B' => Some(11),
-                    _ => None,
-                };
-                if let Some(base_pc) = pc {
-                    let mut midi: i16 = if ch.is_ascii_lowercase() {
-                        72 + base_pc
-                    } else {
-                        60 + base_pc
-                    };
-                    // Check preceding accidental
-                    if i > 0 {
-                        if bytes[i - 1] == b'^' {
-                            midi += 1;
-                        } else if bytes[i - 1] == b'_' {
-                            midi -= 1;
-                        }
-                    }
-                    i += 1;
-                    while i < bytes.len() && (bytes[i] == b'\'' || bytes[i] == b',') {
-                        if bytes[i] == b'\'' {
-                            midi += 12;
-                        } else {
-                            midi -= 12;
-                        }
-                        i += 1;
-                    }
-                    let mut mult = 1_u32;
-                    if i < bytes.len() && bytes[i].is_ascii_digit() {
-                        mult = u32::from(bytes[i] - b'0').max(1);
-                        i += 1;
-                    }
-                    let dur = eighth_ticks.saturating_mul(mult);
-                    melody.push(NoteEvent {
-                        midi_note: midi.clamp(24, 108) as u8,
-                        velocity: 92,
-                        start_tick: current_tick,
-                        duration_ticks: dur.saturating_sub(10).max(20),
-                        channel: 0,
-                    });
-                    current_tick = current_tick.saturating_add(dur);
-                    continue;
-                }
-            } else if ch == b'z' || ch == b'Z' {
-                i += 1;
-                let mut mult = 1_u32;
-                if i < bytes.len() && bytes[i].is_ascii_digit() {
-                    mult = u32::from(bytes[i] - b'0').max(1);
-                    i += 1;
-                }
-                current_tick = current_tick.saturating_add(eighth_ticks.saturating_mul(mult));
-                continue;
-            }
-            i += 1;
-        }
-    }
-
-    (chords, melody)
-}
-
 /// Renders a chord progression and melody into a clean ABC notation lead sheet.
 pub fn export_abc_score(title: &str, key: &str, bpm: u32, chords: &[String]) -> String {
     let mut out = format!("X:1\nT:{title}\nM:4/4\nL:1/8\nQ:1/4={bpm}\nK:{key}\n");
@@ -598,7 +555,124 @@ mod tests {
         assert_eq!(bass.len(), 4);
     }
 
+    const STYLES: [VoicingStyle; 4] = [
+        VoicingStyle::Close,
+        VoicingStyle::Drop2,
+        VoicingStyle::NeoSoulRootless,
+        VoicingStyle::CinematicSpread,
+    ];
+    const GROOVES: [GrooveStyle; 4] = [
+        GrooveStyle::Straight,
+        GrooveStyle::NeoSoulDilla,
+        GrooveStyle::MpcSwing58,
+        GrooveStyle::AcousticStrum,
+    ];
+
+    /// M9 / M10: extensions, alterations and suspensions are spelled out, not guessed.
+    #[test]
+    fn test_chord_extensions_and_alterations_m9_m10() {
+        let cases: &[(&str, u8, &[u8])] = &[
+            ("Cmaj7#11", 0, &[0, 4, 7, 11, 18]),
+            ("Cmaj11", 0, &[0, 4, 7, 11, 14, 17]),
+            ("G7b5", 7, &[0, 4, 6, 10]),
+            ("G7#5", 7, &[0, 4, 8, 10]),
+            ("G7#11", 7, &[0, 4, 7, 10, 18]),
+            ("G9sus4", 7, &[0, 5, 7, 10, 14]),
+            ("G13b9", 7, &[0, 4, 7, 10, 13, 21]),
+            ("G11", 7, &[0, 4, 7, 10, 14, 17]),
+            ("Gm11", 7, &[0, 3, 7, 10, 14, 17]),
+            ("Dm11b5", 2, &[0, 3, 6, 10, 14, 17]),
+            ("C7(b9,#11)", 0, &[0, 4, 7, 10, 13, 18]),
+            ("F#7#9b13", 6, &[0, 4, 7, 10, 15, 20]),
+            ("Ebmaj9#11", 3, &[0, 4, 7, 11, 14, 18]),
+            ("Bbm(maj9)", 10, &[0, 3, 7, 11, 14]),
+            ("C+maj7", 0, &[0, 4, 8, 11]),
+            ("Cmadd9", 0, &[0, 3, 7, 14]),
+            ("Cm6/9", 0, &[0, 3, 7, 9, 14]),
+            ("C5", 0, &[0, 7]),
+            // Enharmonic roots
+            ("Db7", 1, &[0, 4, 7, 10]),
+            ("C#7", 1, &[0, 4, 7, 10]),
+            ("E#", 5, &[0, 4, 7]),
+            ("Cbmaj7", 11, &[0, 4, 7, 11]),
+            ("B#m", 0, &[0, 3, 7]),
+        ];
+        for &(symbol, root, intervals) in cases {
+            let parsed = parse_chord_symbol(symbol).unwrap_or_else(|e| panic!("{symbol}: {e}"));
+            assert_eq!(parsed, (root, intervals.to_vec()), "{symbol}");
+        }
+    }
+
+    #[test]
+    fn test_slash_and_six_nine_chords() {
+        let cases: &[(&str, u8, &[u8], Option<u8>)] = &[
+            ("C/E", 0, &[0, 4, 7], Some(4)),
+            ("Am7/G", 9, &[0, 3, 7, 10], Some(7)),
+            ("Dm7b5/Ab", 2, &[0, 3, 6, 10], Some(8)),
+            ("F#m/C#", 6, &[0, 3, 7], Some(1)),
+            ("C6/9", 0, &[0, 4, 7, 9, 14], None),
+            ("C6/9/E", 0, &[0, 4, 7, 9, 14], Some(4)),
+        ];
+        for &(symbol, root_pc, intervals, bass_pc) in cases {
+            let expected = ParsedChord {
+                root_pc,
+                intervals: intervals.to_vec(),
+                bass_pc,
+            };
+            assert_eq!(parse_chord(symbol).expect(symbol), expected, "{symbol}");
+        }
+    }
+
+    #[test]
+    fn test_malformed_chord_symbols_are_rejected() {
+        let cases = [
+            ("Cxyz", "Unknown chord quality"),
+            ("C7b10", "Unknown chord quality"),
+            ("Cmsus4", "sus cannot follow a minor third"),
+            ("Cm5", "power chord"),
+            ("C##", "Unknown chord quality"),
+            ("C7(b9", "unclosed"),
+            ("C7b9)", "unbalanced"),
+            ("C7((b9))", "nested"),
+            ("C/H", "Invalid slash bass"),
+            ("C/", "Invalid slash bass"),
+            ("C/E/G", "Invalid slash bass"),
+            ("C/Em", "Invalid slash bass"),
+            ("H7", "Invalid root note"),
+            ("", "Empty chord symbol"),
+        ];
+        for (symbol, needle) in cases {
+            let err = parse_chord(symbol).expect_err(symbol).to_string();
+            assert!(err.contains(needle), "{symbol}: {err}");
+        }
+    }
+
     proptest! {
+        /// Grammar-generated symbols always parse, and each written alteration is in the result.
+        #[test]
+        fn prop_chord_grammar_spells_every_alteration(
+            root in "[A-G][#b]?",
+            family in "(|m|maj|dim|aug|ø)",
+            // Always present, so `C` + `b9` is never read as the root `Cb`.
+            extension in "(6|69|7|9|11|13)",
+            modifiers in prop::collection::vec("(b5|#5|b9|#9|#11|b13|add9)", 0..3),
+            bass in "(|/[A-G][#b]?)",
+        ) {
+            let symbol = format!("{root}{family}{extension}{}{bass}", modifiers.concat());
+            let chord = parse_chord(&symbol).unwrap();
+            prop_assert!(chord.root_pc < 12);
+            prop_assert_eq!(chord.intervals.first(), Some(&0));
+            prop_assert!(chord.intervals.windows(2).all(|w| w[0] < w[1]));
+            for (modifier, interval) in [("b5", 6), ("#5", 8), ("b9", 13), ("#9", 15), ("#11", 18), ("b13", 20)] {
+                if modifiers.iter().any(|m| m == modifier) {
+                    prop_assert!(chord.intervals.contains(&interval), "{} lacks {}", symbol, modifier);
+                }
+            }
+            prop_assert_eq!(chord.bass_pc.is_some(), !bass.is_empty());
+            let progression = vec![symbol.clone(), "G7".to_string()];
+            prop_assert!(solve_voice_leading(&progression, VoicingStyle::Close, GrooveStyle::Straight, 480, 4).is_ok());
+        }
+
         #[test]
         fn prop_chord_parser_voice_leading_and_midi_compiler_totality(
             sym_a in ".*",
@@ -614,18 +688,8 @@ mod tests {
             prop_assert!(parsed.0 < 12);
             prop_assert!(!parsed.1.is_empty());
 
-            let style = match style_idx % 4 {
-                0 => VoicingStyle::Close,
-                1 => VoicingStyle::Drop2,
-                2 => VoicingStyle::NeoSoulRootless,
-                _ => VoicingStyle::CinematicSpread,
-            };
-            let groove = match groove_idx % 4 {
-                0 => GrooveStyle::Straight,
-                1 => GrooveStyle::NeoSoulDilla,
-                2 => GrooveStyle::MpcSwing58,
-                _ => GrooveStyle::AcousticStrum,
-            };
+            let style = STYLES[style_idx % 4];
+            let groove = GROOVES[groove_idx % 4];
 
             let prog = vec![sym_b.clone(), "G7".to_string(), "Cmaj9".to_string()];
             let reharm = reharmonize_progression(&prog, style);
@@ -640,7 +704,7 @@ mod tests {
             }
 
             let abc = export_abc_score("PropTest", "C", 120, &reharm);
-            let (abc_chords, abc_melody) = parse_abc_score(&abc, ticks_per_beat);
+            let (abc_chords, abc_melody) = parse_abc_score(&abc, ticks_per_beat).unwrap();
             prop_assert_eq!(abc_chords.len(), 3);
             prop_assert!(!abc_melody.is_empty());
 

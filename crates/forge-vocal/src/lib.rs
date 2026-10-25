@@ -4,7 +4,7 @@
 //! - Chord-Aware Multi-Part Harmony Stack Generator (3rd above, 5th below, octave double)
 //! - Native REAPER Take Pitch Envelope (`<PITCHENV`) & `ReaPitch` curve compiler
 
-use forge_core::{AudioBuffer, Result};
+use forge_core::{AudioBuffer, ForgeError, Result};
 use forge_theory::parse_pitch_class;
 use serde::{Deserialize, Serialize};
 
@@ -31,51 +31,29 @@ pub struct VocalScale {
 }
 
 impl VocalScale {
-    /// Parses a scale descriptor such as `"D minor"`, `"C major"`, `"F# minor"`.
+    /// Parses a scale descriptor: a root note followed by an optional mode, written attached or
+    /// after a space (`"D minor"`, `"Am"`, `"F#m"`, `"F# dorian"`, `"A minor pentatonic"`, `"C"`).
+    ///
+    /// Modes: major/ionian, minor/aeolian, dorian, phrygian, lydian, mixolydian, locrian, harmonic
+    /// and melodic minor, major and minor pentatonic, blues and chromatic, with the usual
+    /// abbreviations (`m`, `min`, `maj`, `dor`, `mix`, `pent`, ...). Anything else is an error.
     pub fn parse(scale_str: &str) -> Result<Self> {
-        let parts: Vec<&str> = scale_str.split_whitespace().collect();
-        let root_token = parts.first().copied().unwrap_or("C");
-        let (root_pc, _) = parse_pitch_class(root_token)?;
-        let mode_str = parts
-            .get(1)
-            .copied()
-            .unwrap_or("major")
-            .to_ascii_lowercase();
-        let is_minor = mode_str.contains("min")
-            || mode_str == "m"
-            || mode_str.contains("aeolian")
-            || mode_str.contains("dorian");
-
+        let trimmed = scale_str.trim();
+        let (root_pc, mode) = parse_pitch_class(trimmed)
+            .map_err(|_| ForgeError::TheoryError(format!("Invalid scale root in '{trimmed}'")))?;
+        let intervals = scale_intervals(mode).ok_or_else(|| {
+            ForgeError::TheoryError(format!(
+                "Unknown scale mode '{}' in '{trimmed}'",
+                mode.trim()
+            ))
+        })?;
         let mut allowed_pcs = [false; 12];
-        if mode_str.contains("chrom") {
-            allowed_pcs = [true; 12];
-        } else if mode_str.contains("dorian") {
-            for &iv in &[0_u8, 2, 3, 5, 7, 9, 10] {
-                allowed_pcs[((root_pc + iv) % 12) as usize] = true;
-            }
-        } else if mode_str.contains("pent") {
-            let pent: [u8; 5] = if is_minor {
-                [0, 3, 5, 7, 10]
-            } else {
-                [0, 2, 4, 7, 9]
-            };
-            for &iv in &pent {
-                allowed_pcs[((root_pc + iv) % 12) as usize] = true;
-            }
-        } else {
-            let intervals: [u8; 7] = if is_minor {
-                [0, 2, 3, 5, 7, 8, 10]
-            } else {
-                [0, 2, 4, 5, 7, 9, 11]
-            };
-            for &iv in &intervals {
-                allowed_pcs[((root_pc + iv) % 12) as usize] = true;
-            }
+        for &iv in intervals {
+            allowed_pcs[usize::from((root_pc + iv) % 12)] = true;
         }
-
         Ok(Self {
             root_pc,
-            is_minor,
+            is_minor: intervals.contains(&3) && !intervals.contains(&4),
             allowed_pcs,
         })
     }
@@ -129,6 +107,75 @@ impl VocalScale {
             .clamp(0, (scale_notes.len() - 1) as i32) as usize;
         f64::from(scale_notes[target_idx] - clamped_note)
     }
+}
+
+const MAJOR: [u8; 7] = [0, 2, 4, 5, 7, 9, 11];
+const NATURAL_MINOR: [u8; 7] = [0, 2, 3, 5, 7, 8, 10];
+const DORIAN: [u8; 7] = [0, 2, 3, 5, 7, 9, 10];
+const PHRYGIAN: [u8; 7] = [0, 1, 3, 5, 7, 8, 10];
+const LYDIAN: [u8; 7] = [0, 2, 4, 6, 7, 9, 11];
+const MIXOLYDIAN: [u8; 7] = [0, 2, 4, 5, 7, 9, 10];
+const LOCRIAN: [u8; 7] = [0, 1, 3, 5, 6, 8, 10];
+const HARMONIC_MINOR: [u8; 7] = [0, 2, 3, 5, 7, 8, 11];
+const MELODIC_MINOR: [u8; 7] = [0, 2, 3, 5, 7, 9, 11];
+const MAJOR_PENTATONIC: [u8; 5] = [0, 2, 4, 7, 9];
+const MINOR_PENTATONIC: [u8; 5] = [0, 3, 5, 7, 10];
+const BLUES: [u8; 6] = [0, 3, 5, 6, 7, 10];
+const CHROMATIC: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+
+/// Maps the mode text after the root to scale intervals; word order does not matter.
+fn scale_intervals(mode: &str) -> Option<&'static [u8]> {
+    // `CM` is C major, so check the capital before folding case.
+    if mode.trim() == "M" {
+        return Some(&MAJOR);
+    }
+    let mut words = mode
+        .split_whitespace()
+        .map(canonical_scale_word)
+        .collect::<Option<Vec<_>>>()?;
+    words.sort_unstable();
+    SCALES
+        .iter()
+        .find(|(spelling, _)| *spelling == words.as_slice())
+        .map(|&(_, intervals)| intervals)
+}
+
+/// Canonical mode words, sorted, and the scale they name.
+const SCALES: [(&[&str], &[u8]); 16] = [
+    (&[], &MAJOR),
+    (&["major"], &MAJOR),
+    (&["minor"], &NATURAL_MINOR),
+    (&["dorian"], &DORIAN),
+    (&["phrygian"], &PHRYGIAN),
+    (&["lydian"], &LYDIAN),
+    (&["mixolydian"], &MIXOLYDIAN),
+    (&["locrian"], &LOCRIAN),
+    (&["harmonic", "minor"], &HARMONIC_MINOR),
+    (&["melodic", "minor"], &MELODIC_MINOR),
+    (&["pentatonic"], &MAJOR_PENTATONIC),
+    (&["major", "pentatonic"], &MAJOR_PENTATONIC),
+    (&["minor", "pentatonic"], &MINOR_PENTATONIC),
+    (&["blues"], &BLUES),
+    (&["blues", "minor"], &BLUES),
+    (&["chromatic"], &CHROMATIC),
+];
+
+fn canonical_scale_word(word: &str) -> Option<&'static str> {
+    Some(match word.to_ascii_lowercase().as_str() {
+        "maj" | "major" | "ion" | "ionian" => "major",
+        "m" | "min" | "minor" | "aeo" | "aeolian" => "minor",
+        "dor" | "dorian" => "dorian",
+        "phr" | "phrygian" => "phrygian",
+        "lyd" | "lydian" => "lydian",
+        "mix" | "mixolydian" => "mixolydian",
+        "loc" | "locrian" => "locrian",
+        "harm" | "harmonic" => "harmonic",
+        "mel" | "melodic" => "melodic",
+        "pent" | "pentatonic" => "pentatonic",
+        "blues" => "blues",
+        "chrom" | "chromatic" => "chromatic",
+        _ => return None,
+    })
 }
 
 /// Extracts a 20ms-hop F0 pitch contour using normalized difference (YIN estimator) and computes
@@ -526,7 +573,89 @@ mod tests {
         assert!(env.contains("PT "));
     }
 
+    fn mask(root: u8, intervals: &[u8]) -> [bool; 12] {
+        let mut allowed = [false; 12];
+        for &iv in intervals {
+            allowed[usize::from((root + iv) % 12)] = true;
+        }
+        allowed
+    }
+
+    /// M14: the mode after the root is read, attached or not, and never silently dropped.
+    #[test]
+    fn test_scale_modes_m14() {
+        let cases: &[(&str, u8, &[u8], bool)] = &[
+            ("Am", 9, &NATURAL_MINOR, true),
+            ("F#m", 6, &NATURAL_MINOR, true),
+            ("Bbmin", 10, &NATURAL_MINOR, true),
+            ("A minor pentatonic", 9, &MINOR_PENTATONIC, true),
+            ("A pentatonic minor", 9, &MINOR_PENTATONIC, true),
+            ("Am pent", 9, &MINOR_PENTATONIC, true),
+            ("C pentatonic", 0, &MAJOR_PENTATONIC, false),
+            ("G mixolydian", 7, &MIXOLYDIAN, false),
+            ("Gmix", 7, &MIXOLYDIAN, false),
+            ("F lydian", 5, &LYDIAN, false),
+            ("E phrygian", 4, &PHRYGIAN, true),
+            ("B locrian", 11, &LOCRIAN, true),
+            ("D Dorian", 2, &DORIAN, true),
+            ("A harmonic minor", 9, &HARMONIC_MINOR, true),
+            ("A melodic minor", 9, &MELODIC_MINOR, true),
+            ("E blues", 4, &BLUES, true),
+            ("C chromatic", 0, &CHROMATIC, false),
+            ("C", 0, &MAJOR, false),
+            ("CM", 0, &MAJOR, false),
+            ("Db major", 1, &MAJOR, false),
+            ("C# minor", 1, &NATURAL_MINOR, true),
+            ("  d minor  ", 2, &NATURAL_MINOR, true),
+        ];
+        for &(text, root, intervals, is_minor) in cases {
+            let scale = VocalScale::parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(scale.root_pc, root, "{text}");
+            assert_eq!(scale.allowed_pcs, mask(root, intervals), "{text}");
+            assert_eq!(scale.is_minor, is_minor, "{text}");
+        }
+    }
+
+    #[test]
+    fn test_malformed_scales_are_rejected() {
+        let cases = [
+            ("", "Invalid scale root"),
+            ("H minor", "Invalid scale root"),
+            ("A minorx", "Unknown scale mode 'minorx'"),
+            ("Ammm", "Unknown scale mode 'mmm'"),
+            ("A minor pentatonic blues", "Unknown scale mode"),
+            ("C majr", "Unknown scale mode 'majr'"),
+        ];
+        for (text, needle) in cases {
+            let err = VocalScale::parse(text).expect_err(text).to_string();
+            assert!(err.contains(needle), "{text}: {err}");
+        }
+    }
+
     proptest! {
+        /// Every mode spelling gives the same mask attached (`Amix`) or spaced (`A mix`).
+        #[test]
+        fn prop_scale_mode_spellings(
+            root in "[A-G][#b]?",
+            mode_idx in 0usize..8,
+            attached in any::<bool>(),
+        ) {
+            let modes: [(&str, &[u8]); 8] = [
+                ("m", &NATURAL_MINOR),
+                ("minor", &NATURAL_MINOR),
+                ("dorian", &DORIAN),
+                ("phrygian", &PHRYGIAN),
+                ("lydian", &LYDIAN),
+                ("mix", &MIXOLYDIAN),
+                ("locrian", &LOCRIAN),
+                ("minor pentatonic", &MINOR_PENTATONIC),
+            ];
+            let (mode, intervals) = modes[mode_idx];
+            let text = if attached { format!("{root}{mode}") } else { format!("{root} {mode}") };
+            let scale = VocalScale::parse(&text).unwrap();
+            prop_assert_eq!(scale.allowed_pcs, mask(scale.root_pc, intervals));
+        }
+
         #[test]
         fn prop_vocal_scale_snap_and_diatonic_shift_totality(
             arb_str in ".*",
