@@ -1038,18 +1038,21 @@ impl Default for SubAndTapeParams {
                 0.25,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
+            .with_smoother(SmoothingStyle::Linear(20.0))
             .with_value_to_string(formatters::v2s_f32_rounded(3)),
             stereo_width: FloatParam::new(
                 "High Stereo Width",
                 1.08,
                 FloatRange::Linear { min: 0.0, max: 2.0 },
             )
+            .with_smoother(SmoothingStyle::Linear(20.0))
             .with_value_to_string(formatters::v2s_f32_rounded(3)),
             tape_drive: FloatParam::new(
                 "Console8 / ChowTape RK4 Drive",
                 0.22,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
+            .with_smoother(SmoothingStyle::Linear(20.0))
             .with_value_to_string(formatters::v2s_f32_rounded(3)),
         }
     }
@@ -1143,13 +1146,14 @@ impl Plugin for ForgeSubAndTapePlug {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        // Only sets the glide target; the DSP retunes its side high-passes in place.
         self.dsp
             .set_mono_cutoff(f64::from(self.params.mono_cutoff_hz.value()));
-        let sub = f64::from(self.params.sub_reinforce.value());
-        let width = f64::from(self.params.stereo_width.value());
-        let drive = f64::from(self.params.tape_drive.value());
 
         for mut channel_samples in buffer.iter_samples() {
+            let sub = f64::from(self.params.sub_reinforce.smoothed.next());
+            let width = f64::from(self.params.stereo_width.smoothed.next());
+            let drive = f64::from(self.params.tape_drive.smoothed.next());
             let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
             let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
             let (out_l, out_r) = self
