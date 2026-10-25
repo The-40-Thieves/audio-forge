@@ -44,9 +44,9 @@ pub use spectral_defizz::{DeFizzConfig, apply_spectral_defizz};
 pub use spectral_unmask::{UnmaskConfig, apply_spectral_unmask};
 pub use spectrum::{
     RealtimeSpectrumAnalyzer32, SHARED_SPECTRUM_SLOT_COUNT, SHARED_SPECTRUM_SLOTS, SPECTRUM_BANDS,
-    SPECTRUM_CEIL_DB, SPECTRUM_FLOOR_DB, clear_shared_spectrum, publish_shared_spectrum,
-    read_shared_spectrum, shared_spectrum_slot_index, spectrum_band_center_hz,
-    spectrum_band_edges_hz,
+    SPECTRUM_CEIL_DB, SPECTRUM_FLOOR_DB, SpectrumBusOwner, clear_shared_spectrum,
+    publish_shared_spectrum, read_shared_spectrum, shared_spectrum_owner,
+    shared_spectrum_slot_index, spectrum_band_center_hz, spectrum_band_edges_hz,
 };
 
 #[cfg(test)]
@@ -189,7 +189,7 @@ mod tests {
         // Verify Cross-Instance Shared Spectrum Bus
         let mut test_bands = [0.0_f32; 32];
         test_bands[5] = -12.5;
-        publish_shared_spectrum(2, &test_bands);
+        publish_shared_spectrum(SpectrumBusOwner::unique(), 2, &test_bands);
         let read_back = read_shared_spectrum(2);
         assert!((read_back[5] - (-12.5)).abs() < 1e-4);
     }

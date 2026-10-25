@@ -25,9 +25,9 @@ use forge_dsp::{
     RealtimeMasteringEq18, RealtimeNeuralPreamp, RealtimeOpenSoothe, RealtimeOpenSpacer,
     RealtimePhaseAligner, RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus,
     RealtimeTransientTonalSplit, RealtimeVocalSurgical, RestorationConfig, SPECTRUM_FLOOR_DB,
-    UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw, apply_spectral_defizz,
-    apply_spectral_unmask, audit_audio, compute_reference_match_eq, normalize_and_limit,
-    publish_shared_spectrum, read_shared_spectrum, remove_dc_and_declip,
+    SpectrumBusOwner, UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw,
+    apply_spectral_defizz, apply_spectral_unmask, audit_audio, compute_reference_match_eq,
+    normalize_and_limit, publish_shared_spectrum, read_shared_spectrum, remove_dc_and_declip,
     run_full_restoration_chain,
 };
 use proptest::prelude::*;
@@ -335,7 +335,7 @@ proptest! {
         for (i, b) in bands.iter_mut().enumerate() {
             *b = if i % 2 == 0 { f_val } else { -18.5_f32 };
         }
-        publish_shared_spectrum(slot, &bands);
+        publish_shared_spectrum(SpectrumBusOwner::unique(), slot, &bands);
         let read_back = read_shared_spectrum(slot);
         for &v in &read_back {
             prop_assert!(is_clean_audio_f32(v));

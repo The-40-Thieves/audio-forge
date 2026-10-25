@@ -5,7 +5,7 @@
 //! All levels are dB relative to a full-scale sine: a sine of amplitude `A` centred in a band
 //! reads `20 * log10(A)` in that band, so a full-scale sine reads 0 dB.
 
-use std::sync::atomic::{AtomicU32, Ordering, fence};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 use crate::loudness_limiter::{CytomicSvf, sanitize_param_f64, sanitize_sample_f32};
 
@@ -213,19 +213,86 @@ pub const SHARED_SPECTRUM_SLOT_COUNT: usize = 8;
 const FLOOR_BITS: u32 = SPECTRUM_FLOOR_DB.to_bits();
 /// How many times a reader retries a slot a writer is updating before giving up.
 const READ_RETRIES: usize = 64;
+/// How many times a clear retries a slot another writer is updating before giving up.
+const WRITE_RETRIES: usize = 64;
+/// Owner id of a slot nobody has published to since it was last cleared.
+const NO_OWNER: u64 = 0;
 
 /// Process-wide shared spectrum slots, holding 32 band levels in dB each. Every band starts at
 /// [`SPECTRUM_FLOOR_DB`], so a slot nobody has published to reads as silence.
 ///
-/// Read and write them only through [`publish_shared_spectrum`] and [`read_shared_spectrum`],
-/// which guard each slot with a sequence counter so a reader never sees half of one frame and
-/// half of another.
+/// Read and write them only through [`publish_shared_spectrum`], [`clear_shared_spectrum`] and
+/// [`read_shared_spectrum`], which guard each slot with a sequence counter so a reader never
+/// sees half of one frame and half of another.
 pub static SHARED_SPECTRUM_SLOTS: [[AtomicU32; SPECTRUM_BANDS]; SHARED_SPECTRUM_SLOT_COUNT] =
     [const { [const { AtomicU32::new(FLOOR_BITS) }; SPECTRUM_BANDS] }; SHARED_SPECTRUM_SLOT_COUNT];
 
 /// Per-slot seqlock counter: odd while a writer is storing a frame.
 static SHARED_SPECTRUM_SEQ: [AtomicU32; SHARED_SPECTRUM_SLOT_COUNT] =
     [const { AtomicU32::new(0) }; SHARED_SPECTRUM_SLOT_COUNT];
+
+/// Per-slot owner: the [`SpectrumBusOwner`] id of the last successful publish, or [`NO_OWNER`].
+/// Written only while holding the slot's seqlock.
+static SHARED_SPECTRUM_OWNER: [AtomicU64; SHARED_SPECTRUM_SLOT_COUNT] =
+    [const { AtomicU64::new(NO_OWNER) }; SHARED_SPECTRUM_SLOT_COUNT];
+
+/// Source of [`SpectrumBusOwner`] ids. It starts at 1 because 0 is [`NO_OWNER`].
+static NEXT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Identity of one publisher (one plugin instance) on the shared spectrum bus.
+///
+/// Ownership rule: the last instance to publish to a slot owns it. Clearing a slot only
+/// empties it when the clearing instance is still the owner, so when two instances share a
+/// slot, the one that moves away or is removed never silences the other's frame. When the
+/// owner itself leaves, the slot reads as silence until the other instance's next publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SpectrumBusOwner(u64);
+
+impl SpectrumBusOwner {
+    /// A process-wide unique owner id. Allocation-free and lock-free.
+    pub fn unique() -> Self {
+        Self(NEXT_OWNER_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// The atomics behind one slot.
+struct BusSlot {
+    seq: &'static AtomicU32,
+    owner: &'static AtomicU64,
+    bands: &'static [AtomicU32; SPECTRUM_BANDS],
+}
+
+fn bus_slot(slot_idx: usize) -> Option<BusSlot> {
+    Some(BusSlot {
+        seq: SHARED_SPECTRUM_SEQ.get(slot_idx)?,
+        owner: SHARED_SPECTRUM_OWNER.get(slot_idx)?,
+        bands: SHARED_SPECTRUM_SLOTS.get(slot_idx)?,
+    })
+}
+
+/// Takes a slot's seqlock without waiting: returns the even counter value it started from, or
+/// `None` if another writer holds it.
+fn try_lock_slot(seq: &AtomicU32) -> Option<u32> {
+    let start = seq.load(Ordering::Relaxed);
+    if start & 1 == 1 {
+        return None;
+    }
+    seq.compare_exchange(
+        start,
+        start.wrapping_add(1),
+        Ordering::Acquire,
+        Ordering::Relaxed,
+    )
+    .ok()?;
+    fence(Ordering::Release);
+    Some(start)
+}
+
+fn store_frame(slot: &[AtomicU32; SPECTRUM_BANDS], bands_32: &[f32; SPECTRUM_BANDS]) {
+    for (atom, &val) in slot.iter().zip(bands_32.iter()) {
+        atom.store(sanitize_bus_db(val).to_bits(), Ordering::Relaxed);
+    }
+}
 
 /// Maps a plugin's bus-slot parameter (`0 = Off`, `1..=8 = Slot A..H`) to a slot index.
 pub fn shared_spectrum_slot_index(bus_param: usize) -> Option<usize> {
@@ -245,43 +312,65 @@ fn sanitize_bus_db(v: f32) -> f32 {
     }
 }
 
-/// Publishes a 32-band spectrum (dB) into slot `slot_idx` (`0..8`) as one consistent frame.
+/// Publishes a 32-band spectrum (dB) into slot `slot_idx` (`0..8`) as one consistent frame and
+/// makes `owner` the slot's owner.
 ///
-/// Wait-free: if another instance is publishing to the same slot at that moment, this frame is
-/// skipped and `false` is returned. Out-of-range slots are ignored and also return `false`.
+/// Wait-free: if another instance is writing to the same slot at that moment, this frame is
+/// skipped, ownership does not change, and `false` is returned. Out-of-range slots are ignored
+/// and also return `false`.
 #[inline]
-pub fn publish_shared_spectrum(slot_idx: usize, bands_32: &[f32; SPECTRUM_BANDS]) -> bool {
-    let (Some(seq), Some(slot)) = (
-        SHARED_SPECTRUM_SEQ.get(slot_idx),
-        SHARED_SPECTRUM_SLOTS.get(slot_idx),
-    ) else {
+pub fn publish_shared_spectrum(
+    owner: SpectrumBusOwner,
+    slot_idx: usize,
+    bands_32: &[f32; SPECTRUM_BANDS],
+) -> bool {
+    let Some(bus) = bus_slot(slot_idx) else {
         return false;
     };
-    let start = seq.load(Ordering::Relaxed);
-    if start & 1 == 1
-        || seq
-            .compare_exchange(
-                start,
-                start.wrapping_add(1),
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            )
-            .is_err()
-    {
+    let Some(start) = try_lock_slot(bus.seq) else {
         return false;
-    }
-    fence(Ordering::Release);
-    for (atom, &val) in slot.iter().zip(bands_32.iter()) {
-        atom.store(sanitize_bus_db(val).to_bits(), Ordering::Relaxed);
-    }
-    seq.store(start.wrapping_add(2), Ordering::Release);
+    };
+    bus.owner.store(owner.0, Ordering::Relaxed);
+    store_frame(bus.bands, bands_32);
+    bus.seq.store(start.wrapping_add(2), Ordering::Release);
     true
 }
 
-/// Resets slot `slot_idx` to silence, as when its publishing instance goes away.
+/// Resets slot `slot_idx` to silence if `owner` still owns it, as when its publishing instance
+/// moves to another slot or goes away. Returns `true` if it cleared the slot.
+///
+/// If another instance published to the slot since `owner` last did, that instance owns it and
+/// its frame stays. Lock-free and bounded: while another writer holds the slot it retries, and
+/// a publisher holding the slot takes it over, which ends the retries.
 #[inline]
-pub fn clear_shared_spectrum(slot_idx: usize) -> bool {
-    publish_shared_spectrum(slot_idx, &[SPECTRUM_FLOOR_DB; SPECTRUM_BANDS])
+pub fn clear_shared_spectrum(owner: SpectrumBusOwner, slot_idx: usize) -> bool {
+    let Some(bus) = bus_slot(slot_idx) else {
+        return false;
+    };
+    for _ in 0..WRITE_RETRIES {
+        if bus.owner.load(Ordering::Relaxed) != owner.0 {
+            return false;
+        }
+        if let Some(start) = try_lock_slot(bus.seq) {
+            // Authoritative under the lock: the acquire on `seq` sees every earlier owner.
+            let owned = bus.owner.load(Ordering::Relaxed) == owner.0;
+            if owned {
+                bus.owner.store(NO_OWNER, Ordering::Relaxed);
+                store_frame(bus.bands, &[SPECTRUM_FLOOR_DB; SPECTRUM_BANDS]);
+            }
+            bus.seq.store(start.wrapping_add(2), Ordering::Release);
+            return owned;
+        }
+        std::hint::spin_loop();
+    }
+    false
+}
+
+/// Current owner of slot `slot_idx`, or `None` if nobody has published to it since it was last
+/// cleared (and for out-of-range slots).
+pub fn shared_spectrum_owner(slot_idx: usize) -> Option<SpectrumBusOwner> {
+    let id = bus_slot(slot_idx)?.owner.load(Ordering::Acquire);
+    (id != NO_OWNER).then_some(SpectrumBusOwner(id))
 }
 
 /// Reads one consistent 32-band frame (dB) from slot `slot_idx` (`0..8`).
@@ -290,19 +379,16 @@ pub fn clear_shared_spectrum(slot_idx: usize) -> bool {
 /// read as silence ([`SPECTRUM_FLOOR_DB`]).
 #[inline]
 pub fn read_shared_spectrum(slot_idx: usize) -> [f32; SPECTRUM_BANDS] {
-    let (Some(seq), Some(slot)) = (
-        SHARED_SPECTRUM_SEQ.get(slot_idx),
-        SHARED_SPECTRUM_SLOTS.get(slot_idx),
-    ) else {
+    let Some(bus) = bus_slot(slot_idx) else {
         return [SPECTRUM_FLOOR_DB; SPECTRUM_BANDS];
     };
     for _ in 0..READ_RETRIES {
-        let before = seq.load(Ordering::Acquire);
+        let before = bus.seq.load(Ordering::Acquire);
         if before & 1 == 0 {
             let frame: [f32; SPECTRUM_BANDS] =
-                std::array::from_fn(|b| f32::from_bits(slot[b].load(Ordering::Relaxed)));
+                std::array::from_fn(|b| f32::from_bits(bus.bands[b].load(Ordering::Relaxed)));
             fence(Ordering::Acquire);
-            if seq.load(Ordering::Relaxed) == before {
+            if bus.seq.load(Ordering::Relaxed) == before {
                 return frame.map(sanitize_bus_db);
             }
         }

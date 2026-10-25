@@ -22,7 +22,7 @@ use forge_dsp::{
     RealtimeDensityAndClipper, RealtimeDrumTrigger, RealtimeFdnReverb, RealtimeMasterLimiter,
     RealtimeMasteringEq18, RealtimeNeuralPreamp, RealtimeOpenSoothe, RealtimeOpenSpacer,
     RealtimePhaseAligner, RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus,
-    RealtimeTransientTonalSplit, RealtimeVocalSurgical, clear_shared_spectrum,
+    RealtimeTransientTonalSplit, RealtimeVocalSurgical, SpectrumBusOwner, clear_shared_spectrum,
     publish_shared_spectrum, read_shared_spectrum, shared_spectrum_slot_index,
 };
 use nih_plug::prelude::*;
@@ -248,6 +248,9 @@ pub struct ForgeOpenSoothePlug {
     sample_rate: f64,
     /// Shared-bus slot this instance last published to, cleared when it changes or on drop.
     published_slot: Option<usize>,
+    /// This instance's identity on the shared bus, so its clears never empty a slot another
+    /// instance has published to since.
+    bus_owner: SpectrumBusOwner,
 }
 
 #[derive(Params)]
@@ -346,6 +349,7 @@ impl Default for ForgeOpenSoothePlug {
             limiter_dsp: RealtimeMasterLimiter::new(48_000.0),
             sample_rate: 48_000.0,
             published_slot: None,
+            bus_owner: SpectrumBusOwner::unique(),
         }
     }
 }
@@ -359,25 +363,27 @@ fn bus_slot_to_string(value: i32) -> String {
 }
 
 impl Drop for ForgeOpenSoothePlug {
-    /// A removed instance must not leave its last frame on the bus.
+    /// A removed instance must not leave its last frame on the bus. The clear only empties the
+    /// slot if this instance published to it last, so it never silences another instance.
     fn drop(&mut self) {
         if let Some(slot) = self.published_slot.take() {
-            clear_shared_spectrum(slot);
+            clear_shared_spectrum(self.bus_owner, slot);
         }
     }
 }
 
 impl ForgeOpenSoothePlug {
     /// Publishes `bands` to the bus slot selected by `bus_param` (`0 = Off`). Moving to another
-    /// slot or to `Off` clears the slot this instance published to before.
+    /// slot or to `Off` clears the slot this instance published to before, unless another
+    /// instance has published to it since (the last publisher owns a slot).
     fn publish_to_bus(&mut self, bus_param: usize, bands: &[f32; 32]) {
         let slot = shared_spectrum_slot_index(bus_param);
         if let Some(old) = self.published_slot.filter(|&old| Some(old) != slot) {
-            clear_shared_spectrum(old);
+            clear_shared_spectrum(self.bus_owner, old);
         }
         self.published_slot = slot;
         if let Some(idx) = slot {
-            publish_shared_spectrum(idx, bands);
+            publish_shared_spectrum(self.bus_owner, idx, bands);
         }
     }
 
@@ -2766,5 +2772,36 @@ mod tests {
         assert_eq!(bus_slot_to_string(0), "Off");
         assert_eq!(bus_slot_to_string(1), "Slot A");
         assert_eq!(bus_slot_to_string(8), "Slot H");
+    }
+
+    /// Plugs A and B share Slot F (index 5) and B published last, so B owns it. A switching
+    /// away or being dropped must leave B's frame; B dropping clears it.
+    #[test]
+    fn open_soothe_instances_sharing_a_slot_never_silence_each_other() {
+        const PARAM: usize = 6;
+        const SLOT: usize = 5;
+        let silent = [forge_dsp::SPECTRUM_FLOOR_DB; 32];
+        let (a_bands, b_bands, c_bands) = ([-30.0_f32; 32], [-10.0_f32; 32], [-40.0_f32; 32]);
+        let mut a = ForgeOpenSoothePlug::default();
+        let mut b = ForgeOpenSoothePlug::default();
+        a.publish_to_bus(PARAM, &a_bands);
+        b.publish_to_bus(PARAM, &b_bands);
+
+        // A moves to Slot G (index 6): its clear of Slot F must not touch B's frame.
+        a.publish_to_bus(PARAM + 1, &a_bands);
+        assert_eq!(read_shared_spectrum(SLOT), b_bands, "A's switch silenced B");
+        assert_eq!(read_shared_spectrum(SLOT + 1), a_bands);
+
+        // C joins Slot F and is removed after B publishes again: B's frame stays.
+        let mut c = ForgeOpenSoothePlug::default();
+        c.publish_to_bus(PARAM, &c_bands);
+        b.publish_to_bus(PARAM, &b_bands);
+        drop(c);
+        assert_eq!(read_shared_spectrum(SLOT), b_bands, "C's drop silenced B");
+
+        drop(a);
+        assert_eq!(read_shared_spectrum(SLOT + 1), silent, "A owned Slot G");
+        drop(b);
+        assert_eq!(read_shared_spectrum(SLOT), silent, "B owned Slot F");
     }
 }
