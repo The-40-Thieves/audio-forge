@@ -43,8 +43,10 @@ Build the server, then register it with any MCP client. For example, with Claude
 
 ```bash
 cargo build --release -p forge-mcp
-claude mcp add forge -- /path/to/audio-forge/target/release/forge-mcp
+claude mcp add forge -e FORGE_MCP_ROOT=/path/to/your/music -- /path/to/audio-forge/target/release/forge-mcp
 ```
+
+The server only reads and writes files inside `FORGE_MCP_ROOT` (several roots can be listed, separated like `PATH`). If it is unset, the directory the server was launched from is used. Relative paths in tool arguments resolve against the first root, `..` is rejected, and every path in a result is absolute.
 
 ### Deliver a track
 

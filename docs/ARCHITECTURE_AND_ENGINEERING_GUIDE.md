@@ -328,11 +328,13 @@ Add the following entry to your MCP configuration (`mcp_config.json` or `.mcp.js
   "mcpServers": {
     "forge-audio": {
       "command": "C:/Users/misla/.gemini/antigravity/scratch/audio-forge/target/release/forge-mcp.exe",
-      "args": []
+      "args": [],
+      "env": { "FORGE_MCP_ROOT": "E:/Music" }
     }
   }
 }
 ```
+`FORGE_MCP_ROOT` lists the directories the server may read and write (separated like `PATH`). If it is unset, the server's launch directory is used. Any tool path that resolves outside these roots, or contains `..`, is rejected before any file I/O.
 
 ### Step 5: Optional GPU Sidecar Setup (`Mel-Band-RoFormer` / `Apollo` / `YuE2-3B`)
 ```bash
