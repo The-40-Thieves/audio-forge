@@ -10,10 +10,9 @@ import sys
 import tempfile
 import time
 import types
-import unittest
 from concurrent.futures import Future
 from pathlib import Path
-from unittest import mock
+from unittest import TestCase, main, mock
 
 import forge_gpu_worker as worker
 
@@ -51,7 +50,7 @@ def fake_module(name: str, **attrs: object) -> types.ModuleType:
     return module
 
 
-class StemTagTests(unittest.TestCase):
+class StemTagTests(TestCase):
     def test_tag_is_the_last_group_even_when_the_input_name_has_one(self) -> None:
         name = f"Lead_Vocal_(Vocals)_mix_(Instrumental)_{KIM}.wav"
         self.assertEqual(worker.stem_tag(name), "Instrumental")
@@ -74,7 +73,7 @@ class StemTagTests(unittest.TestCase):
         )
 
 
-class RunSeparateTests(unittest.TestCase):
+class RunSeparateTests(TestCase):
     def run_separate(self, input_name: str, dereverb: bool) -> dict[str, str | None]:
         separator = fake_module("audio_separator.separator", Separator=FakeSeparator)
         modules = {
@@ -101,7 +100,7 @@ class RunSeparateTests(unittest.TestCase):
         )
 
 
-class YueTimeoutTests(unittest.TestCase):
+class YueTimeoutTests(TestCase):
     def test_a_space_that_never_answers_times_out(self) -> None:
         never_done: Future[tuple[str, str, str, str]] = Future()
 
@@ -130,4 +129,4 @@ class YueTimeoutTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    main()

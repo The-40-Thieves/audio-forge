@@ -254,7 +254,7 @@ fn hung_colab_worker_times_out() {
 }
 
 #[test]
-fn worker_script_is_found_from_the_executable_not_the_cwd() {
+fn worker_script_comes_from_config_or_the_build_tree_only() {
     let root = tempfile::tempdir().unwrap();
     let script = root
         .path()
@@ -262,26 +262,63 @@ fn worker_script_is_found_from_the_executable_not_the_cwd() {
         .join("forge_gpu_worker.py");
     std::fs::create_dir_all(script.parent().unwrap()).unwrap();
     std::fs::write(&script, "").unwrap();
-    let exe = root
-        .path()
-        .join("target")
-        .join("release")
-        .join("forge-mcp.exe");
     assert_eq!(
-        resolve_worker_script(None, Some(&exe)),
+        resolve_worker_script(None, Some(root.path())),
         Some(script.clone())
     );
-    let elsewhere = tempfile::tempdir().unwrap();
-    let stray_exe = elsewhere.path().join("forge-mcp.exe");
-    assert_eq!(resolve_worker_script(None, Some(&stray_exe)), None);
+    // A script in some ancestor of the source root is not picked up.
+    let nested = root.path().join("target").join("release");
+    std::fs::create_dir_all(&nested).unwrap();
+    assert_eq!(resolve_worker_script(None, Some(&nested)), None);
     assert_eq!(
         resolve_worker_script(Some(script.clone()), None),
         Some(script)
     );
     assert_eq!(
-        resolve_worker_script(Some(root.path().join("missing.py")), Some(&exe)),
+        resolve_worker_script(Some(root.path().join("missing.py")), Some(root.path())),
         None
     );
+}
+
+#[test]
+fn build_source_root_holds_the_worker_script() {
+    let root = Path::new(local_gpu::BUILD_SOURCE_ROOT);
+    assert!(
+        resolve_worker_script(None, Some(root)).is_some(),
+        "{}",
+        root.display()
+    );
+}
+
+#[test]
+fn timeouts_outside_the_supported_range_are_rejected() {
+    for bad in ["", "abc", "0", "-5", "nan", "inf", "1e300", "604801"] {
+        assert_eq!(parse_timeout_secs(bad), None, "{bad}");
+    }
+    assert_eq!(
+        parse_timeout_secs(" 1.5 "),
+        Some(Duration::from_millis(1_500))
+    );
+    assert_eq!(
+        parse_timeout_secs("604800"),
+        Some(Duration::from_secs(604_800))
+    );
+}
+
+#[test]
+fn worker_whose_child_keeps_the_pipes_open_still_times_out() {
+    // The worker exits at once but leaves a grandchild holding stdout for 5 s.
+    let dir = tempfile::tempdir().unwrap();
+    let worker = stub_worker(
+        dir.path(),
+        "sleep 5 & exit 0",
+        "start /b powershell -NoProfile -Command Start-Sleep -Seconds 5",
+    );
+    let started = Instant::now();
+    let err = local_gpu::separate(&worker, Path::new("in.wav"), dir.path(), SHORT).unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(err.to_string().contains("timed out after 0.3 s"), "{err}");
+    assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
 }
 
 #[test]

@@ -9,7 +9,7 @@ use std::time::Duration;
 use forge_core::{ForgeError, Result, StemBundle};
 use serde::{Deserialize, Serialize};
 
-use crate::local_gpu::{LocalWorkerCommand, resolve_worker_script};
+use crate::local_gpu::{BUILD_SOURCE_ROOT, LocalWorkerCommand, resolve_worker_script};
 use crate::{colab, dsp_split, local_gpu};
 
 /// Default wall-clock limit for one local GPU worker run.
@@ -77,7 +77,7 @@ impl SeparationConfig {
         let colab_url = env_nonempty("FORGE_COLAB_WORKER_URL");
         let script = resolve_worker_script(
             env_nonempty("FORGE_GPU_WORKER_SCRIPT").map(PathBuf::from),
-            std::env::current_exe().ok().as_deref(),
+            Some(Path::new(BUILD_SOURCE_ROOT)),
         );
         let backend = env_nonempty("FORGE_WORKER_BACKEND").map_or(WorkerBackend::Auto, |name| {
             parse_backend(&name, colab_url.as_deref()).unwrap_or_else(|e| {
@@ -121,10 +121,24 @@ fn env_nonempty(key: &str) -> Option<String> {
 }
 
 fn env_secs(key: &str, default: Duration) -> Duration {
-    env_nonempty(key)
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|s| s.is_finite() && *s > 0.0)
-        .map_or(default, Duration::from_secs_f64)
+    env_nonempty(key).map_or(default, |v| {
+        parse_timeout_secs(&v).unwrap_or_else(|| {
+            eprintln!(
+                "forge-worker: ignoring {key}='{v}' (expected 0 < seconds <= {MAX_TIMEOUT_SECS})"
+            );
+            default
+        })
+    })
+}
+
+/// Longest accepted timeout, one week. Larger values (up to `inf`) would make
+/// `Duration::from_secs_f64` panic or the deadline arithmetic overflow.
+pub const MAX_TIMEOUT_SECS: f64 = 7.0 * 24.0 * 3600.0;
+
+/// Parses a timeout in seconds, rejecting non-numbers, non-positive and out-of-range values.
+pub fn parse_timeout_secs(value: &str) -> Option<Duration> {
+    let secs = value.trim().parse::<f64>().ok()?;
+    (secs > 0.0 && secs <= MAX_TIMEOUT_SECS).then(|| Duration::from_secs_f64(secs))
 }
 
 /// One neural backend to try before the DSP fallback.
@@ -136,7 +150,7 @@ enum Attempt<'a> {
 /// Lists the neural attempts for `config`, recording skipped ones in `skipped`.
 fn plan<'a>(config: &'a SeparationConfig, skipped: &mut Vec<String>) -> Vec<Attempt<'a>> {
     const NO_SCRIPT: &str = "local_gpu skipped: python-worker/forge_gpu_worker.py not found \
-                             next to the executable (set FORGE_GPU_WORKER_SCRIPT)";
+                             in the build source tree (set FORGE_GPU_WORKER_SCRIPT)";
     let mut local = || match &config.local_worker {
         Some(worker) => Some(Attempt::Local(worker)),
         None => {

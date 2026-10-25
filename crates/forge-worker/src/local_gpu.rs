@@ -7,7 +7,7 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::thread::JoinHandle;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use forge_core::{ForgeError, Result, StemBundle};
@@ -43,20 +43,23 @@ impl LocalWorkerCommand {
     }
 }
 
+/// Repository root of the source tree this binary was built from, fixed at compile time.
+pub const BUILD_SOURCE_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+
 /// Finds the worker script: `override_path` (from `FORGE_GPU_WORKER_SCRIPT`) when given,
-/// otherwise the first ancestor of the executable's directory that contains
-/// `python-worker/forge_gpu_worker.py`. The process working directory is never consulted.
+/// otherwise `python-worker/forge_gpu_worker.py` under `source_root` (normally
+/// [`BUILD_SOURCE_ROOT`]). Neither the working directory nor the executable's location, which a
+/// symlink or copy can change, is consulted: the script either comes from explicit
+/// configuration or from the tree the binary was compiled from.
 pub fn resolve_worker_script(
     override_path: Option<PathBuf>,
-    exe: Option<&Path>,
+    source_root: Option<&Path>,
 ) -> Option<PathBuf> {
     if let Some(path) = override_path {
         return path.is_file().then_some(path);
     }
-    exe?.parent()?
-        .ancestors()
-        .map(|dir| dir.join(SCRIPT_REL))
-        .find(|candidate| candidate.is_file())
+    let candidate = source_root?.join(SCRIPT_REL);
+    candidate.is_file().then_some(candidate)
 }
 
 /// Runs `separate` on the local worker and parses the `StemBundle` it prints.
@@ -101,8 +104,9 @@ pub(crate) struct WorkerOutput {
     pub stderr: Vec<u8>,
 }
 
-/// Spawns `cmd` and waits at most `timeout`. On timeout the process tree is killed and the
-/// reader threads are left to finish on their own (a surviving grandchild may hold the pipes).
+/// Spawns `cmd` and waits at most `timeout`, including the time spent draining its output. On
+/// timeout the process tree is killed and the reader threads are abandoned (a surviving
+/// grandchild may hold the pipes open after the worker itself exits).
 pub(crate) fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<WorkerOutput> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -115,34 +119,54 @@ pub(crate) fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<Wo
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
     let deadline = Instant::now() + timeout;
+    let timed_out = |child: &mut Child| {
+        kill_tree(child);
+        ForgeError::WorkerError(format!(
+            "GPU worker timed out after {:.1} s and was killed",
+            timeout.as_secs_f64()
+        ))
+    };
 
-    loop {
+    let status = loop {
         if let Some(status) = child.try_wait()? {
-            return Ok(WorkerOutput {
-                status,
-                stdout: stdout.join().unwrap_or_default(),
-                stderr: stderr.join().unwrap_or_default(),
-            });
+            break status;
         }
         if Instant::now() >= deadline {
-            kill_tree(&mut child);
-            return Err(ForgeError::WorkerError(format!(
-                "GPU worker timed out after {:.1} s and was killed",
-                timeout.as_secs_f64()
-            )));
+            return Err(timed_out(&mut child));
         }
         std::thread::sleep(Duration::from_millis(20));
+    };
+    match (collect(&stdout, deadline), collect(&stderr, deadline)) {
+        (Some(stdout), Some(stderr)) => Ok(WorkerOutput {
+            status,
+            stdout,
+            stderr,
+        }),
+        _ => Err(timed_out(&mut child)),
     }
 }
 
-fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<Vec<u8>> {
+/// Reads a pipe to its end on a helper thread and sends the bytes back once it closes.
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut pipe) = pipe {
             let _ = pipe.read_to_end(&mut buf);
         }
-        buf
-    })
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
+/// Waits for a drained pipe until `deadline`; `None` when it is still held open then.
+fn collect(rx: &Receiver<Vec<u8>>, deadline: Instant) -> Option<Vec<u8>> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    match rx.recv_timeout(left) {
+        Ok(buf) => Some(buf),
+        Err(RecvTimeoutError::Disconnected) => Some(Vec::new()),
+        Err(RecvTimeoutError::Timeout) => None,
+    }
 }
 
 fn stderr_excerpt(stderr: &[u8]) -> String {
