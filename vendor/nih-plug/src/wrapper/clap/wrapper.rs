@@ -3153,20 +3153,51 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
         let length = u64::from_le_bytes(length_bytes);
 
-        let mut read_buffer: Vec<u8> = Vec::with_capacity(length as usize);
-        if !read_stream(&*stream, read_buffer.spare_capacity_mut()) {
+        // The length prefix comes from the host and may be garbage (e.g. a corrupted or foreign
+        // state blob). Never trust it for a single up-front allocation, since a bogus length would
+        // otherwise abort the host with an allocation failure. Real states are nowhere near this
+        // size.
+        const MAX_STATE_LENGTH: u64 = 64 * 1024 * 1024;
+        if length > MAX_STATE_LENGTH {
             nih_debug_assert_failure!(
-                "Error or end of stream while reading the state buffer from the stream."
+                "The state length prefix ({} bytes) exceeds the maximum state size, the state is \
+                 likely corrupted",
+                length
             );
             return false;
         }
-        read_buffer.set_len(length as usize);
+        let length = length as usize;
+
+        // Read the state in bounded chunks so the allocation grows with the data the stream
+        // actually contains rather than with the declared length
+        const READ_CHUNK_SIZE: usize = 64 * 1024;
+        let mut read_buffer: Vec<u8> = Vec::with_capacity(length.min(READ_CHUNK_SIZE));
+        while read_buffer.len() < length {
+            let chunk_size = (length - read_buffer.len()).min(READ_CHUNK_SIZE);
+            read_buffer.reserve(chunk_size);
+            if !read_stream(
+                &*stream,
+                &mut read_buffer.spare_capacity_mut()[..chunk_size],
+            ) {
+                nih_debug_assert_failure!(
+                    "Error or end of stream while reading the state buffer from the stream."
+                );
+                return false;
+            }
+            read_buffer.set_len(read_buffer.len() + chunk_size);
+        }
 
         match state::deserialize_json(&read_buffer) {
             Some(mut state) => {
                 let success = wrapper.set_state_inner(&mut state);
                 if success {
                     nih_trace!("Loaded state ({} bytes)", read_buffer.len());
+
+                    // The host needs to know that the parameter values changed. `state.load()` is
+                    // a main thread function so this will normally run immediately, but
+                    // `schedule_gui()` defers to the main thread otherwise.
+                    let task_posted = wrapper.schedule_gui(Task::RescanParamValues);
+                    nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
                 }
 
                 success
