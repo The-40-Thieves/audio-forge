@@ -1,0 +1,22 @@
+# Vendored `nih_plug`
+
+This is the `nih_plug` crate (plus its `nih_plug_derive` path dependency) from
+<https://github.com/robbert-vdh/nih-plug> at commit
+`de421011f41a6d10fc8c7a6084e4f4dee0143683`, wired in through
+`[patch."https://github.com/robbert-vdh/nih-plug.git"]` in the root `Cargo.toml`.
+The other nih-plug crates (`nih_plug_egui`, `nih_plug_xtask`) still come from git.
+
+Changes from upstream:
+
+- `Cargo.toml`: dropped the upstream `[workspace]` and `[profile.*]` sections.
+- `src/wrapper/clap/wrapper.rs`, `ext_state_load`:
+  - Reject state whose 8-byte length prefix is over 64 MiB, and read the body in
+    64 KiB chunks instead of calling `Vec::with_capacity` on the untrusted
+    length. Random state previously aborted the host (clap-validator
+    `state-invalid-random`).
+  - After a successful load, schedule `Task::RescanParamValues` so the host gets
+    `clap_host_params.rescan(CLAP_PARAM_RESCAN_VALUES)` on the main thread
+    (clap-validator `state-reproducibility-basic`, `-binary`, `-buffered`).
+
+Remove this directory and the `[patch]` entry once both fixes are upstream, then
+bump the nih-plug revision in `Cargo.lock`.

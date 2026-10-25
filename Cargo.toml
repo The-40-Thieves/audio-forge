@@ -22,6 +22,8 @@ members = [
     "plugins/forge-spaceverb",
     "xtask",
 ]
+# Vendored, patched upstream crates; see `vendor/nih-plug/PATCHES.md`
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -52,6 +54,12 @@ proptest = "1.5"
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_process_allocs"] }
 nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
 nih_plug_xtask = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+
+# nih-plug's CLAP wrapper aborts the host on corrupt state and never asks the host to rescan
+# parameter values after loading state, which fails clap-validator. Until the fixes land upstream,
+# use a vendored copy of `nih_plug` at the locked upstream commit with those two fixes applied.
+[patch."https://github.com/robbert-vdh/nih-plug.git"]
+nih_plug = { path = "vendor/nih-plug" }
 
 [profile.release]
 opt-level = 3
