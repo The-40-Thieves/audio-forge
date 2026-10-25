@@ -172,3 +172,30 @@ fn offline_limiter_ramps_its_attack() {
         }
     }
 }
+
+#[test]
+fn offline_limiter_handles_an_over_at_the_file_start() {
+    for sr in SAMPLE_RATES {
+        for over_db in OVERS_DB {
+            // The bed alone, with one spike on the very first frame.
+            let mut x: Vec<f64> = (0..3 * SPACING)
+                .map(|i| 0.1 * (2.0 * PI * 200.0 * i as f64 / f64::from(sr)).sin())
+                .collect();
+            x[0] = db_to_lin(CEILING_DBTP + over_db);
+            let out = offline_limit(&x, sr);
+            let (_, tp_db, at) = compute_true_peak(&stereo(&out, sr));
+            assert!(
+                tp_db <= CEILING_DBTP + TP_TOLERANCE_DB,
+                "start spike +{over_db} dB @ {sr}: output true peak {tp_db:.3} dBTP at {at:.4} s"
+            );
+            // Well past the release, the bed keeps its level: the spike was limited where it
+            // occurred, not by attenuating the whole file.
+            let bed = |v: &[f64]| v[2 * SPACING..].iter().fold(0.0_f64, |m, s| m.max(s.abs()));
+            let bed_change_db = 20.0 * (bed(&out) / bed(&x)).log10();
+            assert!(
+                bed_change_db.abs() < 0.5,
+                "start spike +{over_db} dB @ {sr}: bed level moved {bed_change_db:.2} dB"
+            );
+        }
+    }
+}

@@ -943,6 +943,12 @@ impl SlidingMin {
     /// Adds `v` and returns the minimum of the last `window` values pushed.
     fn push(&mut self, v: f64) -> f64 {
         let cap = self.vals.len();
+        // Expire before inserting: at most `window - 1` entries survive, so the insert below
+        // can never overwrite the head even when `window == cap`.
+        while self.len > 0 && self.idx[self.head] + self.window <= self.next {
+            self.head = (self.head + 1) % cap;
+            self.len -= 1;
+        }
         while self.len > 0 && self.vals[(self.head + self.len - 1) % cap] >= v {
             self.len -= 1;
         }
@@ -950,10 +956,6 @@ impl SlidingMin {
         self.vals[slot] = v;
         self.idx[slot] = self.next;
         self.len += 1;
-        while self.idx[self.head] + self.window <= self.next {
-            self.head = (self.head + 1) % cap;
-            self.len -= 1;
-        }
         self.next += 1;
         self.vals[self.head]
     }
@@ -1403,5 +1405,52 @@ impl RealtimeDrumTrigger {
         }
 
         out
+    }
+}
+
+#[cfg(test)]
+mod sliding_min_tests {
+    use super::SlidingMin;
+
+    /// Checks `SlidingMin` against a brute-force minimum over the same window.
+    fn check(capacity: usize, window: usize, values: &[f64]) {
+        let mut sm = SlidingMin::new(capacity);
+        sm.reset(window);
+        let window = window.clamp(1, capacity);
+        for (i, &v) in values.iter().enumerate() {
+            let got = sm.push(v);
+            let start = (i + 1).saturating_sub(window);
+            let want = values[start..=i]
+                .iter()
+                .copied()
+                .fold(f64::INFINITY, f64::min);
+            assert_eq!(got, want, "cap {capacity} window {window} at {i}");
+        }
+    }
+
+    #[test]
+    fn rising_run_at_full_capacity_keeps_the_window_minimum() {
+        // The 192 kHz case: the hold window equals the deque capacity and the required gain
+        // rises for longer than the window.
+        let values: Vec<f64> = (0..1_200).map(|i| 0.2 + 0.001 * i as f64).collect();
+        check(519, 519, &values);
+    }
+
+    #[test]
+    fn matches_brute_force_on_mixed_input() {
+        let values: Vec<f64> = (0..2_000_u32)
+            .map(|i| f64::from(i.wrapping_mul(2_654_435_761) % 1_000) / 1_000.0)
+            .collect();
+        for (cap, window) in [
+            (1, 1),
+            (8, 1),
+            (8, 3),
+            (8, 8),
+            (64, 64),
+            (519, 151),
+            (519, 519),
+        ] {
+            check(cap, window, &values);
+        }
     }
 }

@@ -891,9 +891,13 @@ fn limiter_gain_envelope(
         .collect();
     let ahead_min = forward_window_min(&required, lookahead + 2 * LIMITER_HOLD_FRAMES + 1);
 
-    let mut released = 1.0_f64;
-    let mut ring = vec![1.0_f64; lookahead];
-    let mut sum = lookahead as f64;
+    // Prime the release and the moving average as if the first window's gain had been held for
+    // a full lookahead before the file starts, so an over in the first frames is fully reduced
+    // where it occurs instead of leaving the whole-file trim to catch it.
+    let start = ahead_min.first().copied().unwrap_or(1.0);
+    let mut released = start;
+    let mut ring = vec![start; lookahead];
+    let mut sum = start * lookahead as f64;
     let mut gain_env = vec![1.0_f64; peaks.len()];
     for (i, g) in gain_env.iter_mut().enumerate() {
         let held = ahead_min[i.saturating_sub(LIMITER_HOLD_FRAMES)];
