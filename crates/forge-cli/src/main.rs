@@ -12,8 +12,8 @@ use forge_dsp::{
     run_full_restoration_chain,
 };
 use forge_reaper::{
-    ReaperProjectBuilder, ReaperTrackSpec, ReleaseMetadata, install_jsfx_plugins, send_reaper_osc,
-    validate_isrc, write_distrokid_metadata,
+    ReaperProjectBuilder, ReaperTrackSpec, ReleaseMetadata, TempFileGuard, install_jsfx_plugins,
+    send_reaper_osc, validate_isrc, write_distrokid_metadata,
 };
 use forge_theory::{
     GrooveStyle, VoicingStyle, export_abc_score, extract_drum_midi_triggers,
@@ -507,8 +507,8 @@ async fn main() -> anyhow::Result<()> {
             let mastered = normalize_and_limit(&buf, target_lufs, ceiling_dbtp)?;
             if let Some(raw_isrc) = isrc {
                 let canonical = validate_isrc(&raw_isrc)?;
-                let tmp = output.with_extension("pre_tag.wav");
-                mastered.save_wav(&tmp, 24)?;
+                let tmp = TempFileGuard::new(output.with_extension("pre_tag.wav"));
+                mastered.save_wav(tmp.path(), 24)?;
                 let meta = ReleaseMetadata {
                     title,
                     artist,
@@ -518,8 +518,7 @@ async fn main() -> anyhow::Result<()> {
                     key: None,
                     year: Some(2026),
                 };
-                write_distrokid_metadata(&tmp, &output, &meta)?;
-                let _ = std::fs::remove_file(&tmp);
+                write_distrokid_metadata(tmp.path(), output.as_path(), &meta)?;
                 println!(
                     "Mastered & tagged with ISRC {canonical} -> {}",
                     output.display()
