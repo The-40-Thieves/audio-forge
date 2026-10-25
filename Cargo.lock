@@ -1078,6 +1078,7 @@ dependencies = [
 name = "forge-dsp"
 version = "0.1.0"
 dependencies = [
+ "assert_no_alloc",
  "codspeed-divan-compat",
  "forge-core",
  "proptest",

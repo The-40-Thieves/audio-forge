@@ -1,62 +1,28 @@
 //! Allocation guard for the real-time processors the plugins run on the audio thread.
 //!
-//! A counting global allocator records heap allocations made by the current thread while a
-//! guard is armed. Each processor is built first (construction may allocate), then its
-//! per-sample `process` path and its `reset` are run under the guard, which must see zero
-//! allocations.
+//! `assert_no_alloc`'s allocator (the one nih-plug uses for `assert_process_allocs`) counts
+//! every allocation and deallocation the current thread makes inside `assert_no_alloc`. Each
+//! processor is built first (construction may allocate), then its per-sample `process` path
+//! and its `reset` are run under the guard, which must see zero violations.
+//!
+//! Debug builds only: in release, `assert_no_alloc`'s default `disable_release` feature (also
+//! used by nih-plug) compiles the allocator out. CI runs `cargo test` in debug.
+#![cfg(debug_assertions)]
 
+use assert_no_alloc::{AllocDisabler, assert_no_alloc, reset_violation_count, violation_count};
 use forge_dsp::{
     RealtimeDrumTrigger, RealtimeMasterLimiter, RealtimeMasteringEq18, RealtimeOpenSoothe,
     RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSubAndTapeBus, RealtimeVocalSurgical,
 };
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
-
-struct CountingAlloc;
-
-thread_local! {
-    static ARMED: Cell<bool> = const { Cell::new(false) };
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-}
-
-fn record() {
-    // `try_with` so allocations during thread-local teardown are ignored instead of panicking.
-    let _ = ARMED.try_with(|armed| {
-        if armed.get() {
-            let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
-        }
-    });
-}
-
-// SAFETY: every method forwards unchanged to `System`, which upholds the `GlobalAlloc`
-// contract; counting adds no allocation of its own (the thread-locals are `const`-initialised).
-// `alloc_zeroed` and `realloc` keep their default implementations, which allocate through
-// `alloc` below, so they are counted too.
-unsafe impl GlobalAlloc for CountingAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        record();
-        // SAFETY: the caller guarantees `layout` has non-zero size, as `GlobalAlloc::alloc`
-        // requires; it is passed to `System` as is.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: `ptr` was returned by `alloc` above, i.e. by `System`, with this same
-        // `layout`, as `GlobalAlloc::dealloc` requires of the caller.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
 
 #[global_allocator]
-static GLOBAL: CountingAlloc = CountingAlloc;
+static GLOBAL: AllocDisabler = AllocDisabler;
 
-/// Runs `f` with the guard armed and returns how many allocations it made on this thread.
-fn allocations_during(f: impl FnOnce()) -> usize {
-    ALLOCS.with(|n| n.set(0));
-    ARMED.with(|a| a.set(true));
-    f();
-    ARMED.with(|a| a.set(false));
-    ALLOCS.with(Cell::get)
+/// Runs `f` under the guard and returns how many allocator calls it made on this thread.
+fn allocations_during(f: impl FnOnce()) -> u32 {
+    reset_violation_count();
+    assert_no_alloc(f);
+    violation_count()
 }
 
 /// Enough frames to run several 512-sample STFT hops.
@@ -71,7 +37,7 @@ fn signal(i: usize) -> (f32, f32) {
 
 fn assert_no_allocs(name: &str, f: impl FnOnce()) {
     let n = allocations_during(f);
-    assert_eq!(n, 0, "{name} allocated {n} time(s) on the audio path");
+    assert_eq!(n, 0, "{name} made {n} allocator call(s) on the audio path");
 }
 
 #[test]
@@ -79,7 +45,7 @@ fn guard_detects_allocations() {
     let n = allocations_during(|| {
         std::hint::black_box(vec![0_u8; 64]);
     });
-    assert!(n > 0, "the counting allocator should see a Vec allocation");
+    assert!(n > 0, "the guard should see a Vec allocation");
 }
 
 #[test]
