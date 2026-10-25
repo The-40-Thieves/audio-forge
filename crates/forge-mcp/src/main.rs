@@ -6,8 +6,14 @@
 //!
 //! File access is confined: every path argument must resolve inside the roots listed in
 //! `FORGE_MCP_ROOT` (default: the directory the server was launched from). See [`sandbox`].
+//! Files are then opened through handles anchored at those roots; see [`anchored`] and,
+//! for the FFmpeg and worker steps that still take path names, [`external`].
 
+mod anchored;
+mod external;
 mod sandbox;
+#[cfg(all(test, unix))]
+mod toctou_tests;
 
 use forge_core::{AudioBuffer, ForgeError};
 use forge_dsp::{
@@ -16,19 +22,15 @@ use forge_dsp::{
     apply_spectral_defizz, apply_spectral_unmask, audit_audio, clean_vocal_surgical,
     compute_reference_match_eq, deliver, normalize_and_limit, run_full_restoration_chain,
 };
-use forge_reaper::{
-    ReaperProjectBuilder, ReaperTrackSpec, ReleaseMetadata, install_jsfx_plugins, validate_isrc,
-    write_distrokid_metadata,
-};
+use forge_reaper::{ReaperProjectBuilder, ReaperTrackSpec, ReleaseMetadata, validate_isrc};
 use forge_theory::{
     GrooveStyle, NoteEvent, VoicingStyle, export_abc_score, extract_drum_midi_triggers,
-    reharmonize_progression, solve_voice_leading, write_midi_file,
+    reharmonize_progression, solve_voice_leading,
 };
 use forge_vocal::{
     PitchFrame, VocalScale, generate_vocal_harmony_stack, shift_vocal_pitch_formant_preserved,
     track_vocal_pitch,
 };
-use forge_worker::{WorkerBackend, separate_stems};
 use sandbox::PathSandbox;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -499,18 +501,15 @@ fn tool_deliver(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, Forge
     options.defizz = bool_arg(args, "defizz", true);
     options.vocal = bool_arg(args, "vocal", false);
     if let Some(reference) = reference {
-        options.tone_match = Some(ToneMatch::Reference(AudioBuffer::load(&reference)?));
+        options.tone_match = Some(ToneMatch::Reference(sandbox.load_audio(&reference)?));
     } else if let Some(genre) = args.get("genre").and_then(Value::as_str) {
         options.tone_match = Some(ToneMatch::Genre(GenreTonalTarget::parse(genre)));
     }
 
-    let buf = AudioBuffer::load(&input)?;
+    let buf = sandbox.load_audio(&input)?;
     let (master, report) = deliver(&buf, &options)?;
-    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)?;
-    }
-    master.save_wav(&output, 24)?;
-    std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
+    sandbox.save_wav(&master, &output, 24)?;
+    sandbox.write_json(&report_path, &report)?;
     Ok(ToolOutput {
         success: report.ready,
         value: json!({
@@ -523,7 +522,7 @@ fn tool_deliver(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, Forge
 
 fn tool_audit_audio(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
     let path = path_arg(args, "path", sandbox)?;
-    let buf = AudioBuffer::load(&path)?;
+    let buf = sandbox.load_audio(&path)?;
     Ok(serde_json::to_value(audit_audio(&buf))?.into())
 }
 
@@ -536,7 +535,7 @@ fn tool_restore_and_defizz(args: &Value, sandbox: &PathSandbox) -> Result<ToolOu
         ..DeFizzConfig::default()
     };
 
-    let raw = AudioBuffer::load(&input)?;
+    let raw = sandbox.load_audio(&input)?;
     let before = audit_audio(&raw);
     let mut stage1 = run_full_restoration_chain(&raw, &RestorationConfig::default())?;
     if bool_arg(args, "vocal", false) {
@@ -544,7 +543,7 @@ fn tool_restore_and_defizz(args: &Value, sandbox: &PathSandbox) -> Result<ToolOu
     }
     let cleaned = apply_spectral_defizz(&stage1, &config)?;
     let after = audit_audio(&cleaned);
-    cleaned.save_wav(&output, 24)?;
+    sandbox.save_wav(&cleaned, &output, 24)?;
     Ok(json!({
         "output": output,
         "before_fizz_index": before.ai_fizz_index,
@@ -560,15 +559,15 @@ fn tool_spectral_unmask(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutpu
     let output = path_arg(args, "output", sandbox)?;
     let kick_bass = bool_arg(args, "kick_bass_mode", false);
 
-    let target_buf = AudioBuffer::load(&target)?;
-    let sc_buf = AudioBuffer::load(&sidechain)?;
+    let target_buf = sandbox.load_audio(&target)?;
+    let sc_buf = sandbox.load_audio(&sidechain)?;
     let cfg = if kick_bass {
         UnmaskConfig::kick_over_bass()
     } else {
         UnmaskConfig::vocal_over_instruments()
     };
     let unmasked = apply_spectral_unmask(&target_buf, &sc_buf, &cfg)?;
-    unmasked.save_wav(&output, 24)?;
+    sandbox.save_wav(&unmasked, &output, 24)?;
     Ok(json!({ "output": output, "kick_bass_mode": kick_bass }).into())
 }
 
@@ -577,11 +576,11 @@ fn tool_phase_align(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, F
     let target = path_arg(args, "target", sandbox)?;
     let output = path_arg(args, "output", sandbox)?;
 
-    let ref_buf = AudioBuffer::load(&reference)?;
-    let tgt_buf = AudioBuffer::load(&target)?;
+    let ref_buf = sandbox.load_audio(&reference)?;
+    let tgt_buf = sandbox.load_audio(&target)?;
     if bool_arg(args, "vocal_dtw", false) {
         let (warped, markers) = align_vocal_double_dtw(&ref_buf, &tgt_buf, 120.0)?;
-        warped.save_wav(&output, 24)?;
+        sandbox.save_wav(&warped, &output, 24)?;
         Ok(json!({
             "mode": "vocal_dtw",
             "output": output,
@@ -590,7 +589,7 @@ fn tool_phase_align(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, F
         .into())
     } else {
         let (aligned, info) = align_phase_gcc_phat(&ref_buf, &tgt_buf, 35.0)?;
-        aligned.save_wav(&output, 24)?;
+        sandbox.save_wav(&aligned, &output, 24)?;
         Ok(serde_json::to_value(info)?.into())
     }
 }
@@ -606,9 +605,9 @@ fn tool_vocal_suite(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, F
     ];
     let scale = VocalScale::parse(str_arg_or(args, "scale", "D minor"))?;
     let retune = f64_arg(args, "retune_strength", 0.85);
-    std::fs::create_dir_all(&output_dir)?;
+    sandbox.create_dir_all(&output_dir)?;
 
-    let raw = AudioBuffer::load(&input)?;
+    let raw = sandbox.load_audio(&input)?;
     let clean = clean_vocal_surgical(&raw, true, true, -12.0)?;
     let contour = track_vocal_pitch(&clean, &scale, retune);
     let corr_curve: Vec<(f64, f64)> = contour
@@ -616,13 +615,13 @@ fn tool_vocal_suite(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, F
         .map(|f| (f.time_secs, f.correction_semitones))
         .collect();
     let tuned = shift_vocal_pitch_formant_preserved(&clean, &corr_curve, 0.0)?;
-    tuned.save_wav(&tuned_path, 24)?;
+    sandbox.save_wav(&tuned, &tuned_path, 24)?;
 
     let mut harmonies = Vec::new();
     if bool_arg(args, "generate_harmonies", true) {
         let (h_up, h_down, h_dbl) = generate_vocal_harmony_stack(&tuned, &scale)?;
         for (buf, path) in [h_up, h_down, h_dbl].iter().zip(&harmony_paths) {
-            buf.save_wav(path, 24)?;
+            sandbox.save_wav(buf, path, 24)?;
             harmonies.push(path.to_string_lossy().into_owned());
         }
     }
@@ -656,7 +655,7 @@ fn tool_music_theory_midi(args: &Value, sandbox: &PathSandbox) -> Result<ToolOut
     let output_midi = path_arg(args, "output_midi", sandbox)?;
     let bpm = f64_arg(args, "bpm", 92.0);
     let (reharm, chord_notes, bass_notes) = voice_chords(chords)?;
-    write_midi_file(
+    sandbox.write_midi(
         &output_midi,
         bpm,
         480,
@@ -678,9 +677,9 @@ fn tool_master_distrokid(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
     let tmp = sandbox.check(&out_path.with_extension("pre_tag.wav"))?;
     let reference = optional_path_arg(args, "reference", sandbox)?;
 
-    let mut buf = AudioBuffer::load(&input)?;
+    let mut buf = sandbox.load_audio(&input)?;
     if let Some(reference) = reference {
-        let ref_buf = AudioBuffer::load(&reference)?;
+        let ref_buf = sandbox.load_audio(&reference)?;
         let curve = compute_reference_match_eq(&buf, &ref_buf, 4.5);
         apply_18_band_eq(&mut buf, &curve);
     }
@@ -699,11 +698,10 @@ fn tool_master_distrokid(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
             key: None,
             year: Some(2026),
         };
-        mastered.save_wav(&tmp, 24)?;
-        write_distrokid_metadata(&tmp, &out_path, &meta)?;
-        let _ = std::fs::remove_file(&tmp);
+        sandbox.save_wav(&mastered, &tmp, 24)?;
+        external::tag_master(sandbox, &tmp, &out_path, &meta)?;
     } else {
-        mastered.save_wav(&out_path, 24)?;
+        sandbox.save_wav(&mastered, &out_path, 24)?;
     }
     Ok(serde_json::to_value(audit_audio(&mastered))?.into())
 }
@@ -752,26 +750,22 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
     let scale = VocalScale::parse(str_arg_or(args, "scale", "D minor"))?;
     let chords = str_arg_or(args, "chords", "Dm9 Bbmaj7 Gm9 A7b13");
 
-    std::fs::create_dir_all(&paths.output_dir)?;
-    std::fs::create_dir_all(&paths.stems_dir)?;
-    std::fs::create_dir_all(&paths.midi_dir)?;
+    sandbox.create_dir_all(&paths.output_dir)?;
+    sandbox.create_dir_all(&paths.midi_dir)?;
 
-    let bundle = separate_stems(&input, &paths.stems_dir, &WorkerBackend::Auto)?;
-    let vocal_pitch_frames = match bundle.vocals {
-        Some(ref voc_path) => clean_ingested_vocal(&sandbox.check(voc_path)?, &scale)?,
-        None => Vec::new(),
-    };
+    let bundle = external::separate_stems_checked(sandbox, &input, &paths.stems_dir)?;
+    let vocal_pitch_frames = ingest_vocal_frames(sandbox, bundle.vocals.as_deref(), &scale)?;
 
-    let drum_buf = AudioBuffer::load(bundle.drums.as_ref().unwrap_or(&input))?;
+    let drum_buf = sandbox.load_audio(&sandbox.check(bundle.drums.as_ref().unwrap_or(&input))?)?;
     let duration_secs = drum_buf.duration_secs();
-    write_ingest_midi(&paths, &drum_buf, bpm, chords)?;
+    write_ingest_midi(sandbox, &paths, &drum_buf, bpm, chords)?;
 
-    let full_mix = AudioBuffer::load(&input)?;
+    let full_mix = sandbox.load_audio(&input)?;
     let (mastered, delivery) = deliver(&full_mix, &DeliveryOptions::for_target(target))?;
-    mastered.save_wav(&paths.master, 24)?;
-    std::fs::write(&paths.delivery, serde_json::to_string_pretty(&delivery)?)?;
+    sandbox.save_wav(&mastered, &paths.master, 24)?;
+    sandbox.write_json(&paths.delivery, &delivery)?;
 
-    let _ = install_jsfx_plugins(Some(&paths.jsfx_dir))?;
+    let _ = sandbox.install_jsfx(&paths.jsfx_dir)?;
     let session = SessionSpec {
         bpm,
         sample_rate: full_mix.sample_rate,
@@ -780,7 +774,7 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
         vocal_pitch_frames,
         chords_midi: paths.chords_midi.clone(),
     };
-    build_session(session).save_rpp(&paths.rpp)?;
+    sandbox.save_rpp(&build_session(session), &paths.rpp)?;
 
     Ok(ToolOutput {
         success: delivery.ready,
@@ -801,13 +795,14 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
 
 /// Writes the drum-trigger MIDI (from `drum_buf`) and the voice-led chord MIDI.
 fn write_ingest_midi(
+    sandbox: &PathSandbox,
     paths: &IngestPaths,
     drum_buf: &AudioBuffer,
     bpm: f64,
     chords: &str,
 ) -> Result<(), ForgeError> {
     let (kick_notes, snare_notes, hat_notes) = extract_drum_midi_triggers(drum_buf, bpm, 480);
-    write_midi_file(
+    sandbox.write_midi(
         &paths.drum_midi,
         bpm,
         480,
@@ -818,7 +813,7 @@ fn write_ingest_midi(
         ],
     )?;
     let (_, chord_notes, bass_notes) = voice_chords(chords)?;
-    write_midi_file(
+    sandbox.write_midi(
         &paths.chords_midi,
         bpm,
         480,
@@ -826,16 +821,29 @@ fn write_ingest_midi(
     )
 }
 
+/// The pitch contour of the separated vocal (cleaned in place), or none without a vocal.
+fn ingest_vocal_frames(
+    sandbox: &PathSandbox,
+    vocal: Option<&std::path::Path>,
+    scale: &VocalScale,
+) -> Result<Vec<PitchFrame>, ForgeError> {
+    match vocal {
+        Some(voc_path) => clean_ingested_vocal(sandbox, &sandbox.check(voc_path)?, scale),
+        None => Ok(Vec::new()),
+    }
+}
+
 /// Cleans and de-fizzes the separated vocal in place; returns its pitch contour.
 fn clean_ingested_vocal(
+    sandbox: &PathSandbox,
     voc_path: &std::path::Path,
     scale: &VocalScale,
 ) -> Result<Vec<PitchFrame>, ForgeError> {
-    let voc_buf = AudioBuffer::load(voc_path)?;
+    let voc_buf = sandbox.load_audio(voc_path)?;
     let voc_clean = clean_vocal_surgical(&voc_buf, true, true, -10.0)?;
     let voc_defizz = apply_spectral_defizz(&voc_clean, &DeFizzConfig::default())?;
     let frames = track_vocal_pitch(&voc_defizz, scale, 0.85);
-    voc_defizz.save_wav(voc_path, 24)?;
+    sandbox.save_wav(&voc_defizz, voc_path, 24)?;
     Ok(frames)
 }
 

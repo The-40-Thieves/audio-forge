@@ -4,11 +4,18 @@
 //! file is read or written. Relative paths resolve against the first root; `..` components
 //! are rejected outright, and the resolved path (with symlinks in its existing ancestors
 //! followed) must stay inside one of the roots.
+//!
+//! That check runs when a request arrives. The I/O itself goes through a directory handle
+//! opened on each root once, at startup (see [`PathSandbox::anchor`] and the `anchored`
+//! module), so a path swapped for an escaping symlink after the check fails to open instead
+//! of being followed out of the root.
 
+use cap_std::fs::Dir;
 use forge_core::ForgeError;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 /// Environment variable listing the allowed roots, separated like `PATH`.
 pub const ROOT_ENV: &str = "FORGE_MCP_ROOT";
@@ -16,12 +23,17 @@ pub const ROOT_ENV: &str = "FORGE_MCP_ROOT";
 #[derive(Debug, Clone)]
 pub struct PathSandbox {
     roots: Vec<PathBuf>,
+    /// One handle per entry of `roots`, opened once with ambient authority.
+    dirs: Vec<Arc<Dir>>,
 }
 
 impl PathSandbox {
     /// Creates a sandbox over `roots`. Each root must exist; it is canonicalized and stored
     /// without the Windows verbatim prefix, so joined client paths are still parsed normally
     /// (inside a `\\?\` path, `..` and `/` are literal).
+    ///
+    /// Each root is then opened as a directory handle. This is the only place the server
+    /// uses ambient authority to reach the filesystem for client files.
     pub fn new<I: IntoIterator<Item = PathBuf>>(roots: I) -> io::Result<Self> {
         let roots = roots
             .into_iter()
@@ -33,7 +45,11 @@ impl PathSandbox {
                 "at least one sandbox root is required",
             ));
         }
-        Ok(Self { roots })
+        let dirs = roots
+            .iter()
+            .map(|r| Dir::open_ambient_dir(r, cap_std::ambient_authority()).map(Arc::new))
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(Self { roots, dirs })
     }
 
     /// Roots from `FORGE_MCP_ROOT`, or the current working directory when it is unset or empty.
@@ -99,7 +115,25 @@ impl PathSandbox {
         }
     }
 
-    fn denied(&self, raw: &str, reason: &str) -> ForgeError {
+    /// Splits a path returned by [`Self::resolve`] or [`Self::check`] into the handle of the
+    /// root that contains it and the path relative to that root (the innermost root wins
+    /// when roots nest). All file I/O goes through this pair.
+    pub fn anchor(&self, resolved: &Path) -> Result<(&Dir, PathBuf), ForgeError> {
+        self.roots
+            .iter()
+            .zip(&self.dirs)
+            .filter_map(|(root, dir)| resolved.strip_prefix(root).ok().map(|rel| (root, dir, rel)))
+            .max_by_key(|(root, _, _)| root.components().count())
+            .map(|(_, dir, rel)| (dir.as_ref(), rel.to_path_buf()))
+            .ok_or_else(|| {
+                self.denied(
+                    &resolved.display().to_string(),
+                    "path is outside the allowed roots",
+                )
+            })
+    }
+
+    pub(crate) fn denied(&self, raw: &str, reason: &str) -> ForgeError {
         let roots: Vec<String> = self.roots.iter().map(|r| r.display().to_string()).collect();
         ForgeError::InvalidParameter(format!(
             "Path '{raw}' rejected: {reason} (allowed roots: {}; set {ROOT_ENV} to change)",
