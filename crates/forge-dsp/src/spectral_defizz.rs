@@ -77,8 +77,10 @@ pub fn apply_spectral_defizz(buffer: &AudioBuffer, config: &DeFizzConfig) -> Res
         })
         .collect();
 
-    let clean_sens_db = crate::loudness_limiter::sanitize_param_f64(config.sensitivity_db, 3.5, 0.5, 24.0);
-    let clean_depth_db = crate::loudness_limiter::sanitize_param_f64(config.max_depth_db, 9.0, 0.5, 24.0);
+    let clean_sens_db =
+        crate::loudness_limiter::sanitize_param_f64(config.sensitivity_db, 3.5, 0.5, 24.0);
+    let clean_depth_db =
+        crate::loudness_limiter::sanitize_param_f64(config.max_depth_db, 9.0, 0.5, 24.0);
     let thresh_ratio = 10.0_f64.powf(clean_sens_db / 20.0);
     let min_gain = 10.0_f64.powf(-clean_depth_db / 20.0);
     let radius = config.sharpness_bins.clamp(2, 24);
@@ -89,7 +91,10 @@ pub fn apply_spectral_defizz(buffer: &AudioBuffer, config: &DeFizzConfig) -> Res
         .map(|ch| {
             let padded_len = frames + fft_size * 2;
             let mut padded = vec![0.0_f64; padded_len];
-            for (dst, &src) in padded[fft_size..fft_size + frames].iter_mut().zip(ch.iter()) {
+            for (dst, &src) in padded[fft_size..fft_size + frames]
+                .iter_mut()
+                .zip(ch.iter())
+            {
                 *dst = crate::loudness_limiter::sanitize_sample_f64(src);
             }
 

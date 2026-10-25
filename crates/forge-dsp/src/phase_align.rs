@@ -74,9 +74,12 @@ pub fn align_phase_gcc_phat(
     }
     fft_inv.process(&mut cross);
 
-    let clean_search_ms = crate::loudness_limiter::sanitize_param_f64(max_search_ms, 20.0, 0.5, 500.0);
+    let clean_search_ms =
+        crate::loudness_limiter::sanitize_param_f64(max_search_ms, 20.0, 0.5, 500.0);
+    // `n >= 64` above already keeps `fft_len / 2 >= 32`; saturate anyway so the bound stays
+    // safe if that guard ever changes.
     let max_lag = (((sr * clean_search_ms / 1000.0).round() as isize).max(1) as usize)
-        .min(fft_len / 2 - 1);
+        .min((fft_len / 2).saturating_sub(1));
 
     let mut best_lag: isize = 0;
     let mut best_val: f64 = 0.0;
@@ -183,7 +186,8 @@ pub fn align_vocal_double_dtw(
     let g_feats = extract_features(&g_mono);
     let d_feats = extract_features(&d_mono);
 
-    let clean_warp_ms = crate::loudness_limiter::sanitize_param_f64(max_warp_ms, 60.0, 10.0, 1000.0);
+    let clean_warp_ms =
+        crate::loudness_limiter::sanitize_param_f64(max_warp_ms, 60.0, 10.0, 1000.0);
     let band = (((clean_warp_ms / 10.0).round() as usize).max(2)).min(num_steps / 2);
     let mut cost = vec![vec![f64::INFINITY; num_steps]; num_steps];
     let mut back = vec![vec![(0_usize, 0_usize); num_steps]; num_steps];
@@ -262,10 +266,12 @@ pub fn align_vocal_double_dtw(
             let s1 = (s0 + 1).min(num_steps - 1);
             let frac = step_f - (s0 as f64);
             let mapped_step = step_map[s0] * (1.0 - frac) + step_map[s1] * frac;
-            let src_f = (mapped_step * (hop as f64)).clamp(0.0, (dub_frames.saturating_sub(2)) as f64);
+            let src_f =
+                (mapped_step * (hop as f64)).clamp(0.0, (dub_frames.saturating_sub(2)) as f64);
             let idx0 = src_f.floor() as usize;
             let idx_frac = src_f - (idx0 as f64);
-            *sample_out = ch[idx0] * (1.0 - idx_frac) + ch[(idx0 + 1).min(dub_frames - 1)] * idx_frac;
+            *sample_out =
+                ch[idx0] * (1.0 - idx_frac) + ch[(idx0 + 1).min(dub_frames - 1)] * idx_frac;
         }
         warped_channels.push(out_ch);
     }

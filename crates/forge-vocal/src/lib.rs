@@ -36,7 +36,11 @@ impl VocalScale {
         let parts: Vec<&str> = scale_str.split_whitespace().collect();
         let root_token = parts.first().copied().unwrap_or("C");
         let (root_pc, _) = parse_pitch_class(root_token)?;
-        let mode_str = parts.get(1).copied().unwrap_or("major").to_ascii_lowercase();
+        let mode_str = parts
+            .get(1)
+            .copied()
+            .unwrap_or("major")
+            .to_ascii_lowercase();
         let is_minor = mode_str.contains("min")
             || mode_str == "m"
             || mode_str.contains("aeolian")
@@ -461,8 +465,10 @@ pub fn generate_vocal_harmony_stack(
         let vib_b = 0.08 * (frame.time_secs * 2.0 * std::f64::consts::PI * 5.6 + 1.3).sin();
         let vib_c = 0.05 * (frame.time_secs * 2.0 * std::f64::consts::PI * 4.8 + 2.5).sin();
 
-        let up_semi = scale.diatonic_shift_semitones(base_note, 2) + frame.correction_semitones + vib_a;
-        let down_semi = scale.diatonic_shift_semitones(base_note, -2) + frame.correction_semitones + vib_b;
+        let up_semi =
+            scale.diatonic_shift_semitones(base_note, 2) + frame.correction_semitones + vib_a;
+        let down_semi =
+            scale.diatonic_shift_semitones(base_note, -2) + frame.correction_semitones + vib_b;
         let dbl_semi = frame.correction_semitones + vib_c + if idx % 2 == 0 { 0.04 } else { -0.04 };
 
         third_up_curve.push((frame.time_secs, up_semi));
@@ -574,5 +580,3 @@ mod tests {
         }
     }
 }
-
-
