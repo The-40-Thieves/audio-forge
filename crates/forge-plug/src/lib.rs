@@ -846,6 +846,10 @@ pub struct VocalSurgicalParams {
     pub breath_gate_db: FloatParam,
 }
 
+/// Ramp time for every Vocal Surgical control, in milliseconds. All four controls are linear
+/// amounts or dB thresholds, so a linear ramp is the right curve for each of them.
+const VOCAL_SURGICAL_SMOOTHING_MS: f32 = 20.0;
+
 impl Default for VocalSurgicalParams {
     fn default() -> Self {
         Self {
@@ -855,13 +859,15 @@ impl Default for VocalSurgicalParams {
                 0.65,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
-            .with_value_to_string(formatters::v2s_f32_rounded(3)),
+            .with_value_to_string(formatters::v2s_f32_rounded(3))
+            .with_smoother(SmoothingStyle::Linear(VOCAL_SURGICAL_SMOOTHING_MS)),
             deplosive_strength: FloatParam::new(
                 "Plosive Duck (<115Hz)",
                 0.75,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
-            .with_value_to_string(formatters::v2s_f32_rounded(3)),
+            .with_value_to_string(formatters::v2s_f32_rounded(3))
+            .with_smoother(SmoothingStyle::Linear(VOCAL_SURGICAL_SMOOTHING_MS)),
             deess_threshold_db: FloatParam::new(
                 "Split-Band De-Esser",
                 -22.0,
@@ -871,7 +877,8 @@ impl Default for VocalSurgicalParams {
                 },
             )
             .with_value_to_string(formatters::v2s_f32_rounded(2))
-            .with_unit(" dB"),
+            .with_unit(" dB")
+            .with_smoother(SmoothingStyle::Linear(VOCAL_SURGICAL_SMOOTHING_MS)),
             breath_gate_db: FloatParam::new(
                 "Breath Gate Threshold",
                 -48.0,
@@ -881,8 +888,28 @@ impl Default for VocalSurgicalParams {
                 },
             )
             .with_value_to_string(formatters::v2s_f32_rounded(2))
-            .with_unit(" dB"),
+            .with_unit(" dB")
+            .with_smoother(SmoothingStyle::Linear(VOCAL_SURGICAL_SMOOTHING_MS)),
         }
+    }
+}
+
+/// One sample's worth of Vocal Surgical control values, read from the parameter smoothers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VocalSurgicalControls {
+    declick: f64,
+    deplosive: f64,
+    deess_db: f64,
+    gate_db: f64,
+}
+
+/// Advances every Vocal Surgical smoother by one sample and returns the new values.
+fn next_vocal_surgical_controls(params: &VocalSurgicalParams) -> VocalSurgicalControls {
+    VocalSurgicalControls {
+        declick: f64::from(params.declick_sensitivity.smoothed.next()),
+        deplosive: f64::from(params.deplosive_strength.smoothed.next()),
+        deess_db: f64::from(params.deess_threshold_db.smoothed.next()),
+        gate_db: f64::from(params.breath_gate_db.smoothed.next()),
     }
 }
 
@@ -974,17 +1001,18 @@ impl Plugin for ForgeVocalSurgicalPlug {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        let declick = f64::from(self.params.declick_sensitivity.value());
-        let deplosive = f64::from(self.params.deplosive_strength.value());
-        let deess = f64::from(self.params.deess_threshold_db.value());
-        let gate = f64::from(self.params.breath_gate_db.value());
-
         for mut channel_samples in buffer.iter_samples() {
+            let ctl = next_vocal_surgical_controls(&self.params);
             let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
             let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
-            let (out_l, out_r) = self
-                .dsp
-                .process_stereo_sample(in_l, in_r, declick, deplosive, deess, gate);
+            let (out_l, out_r) = self.dsp.process_stereo_sample(
+                in_l,
+                in_r,
+                ctl.declick,
+                ctl.deplosive,
+                ctl.deess_db,
+                ctl.gate_db,
+            );
             self.analyzer.push_stereo_sample(out_l, out_r);
             let gr_est = 20.0
                 * (out_l.abs().max(out_r.abs()) / in_l.abs().max(in_r.abs()).max(1e-5))
@@ -2415,6 +2443,67 @@ pub struct SpaceVerbAndPreampParams {
     pub wet_mix: FloatParam,
 }
 
+/// Bottom of the stored `decay` knob range. The stored range is kept as it was so saved state
+/// and automation stay compatible; [`reverb_decay_knob_to_rt60_secs`] gives it its meaning.
+const REVERB_DECAY_KNOB_MIN: f32 = 0.05;
+/// Top of the stored `decay` knob range.
+const REVERB_DECAY_KNOB_MAX: f32 = 0.98;
+/// RT60 at the bottom of the decay knob. Matches the floor `RealtimeFdnReverb` clamps to.
+pub const REVERB_RT60_MIN_SECS: f64 = 0.2;
+/// RT60 at the top of the decay knob. Matches the ceiling `RealtimeFdnReverb` clamps to.
+pub const REVERB_RT60_MAX_SECS: f64 = 20.0;
+
+/// Position of a stored decay knob value along its range, from 0 at the bottom to 1 at the top.
+fn reverb_decay_knob_position(knob: f32) -> f64 {
+    let span = f64::from(REVERB_DECAY_KNOB_MAX - REVERB_DECAY_KNOB_MIN);
+    let pos = (f64::from(knob) - f64::from(REVERB_DECAY_KNOB_MIN)) / span;
+    if pos.is_finite() {
+        pos.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// Maps the stored SpaceVerb decay knob (0.05 to 0.98) onto an RT60 in seconds.
+///
+/// The curve is logarithmic: equal knob travel multiplies the decay time by the same factor,
+/// running from [`REVERB_RT60_MIN_SECS`] at the bottom to [`REVERB_RT60_MAX_SECS`] at the top.
+pub fn reverb_decay_knob_to_rt60_secs(knob: f32) -> f64 {
+    let ratio = REVERB_RT60_MAX_SECS / REVERB_RT60_MIN_SECS;
+    REVERB_RT60_MIN_SECS * ratio.powf(reverb_decay_knob_position(knob))
+}
+
+/// Inverse of [`reverb_decay_knob_to_rt60_secs`]; RT60 values outside the range are clamped.
+pub fn rt60_secs_to_reverb_decay_knob(rt60_secs: f64) -> f32 {
+    let ratio = REVERB_RT60_MAX_SECS / REVERB_RT60_MIN_SECS;
+    let pos = (rt60_secs / REVERB_RT60_MIN_SECS).ln() / ratio.ln();
+    let pos = if pos.is_nan() {
+        0.0
+    } else {
+        pos.clamp(0.0, 1.0)
+    };
+    let span = f64::from(REVERB_DECAY_KNOB_MAX - REVERB_DECAY_KNOB_MIN);
+    (f64::from(REVERB_DECAY_KNOB_MIN) + pos * span) as f32
+}
+
+/// Shows the decay knob as the RT60 it produces, for example `3.90 s`.
+fn reverb_decay_knob_to_string(knob: f32) -> String {
+    format!("{:.2} s", reverb_decay_knob_to_rt60_secs(knob))
+}
+
+/// Parses a decay typed in seconds (`4`, `4 s`, `4.0s`, `4 sec`) back to the stored knob value.
+fn string_to_reverb_decay_knob(text: &str) -> Option<f32> {
+    let trimmed = text.trim();
+    let number = trimmed
+        .strip_suffix("sec")
+        .or_else(|| trimmed.strip_suffix('s'))
+        .unwrap_or(trimmed)
+        .trim();
+    let secs: f64 = number.parse().ok()?;
+    secs.is_finite()
+        .then(|| rt60_secs_to_reverb_decay_knob(secs))
+}
+
 impl Default for SpaceVerbAndPreampParams {
     fn default() -> Self {
         Self {
@@ -2435,11 +2524,12 @@ impl Default for SpaceVerbAndPreampParams {
                 "FDN Reverb Decay",
                 0.65,
                 FloatRange::Linear {
-                    min: 0.05,
-                    max: 0.98,
+                    min: REVERB_DECAY_KNOB_MIN,
+                    max: REVERB_DECAY_KNOB_MAX,
                 },
             )
-            .with_value_to_string(formatters::v2s_f32_rounded(3)),
+            .with_value_to_string(Arc::new(reverb_decay_knob_to_string))
+            .with_string_to_value(Arc::new(string_to_reverb_decay_knob)),
             reverb_damping: FloatParam::new(
                 "High-Frequency Damping",
                 0.40,
@@ -2577,7 +2667,7 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
             _ => AnalogHardwareModel::Neve1073ClassA,
         };
         self.preamp_dsp.set_model(model);
-        let decay = f64::from(self.params.reverb_decay.value());
+        let decay = reverb_decay_knob_to_rt60_secs(self.params.reverb_decay.value());
         let damp = f64::from(self.params.reverb_damping.value());
         let shimmer = f64::from(self.params.shimmer_amount.value());
         let duck = f64::from(self.params.vocal_ducking.value());
@@ -2747,6 +2837,154 @@ mod tests {
             silent,
             "a dropped instance left its frame"
         );
+    }
+
+    const RT60_TEST_SAMPLE_RATE: f64 = 24_000.0;
+
+    /// RT60 measured from a Schroeder backward-integrated decay curve: the time the curve takes
+    /// to fall from -5 dB to -25 dB (T20), scaled up to 60 dB.
+    fn schroeder_t20_rt60_secs(energy: &[f64], sample_rate: f64) -> f64 {
+        let total: f64 = energy.iter().sum();
+        let mut remaining = total;
+        let mut t5 = None;
+        for (n, e) in energy.iter().enumerate() {
+            let level_db = 10.0 * (remaining / total).log10();
+            if t5.is_none() && level_db <= -5.0 {
+                t5 = Some(n);
+            }
+            if level_db <= -25.0 {
+                let start = t5.unwrap_or(n);
+                return 3.0 * (n - start) as f64 / sample_rate;
+            }
+            remaining -= e;
+        }
+        panic!("the reverb tail never fell 25 dB");
+    }
+
+    /// Fires an impulse through the SpaceVerb FDN at the plug's default damping, 100 % wet, and
+    /// returns the RT60 measured from its tail. The dry impulse itself is left out of the curve.
+    fn measured_spaceverb_rt60_secs(decay_rt60_secs: f64) -> f64 {
+        let defaults = SpaceVerbAndPreampParams::default();
+        let damp = f64::from(defaults.reverb_damping.value());
+        let mut reverb = RealtimeFdnReverb::new(RT60_TEST_SAMPLE_RATE);
+        let len = (RT60_TEST_SAMPLE_RATE * 25.0) as usize;
+        let mut energy = Vec::with_capacity(len);
+        for n in 0..len {
+            let x = if n == 0 { 1.0 } else { 0.0 };
+            let (l, r) = reverb.process_stereo_sample(x, x, decay_rt60_secs, damp, 0.0, 0.0, 1.0);
+            let e = f64::from(l).powi(2) + f64::from(r).powi(2);
+            energy.push(if n == 0 { 0.0 } else { e });
+        }
+        schroeder_t20_rt60_secs(&energy, RT60_TEST_SAMPLE_RATE)
+    }
+
+    #[test]
+    fn spaceverb_decay_knob_sweeps_the_measured_rt60_well_past_one_second() {
+        let params = SpaceVerbAndPreampParams::default();
+        let measured: Vec<f64> = [0.0_f32, 0.33, 0.66, 1.0]
+            .iter()
+            .map(|&normalized| {
+                let knob = params.reverb_decay.preview_plain(normalized);
+                measured_spaceverb_rt60_secs(reverb_decay_knob_to_rt60_secs(knob))
+            })
+            .collect();
+        for pair in measured.windows(2) {
+            assert!(
+                pair[1] > pair[0] * 1.5,
+                "measured RT60 did not rise with the knob: {measured:?}"
+            );
+        }
+        assert!(
+            measured[0] < 0.6,
+            "bottom of the knob is too long: {measured:?}"
+        );
+        assert!(
+            measured[3] > 5.0,
+            "top of the knob never got well past 1 s: {measured:?}"
+        );
+    }
+
+    #[test]
+    fn spaceverb_decay_shows_seconds_and_keeps_its_parameter_ids() {
+        let params = SpaceVerbAndPreampParams::default();
+        let decay = &params.reverb_decay;
+        assert_eq!(decay.normalized_value_to_string(0.0, true), "0.20 s");
+        assert_eq!(decay.normalized_value_to_string(1.0, true), "20.00 s");
+        let normalized = decay
+            .string_to_normalized_value("4 s")
+            .expect("a decay typed in seconds parses");
+        let rt60 = reverb_decay_knob_to_rt60_secs(decay.preview_plain(normalized));
+        assert!((rt60 - 4.0).abs() < 1e-3, "4 s round-tripped to {rt60} s");
+        assert!(decay.string_to_normalized_value("long").is_none());
+
+        let ids: Vec<String> = params.param_map().into_iter().map(|p| p.0).collect();
+        for id in ["model", "pdrive", "decay", "damp", "shimmer", "duck", "mix"] {
+            assert!(ids.iter().any(|i| i == id), "parameter id {id} is missing");
+        }
+    }
+
+    /// Reads one Vocal Surgical control out of a [`VocalSurgicalControls`] snapshot.
+    type VocalControlField = fn(&VocalSurgicalControls) -> f64;
+
+    /// Each Vocal Surgical control, its smoother, and a full-range jump to automate it through.
+    fn vocal_surgical_jumps(
+        params: &VocalSurgicalParams,
+    ) -> [(&'static str, &FloatParam, VocalControlField, f32, f32); 4] {
+        [
+            (
+                "declick",
+                &params.declick_sensitivity,
+                |c| c.declick,
+                0.0,
+                1.0,
+            ),
+            (
+                "deplosive",
+                &params.deplosive_strength,
+                |c| c.deplosive,
+                0.0,
+                1.0,
+            ),
+            (
+                "deess",
+                &params.deess_threshold_db,
+                |c| c.deess_db,
+                -45.0,
+                0.0,
+            ),
+            ("gate", &params.breath_gate_db, |c| c.gate_db, -70.0, -20.0),
+        ]
+    }
+
+    #[test]
+    fn vocal_surgical_controls_ramp_across_a_block_instead_of_stepping() {
+        const BLOCK: usize = 64;
+        let params = VocalSurgicalParams::default();
+        let jumps = vocal_surgical_jumps(&params);
+        for (_, param, _, from, to) in jumps {
+            param.smoothed.reset(from);
+            param.smoothed.set_target(48_000.0, to);
+        }
+        let block: Vec<VocalSurgicalControls> = (0..BLOCK)
+            .map(|_| next_vocal_surgical_controls(&params))
+            .collect();
+        for (name, _, field, from, to) in jumps {
+            let span = f64::from(to - from);
+            let values: Vec<f64> = block.iter().map(field).collect();
+            let largest_step = values
+                .windows(2)
+                .map(|w| (w[1] - w[0]).abs())
+                .fold((values[0] - f64::from(from)).abs(), f64::max);
+            assert!(
+                largest_step < span * 0.01,
+                "{name} stepped by {largest_step} of a {span} jump within one block"
+            );
+            let moved = values[BLOCK - 1] - f64::from(from);
+            assert!(
+                moved * span > 0.0 && moved.abs() < span.abs() * 0.5,
+                "{name} moved {moved} of {span} by the end of the block"
+            );
+        }
     }
 
     #[test]

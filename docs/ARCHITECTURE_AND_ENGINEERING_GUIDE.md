@@ -182,14 +182,14 @@ flowchart TD
 - **Architecture:** Built on `nih-plug` (`rev de421011`) and `nih_plug_egui` (`egui 0.31.1` + `egui_glow` + `baseview`). Exports **all 10 plugins** from a single compiled dynamic library into both `forge-plug.vst3` and `forge-plug.clap`:
   1. **`ForgeOpenSoothePlug`** (`Forge OpenSoothe De-Fizz`) — 2048-pt OLA STFT Dynamic Spectral Resonance & AI Fizz Suppressor (`2048`-sample STFT delay plus the limiter lookahead reported to the host for PDC, `egui` 60 FPS spectrum GUI, 8-slot Shared Spectrum Bus).
   2. **`ForgeOpenSpacerPlug`** (`Forge OpenSpacer Unmask`) — 4-Channel Sidechain Spectral Unmasker (`aux_input_ports: &[new_nonzero_u32(2)]`).
-  3. **`ForgeVocalSurgicalPlug`** (`Forge Vocal Surgical Strip`) — Zero-Latency Mouth De-Click, `<115 Hz` Plosive Duck, Split-Band De-Esser & Breath Gate.
+  3. **`ForgeVocalSurgicalPlug`** (`Forge Vocal Surgical Strip`): Zero-Latency Mouth De-Click, `<115 Hz` Plosive Duck, Split-Band De-Esser & Breath Gate. All four controls ramp linearly over `20 ms` through `nih-plug` smoothers read every sample, so automation never steps.
   4. **`ForgeSubAndTapePlug`** (`Forge SubMono & Console Tape`) — Linkwitz-Riley `<160 Hz` Sub Mono-Maker, Harmonic Bass Reinforcer & Console8/ChowTape Saturation.
   5. **`ForgeMasterLimiterPlug`** (`Forge Master True-Peak Limiter`) — Lookahead 4x Inter-Sample True-Peak `-1.0 dBTP` Brickwall Limiter.
   6. **`ForgeDrumTriggerPlug`** (`Forge Drum Trigger & Theory MIDI`): Real-Time Audio-to-MIDI 3-Band Drum Replacer (`C1/D1/F#1`, each hit gated to a `20 ms` note with its own `NoteOff`) + 1-Finger MIDI-to-Neo-Soul 9th Chord Voicer (`NoteEvent::NoteOn` / `NoteOff`). `forge_dsp::DrumTriggerNotes` tracks every generated note, so a root releases the chord it started even if voicing is toggled mid-note, shared chord tones never stack, and reset or transport stop releases everything still held.
   7. **`ForgePhaseAndMatchPlug`** (`Forge PhaseAlign & 18-Band EQ`) — Sample-Accurate Phase/Polarity Aligner + 18-Band AI De-Harsh EQ + 6 Built-In Genre Tonal Balance Target Curves.
   8. **`ForgeSplitEqPlug`** (`Forge SplitEQ Transient & Tonal`) — 3-Band Structural Transient Attack vs. Tonal Sustain Equalizer & Shaper with 60 FPS `egui` GUI.
   9. **`ForgeDensityClipperPlug`** (`Forge Density & 3-Band ADAA Clipper`) — Upward Low-Level Density Compressor + 3-Band 2x-Oversampled 1st-Order ADAA Soft Clipper with 60 FPS `egui` GUI.
-  10. **`ForgeSpaceVerbAndPreampPlug`** (`Forge SpaceVerb FDN & Neural Preamp`) — Dilated Causal WaveNet Hardware Preamp (`Neve 1073`, `1176 All-Buttons`, `V76 Triode`, `Studer A800`) + 8x8 Walsh-Hadamard FDN Reverb with Vocal Auto-Ducking & `+12 st` Octave Shimmer + 60 FPS `egui` GUI.
+  10. **`ForgeSpaceVerbAndPreampPlug`** (`Forge SpaceVerb FDN & Neural Preamp`): Dilated Causal WaveNet Hardware Preamp (`Neve 1073`, `1176 All-Buttons`, `V76 Triode`, `Studer A800`) + 8x8 Walsh-Hadamard FDN Reverb with Vocal Auto-Ducking & `+12 st` Octave Shimmer + 60 FPS `egui` GUI. The stored `decay` knob keeps its `0.05` to `0.98` range (same ID, same saved state) and maps onto an RT60 of `0.2` to `20 s` on a log curve; the host and GUI show the value in seconds. The FDN's `0.985` feedback-gain ceiling holds the measured tail at about `13.5 s` at the top of the knob with default damping.
 
 ---
 
