@@ -161,17 +161,43 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p tools/pluginval tools/clap-validator
+          # SHA256 of each pinned release asset, computed from the downloaded files
+          # (and matching the digests GitHub reports for the clap-validator assets).
+          # Bump these together with the version pins; a mismatch fails the job.
+          cv_build="clap-validator-${CLAP_VALIDATOR_VERSION}-127-g152b982"
           case "$RUNNER_OS" in
-            Linux)   pv_asset=pluginval_Linux.zip;   cv_pattern='*ubuntu-22.04.zip' ;;
-            Windows) pv_asset=pluginval_Windows.zip; cv_pattern='*windows.zip' ;;
-            macOS)   pv_asset=pluginval_macOS.zip;   cv_pattern='*macos-universal.zip' ;;
+            Linux)
+              pv_asset=pluginval_Linux.zip
+              pv_sha256=c01c49d8063965c4c2dea8324468336768f5c9139e0b1caebde14c2400b55352
+              cv_asset="${cv_build}-ubuntu-22.04.zip"
+              cv_sha256=49edadcfb407ea0dd946ce418300e853fbd2660fa4b0d00e4f19ff8eef24ad90 ;;
+            Windows)
+              pv_asset=pluginval_Windows.zip
+              pv_sha256=c08e61ce3b96db41636f8ec7e76f4c7e2c13ebdac7fa1b5a1f52b4f32ec715ab
+              cv_asset="${cv_build}-windows.zip"
+              cv_sha256=d935c3af0a45c3911ea2e900f4aa5d6709dac82bb485f0c4ce28648ab2cd0c10 ;;
+            macOS)
+              pv_asset=pluginval_macOS.zip
+              pv_sha256=3c4c533bda0c5059eea3ddaea752d757ee2025041f0f47e6bcb0e87f6082b29f
+              cv_asset="${cv_build}-macos-universal.zip"
+              cv_sha256=bbec8cd7d18274e549d5d8c12ece3cec54be966129388dd2e742b9957f2ba9f1 ;;
+            *)
+              echo "::error::unsupported runner OS: $RUNNER_OS"
+              exit 1 ;;
           esac
           gh release download "$PLUGINVAL_VERSION" --repo Tracktion/pluginval \
             --pattern "$pv_asset" --dir tools
           gh release download "$CLAP_VALIDATOR_VERSION" --repo free-audio/clap-validator \
-            --pattern "$cv_pattern" --dir tools
+            --pattern "$cv_asset" --dir tools
+          printf '%s  %s\n' "$pv_sha256" "tools/$pv_asset" "$cv_sha256" "tools/$cv_asset" \
+            > tools/SHA256SUMS
+          if [ "$RUNNER_OS" = macOS ]; then
+            shasum -a 256 -c tools/SHA256SUMS
+          else
+            sha256sum -c tools/SHA256SUMS
+          fi
           unzip -q "tools/$pv_asset" -d tools/pluginval
-          unzip -q tools/clap-validator-*.zip -d tools/clap-validator
+          unzip -q "tools/$cv_asset" -d tools/clap-validator
           # Some clap-validator releases nest a tarball inside the zip.
           find tools/clap-validator -name '*.tar.gz' -exec tar -xzf {} -C tools/clap-validator \;
 
