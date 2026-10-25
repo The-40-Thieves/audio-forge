@@ -1506,16 +1506,100 @@ pub struct RealtimeDrumTrigger {
     kick_lp: Biquad,
     snare_band: [Biquad; 4],
     hat_hp: Biquad,
-    kick_fast: f64,
-    kick_slow: f64,
-    snare_fast: f64,
-    snare_slow: f64,
-    hat_fast: f64,
-    hat_slow: f64,
-    kick_cooldown: usize,
-    snare_cooldown: usize,
-    hat_cooldown: usize,
+    kick: BandEnvelope,
+    snare: BandEnvelope,
+    hat: BandEnvelope,
     min_holdoff_samples: usize,
+}
+
+/// Envelope smoothing, trigger thresholds and output of one drum band.
+struct BandTuning {
+    /// `(keep, add)` weights of the fast and slow envelope followers.
+    fast: (f64, f64),
+    slow: (f64, f64),
+    /// Scale on the threshold amplitude the fast envelope must exceed.
+    amp_scale: f64,
+    /// How far the fast envelope must rise above the slow one.
+    ratio: f64,
+    /// `(scale, floor)` mapping the fast envelope to a velocity.
+    velocity: (f64, f64),
+    /// Divisor on the refractory holdoff.
+    holdoff_div: usize,
+    note: u8,
+}
+
+/// C1 kick.
+const KICK_TUNING: BandTuning = BandTuning {
+    fast: (0.85, 0.15),
+    slow: (0.996, 0.004),
+    amp_scale: 1.0,
+    ratio: 2.8,
+    velocity: (2.2, 0.15),
+    holdoff_div: 1,
+    note: 36,
+};
+/// D1 snare.
+const SNARE_TUNING: BandTuning = BandTuning {
+    fast: (0.85, 0.15),
+    slow: (0.996, 0.004),
+    amp_scale: 1.0,
+    ratio: 3.0,
+    velocity: (2.4, 0.15),
+    holdoff_div: 1,
+    note: 38,
+};
+/// F#1 closed hat: half the threshold and half the holdoff.
+const HAT_TUNING: BandTuning = BandTuning {
+    fast: (0.80, 0.20),
+    slow: (0.995, 0.005),
+    amp_scale: 0.5,
+    ratio: 2.9,
+    velocity: (3.0, 0.12),
+    holdoff_div: 2,
+    note: 42,
+};
+
+/// One band's fast and slow envelopes and refractory countdown.
+#[derive(Clone, Copy)]
+struct BandEnvelope {
+    fast: f64,
+    slow: f64,
+    cooldown: usize,
+}
+
+impl BandEnvelope {
+    const fn new() -> Self {
+        Self {
+            fast: 0.0,
+            slow: 1e-5,
+            cooldown: 0,
+        }
+    }
+
+    /// Advances the band by one sample of rectified `level` and returns its trigger, if any.
+    #[inline]
+    fn process(
+        &mut self,
+        level: f64,
+        min_amp: f64,
+        holdoff: usize,
+        tuning: &BandTuning,
+    ) -> Option<(u8, f32)> {
+        let (fast_keep, fast_add) = tuning.fast;
+        let (slow_keep, slow_add) = tuning.slow;
+        self.fast = flush_denormal_f64(fast_keep * self.fast + fast_add * level);
+        self.slow = flush_denormal_f64(slow_keep * self.slow + slow_add * level) + 1e-6;
+        self.cooldown = self.cooldown.saturating_sub(1);
+        let fires = self.cooldown == 0
+            && self.fast > min_amp * tuning.amp_scale
+            && self.fast > self.slow * tuning.ratio;
+        if !fires {
+            return None;
+        }
+        self.cooldown = holdoff / tuning.holdoff_div;
+        let (scale, floor) = tuning.velocity;
+        Some((tuning.note, (self.fast * scale).clamp(floor, 1.0) as f32))
+    }
 }
 
 impl RealtimeDrumTrigger {
@@ -1525,15 +1609,9 @@ impl RealtimeDrumTrigger {
             kick_lp: Biquad::lowpass(sr, 115.0, FRAC_1_SQRT_2),
             snare_band: snare_band_pass(sr),
             hat_hp: Biquad::highpass(sr, 5500.0, FRAC_1_SQRT_2),
-            kick_fast: 0.0,
-            kick_slow: 1e-5,
-            snare_fast: 0.0,
-            snare_slow: 1e-5,
-            hat_fast: 0.0,
-            hat_slow: 1e-5,
-            kick_cooldown: 0,
-            snare_cooldown: 0,
-            hat_cooldown: 0,
+            kick: BandEnvelope::new(),
+            snare: BandEnvelope::new(),
+            hat: BandEnvelope::new(),
             min_holdoff_samples: ((sr * 0.045).round() as usize).max(256), // 45ms refractory window
         }
     }
@@ -1562,47 +1640,13 @@ impl RealtimeDrumTrigger {
             .abs();
         let h_abs = self.hat_hp.process_sample(mono).abs();
 
-        self.kick_fast = flush_denormal_f64(0.85 * self.kick_fast + 0.15 * k_abs);
-        self.kick_slow = flush_denormal_f64(0.996 * self.kick_slow + 0.004 * k_abs) + 1e-6;
-
-        self.snare_fast = flush_denormal_f64(0.85 * self.snare_fast + 0.15 * s_abs);
-        self.snare_slow = flush_denormal_f64(0.996 * self.snare_slow + 0.004 * s_abs) + 1e-6;
-
-        self.hat_fast = flush_denormal_f64(0.80 * self.hat_fast + 0.20 * h_abs);
-        self.hat_slow = flush_denormal_f64(0.995 * self.hat_slow + 0.005 * h_abs) + 1e-6;
-
-        self.kick_cooldown = self.kick_cooldown.saturating_sub(1);
-        self.snare_cooldown = self.snare_cooldown.saturating_sub(1);
-        self.hat_cooldown = self.hat_cooldown.saturating_sub(1);
-
-        let mut out = [None, None, None];
-
-        if self.kick_cooldown == 0
-            && self.kick_fast > min_amp
-            && self.kick_fast > self.kick_slow * 2.8
-        {
-            self.kick_cooldown = self.min_holdoff_samples;
-            let vel = (self.kick_fast * 2.2).clamp(0.15, 1.0) as f32;
-            out[0] = Some((36, vel)); // C1 Kick
-        }
-        if self.snare_cooldown == 0
-            && self.snare_fast > min_amp
-            && self.snare_fast > self.snare_slow * 3.0
-        {
-            self.snare_cooldown = self.min_holdoff_samples;
-            let vel = (self.snare_fast * 2.4).clamp(0.15, 1.0) as f32;
-            out[1] = Some((38, vel)); // D1 Snare
-        }
-        if self.hat_cooldown == 0
-            && self.hat_fast > min_amp * 0.5
-            && self.hat_fast > self.hat_slow * 2.9
-        {
-            self.hat_cooldown = self.min_holdoff_samples / 2;
-            let vel = (self.hat_fast * 3.0).clamp(0.12, 1.0) as f32;
-            out[2] = Some((42, vel)); // F#1 Closed Hat
-        }
-
-        out
+        // The bands are independent, so each runs its envelopes, countdown and trigger in turn.
+        let holdoff = self.min_holdoff_samples;
+        [
+            self.kick.process(k_abs, min_amp, holdoff, &KICK_TUNING),
+            self.snare.process(s_abs, min_amp, holdoff, &SNARE_TUNING),
+            self.hat.process(h_abs, min_amp, holdoff, &HAT_TUNING),
+        ]
     }
 }
 

@@ -1606,8 +1606,9 @@ impl Plugin for ForgeDrumTriggerPlug {
 }
 
 impl ForgeDrumTriggerPlug {
-    /// Converts a generated note to a host event. Generated notes carry no voice ID (see
-    /// [`NoteMsg`]), so they never share the ID of the root that started them.
+    /// Converts a tracked note to a host event. Forwarded roots keep their incoming voice ID and
+    /// generated notes carry none (see [`NoteMsg`]), so a chord tone never shares the ID of the
+    /// root that started it.
     fn note_event(msg: NoteMsg) -> PluginNoteEvent<Self> {
         match msg {
             NoteMsg::On {
@@ -1615,9 +1616,10 @@ impl ForgeDrumTriggerPlug {
                 channel,
                 note,
                 velocity,
+                voice_id,
             } => NoteEvent::NoteOn {
                 timing,
-                voice_id: None,
+                voice_id,
                 channel,
                 note,
                 velocity,
@@ -1626,9 +1628,10 @@ impl ForgeDrumTriggerPlug {
                 timing,
                 channel,
                 note,
+                voice_id,
             } => NoteEvent::NoteOff {
                 timing,
-                voice_id: None,
+                voice_id,
                 channel,
                 note,
                 velocity: 0.0,
@@ -1636,8 +1639,8 @@ impl ForgeDrumTriggerPlug {
         }
     }
 
-    /// Releases every generated note at the start of the block after a reset, or when the
-    /// transport stops.
+    /// Releases every tracked note, forwarded roots included, at the start of the block after a
+    /// reset, or when the transport stops.
     fn release_on_reset_or_stop(&mut self, context: &mut impl ProcessContext<Self>) {
         let playing = context.transport().playing;
         let stopped = self.was_playing && !playing;
@@ -1649,30 +1652,39 @@ impl ForgeDrumTriggerPlug {
     }
 
     /// Step 1: forwards an incoming event and, when enabled, expands 1-finger MIDI notes into
-    /// rootless Neo-Soul 9th voicings (3, 7, 9, 13) at the same timing. A root's NoteOff
-    /// releases the chord it started even if expansion was switched off in between.
+    /// rootless Neo-Soul 9th voicings (3, 7, 9, 13) at the same timing. NoteOns and NoteOffs go
+    /// through the tracker, which shares each key's occupancy between forwarded roots and
+    /// generated notes and releases only the chord of the voice a NoteOff names. Every other
+    /// event is forwarded unchanged.
     fn forward_event(
         &mut self,
         context: &mut impl ProcessContext<Self>,
         event: PluginNoteEvent<Self>,
     ) {
-        context.send_event(event);
-        let emit = &mut |msg| context.send_event(Self::note_event(msg));
         match event {
             NoteEvent::NoteOn {
                 timing,
+                voice_id,
                 channel,
                 note,
                 velocity,
-                ..
-            } => self.notes.root_on(timing, channel, note, velocity, emit),
+            } => self
+                .notes
+                .root_on(timing, channel, note, velocity, voice_id, &mut |msg| {
+                    context.send_event(Self::note_event(msg))
+                }),
             NoteEvent::NoteOff {
                 timing,
+                voice_id,
                 channel,
                 note,
                 ..
-            } => self.notes.root_off(timing, channel, note, emit),
-            _ => {}
+            } => self
+                .notes
+                .root_off(timing, channel, note, voice_id, &mut |msg| {
+                    context.send_event(Self::note_event(msg))
+                }),
+            other => context.send_event(other),
         }
     }
 
