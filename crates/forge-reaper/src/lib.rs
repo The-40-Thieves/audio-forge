@@ -315,8 +315,25 @@ fn jsfx_ref(name: &str) -> String {
 /// The quoted `FILE` path. REAPER resolves a relative path against the `.rpp`'s folder,
 /// not the working directory it was given in, so relative paths are made absolute.
 fn rpp_media_path(path: &Path) -> String {
-    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    quote_rpp(&absolute.to_string_lossy())
+    quote_rpp(&absolute_media_path(path).to_string_lossy())
+}
+
+/// `path` as it is written to the `.rpp`: unchanged when absolute, otherwise joined onto the
+/// working directory.
+fn absolute_media_path(path: &Path) -> PathBuf {
+    match std::env::current_dir() {
+        Ok(cwd) => media_path_under(&cwd, path),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// `path` resolved against `cwd`, so the exact absolute path can be validated and written.
+fn media_path_under(cwd: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
 }
 
 /// Rejects a media path that [`rpp_media_path`] could not write back unchanged.
@@ -500,14 +517,19 @@ impl ReaperProjectBuilder {
         rpp
     }
 
+    /// Checks every track's media path as it will be written: resolved against `cwd`, so a
+    /// working directory that cannot be represented is caught too.
+    fn check_media_paths(&self, cwd: &Path) -> Result<()> {
+        for media in self.tracks.iter().filter_map(|tr| tr.file_path.as_deref()) {
+            check_media_path(&media_path_under(cwd, media))?;
+        }
+        Ok(())
+    }
+
     /// Writes the `.RPP` project to disk. Fails, writing nothing, when a track's media path
     /// cannot be represented in the file.
     pub fn save_rpp<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
-        for tr in &self.tracks {
-            if let Some(ref media) = tr.file_path {
-                check_media_path(media)?;
-            }
-        }
+        self.check_media_paths(&std::env::current_dir()?)?;
         let p = path.as_ref();
         if let Some(parent) = p.parent()
             && !parent.as_os_str().is_empty()
@@ -708,9 +730,8 @@ mod tests {
         assert_eq!(quote_rpp("a\"b'c`d"), "`a\"b'c'd`");
         assert_eq!(quote_rpp("line\r\nbreak\0"), "\"linebreak\"");
 
-        let dir = std::env::temp_dir()
-            .join("Jane \"JD\" Doe")
-            .join("M\u{fa}sica");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("Jane \"JD\" Doe").join("M\u{fa}sica");
         let media = dir.join("take 'two'.wav");
         let mut rpp = ReaperProjectBuilder::new("My \"Big\" Song", 120.0, 48_000);
         rpp.isrc = Some("USS1Z2600001".to_string());
@@ -737,6 +758,23 @@ mod tests {
             assert!(err.to_string().contains("cannot be referenced"), "{err}");
             assert!(!target.exists(), "{bad:?} still wrote the session");
         }
+    }
+
+    #[test]
+    fn relative_media_paths_are_validated_with_their_working_directory() {
+        // A relative path that is fine on its own must still be rejected when the directory
+        // it resolves under cannot be written to an .rpp unchanged.
+        let cwd = Path::new("/sessions/session\nfolder");
+        let mut rpp = ReaperProjectBuilder::new("S", 120.0, 48_000);
+        rpp.tracks
+            .push(track("T", Some(PathBuf::from("stem.wav")), false, &[]));
+        let err = rpp
+            .check_media_paths(cwd)
+            .expect_err("newline in the working directory");
+        assert!(err.to_string().contains("line break"), "{err}");
+        assert!(rpp.check_media_paths(Path::new("/sessions/ok")).is_ok());
+        let abs = std::env::temp_dir().join("stem.wav");
+        assert_eq!(media_path_under(cwd, &abs), abs);
     }
 
     #[test]
