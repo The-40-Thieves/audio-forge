@@ -157,7 +157,7 @@ impl AudioIOLayout {
 
     /// The name for the main output port. Either generated or taken from the `names` field.
     pub fn main_output_name(&self) -> String {
-        self.names.main_input.unwrap_or("Output").to_owned()
+        self.names.main_output.unwrap_or("Output").to_owned()
     }
 
     /// The name for the auxiliary input port with the given index. Either generated or taken from

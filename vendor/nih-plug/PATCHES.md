@@ -17,6 +17,8 @@ Changes from upstream:
   - After a successful load, schedule `Task::RescanParamValues` so the host gets
     `clap_host_params.rescan(CLAP_PARAM_RESCAN_VALUES)` on the main thread
     (clap-validator `state-reproducibility-basic`, `-binary`, `-buffered`).
+- `src/audio_setup.rs`, `main_output_name`: read `names.main_output` instead of
+  `names.main_input`, so a custom output port name is not replaced by the input's.
 
 Upstream tracking: issue <https://github.com/robbert-vdh/nih-plug/issues/279>,
 fix PR <https://github.com/robbert-vdh/nih-plug/pull/280> (same two fixes; it
