@@ -640,13 +640,15 @@ impl RealtimeVocalSurgical {
                 l = 0.5 * (self.prev_l + self.prev2_l);
             } else {
                 self.slew_env_l =
-                    flush_denormal_f64(0.992 * self.slew_env_l + 0.008 * slew_l.max(1e-5)).max(1e-5);
+                    flush_denormal_f64(0.992 * self.slew_env_l + 0.008 * slew_l.max(1e-5))
+                        .max(1e-5);
             }
             if slew_r > self.slew_env_r * thresh_mult && slew_r > 0.015 {
                 r = 0.5 * (self.prev_r + self.prev2_r);
             } else {
                 self.slew_env_r =
-                    flush_denormal_f64(0.992 * self.slew_env_r + 0.008 * slew_r.max(1e-5)).max(1e-5);
+                    flush_denormal_f64(0.992 * self.slew_env_r + 0.008 * slew_r.max(1e-5))
+                        .max(1e-5);
             }
         }
         self.prev2_l = flush_denormal_f64(self.prev_l);
@@ -893,7 +895,9 @@ impl RealtimeMasterLimiter {
         hist[2] = hist[3];
         hist[3] = x;
         let p0 = (-0.0625 * hist[0] + 0.5625 * hist[1] + 0.5625 * hist[2] - 0.0625 * hist[3]).abs();
-        let p1 = (-0.046875 * hist[0] + 0.328125 * hist[1] + 0.765625 * hist[2] - 0.046875 * hist[3]).abs();
+        let p1 = (-0.046875 * hist[0] + 0.328125 * hist[1] + 0.765625 * hist[2]
+            - 0.046875 * hist[3])
+            .abs();
         x.abs().max(p0).max(p1)
     }
 
@@ -986,8 +990,10 @@ pub struct RealtimeMasteringEq18 {
 impl RealtimeMasteringEq18 {
     pub fn new(sample_rate: f64) -> Self {
         let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
-        let bands_l = std::array::from_fn(|i| Biquad::peaking_eq(sr, MASTERING_18_BANDS_HZ[i], 1.4, 0.0));
-        let bands_r = std::array::from_fn(|i| Biquad::peaking_eq(sr, MASTERING_18_BANDS_HZ[i], 1.4, 0.0));
+        let bands_l =
+            std::array::from_fn(|i| Biquad::peaking_eq(sr, MASTERING_18_BANDS_HZ[i], 1.4, 0.0));
+        let bands_r =
+            std::array::from_fn(|i| Biquad::peaking_eq(sr, MASTERING_18_BANDS_HZ[i], 1.4, 0.0));
         Self {
             sample_rate: sr,
             bands_l,
@@ -1007,8 +1013,10 @@ impl RealtimeMasteringEq18 {
             let g = (g_in * amt).clamp(-15.0, 15.0);
             if (g - self.current_gains_db[i]).abs() > 0.02 {
                 self.current_gains_db[i] = g;
-                self.bands_l[i] = Biquad::peaking_eq(self.sample_rate, MASTERING_18_BANDS_HZ[i], 1.4, g);
-                self.bands_r[i] = Biquad::peaking_eq(self.sample_rate, MASTERING_18_BANDS_HZ[i], 1.4, g);
+                self.bands_l[i] =
+                    Biquad::peaking_eq(self.sample_rate, MASTERING_18_BANDS_HZ[i], 1.4, g);
+                self.bands_r[i] =
+                    Biquad::peaking_eq(self.sample_rate, MASTERING_18_BANDS_HZ[i], 1.4, g);
             }
         }
     }
@@ -1068,8 +1076,15 @@ impl RealtimePhaseAligner {
             % self.max_delay_samples;
         self.write_pos = (self.write_pos + 1) % self.max_delay_samples;
 
-        let sign = if self.invert_polarity { -1.0_f32 } else { 1.0_f32 };
-        (self.delay_line_l[read_pos] * sign, self.delay_line_r[read_pos] * sign)
+        let sign = if self.invert_polarity {
+            -1.0_f32
+        } else {
+            1.0_f32
+        };
+        (
+            self.delay_line_l[read_pos] * sign,
+            self.delay_line_r[read_pos] * sign,
+        )
     }
 }
 
@@ -1148,17 +1163,26 @@ impl RealtimeDrumTrigger {
 
         let mut out = [None, None, None];
 
-        if self.kick_cooldown == 0 && self.kick_fast > min_amp && self.kick_fast > self.kick_slow * 2.8 {
+        if self.kick_cooldown == 0
+            && self.kick_fast > min_amp
+            && self.kick_fast > self.kick_slow * 2.8
+        {
             self.kick_cooldown = self.min_holdoff_samples;
             let vel = (self.kick_fast * 2.2).clamp(0.15, 1.0) as f32;
             out[0] = Some((36, vel)); // C1 Kick
         }
-        if self.snare_cooldown == 0 && self.snare_fast > min_amp && self.snare_fast > self.snare_slow * 3.0 {
+        if self.snare_cooldown == 0
+            && self.snare_fast > min_amp
+            && self.snare_fast > self.snare_slow * 3.0
+        {
             self.snare_cooldown = self.min_holdoff_samples;
             let vel = (self.snare_fast * 2.4).clamp(0.15, 1.0) as f32;
             out[1] = Some((38, vel)); // D1 Snare
         }
-        if self.hat_cooldown == 0 && self.hat_fast > min_amp * 0.5 && self.hat_fast > self.hat_slow * 2.9 {
+        if self.hat_cooldown == 0
+            && self.hat_fast > min_amp * 0.5
+            && self.hat_fast > self.hat_slow * 2.9
+        {
             self.hat_cooldown = self.min_holdoff_samples / 2;
             let vel = (self.hat_fast * 3.0).clamp(0.12, 1.0) as f32;
             out[2] = Some((42, vel)); // F#1 Closed Hat
@@ -1167,4 +1191,3 @@ impl RealtimeDrumTrigger {
         out
     }
 }
-

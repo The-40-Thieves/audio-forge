@@ -138,9 +138,8 @@ pub fn apply_spectral_unmask(
             fft_fwd.process(&mut t_spec);
 
             for b in 1..(half_bins - 1) {
-                let g = 0.25 * frame_gains[b - 1]
-                    + 0.50 * frame_gains[b]
-                    + 0.25 * frame_gains[b + 1];
+                let g =
+                    0.25 * frame_gains[b - 1] + 0.50 * frame_gains[b] + 0.25 * frame_gains[b + 1];
                 t_spec[b] *= g;
                 t_spec[fft_size - b] = t_spec[b].conj();
             }

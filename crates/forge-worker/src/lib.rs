@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use forge_core::{AudioBuffer, ForgeError, Result, StemBundle};
-use forge_dsp::{Biquad, sanitize_sample_f64};
+use forge_dsp::{sanitize_sample_f64, Biquad};
 use serde::{Deserialize, Serialize};
 
 /// Execution backend selection for neural separation, restoration, and generation.
@@ -85,7 +85,8 @@ pub fn separate_stems(
         let transient_mask = ((env_fast / env_slow - 1.15) * 1.4).clamp(0.0, 1.0);
 
         // 3. Center-panned harmonic vocal band
-        let v_mid = voc_lp.process_sample(voc_hp.process_sample(mid)) * (1.0 - transient_mask * 0.7);
+        let v_mid =
+            voc_lp.process_sample(voc_hp.process_sample(mid)) * (1.0 - transient_mask * 0.7);
         vocals.channels[0][i] = v_mid;
         vocals.channels[1][i] = v_mid;
 
@@ -354,4 +355,3 @@ mod tests {
         }
     }
 }
-
