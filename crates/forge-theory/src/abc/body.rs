@@ -19,8 +19,10 @@ pub(super) fn parse_body_line(
 ) -> Parse<()> {
     let mut lx = Lexer { text, pos: 0 };
     while let Some(byte) = lx.peek() {
-        // An inline `[V:...]` can switch to another voice mid-line; drop what that voice writes.
-        let (active, before) = (ctx.voice_active, out.len());
+        if !ctx.voice_active {
+            skip_inactive(ctx, &mut lx)?;
+            continue;
+        }
         match byte {
             b'%' => break,
             b'"' => parse_quoted(&mut lx, out)?,
@@ -46,11 +48,35 @@ pub(super) fn parse_body_line(
             }
             _ => parse_note_or_rest(ctx, &mut lx, out)?,
         }
-        if !active {
-            out.truncate(before);
-        }
     }
     Ok(())
+}
+
+/// Steps over one token of a voice that is not being read. Its music is ignored, but inline
+/// fields still apply, so a `[V:...]` can switch back to the first voice on any line.
+fn skip_inactive(ctx: &mut Context, lx: &mut Lexer) -> Parse<()> {
+    match lx.peek() {
+        Some(b'%') => lx.pos = lx.text.len(),
+        Some(b'"') => {
+            lx.bump();
+            lx.take_until(b'"', "quoted chord symbol")?;
+        }
+        Some(b'[') if is_inline_field(lx) => parse_inline_field(ctx, lx)?,
+        _ => lx.bump(),
+    }
+    Ok(())
+}
+
+/// The cursor is on the `[` of an inline field such as `[K:G]` or `[V:2]`.
+fn is_inline_field(lx: &Lexer) -> bool {
+    lx.peek_at(1).is_some_and(|b| b.is_ascii_alphabetic()) && lx.peek_at(2) == Some(b':')
+}
+
+fn parse_inline_field(ctx: &mut Context, lx: &mut Lexer) -> Parse<()> {
+    lx.bump();
+    let field = lx.take_until(b']', "inline field")?;
+    let (letter, value) = field_line(field).ok_or("malformed inline field")?;
+    apply_field(ctx, letter, value)
 }
 
 fn parse_note_or_rest(ctx: &mut Context, lx: &mut Lexer, out: &mut Vec<Element>) -> Parse<()> {
@@ -113,13 +139,10 @@ fn parse_bar(ctx: &mut Context, lx: &mut Lexer) {
 
 /// `[K:...]` inline field, `[1` repeat ending, `[|` bar line, or a `[CEG]` chord.
 fn parse_bracket(ctx: &mut Context, lx: &mut Lexer, out: &mut Vec<Element>) -> Parse<()> {
-    let next = lx.peek_at(1);
-    if next.is_some_and(|b| b.is_ascii_alphabetic()) && lx.peek_at(2) == Some(b':') {
-        lx.bump();
-        let field = lx.take_until(b']', "inline field")?;
-        let (letter, value) = field_line(field).ok_or("malformed inline field")?;
-        return apply_field(ctx, letter, value);
+    if is_inline_field(lx) {
+        return parse_inline_field(ctx, lx);
     }
+    let next = lx.peek_at(1);
     if next.is_some_and(|b| b.is_ascii_digit()) {
         lx.bump();
         lx.skip_while(|b| b.is_ascii_digit() || b == b',' || b == b'-');

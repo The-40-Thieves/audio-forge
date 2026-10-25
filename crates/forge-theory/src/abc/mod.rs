@@ -173,8 +173,7 @@ fn tokenize(abc: &str) -> Result<Vec<Element>> {
         }
         let result = match field_line(text) {
             Some((letter, value)) => apply_field(&mut ctx, letter, value),
-            None if ctx.voice_active => parse_body_line(&mut ctx, text, line, &mut out),
-            None => Ok(()),
+            None => parse_body_line(&mut ctx, text, line, &mut out),
         };
         result.map_err(|message| line_error(line, &message))?;
     }

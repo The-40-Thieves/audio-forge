@@ -144,6 +144,23 @@ fn test_headers_decorations_annotations_and_voices_are_not_notes() {
 }
 
 #[test]
+fn test_inline_voice_switches_on_inactive_lines() {
+    let cases: &[(&str, &[u8])] = &[
+        ("K:C\n[V:1] C [V:2] E\n[V:1] D", &[60, 62]),
+        ("V:1\nC\nV:2\nE [V:1] F\nG", &[60, 65, 67]),
+        ("K:C\n[V:1] C [V:2] E\nF G\n[V:2] A [V:1] B", &[60, 71]),
+        // The other voice's accidentals and chord symbols do not leak into the first voice.
+        ("K:C\n[V:1] C [V:2] ^F [V:1] F", &[60, 65]),
+        ("V:1\nC\nV:2\n\"^[V:1]\" E\nV:1\nD", &[60, 62]),
+    ];
+    for &(abc, expected) in cases {
+        assert_eq!(pitches(abc), expected, "{abc}");
+    }
+    let (chords, _) = parse_abc_score("V:1\n\"C\"C\nV:2\n\"G7\"G [V:1] \"F\"F", TPB).unwrap();
+    assert_eq!(chords, ["C", "F"]);
+}
+
+#[test]
 fn test_trailing_comments_on_fields_are_ignored() {
     assert_eq!(pitches("K:C % key\nC"), [60]);
     assert_eq!(pitches("K:G % key\nF"), [66]);
