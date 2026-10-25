@@ -13,8 +13,8 @@ use assert_no_alloc::{AllocDisabler, assert_no_alloc, reset_violation_count, vio
 use forge_dsp::{
     DrumTriggerNotes, NoteMsg, RealtimeDrumTrigger, RealtimeMasterLimiter, RealtimeMasteringEq18,
     RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSpectrumAnalyzer32,
-    RealtimeSubAndTapeBus, RealtimeVocalSurgical, clear_shared_spectrum, publish_shared_spectrum,
-    read_shared_spectrum,
+    RealtimeSubAndTapeBus, RealtimeVocalSurgical, SpectrumBusOwner, clear_shared_spectrum,
+    publish_shared_spectrum, read_shared_spectrum, shared_spectrum_owner,
 };
 
 #[global_allocator]
@@ -95,16 +95,20 @@ fn master_limiter_process_and_reset_do_not_allocate() {
 fn spectrum_analyzer_and_shared_bus_do_not_allocate() {
     let mut analyzer = RealtimeSpectrumAnalyzer32::new(48_000.0);
     assert_no_allocs("RealtimeSpectrumAnalyzer32 and shared bus", || {
+        let (owner, other) = (SpectrumBusOwner::unique(), SpectrumBusOwner::unique());
         for i in 0..FRAMES {
             let (l, r) = signal(i);
             analyzer.push_stereo_sample(l, r);
             if i % 512 == 0 {
                 let bands = analyzer.snapshot_db();
-                std::hint::black_box(publish_shared_spectrum(6, &bands));
+                std::hint::black_box(publish_shared_spectrum(owner, 6, &bands));
                 std::hint::black_box(read_shared_spectrum(6));
             }
         }
-        std::hint::black_box(clear_shared_spectrum(6));
+        // Both clear paths: a non-owner's clear that leaves the frame, then the owner's.
+        std::hint::black_box(clear_shared_spectrum(other, 6));
+        std::hint::black_box(shared_spectrum_owner(6));
+        std::hint::black_box(clear_shared_spectrum(owner, 6));
         analyzer.reset(44_100.0);
         analyzer.reset(96_000.0);
     });

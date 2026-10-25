@@ -5,7 +5,7 @@
 //! All levels are dB relative to a full-scale sine: a sine of amplitude `A` centred in a band
 //! reads `20 * log10(A)` in that band, so a full-scale sine reads 0 dB.
 
-use std::sync::atomic::{AtomicU32, Ordering, fence};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 use crate::loudness_limiter::{CytomicSvf, sanitize_param_f64, sanitize_sample_f32};
 
@@ -21,9 +21,15 @@ pub const SPECTRUM_FLOOR_DB: f32 = -90.0;
 /// Highest level a band reports, in dB.
 pub const SPECTRUM_CEIL_DB: f32 = 6.0;
 
-/// Power below which a band is treated as silent (-120 dB), which also keeps the envelopes
-/// out of the subnormal range.
+/// Power below which a band displays as silent (-120 dB). It applies only to the displayed
+/// level; the integrators keep integrating smaller contributions.
 const POWER_FLOOR: f64 = 1.0e-12;
+/// Integrator and envelope state below this power (-300 dB) flushes to zero, which keeps it out
+/// of the subnormal range without discarding any signal the display could show.
+const STATE_FLUSH: f64 = 1.0e-30;
+/// Highest band edge, as a fraction of the sample rate, a band-pass is designed for. Bands above
+/// it (only at sample rates below about 41 kHz) are squeezed under it with their log width.
+const MAX_EDGE_RATIO: f64 = 0.45;
 /// Release time constant of the display envelope (about 14 dB/s of fall).
 const RELEASE_TAU_S: f64 = 0.3;
 /// Bounds of the per-band power integration time: three periods of the band centre.
@@ -44,10 +50,27 @@ pub fn spectrum_band_center_hz(band: usize) -> f64 {
     (lo * hi).sqrt()
 }
 
-/// Constant Q that puts each band-pass's -3 dB points on its band edges.
-fn band_q() -> f64 {
-    let step = (SPECTRUM_HIGH_HZ / SPECTRUM_LOW_HZ).powf(1.0 / SPECTRUM_BANDS as f64);
-    1.0 / (step.sqrt() - 1.0 / step.sqrt())
+/// Centre frequency (Hz) and Q of `band`'s band-pass at `sr`, chosen so that after the SVF's
+/// bilinear transform its -3 dB points land exactly on the band edges.
+///
+/// The SVF is the bilinear transform of the analog band-pass `s / (s^2 + s/Q + 1)` with its
+/// frequency axis prewarped at the centre, so digital frequency `f` sits at analog frequency
+/// `w = tan(pi * f / sr)`. An analog band-pass with -3 dB points `w_lo` and `w_hi` has centre
+/// `w0 = sqrt(w_lo * w_hi)` and `Q = w0 / (w_hi - w_lo)`; mapping `w0` back gives the centre
+/// `f0 = atan(w0) * sr / pi` to configure, whose `tan(pi * f0 / sr)` is `w0` again.
+fn band_pass_design(band: usize, sr: f64) -> (f64, f64) {
+    let (lo, hi) = spectrum_band_edges_hz(band);
+    let hi_capped = hi.min(MAX_EDGE_RATIO * sr);
+    let lo_capped = lo.min(hi_capped * lo / hi);
+    let warp = |f: f64| (std::f64::consts::PI * f / sr).tan();
+    let (w_lo, w_hi) = (warp(lo_capped), warp(hi_capped));
+    let w0 = (w_lo * w_hi).sqrt();
+    (w0.atan() * sr / std::f64::consts::PI, w0 / (w_hi - w_lo))
+}
+
+/// Keeps a power state value unless it has decayed into the subnormal range.
+fn flush_state(power: f64) -> f64 {
+    if power > STATE_FLUSH { power } else { 0.0 }
 }
 
 /// Converts a sine-referenced band power to a clamped display level.
@@ -70,14 +93,17 @@ fn one_pole_coeff(tau_s: f64, sr: f64) -> f64 {
 
 /// Zero-allocation 32-band real-time spectrum analyzer (25 Hz to 18.5 kHz).
 ///
-/// Each band is a Cytomic TPT SVF band-pass at the band's geometric centre, run at the full
-/// sample rate and scaled to unity gain at the centre, with its -3 dB points on the band
-/// edges. Its output power is integrated over about three periods of the centre frequency,
-/// then a peak-hold envelope with a 300 ms release sets the bar's ballistics.
+/// Each band is a Cytomic TPT SVF band-pass run at the full sample rate and scaled to unity
+/// gain at its centre. Its centre and Q come from the band edges prewarped for the sample
+/// rate (see `band_pass_design`), so its -3 dB points sit on the band edges at every rate,
+/// the top bands at 44.1 kHz included. Its output power is integrated over about three periods
+/// of the centre frequency, then a peak-hold envelope with a 300 ms release sets the bar's
+/// ballistics. The -90 dB display floor applies only to the snapshot, so a steady quiet
+/// signal integrates to its true level at every sample rate.
 pub struct RealtimeSpectrumAnalyzer32 {
     filters: [CytomicSvf; SPECTRUM_BANDS],
-    /// `1/Q`: the SVF band-pass output has gain `Q` at its centre.
-    bp_gain: f64,
+    /// `1/Q` per band: the SVF band-pass output has gain `Q` at its centre.
+    bp_gain: [f64; SPECTRUM_BANDS],
     avg_coeff: [f64; SPECTRUM_BANDS],
     release_coeff: f64,
     avg_pow: [f64; SPECTRUM_BANDS],
@@ -87,13 +113,12 @@ pub struct RealtimeSpectrumAnalyzer32 {
 impl RealtimeSpectrumAnalyzer32 {
     pub fn new(sample_rate: f64) -> Self {
         let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
-        let q = band_q();
-        let centre = |b: usize| spectrum_band_center_hz(b).min(sr * 0.45);
+        let design: [(f64, f64); SPECTRUM_BANDS] = std::array::from_fn(|b| band_pass_design(b, sr));
         Self {
-            filters: std::array::from_fn(|b| CytomicSvf::lowpass(sr, centre(b), q)),
-            bp_gain: 1.0 / q,
-            avg_coeff: std::array::from_fn(|b| {
-                let tau = (3.0 / centre(b)).clamp(MIN_AVG_TAU_S, MAX_AVG_TAU_S);
+            filters: design.map(|(centre, q)| CytomicSvf::lowpass(sr, centre, q)),
+            bp_gain: design.map(|(_, q)| 1.0 / q),
+            avg_coeff: design.map(|(centre, _)| {
+                let tau = (3.0 / centre).clamp(MIN_AVG_TAU_S, MAX_AVG_TAU_S);
                 one_pole_coeff(tau, sr)
             }),
             release_coeff: one_pole_coeff(RELEASE_TAU_S, sr),
@@ -112,16 +137,17 @@ impl RealtimeSpectrumAnalyzer32 {
         let mono = 0.5 * (sanitize_sample_f32(l) + sanitize_sample_f32(r));
         for b in 0..SPECTRUM_BANDS {
             let (_lp, bp, _hp) = self.filters[b].process_multimode(mono);
-            let band = bp * self.bp_gain;
+            let band = bp * self.bp_gain[b];
             // Twice the mean square, so a sine of amplitude A integrates to A^2.
-            let avg = self.avg_pow[b] + self.avg_coeff[b] * (2.0 * band * band - self.avg_pow[b]);
-            self.avg_pow[b] = if avg > POWER_FLOOR { avg } else { 0.0 };
+            let avg = flush_state(
+                self.avg_pow[b] + self.avg_coeff[b] * (2.0 * band * band - self.avg_pow[b]),
+            );
+            self.avg_pow[b] = avg;
             let env = self.env_pow[b];
             self.env_pow[b] = if avg >= env {
                 avg
             } else {
-                let fall = env + self.release_coeff * (avg - env);
-                if fall > POWER_FLOOR { fall } else { 0.0 }
+                flush_state(env + self.release_coeff * (avg - env))
             };
         }
     }
@@ -187,19 +213,86 @@ pub const SHARED_SPECTRUM_SLOT_COUNT: usize = 8;
 const FLOOR_BITS: u32 = SPECTRUM_FLOOR_DB.to_bits();
 /// How many times a reader retries a slot a writer is updating before giving up.
 const READ_RETRIES: usize = 64;
+/// How many times a clear retries a slot another writer is updating before giving up.
+const WRITE_RETRIES: usize = 64;
+/// Owner id of a slot nobody has published to since it was last cleared.
+const NO_OWNER: u64 = 0;
 
 /// Process-wide shared spectrum slots, holding 32 band levels in dB each. Every band starts at
 /// [`SPECTRUM_FLOOR_DB`], so a slot nobody has published to reads as silence.
 ///
-/// Read and write them only through [`publish_shared_spectrum`] and [`read_shared_spectrum`],
-/// which guard each slot with a sequence counter so a reader never sees half of one frame and
-/// half of another.
+/// Read and write them only through [`publish_shared_spectrum`], [`clear_shared_spectrum`] and
+/// [`read_shared_spectrum`], which guard each slot with a sequence counter so a reader never
+/// sees half of one frame and half of another.
 pub static SHARED_SPECTRUM_SLOTS: [[AtomicU32; SPECTRUM_BANDS]; SHARED_SPECTRUM_SLOT_COUNT] =
     [const { [const { AtomicU32::new(FLOOR_BITS) }; SPECTRUM_BANDS] }; SHARED_SPECTRUM_SLOT_COUNT];
 
 /// Per-slot seqlock counter: odd while a writer is storing a frame.
 static SHARED_SPECTRUM_SEQ: [AtomicU32; SHARED_SPECTRUM_SLOT_COUNT] =
     [const { AtomicU32::new(0) }; SHARED_SPECTRUM_SLOT_COUNT];
+
+/// Per-slot owner: the [`SpectrumBusOwner`] id of the last successful publish, or [`NO_OWNER`].
+/// Written only while holding the slot's seqlock.
+static SHARED_SPECTRUM_OWNER: [AtomicU64; SHARED_SPECTRUM_SLOT_COUNT] =
+    [const { AtomicU64::new(NO_OWNER) }; SHARED_SPECTRUM_SLOT_COUNT];
+
+/// Source of [`SpectrumBusOwner`] ids. It starts at 1 because 0 is [`NO_OWNER`].
+static NEXT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Identity of one publisher (one plugin instance) on the shared spectrum bus.
+///
+/// Ownership rule: the last instance to publish to a slot owns it. Clearing a slot only
+/// empties it when the clearing instance is still the owner, so when two instances share a
+/// slot, the one that moves away or is removed never silences the other's frame. When the
+/// owner itself leaves, the slot reads as silence until the other instance's next publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SpectrumBusOwner(u64);
+
+impl SpectrumBusOwner {
+    /// A process-wide unique owner id. Allocation-free and lock-free.
+    pub fn unique() -> Self {
+        Self(NEXT_OWNER_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// The atomics behind one slot.
+struct BusSlot {
+    seq: &'static AtomicU32,
+    owner: &'static AtomicU64,
+    bands: &'static [AtomicU32; SPECTRUM_BANDS],
+}
+
+fn bus_slot(slot_idx: usize) -> Option<BusSlot> {
+    Some(BusSlot {
+        seq: SHARED_SPECTRUM_SEQ.get(slot_idx)?,
+        owner: SHARED_SPECTRUM_OWNER.get(slot_idx)?,
+        bands: SHARED_SPECTRUM_SLOTS.get(slot_idx)?,
+    })
+}
+
+/// Takes a slot's seqlock without waiting: returns the even counter value it started from, or
+/// `None` if another writer holds it.
+fn try_lock_slot(seq: &AtomicU32) -> Option<u32> {
+    let start = seq.load(Ordering::Relaxed);
+    if start & 1 == 1 {
+        return None;
+    }
+    seq.compare_exchange(
+        start,
+        start.wrapping_add(1),
+        Ordering::Acquire,
+        Ordering::Relaxed,
+    )
+    .ok()?;
+    fence(Ordering::Release);
+    Some(start)
+}
+
+fn store_frame(slot: &[AtomicU32; SPECTRUM_BANDS], bands_32: &[f32; SPECTRUM_BANDS]) {
+    for (atom, &val) in slot.iter().zip(bands_32.iter()) {
+        atom.store(sanitize_bus_db(val).to_bits(), Ordering::Relaxed);
+    }
+}
 
 /// Maps a plugin's bus-slot parameter (`0 = Off`, `1..=8 = Slot A..H`) to a slot index.
 pub fn shared_spectrum_slot_index(bus_param: usize) -> Option<usize> {
@@ -219,43 +312,65 @@ fn sanitize_bus_db(v: f32) -> f32 {
     }
 }
 
-/// Publishes a 32-band spectrum (dB) into slot `slot_idx` (`0..8`) as one consistent frame.
+/// Publishes a 32-band spectrum (dB) into slot `slot_idx` (`0..8`) as one consistent frame and
+/// makes `owner` the slot's owner.
 ///
-/// Wait-free: if another instance is publishing to the same slot at that moment, this frame is
-/// skipped and `false` is returned. Out-of-range slots are ignored and also return `false`.
+/// Wait-free: if another instance is writing to the same slot at that moment, this frame is
+/// skipped, ownership does not change, and `false` is returned. Out-of-range slots are ignored
+/// and also return `false`.
 #[inline]
-pub fn publish_shared_spectrum(slot_idx: usize, bands_32: &[f32; SPECTRUM_BANDS]) -> bool {
-    let (Some(seq), Some(slot)) = (
-        SHARED_SPECTRUM_SEQ.get(slot_idx),
-        SHARED_SPECTRUM_SLOTS.get(slot_idx),
-    ) else {
+pub fn publish_shared_spectrum(
+    owner: SpectrumBusOwner,
+    slot_idx: usize,
+    bands_32: &[f32; SPECTRUM_BANDS],
+) -> bool {
+    let Some(bus) = bus_slot(slot_idx) else {
         return false;
     };
-    let start = seq.load(Ordering::Relaxed);
-    if start & 1 == 1
-        || seq
-            .compare_exchange(
-                start,
-                start.wrapping_add(1),
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            )
-            .is_err()
-    {
+    let Some(start) = try_lock_slot(bus.seq) else {
         return false;
-    }
-    fence(Ordering::Release);
-    for (atom, &val) in slot.iter().zip(bands_32.iter()) {
-        atom.store(sanitize_bus_db(val).to_bits(), Ordering::Relaxed);
-    }
-    seq.store(start.wrapping_add(2), Ordering::Release);
+    };
+    bus.owner.store(owner.0, Ordering::Relaxed);
+    store_frame(bus.bands, bands_32);
+    bus.seq.store(start.wrapping_add(2), Ordering::Release);
     true
 }
 
-/// Resets slot `slot_idx` to silence, as when its publishing instance goes away.
+/// Resets slot `slot_idx` to silence if `owner` still owns it, as when its publishing instance
+/// moves to another slot or goes away. Returns `true` if it cleared the slot.
+///
+/// If another instance published to the slot since `owner` last did, that instance owns it and
+/// its frame stays. Lock-free and bounded: while another writer holds the slot it retries, and
+/// a publisher holding the slot takes it over, which ends the retries.
 #[inline]
-pub fn clear_shared_spectrum(slot_idx: usize) -> bool {
-    publish_shared_spectrum(slot_idx, &[SPECTRUM_FLOOR_DB; SPECTRUM_BANDS])
+pub fn clear_shared_spectrum(owner: SpectrumBusOwner, slot_idx: usize) -> bool {
+    let Some(bus) = bus_slot(slot_idx) else {
+        return false;
+    };
+    for _ in 0..WRITE_RETRIES {
+        if bus.owner.load(Ordering::Relaxed) != owner.0 {
+            return false;
+        }
+        if let Some(start) = try_lock_slot(bus.seq) {
+            // Authoritative under the lock: the acquire on `seq` sees every earlier owner.
+            let owned = bus.owner.load(Ordering::Relaxed) == owner.0;
+            if owned {
+                bus.owner.store(NO_OWNER, Ordering::Relaxed);
+                store_frame(bus.bands, &[SPECTRUM_FLOOR_DB; SPECTRUM_BANDS]);
+            }
+            bus.seq.store(start.wrapping_add(2), Ordering::Release);
+            return owned;
+        }
+        std::hint::spin_loop();
+    }
+    false
+}
+
+/// Current owner of slot `slot_idx`, or `None` if nobody has published to it since it was last
+/// cleared (and for out-of-range slots).
+pub fn shared_spectrum_owner(slot_idx: usize) -> Option<SpectrumBusOwner> {
+    let id = bus_slot(slot_idx)?.owner.load(Ordering::Acquire);
+    (id != NO_OWNER).then_some(SpectrumBusOwner(id))
 }
 
 /// Reads one consistent 32-band frame (dB) from slot `slot_idx` (`0..8`).
@@ -264,19 +379,16 @@ pub fn clear_shared_spectrum(slot_idx: usize) -> bool {
 /// read as silence ([`SPECTRUM_FLOOR_DB`]).
 #[inline]
 pub fn read_shared_spectrum(slot_idx: usize) -> [f32; SPECTRUM_BANDS] {
-    let (Some(seq), Some(slot)) = (
-        SHARED_SPECTRUM_SEQ.get(slot_idx),
-        SHARED_SPECTRUM_SLOTS.get(slot_idx),
-    ) else {
+    let Some(bus) = bus_slot(slot_idx) else {
         return [SPECTRUM_FLOOR_DB; SPECTRUM_BANDS];
     };
     for _ in 0..READ_RETRIES {
-        let before = seq.load(Ordering::Acquire);
+        let before = bus.seq.load(Ordering::Acquire);
         if before & 1 == 0 {
             let frame: [f32; SPECTRUM_BANDS] =
-                std::array::from_fn(|b| f32::from_bits(slot[b].load(Ordering::Relaxed)));
+                std::array::from_fn(|b| f32::from_bits(bus.bands[b].load(Ordering::Relaxed)));
             fence(Ordering::Acquire);
-            if seq.load(Ordering::Relaxed) == before {
+            if bus.seq.load(Ordering::Relaxed) == before {
                 return frame.map(sanitize_bus_db);
             }
         }

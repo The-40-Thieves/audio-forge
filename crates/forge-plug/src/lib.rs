@@ -22,7 +22,7 @@ use forge_dsp::{
     RealtimeDensityAndClipper, RealtimeDrumTrigger, RealtimeFdnReverb, RealtimeMasterLimiter,
     RealtimeMasteringEq18, RealtimeNeuralPreamp, RealtimeOpenSoothe, RealtimeOpenSpacer,
     RealtimePhaseAligner, RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus,
-    RealtimeTransientTonalSplit, RealtimeVocalSurgical, clear_shared_spectrum,
+    RealtimeTransientTonalSplit, RealtimeVocalSurgical, SpectrumBusOwner, clear_shared_spectrum,
     publish_shared_spectrum, read_shared_spectrum, shared_spectrum_slot_index,
 };
 use nih_plug::prelude::*;
@@ -248,6 +248,9 @@ pub struct ForgeOpenSoothePlug {
     sample_rate: f64,
     /// Shared-bus slot this instance last published to, cleared when it changes or on drop.
     published_slot: Option<usize>,
+    /// This instance's identity on the shared bus, so its clears never empty a slot another
+    /// instance has published to since.
+    bus_owner: SpectrumBusOwner,
 }
 
 #[derive(Params)]
@@ -331,7 +334,8 @@ impl Default for OpenSootheParams {
                 0,
                 IntRange::Linear { min: 0, max: 8 },
             )
-            .with_value_to_string(Arc::new(bus_slot_to_string)),
+            .with_value_to_string(Arc::new(bus_slot_to_string))
+            .with_string_to_value(Arc::new(bus_slot_from_string)),
         }
     }
 }
@@ -346,38 +350,67 @@ impl Default for ForgeOpenSoothePlug {
             limiter_dsp: RealtimeMasterLimiter::new(48_000.0),
             sample_rate: 48_000.0,
             published_slot: None,
+            bus_owner: SpectrumBusOwner::unique(),
         }
     }
 }
 
+/// Slot letters for bus-slot parameter values `1..=8`.
+const BUS_SLOT_LETTERS: &str = "ABCDEFGH";
+
 /// Bus-slot parameter display: `0` is `Off`, `1..=8` are `Slot A..H`.
 fn bus_slot_to_string(value: i32) -> String {
-    match u8::try_from(value) {
-        Ok(v @ 1..=8) => format!("Slot {}", char::from(b'A' + v - 1)),
-        _ => String::from("Off"),
+    usize::try_from(value)
+        .ok()
+        .and_then(|v| v.checked_sub(1))
+        .and_then(|i| BUS_SLOT_LETTERS.get(i..=i))
+        .map_or_else(|| String::from("Off"), |letter| format!("Slot {letter}"))
+}
+
+/// Parses bus-slot text back to its parameter value, ignoring case and surrounding spaces:
+/// `Off`, `Slot A..H`, a bare letter `A..H`, or the plain value `0..8`.
+fn bus_slot_from_string(text: &str) -> Option<i32> {
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("off") {
+        return Some(0);
     }
+    if let Ok(value) = text.parse::<i32>() {
+        return (0..=8).contains(&value).then_some(value);
+    }
+    let letter = match text.get(..4) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("slot") => text[4..].trim(),
+        _ => text,
+    };
+    let mut chars = letter.chars();
+    let (Some(c), None) = (chars.next(), chars.next()) else {
+        return None;
+    };
+    let index = BUS_SLOT_LETTERS.find(c.to_ascii_uppercase())?;
+    i32::try_from(index + 1).ok()
 }
 
 impl Drop for ForgeOpenSoothePlug {
-    /// A removed instance must not leave its last frame on the bus.
+    /// A removed instance must not leave its last frame on the bus. The clear only empties the
+    /// slot if this instance published to it last, so it never silences another instance.
     fn drop(&mut self) {
         if let Some(slot) = self.published_slot.take() {
-            clear_shared_spectrum(slot);
+            clear_shared_spectrum(self.bus_owner, slot);
         }
     }
 }
 
 impl ForgeOpenSoothePlug {
     /// Publishes `bands` to the bus slot selected by `bus_param` (`0 = Off`). Moving to another
-    /// slot or to `Off` clears the slot this instance published to before.
+    /// slot or to `Off` clears the slot this instance published to before, unless another
+    /// instance has published to it since (the last publisher owns a slot).
     fn publish_to_bus(&mut self, bus_param: usize, bands: &[f32; 32]) {
         let slot = shared_spectrum_slot_index(bus_param);
         if let Some(old) = self.published_slot.filter(|&old| Some(old) != slot) {
-            clear_shared_spectrum(old);
+            clear_shared_spectrum(self.bus_owner, old);
         }
         self.published_slot = slot;
         if let Some(idx) = slot {
-            publish_shared_spectrum(idx, bands);
+            publish_shared_spectrum(self.bus_owner, idx, bands);
         }
     }
 
@@ -3035,5 +3068,76 @@ mod tests {
         assert_eq!(bus_slot_to_string(0), "Off");
         assert_eq!(bus_slot_to_string(1), "Slot A");
         assert_eq!(bus_slot_to_string(8), "Slot H");
+        assert_eq!(bus_slot_to_string(-1), "Off");
+        assert_eq!(bus_slot_to_string(9), "Off");
+    }
+
+    /// Plugs A and B share Slot F (index 5) and B published last, so B owns it. A switching
+    /// away or being dropped must leave B's frame; B dropping clears it.
+    #[test]
+    fn open_soothe_instances_sharing_a_slot_never_silence_each_other() {
+        const PARAM: usize = 6;
+        const SLOT: usize = 5;
+        let silent = [forge_dsp::SPECTRUM_FLOOR_DB; 32];
+        let (a_bands, b_bands, c_bands) = ([-30.0_f32; 32], [-10.0_f32; 32], [-40.0_f32; 32]);
+        let mut a = ForgeOpenSoothePlug::default();
+        let mut b = ForgeOpenSoothePlug::default();
+        a.publish_to_bus(PARAM, &a_bands);
+        b.publish_to_bus(PARAM, &b_bands);
+
+        // A moves to Slot G (index 6): its clear of Slot F must not touch B's frame.
+        a.publish_to_bus(PARAM + 1, &a_bands);
+        assert_eq!(read_shared_spectrum(SLOT), b_bands, "A's switch silenced B");
+        assert_eq!(read_shared_spectrum(SLOT + 1), a_bands);
+
+        // C joins Slot F and is removed after B publishes again: B's frame stays.
+        let mut c = ForgeOpenSoothePlug::default();
+        c.publish_to_bus(PARAM, &c_bands);
+        b.publish_to_bus(PARAM, &b_bands);
+        drop(c);
+        assert_eq!(read_shared_spectrum(SLOT), b_bands, "C's drop silenced B");
+
+        drop(a);
+        assert_eq!(read_shared_spectrum(SLOT + 1), silent, "A owned Slot G");
+        drop(b);
+        assert_eq!(read_shared_spectrum(SLOT), silent, "B owned Slot F");
+    }
+
+    /// clap-validator's `param-conversions` check: every value's text must parse back to the
+    /// same value, through the plugin's own parameter, and re-format to the same text.
+    #[test]
+    fn bus_slot_text_round_trips_for_every_value() {
+        let params = OpenSootheParams::default();
+        let param = &params.shared_bus_slot;
+        for value in 0..=8 {
+            let text = bus_slot_to_string(value);
+            assert_eq!(bus_slot_from_string(&text), Some(value), "{text:?}");
+            let normalized = param.preview_normalized(value);
+            let shown = param.normalized_value_to_string(normalized, false);
+            assert_eq!(shown, text);
+            let parsed = param.string_to_normalized_value(&shown);
+            assert_eq!(parsed, Some(normalized), "{shown:?} did not parse back");
+        }
+    }
+
+    #[test]
+    fn bus_slot_text_accepts_letters_numbers_and_any_case() {
+        for (text, value) in [
+            ("off", 0),
+            (" OFF ", 0),
+            ("slot a", 1),
+            ("SLOT H", 8),
+            ("Slot  c", 3),
+            ("d", 4),
+            ("G", 7),
+            ("0", 0),
+            ("5", 5),
+            ("8", 8),
+        ] {
+            assert_eq!(bus_slot_from_string(text), Some(value), "{text:?}");
+        }
+        for text in ["", "Slot", "Slot I", "I", "9", "-1", "Slot AB", "on"] {
+            assert_eq!(bus_slot_from_string(text), None, "{text:?}");
+        }
     }
 }
