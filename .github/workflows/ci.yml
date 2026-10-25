@@ -121,3 +121,105 @@ jobs:
             target/bundled/*.clap
           if-no-files-found: error
           retention-days: 14
+
+  validate:
+    name: validate plugins (${{ matrix.os }})
+    needs: plugins
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    env:
+      PLUGINVAL_VERSION: v1.0.4
+      CLAP_VALIDATOR_VERSION: 0.4.1
+      GH_TOKEN: ${{ github.token }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: forge-plugins-${{ runner.os }}
+          path: bundled
+
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y xvfb libgl1 libxcursor1 libxkbcommon0 libfreetype6
+
+      - name: Install pluginval and clap-validator
+        run: |
+          set -euo pipefail
+          mkdir -p tools/pluginval tools/clap-validator
+          case "$RUNNER_OS" in
+            Linux)   pv_asset=pluginval_Linux.zip;   cv_pattern='*ubuntu-22.04.zip' ;;
+            Windows) pv_asset=pluginval_Windows.zip; cv_pattern='*windows.zip' ;;
+            macOS)   pv_asset=pluginval_macOS.zip;   cv_pattern='*macos-universal.zip' ;;
+          esac
+          gh release download "$PLUGINVAL_VERSION" --repo Tracktion/pluginval \
+            --pattern "$pv_asset" --dir tools
+          gh release download "$CLAP_VALIDATOR_VERSION" --repo free-audio/clap-validator \
+            --pattern "$cv_pattern" --dir tools
+          unzip -q "tools/$pv_asset" -d tools/pluginval
+          unzip -q tools/clap-validator-*.zip -d tools/clap-validator
+          # Some clap-validator releases nest a tarball inside the zip.
+          find tools/clap-validator -name '*.tar.gz' -exec tar -xzf {} -C tools/clap-validator \;
+
+          case "$RUNNER_OS" in
+            macOS)   pluginval="$PWD/tools/pluginval/pluginval.app/Contents/MacOS/pluginval" ;;
+            Windows) pluginval="$PWD/tools/pluginval/pluginval.exe" ;;
+            *)       pluginval="$PWD/tools/pluginval/pluginval" ;;
+          esac
+          clap_validator="$(find "$PWD/tools/clap-validator" -type f \
+            \( -name clap-validator -o -name clap-validator.exe \) | head -n1)"
+          test -f "$pluginval" && test -n "$clap_validator"
+          chmod +x "$pluginval" "$clap_validator" || true
+          echo "PLUGINVAL=$pluginval" >> "$GITHUB_ENV"
+          echo "CLAP_VALIDATOR=$clap_validator" >> "$GITHUB_ENV"
+
+      - name: pluginval (VST3, strictness 5)
+        run: |
+          set -uo pipefail
+          run() { if [ "$RUNNER_OS" = Linux ]; then xvfb-run -a "$@"; else "$@"; fi; }
+          mkdir -p logs/pluginval
+          failed=()
+          for plugin in bundled/*.vst3; do
+            name="$(basename "$plugin" .vst3)"
+            echo "::group::pluginval $name"
+            if ! run "$PLUGINVAL" --strictness-level 5 --skip-gui-tests --timeout-ms 120000 \
+                --output-dir logs/pluginval --validate "$plugin"; then
+              failed+=("$name")
+            fi
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "::error::pluginval failed: ${failed[*]}"
+            exit 1
+          fi
+
+      - name: clap-validator (CLAP)
+        if: success() || failure()
+        run: |
+          set -uo pipefail
+          run() { if [ "$RUNNER_OS" = Linux ]; then xvfb-run -a "$@"; else "$@"; fi; }
+          mkdir -p logs/clap-validator
+          failed=()
+          for plugin in bundled/*.clap; do
+            name="$(basename "$plugin" .clap)"
+            echo "::group::clap-validator $name"
+            if ! run "$CLAP_VALIDATOR" validate "$plugin" 2>&1 | tee "logs/clap-validator/$name.log"; then
+              failed+=("$name")
+            fi
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "::error::clap-validator failed: ${failed[*]}"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: validation-logs-${{ runner.os }}
+          path: logs
+          retention-days: 14
