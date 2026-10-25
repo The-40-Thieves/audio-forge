@@ -1,6 +1,6 @@
 # ForgeAudio (`audio-forge`)
 
-**Open-Source Hybrid Music Production, AI Track Restoration, Vocal Surgery, Music Theory & REAPER 7.82 Mastering Suite**
+**An audio delivery pipeline that AI agents can drive.** Hand it a track and a target (Spotify, Apple Music, YouTube, broadcast), and it returns a repaired, spec-compliant master plus a measured report that says whether the file is ready to ship and why. On request it also produces separated stems, MIDI and a REAPER session.
 
 [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/The-40-Thieves/audio-forge?utm_source=badge)
 [![CI](https://github.com/The-40-Thieves/audio-forge/actions/workflows/ci.yml/badge.svg)](https://github.com/The-40-Thieves/audio-forge/actions/workflows/ci.yml)
@@ -9,25 +9,137 @@
 [![VST3 / CLAP](https://img.shields.io/badge/Plugins-VST3%20%7C%20CLAP%20%7C%20JSFX-purple.svg)](crates/forge-plug/)
 [![REAPER](https://img.shields.io/badge/REAPER-7.82%2B%20Native%20JSFX%20%26%20RPP-green.svg)](reaper-jsfx/)
 
-ForgeAudio (`forge` CLI + `forge-mcp` Model Context Protocol server + `forge-plug` native **VST3 / CLAP** plugin suite + native REAPER `JSFX` DSP plugins) is a zero-bloat **Rust + REAPER 7.82 + Hybrid GPU Worker** audio engineering ecosystem built for **both live studio musicians and AI/hybrid producers** (Suno, Udio, YuE2-3B, ACE-Step 1.5, Google Lyria 3.5).
+The same Rust DSP engine ships in four forms:
+
+- **`forge-mcp`**, a Model Context Protocol server for agents.
+- **`forge`**, a command-line tool.
+- **`forge-plug`**, ten VST3 and CLAP plugins.
+- **Native REAPER JSFX** effects.
 
 ---
 
-## Why ForgeAudio? (Commercial vs. ForgeAudio Open-Source Stack)
+## The agent pipeline
 
-| Commercial Industry Standard | Price | ForgeAudio (`audio-forge`) Equivalent | Runtime & Speed |
+An agent makes one tool call. The pipeline:
+
+1. Audits the input.
+2. Repairs DC offset, clipping and mains hum.
+3. Suppresses harsh spectral resonances ("AI fizz").
+4. Can tone-match the mix to a reference track or a genre curve.
+5. Normalizes loudness and true-peak limits to the target.
+6. Audits the result again.
+
+Each requirement gets an explicit pass or fail, so an agent never has to judge from loose numbers whether a master meets spec.
+
+```
+input.wav ──► audit ──► repair ──► de-fizz ──► tone match ──► loudness + true-peak limit ──► audit ──► checks
+                                               (optional)                                              │
+                                               master.wav + master.delivery.json  ◄──────────────────────┘
+```
+
+### Connect an agent
+
+Build the server, then register it with any MCP client. For example, with Claude Code:
+
+```bash
+cargo build --release -p forge-mcp
+claude mcp add forge -- /path/to/audio-forge/target/release/forge-mcp
+```
+
+### Deliver a track
+
+```json
+{ "name": "forge_deliver",
+  "arguments": { "input": "mix.wav", "output": "out/master.wav", "target": "apple_music" } }
+```
+
+The response, also written to `out/master.delivery.json`, holds both audits and these checks:
+
+```
+apple_music (-16.0 LUFS, -1.0 dBTP): -4.45 -> -16.00 LUFS, -0.59 -> -11.95 dBTP
+  [PASS] integrated_loudness: -16.00 LUFS (target -16.0 +/- 1.0 LU)
+  [PASS] true_peak: -11.95 dBTP (ceiling -1.0 dBTP)
+  [PASS] no_clipping: 0 clipped samples
+  [PASS] sample_rate: 48000 Hz (minimum 44100 Hz)
+READY
+```
+
+### MCP tools
+
+| Tool | What it returns |
+| :--- | :--- |
+| `forge_deliver` | A verified master for a target: before and after audits, pass/fail checks and the WAV, plus a `.delivery.json` report. |
+| `forge_ingest_to_reaper` | The full session from one song: separated stems, cleaned vocal, drum-trigger and chord MIDI, a verified master for the target, and a REAPER `.rpp` project with JSFX inserts. |
+| `forge_audit_audio` | BS.1770-4 integrated, short-term and momentary loudness, LRA, sample and true peak, crest factor, DC, clipping, stereo correlation and a fizz index. |
+| `forge_restore_and_defizz` | The restoration chain and spectral de-fizz, with an optional vocal clean-up pass. |
+| `forge_spectral_unmask` | Sidechain spectral ducking that clears space for a vocal or kick. |
+| `forge_phase_align` | Delay and polarity alignment of two stems (GCC-PHAT). |
+| `forge_vocal_suite` | Scale-locked pitch correction, formant-preserving shifting and harmonies. |
+| `forge_music_theory_midi` | Voice-led chord and bass MIDI, optional reharmonization, and an ABC score. |
+| `forge_master_distrokid` | Low-level mastering with an explicit LUFS and ceiling, reference-match EQ and ISRC tagging. |
+
+### Delivery targets
+
+| `target` | Integrated loudness | True-peak ceiling |
+| :--- | ---: | ---: |
+| `spotify`, `youtube`, `amazon_music`, `tidal` | -14 LUFS | -1 dBTP |
+| `deezer` | -15 LUFS | -1 dBTP |
+| `apple_music`, `podcast` | -16 LUFS | -1 dBTP |
+| `ebu_r128` | -23 LUFS | -1 dBTP |
+| `atsc_a85` | -24 LUFS | -2 dBTP |
+| `custom` | `target_lufs` | `ceiling_dbtp` |
+
+These are the reference levels each service publishes for playback normalization, not upload requirements, and they change. Check the platform's current documentation before a release.
+
+A master passes when:
+
+- Integrated loudness is within 1 LU of the target.
+- True peak is at or below the ceiling.
+- No samples are clipped.
+- The sample rate is at least 44.1 kHz.
+
+Sources:
+
+- [Spotify loudness normalization](https://support.spotify.com/artists/article/loudness-normalization/)
+- [EBU R 128](https://tech.ebu.ch/publications/r128)
+- [ITU-R BS.1770](https://www.itu.int/rec/R-REC-BS.1770)
+- Platform summaries from [Soundbridge](https://www.soundbridge.io/mastering-for-streaming-your-2026-platform-guide) and [MasteringBox](https://www.masteringbox.com/learn/mastering-for-streaming)
+
+---
+
+## Verified, not claimed
+
+| What | Evidence |
+| :--- | :--- |
+| BS.1770-4 loudness, LRA and true peak meet the EBU conformance cases | [`tests/ebu_reference.rs`](crates/forge-dsp/tests/ebu_reference.rs) runs EBU Tech 3341 and 3342 reference signals. True peak uses the BS.1770-4 Annex 2 48-tap 4x polyphase FIR. |
+| Delivery reaches every target it reports as passed | Unit tests in [`delivery.rs`](crates/forge-dsp/src/delivery.rs) push quiet, hot and low-sample-rate mixes through each target. |
+| DSP stays finite and stable for arbitrary input | [`tests/proptest_invariants.rs`](crates/forge-dsp/tests/proptest_invariants.rs) uses property tests: Hadamard involution, ADAA continuity, filter decay, limiter and restoration totality. |
+| Plugins load and behave in hosts | [CI](.github/workflows/ci.yml) runs pluginval (strictness 5) on every VST3 and clap-validator on every CLAP, on Linux, macOS and Windows. |
+| Performance regressions are tracked | [CodSpeed](https://app.codspeed.io/The-40-Thieves/audio-forge) benchmarks [`forge-dsp`](crates/forge-dsp/benches/dsp.rs), [`forge-vocal`](crates/forge-vocal/benches/vocal.rs) and [`forge-theory`](crates/forge-theory/benches/theory.rs). |
+
+Known gap: two clap-validator state tests are excluded in CI because of upstream bugs in nih-plug's state loading. See [SECURITY.md](SECURITY.md).
+
+---
+
+## Modules and what inspired them
+
+These are independent implementations of well-known techniques. They are not clones of, or substitutes for, the commercial products named in the "Inspired by" column.
+
+| Module | What it actually does | Inspired by | Source and tests |
 | :--- | :--- | :--- | :--- |
-| **oeksound Soothe2** | \$209 | `forge-dsp::spectral_defizz` + `Forge_OpenSoothe_DeFizz.jsfx` (2048-pt OLA STFT dynamic spectral resonance & AI metallic fizz suppressor) | Pure Rust SIMD (`>120x` real-time) + REAPER JSFX (`0%` idle CPU) |
-| **Wavesfactory Trackspacer** | \$59 | `forge-dsp::spectral_unmask` + `Forge_OpenSpacer_Unmask.jsfx` (32-band / STFT sidechain dynamic frequency carving: Vocal→Music, Kick→Bass) | Pure Rust + REAPER 4-channel sidechain JSFX |
-| **Sound Radix Auto-Align 2** | \$199 | `forge-dsp::align_phase_gcc_phat` (Sub-sample Generalized Cross-Correlation Phase Transform delay + polarity solver) | Pure Rust (`<50 ms` per stem pair) |
-| **Synchro Arts VocAlign Pro** | \$349 | `forge-dsp::align_vocal_double_dtw` (MFCC + FastDTW time-warping solver emitting non-destructive REAPER `SM` Stretch Markers) | Pure Rust + Native REAPER `.RPP` Stretch Markers |
-| **Melodyne 5 / Auto-Tune Pro** | \$249–\$699 | `forge-vocal` (YIN F0 pitch tracker, **sibilant-aware unvoiced consonant bypass**, **Levinson-Durbin LPC formant envelope preservation**, 3-part harmony generator & REAPER `<PITCHENV` compiler) | Pure Rust + Native REAPER Take Pitch Envelopes |
-| **Eventide SplitEQ / oeksound Spiff** | \$179–\$199 | `forge-dsp::RealtimeTransientTonalSplit` + **Forge SplitEQ** VST3/CLAP (3-band structural Transient attack vs. Tonal sustain splitter & shaper) | Pure Rust (`0` audio-thread allocs) |
-| **oeksound Bloom / Neutron 5 Density** | \$199–\$249 | `forge-dsp::RealtimeDensityAndClipper` + **Forge Density & ADAA Clipper** VST3/CLAP (Upward low-level density compressor + 3-band 2x-oversampled 1st-order ADAA `tanh` soft clipper) | Pure Rust (`2x` polyphase oversampled ADAA) |
-| **Valhalla VintageVerb / Shimmer + Neural DSP** | \$50–\$199 | `forge-dsp::RealtimeFdnReverb` + `RealtimeNeuralPreamp` + **Forge SpaceVerb & Neural Preamp** VST3/CLAP (Dilated causal WaveNet `1073/1176/V76/A800` preamp + 8x8 Walsh-Hadamard FDN reverb with vocal ducking & `+12 st` octave shimmer) | Pure Rust (`O(N log N)` Hadamard + ADAA WaveNet) |
-| **Scaler 2 + Slate Trigger 2** | \$59 + \$149 | `forge-theory` (Neo-Soul/Jazz/Cinematic voice-leading solver, Dilla/MPC micro-timing humanizer, sub-sample drum transient-to-MIDI replacer, ABC notation) | Pure Rust (`midly`) |
-| **iZotope RX 11 Advanced** | \$1,199 | `forge-dsp::restoration` (DC, cubic Hermite de-clip, 50/60 Hz 10-harmonic hum notch, vocal de-click/de-plosive) + `forge-worker` (`Mel-Band-RoFormer` + `Apollo` HF bandwidth restoration) | Rust DSP + Local RTX 3080 / Colab A100 Worker |
-| **FabFilter Pro-Q 4 / Pro-L 2 / Ozone 11 / Tonal Balance 2** | \$199–\$499 | `forge-dsp::loudness_limiter` + `elite_dsp` (ITU-R BS.1770-4 LUFS, 4x True Peak `-1.0 dBTP` brickwall limiter, 18-band Mastering EQ, built-in **Genre Tonal Balance Targets**, **8-Slot Lock-Free Cross-Instance Spectrum Bus**, `nih_plug_egui` 60 FPS OpenGL GUI) | Pure Rust (`f64` headroom + `egui` OpenGL) |
+| Spectral de-fizz | 2048-point overlap-add STFT. Detects narrow resonances against a smoothed spectral envelope and attenuates them dynamically, with a capped depth. | oeksound Soothe | [`spectral_defizz.rs`](crates/forge-dsp/src/spectral_defizz.rs) and its unit test (suppresses a harsh whistle) |
+| Spectral unmask | Sidechain-keyed per-band attenuation of a target stem, in vocal (200 Hz to 7.5 kHz) or kick (30 to 130 Hz) mode. | Wavesfactory Trackspacer | [`spectral_unmask.rs`](crates/forge-dsp/src/spectral_unmask.rs), proptest totality |
+| Phase align | GCC-PHAT cross-correlation finds the delay and polarity between two stems. | Sound Radix Auto-Align | [`phase_align.rs`](crates/forge-dsp/src/phase_align.rs) and its unit test (recovers an exact delay and an inverted polarity) |
+| Vocal double align | MFCC features plus FastDTW. Emits REAPER stretch markers instead of rendering audio. | Synchro Arts VocAlign | [`phase_align.rs`](crates/forge-dsp/src/phase_align.rs) |
+| Pitch and formant | YIN F0 tracking with a bypass for unvoiced consonants, LPC formant preservation, diatonic harmonies, and REAPER `<PITCHENV` output. | Melodyne, Auto-Tune | [`forge-vocal`](crates/forge-vocal/src/lib.rs): YIN unit test and proptests |
+| Restoration | DC removal, cubic Hermite de-clip, a 50/60 Hz hum notch across 10 harmonics, and vocal de-click, de-plosive and breath gate. | iZotope RX | [`restoration.rs`](crates/forge-dsp/src/restoration.rs), proptest totality |
+| Loudness and limiter | BS.1770-4 metering, then gain to target and a 3 ms lookahead true-peak limiter with a final true-peak trim. | FabFilter Pro-L, loudness meters | [`loudness_limiter.rs`](crates/forge-dsp/src/loudness_limiter.rs), EBU reference tests |
+| Mastering EQ and tone match | 18-band EQ, plus curves matched to a reference track or to built-in genre tonal-balance targets. | Ozone, Tonal Balance Control | [`elite_dsp.rs`](crates/forge-dsp/src/elite_dsp.rs), [`restoration.rs`](crates/forge-dsp/src/restoration.rs) |
+| Transient and tonal split | A 3-band transient/sustain split with independent shaping. | Eventide SplitEQ | [`elite_dsp.rs`](crates/forge-dsp/src/elite_dsp.rs), proptest partition of unity |
+| Density and clipper | Upward low-level compression and a 3-band, 2x oversampled, first-order ADAA `tanh` clipper. | oeksound Bloom, multiband clippers | [`elite_dsp.rs`](crates/forge-dsp/src/elite_dsp.rs), ADAA proptests |
+| SpaceVerb and preamp | An 8x8 Walsh-Hadamard FDN reverb with ducking and shimmer, plus a small dilated causal WaveNet preamp model. | Valhalla reverbs, NAM-style amp modeling | [`elite_dsp.rs`](crates/forge-dsp/src/elite_dsp.rs), FDN decay and hysteresis proptests |
+| Music theory | A voice-leading solver, Neo-Soul and jazz reharmonization, Dilla/MPC micro-timing, audio-to-MIDI drum triggers, and ABC export. | Scaler, Slate Trigger | [`forge-theory`](crates/forge-theory/src/lib.rs): unit test and proptests |
+| Stem separation | Dispatches to a local or Colab GPU worker that runs Mel-Band-RoFormer. Not pure Rust; it needs the Python worker. | Stem-splitting services | [`forge-worker`](crates/forge-worker/), [`python-worker/`](python-worker/) |
 
 ---
 
@@ -35,101 +147,77 @@ ForgeAudio (`forge` CLI + `forge-mcp` Model Context Protocol server + `forge-plu
 
 ```
 audio-forge/
-├── Cargo.toml                  # Rust workspace (9 crates)
 ├── crates/
-│   ├── forge-core/             # 64-bit planar AudioBuffer, 16/24/32f WAV & FFmpeg I/O, TPDF dither
-│   ├── forge-dsp/              # BS.1770-4 LUFS, 4x True Peak, OpenSoothe, OpenSpacer, SplitEQ, ADAA Clipper, 8x8 FDN SpaceVerb, Neural WaveNet Preamp, GCC-PHAT, FastDTW
-│   ├── forge-plug/             # 10 Native Cross-DAW VST3 & CLAP Real-Time Plugins (`nih-plug` + `nih_plug_egui` 60 FPS OpenGL GUI + Lock-Free Cross-Instance Spectrum Bus)
-│   ├── forge-theory/           # Voice-leading solver, Neo-Soul reharmonizer, Dilla/MPC groove, Drum-to-MIDI, ABC
-│   ├── forge-vocal/            # YIN F0 pitch tracker, sibilant-aware LPC formant-preserving shifter, 3-part harmonies, REAPER <PITCHENV
-│   ├── forge-reaper/           # Programmatic REAPER 7.82 .RPP AST builder, UDP OSC controller, ISO 3901 ISRC tagger
-│   ├── forge-worker/           # Hybrid GPU dispatcher (Local RTX 3080 uv worker + Colab A100 + Gemini Lyria 3.5 API)
-│   ├── forge-cli/              # `forge` CLI binary (<5ms startup)
-│   └── forge-mcp/              # `forge-mcp` JSON-RPC 2.0 stdio server for AI agents
-├── xtask/                      # `cargo run --package xtask -- bundle forge-plug` VST3 & CLAP bundler
-├── reaper-jsfx/                # Native REAPER EEL2 JSFX real-time plugins
-│   ├── Forge_OpenSoothe_DeFizz.jsfx
-│   ├── Forge_OpenSpacer_Unmask.jsfx
-│   ├── Forge_SubBass_Reinforce.jsfx
-│   └── Forge_Vocal_Surgical.jsfx
-├── python-worker/              # On-demand GPU sidecar (Mel-Band-RoFormer, Apollo, YuE2-3B, Basic-Pitch, Seed-VC)
-└── notebooks/
-    └── ForgeAudio_Colab_A100_Worker.ipynb
+│   ├── forge-core/      # 64-bit planar AudioBuffer, WAV and FFmpeg I/O, TPDF dither, AuditReport
+│   ├── forge-dsp/       # Delivery pipeline, BS.1770-4 meter and limiter, restoration, de-fizz, unmask, alignment, real-time processors
+│   ├── forge-plug/      # Shared nih-plug VST3/CLAP plugin implementations
+│   ├── forge-theory/    # Voice leading, reharmonization, groove, drum-to-MIDI, ABC
+│   ├── forge-vocal/     # YIN pitch, LPC formant-preserving shift, harmonies, REAPER <PITCHENV
+│   ├── forge-reaper/    # .RPP builder, OSC control, ISRC validation and tagging, JSFX installer
+│   ├── forge-worker/    # GPU worker dispatch (local uv worker, Colab, Lyria API)
+│   ├── forge-cli/       # `forge` binary
+│   └── forge-mcp/       # `forge-mcp` JSON-RPC 2.0 stdio MCP server
+├── plugins/forge-*/     # One crate per standalone VST3/CLAP plugin
+├── xtask/               # Plugin bundler and installer
+├── reaper-jsfx/         # Native REAPER EEL2 effects
+├── python-worker/       # GPU sidecar (stem separation, bandwidth restoration)
+└── notebooks/           # Colab worker notebook
 ```
 
 ---
 
-## Quick Start
+## Quick start
 
-### 1. Build, Bundle & Install Individual (or All 10) VST3 / CLAP Plugins
-
-Every plugin in ForgeAudio can be built, bundled, and installed **individually on its own** (under `plugins/forge-*`) or all together via `xtask`:
+### Deliver from the command line
 
 ```bash
-# List all 10 standalone VST3 & CLAP plugins
-cargo run --package xtask -- list
+cargo run --release --bin forge -- deliver mix.wav -o out/master.wav --target spotify
+cargo run --release --bin forge -- deliver mix.wav -o out/master.wav --lufs -10 --ceiling-dbtp -1.5
+cargo run --release --bin forge -- deliver vocal.wav -o out/vocal.wav --target apple_music --vocal --no-defizz
+cargo run --release --bin forge -- deliver mix.wav -o out/master.wav --reference ref.wav
+```
 
-# Bundle a single standalone VST3 & CLAP plugin (e.g., only Forge OpenSoothe or Forge SplitEQ)
+`forge deliver` prints each check and exits with code 2 when the master is not ready, which makes it usable as a CI gate.
+
+### Full session from one song
+
+```bash
+cargo run --release --bin forge -- ingest raw_track.wav -o ./session_out --bpm 96 --chords "Am9 Fmaj9 Cmaj9 G13"
+```
+
+### Individual commands
+
+```bash
+cargo run --release --bin forge -- audit track.wav
+cargo run --release --bin forge -- restore track.wav -o cleaned.wav --defizz-depth 9.5
+cargo run --release --bin forge -- unmask instrumental.wav --sidechain vocal.wav -o unmasked.wav --mode vocal
+cargo run --release --bin forge -- phase-align overhead.wav snare_top.wav -o snare_aligned.wav
+cargo run --release --bin forge -- vocal lead_vox.wav -o ./vox_out --scale "A minor" --harmonize
+cargo run --release --bin forge -- theory --chords "Dm9 G13 Cmaj9 A7" -o chords.mid --style neo-soul --groove dilla
+cargo run --release --bin forge -- master mix.wav -o master.wav --target-lufs -14 --ceiling-dbtp -1 --isrc USABC2600001
+```
+
+### Plugins
+
+```bash
+cargo run --package xtask -- list                            # list the 10 plugins
 cargo run --package xtask -- bundle forge-opensoothe --release
-cargo run --package xtask -- bundle forge-spliteq --release
-
-# Bundle ALL 10 individual standalone VST3 & CLAP plugins into target/bundled/
-cargo run --package xtask -- bundle-all --release
-
-# Install a single plugin (or --all 10 standalone plugins) directly to your system VST3 & CLAP folders
-cargo run --package xtask -- install forge-opensoothe --release
-cargo run --package xtask -- install --all --release
+cargo run --package xtask -- bundle-all --release            # everything into target/bundled/
+cargo run --package xtask -- install --all --release         # copy into system VST3 and CLAP folders
 ```
 
-| Standalone Package Name | Individual Bundles Generated | Studio Processor Description |
-| :--- | :--- | :--- |
-| **`forge-opensoothe`** | `forge-opensoothe.vst3` / `.clap` | **Forge OpenSoothe De-Fizz** — 2048-pt OLA STFT Dynamic Resonance & AI Fizz Suppressor (`1536`-sample PDC, `egui` 60 FPS GUI & 8-Slot Shared Spectrum Bus) |
-| **`forge-openspacer`** | `forge-openspacer.vst3` / `.clap` | **Forge OpenSpacer Unmask** — 4-Channel Sidechain Spectral Unmasker (Vocal $\rightarrow$ Music & Kick $\rightarrow$ Bass) |
-| **`forge-vocal-surgical`** | `forge-vocal-surgical.vst3` / `.clap` | **Forge Vocal Surgical Strip** — Zero-Latency Mouth De-Click, `<115 Hz` Plosive Suppressor, Split-Band De-Esser & Breath Gate |
-| **`forge-submono-tape`** | `forge-submono-tape.vst3` / `.clap` | **Forge SubMono & Console Tape** — Linkwitz-Riley `<160 Hz` Sub Mono-Maker, Harmonic Bass Reinforcer & Console8/ChowTape Saturation |
-| **`forge-master-limiter`** | `forge-master-limiter.vst3` / `.clap` | **Forge Master True-Peak Limiter** — Lookahead 4x Inter-Sample True-Peak `-1.0 dBTP` Brickwall Limiter & ITU-R BS.1770-4 Meter |
-| **`forge-drum-trigger`** | `forge-drum-trigger.vst3` / `.clap` | **Forge Drum Trigger & Theory MIDI** — Real-Time Audio-to-MIDI 3-Band Drum Replacer (`C1/D1/F#1`) + 1-Finger MIDI-to-Neo-Soul Chord Voicer |
-| **`forge-phase-eq`** | `forge-phase-eq.vst3` / `.clap` | **Forge PhaseAlign & 18-Band EQ** — Sample-Accurate Phase/Polarity Aligner, 18-Band AI De-Harsh EQ & Built-In Genre Tonal Balance Targets |
-| **`forge-spliteq`** | `forge-spliteq.vst3` / `.clap` | **Forge SplitEQ Transient & Tonal** — Structural 3-Band Transient Attack vs. Tonal Sustain Equalizer & Shaper with 60 FPS `egui` GUI |
-| **`forge-density-clipper`** | `forge-density-clipper.vst3` / `.clap` | **Forge Density & 3-Band ADAA Clipper** — Upward Low-Level Density Compressor + 3-Band 2x-Oversampled 1st-Order ADAA Soft Clipper with 60 FPS `egui` GUI |
-| **`forge-spaceverb`** | `forge-spaceverb.vst3` / `.clap` | **Forge SpaceVerb FDN & Neural Preamp** — Dilated Causal WaveNet Hardware Preamp (`Neve 1073`, `1176`, `V76`, `Studer A800`) + 8x8 Walsh-Hadamard FDN Reverb w/ Ducking & `+12 st` Shimmer |
-
-### 2. Run the Full End-to-End Pipeline (`forge ingest`)
-
-Takes any raw recording or AI-generated song (Suno, Udio, YuE2-3B, Lyria), removes metallic `2.5–6.5 kHz` fizz, extracts drum trigger MIDI, generates voice-led Neo-Soul/Jazz chords, masters to DistroKid/Spotify `-14.0 LUFS / -1.0 dBTP` (24-bit WAV), installs the native REAPER JSFX plugins, and generates a ready-to-mix `.RPP` project:
-
-```bash
-cargo run --bin forge -- ingest \
-  --input raw_track.wav \
-  --output-dir ./session_out \
-  --bpm 96 \
-  --chords "Am9 Fmaj9 Cmaj9 G13"
-```
-
-### 3. Individual CLI Commands
-
-```bash
-# Audit ITU-R BS.1770-4 LUFS, 4x True Peak (dBTP), LRA, and AI Spectral Fizz Index
-cargo run --bin forge -- audit --path track.wav --json
-
-# Surgical Restoration + OpenSoothe Dynamic De-Fizz
-cargo run --bin forge -- restore --input track.wav --output cleaned.wav --vocal --defizz-depth-db 9.5
-
-# OpenSpacer Sidechain Dynamic Frequency Unmasking (Vocal -> Instrumental or Kick -> Bass)
-cargo run --bin forge -- unmask --target instrumental.wav --sidechain vocal.wav --output unmasked.wav
-
-# GCC-PHAT Multi-Mic Phase Alignment or FastDTW Vocal Double Alignment
-cargo run --bin forge -- align --reference lead_vox.wav --target double_vox.wav --output double_aligned.wav --vocal-dtw
-
-# Vocal Pitch Correction + Formant Shift + 3-Part Harmony Stack + REAPER <PITCHENV
-cargo run --bin forge -- vocal --input lead_vox.wav --output-dir ./vox_out --root-pc 9 --minor --harmonies
-
-# Music Theory Voice-Led MIDI + Dilla/MPC Groove + Drum Trigger Replacement
-cargo run --bin forge -- theory --chords "Dm9 G13 Cmaj9 A7alt" --output-midi chords.mid --style neosoul --groove dilla --reharmonize
-
-# Master for DistroKid / Apple Digital Masters (-14.0 LUFS, -1.0 dBTP, 18-Band EQ, Console8/ChowTape Warmth, ISRC)
-cargo run --bin forge -- master --input mix.wav --output master_24bit.wav --target-lufs -14.0 --ceiling-dbtp -1.0 --isrc USABC2600001
-```
+| Package | What it does |
+| :--- | :--- |
+| `forge-opensoothe` | Dynamic spectral resonance suppressor (STFT, 1536-sample latency compensation, egui GUI) |
+| `forge-openspacer` | Sidechain spectral unmasker (vocal over music, kick over bass) |
+| `forge-vocal-surgical` | Zero-latency de-click, plosive suppression below 115 Hz, split-band de-esser and breath gate |
+| `forge-submono-tape` | Linkwitz-Riley sub mono below 160 Hz, harmonic bass reinforcement, console and tape saturation |
+| `forge-master-limiter` | Lookahead 4x true-peak limiter with a BS.1770-4 meter |
+| `forge-drum-trigger` | Real-time 3-band drum-to-MIDI triggers and a one-finger chord voicer |
+| `forge-phase-eq` | Phase and polarity aligner with an 18-band EQ and genre tonal-balance targets |
+| `forge-spliteq` | 3-band transient/tonal split equalizer and shaper |
+| `forge-density-clipper` | Upward density compressor and a 3-band ADAA soft clipper |
+| `forge-spaceverb` | FDN reverb with ducking and shimmer, plus a WaveNet preamp model |
 
 ---
 

@@ -7,8 +7,9 @@ use forge_core::AudioBuffer;
 use forge_dsp::{
     align_phase_gcc_phat, align_vocal_double_dtw, apply_18_band_eq, apply_spectral_defizz,
     apply_spectral_unmask, audit_audio, clean_vocal_surgical, compute_genre_tonal_balance_eq,
-    compute_reference_match_eq, normalize_and_limit, run_full_restoration_chain, DeFizzConfig,
-    GenreTonalTarget, RestorationConfig, UnmaskConfig,
+    compute_reference_match_eq, deliver, normalize_and_limit, run_full_restoration_chain,
+    DeFizzConfig, DeliveryOptions, DeliveryTarget, GenreTonalTarget, RestorationConfig, ToneMatch,
+    UnmaskConfig,
 };
 use forge_reaper::{
     install_jsfx_plugins, send_reaper_osc, validate_isrc, write_distrokid_metadata,
@@ -139,6 +140,39 @@ enum Commands {
         /// Optional output ABC notation score file (.abc)
         #[arg(long)]
         output_abc: Option<PathBuf>,
+    },
+
+    /// Deliver a mix to a platform target: repair, de-fizz, master, then verify with pass/fail checks
+    Deliver {
+        /// Input mix or stem WAV
+        input: PathBuf,
+        /// Output master WAV path (a `.delivery.json` report is written next to it)
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Target: spotify, apple_music, youtube, amazon_music, tidal, deezer, podcast, ebu_r128, atsc_a85
+        #[arg(short, long, default_value = "spotify", conflicts_with = "lufs")]
+        target: String,
+        /// Custom integrated loudness in LUFS (requires --ceiling-dbtp)
+        #[arg(long, requires = "ceiling_dbtp")]
+        lufs: Option<f64>,
+        /// Custom true-peak ceiling in dBTP (requires --lufs)
+        #[arg(long, requires = "lufs")]
+        ceiling_dbtp: Option<f64>,
+        /// Skip DC removal, de-clip and hum notch
+        #[arg(long)]
+        no_repair: bool,
+        /// Skip spectral de-fizz
+        #[arg(long)]
+        no_defizz: bool,
+        /// Apply vocal clean-up (vocal stems only)
+        #[arg(long)]
+        vocal: bool,
+        /// Reference track WAV for 18-band tone match
+        #[arg(long)]
+        reference: Option<PathBuf>,
+        /// Genre tonal-balance target (`pop`, `hiphop`, `neosoul`, `edm`, `rock`, `jazz`)
+        #[arg(long, conflicts_with = "reference")]
+        genre: Option<String>,
     },
 
     /// Master audio to ITU-R BS.1770-4 LUFS target, -1.0 dBTP True-Peak ceiling, Reference Match EQ & ISO 3901 ISRC
@@ -499,6 +533,63 @@ async fn main() -> anyhow::Result<()> {
                 "Final Master: {:.2} LUFS | {:.2} dBTP True Peak | LRA {:.2} LU | DistroKid Ready: {}",
                 audit.integrated_lufs, audit.true_peak_dbtp, audit.loudness_range_lu, audit.distrokid_ready
             );
+        }
+
+        Commands::Deliver {
+            input,
+            output,
+            target,
+            lufs,
+            ceiling_dbtp,
+            no_repair,
+            no_defizz,
+            vocal,
+            reference,
+            genre,
+        } => {
+            let target = match (lufs, ceiling_dbtp) {
+                (Some(lufs), Some(ceiling)) => DeliveryTarget::custom(lufs, ceiling)?,
+                _ => DeliveryTarget::parse(&target)?,
+            };
+            let mut options = DeliveryOptions::for_target(target);
+            options.repair = !no_repair;
+            options.defizz = !no_defizz;
+            options.vocal = vocal;
+            options.tone_match = match (reference, genre) {
+                (Some(path), _) => Some(ToneMatch::Reference(AudioBuffer::load(&path)?)),
+                (None, Some(g)) => Some(ToneMatch::Genre(GenreTonalTarget::parse(&g))),
+                (None, None) => None,
+            };
+
+            let buf = AudioBuffer::load(&input)?;
+            let (master, report) = deliver(&buf, &options)?;
+            master.save_wav(&output, 24)?;
+            let report_path = output.with_extension("delivery.json");
+            std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
+
+            println!(
+                "{} ({:.1} LUFS, {:.1} dBTP): {:.2} -> {:.2} LUFS, {:.2} -> {:.2} dBTP",
+                report.target,
+                report.target_lufs,
+                report.ceiling_dbtp,
+                report.before.integrated_lufs,
+                report.after.integrated_lufs,
+                report.before.true_peak_dbtp,
+                report.after.true_peak_dbtp
+            );
+            for check in &report.checks {
+                let mark = if check.passed { "PASS" } else { "FAIL" };
+                println!("  [{mark}] {}: {}", check.name, check.detail);
+            }
+            println!(
+                "{} -> {} (report: {})",
+                if report.ready { "READY" } else { "NOT READY" },
+                output.display(),
+                report_path.display()
+            );
+            if !report.ready {
+                std::process::exit(2);
+            }
         }
 
         Commands::Ingest {
