@@ -9,6 +9,7 @@ pub mod realtime;
 pub mod restoration;
 pub mod spectral_defizz;
 pub mod spectral_unmask;
+pub mod spectrum;
 
 pub use delivery::{
     DeliveryCheck, DeliveryOptions, DeliveryReport, DeliveryTarget, ToneMatch, deliver,
@@ -18,9 +19,8 @@ pub use drum_midi::{DrumTriggerNotes, NoteMsg};
 pub use elite_dsp::{
     AdaaSin, AdaaTanh, AllpassDisperser, AnalogHardwareModel, AutoGainCompensator,
     GenreTonalTarget, JilesAthertonHysteresis, NamWaveNetProfile, Oversampler2x,
-    RealtimeDensityAndClipper, RealtimeFdnReverb, RealtimeNeuralPreamp, RealtimeSpectrumAnalyzer32,
-    RealtimeTransientTonalSplit, SHARED_SPECTRUM_SLOTS, compute_genre_tonal_balance_eq,
-    publish_shared_spectrum, read_shared_spectrum,
+    RealtimeDensityAndClipper, RealtimeFdnReverb, RealtimeNeuralPreamp,
+    RealtimeTransientTonalSplit, compute_genre_tonal_balance_eq,
 };
 pub use loudness_limiter::{
     Biquad, CytomicSvf, LIMITER_LOOKAHEAD_MS, LIMITER_RELEASE_MS, audit_audio, compute_true_peak,
@@ -42,6 +42,12 @@ pub use restoration::{
 };
 pub use spectral_defizz::{DeFizzConfig, apply_spectral_defizz};
 pub use spectral_unmask::{UnmaskConfig, apply_spectral_unmask};
+pub use spectrum::{
+    RealtimeSpectrumAnalyzer32, SHARED_SPECTRUM_SLOT_COUNT, SHARED_SPECTRUM_SLOTS, SPECTRUM_BANDS,
+    SPECTRUM_CEIL_DB, SPECTRUM_FLOOR_DB, clear_shared_spectrum, publish_shared_spectrum,
+    read_shared_spectrum, shared_spectrum_slot_index, spectrum_band_center_hz,
+    spectrum_band_edges_hz,
+};
 
 #[cfg(test)]
 mod tests {

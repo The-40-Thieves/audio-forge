@@ -117,7 +117,11 @@ flowchart TD
      - `RealtimeFdnReverb`: **Forge SpaceVerb** — 8x8 Fast Walsh-Hadamard Feedback Delay Network (`FDN`) reverb with LFO modulation, `<180 Hz` mud cut, automatic **Vocal Sidechain Ducking**, and **+12 st Octave Shimmer** (`Valhalla VintageVerb` / `Shimmer` / `Pro-R 2` equivalent).
      - `RealtimeNeuralPreamp`: Dilated causal WaveNet hardware modeler (`NAM` / `RTNeural` architecture) with 4 analog models (`Neve1073ClassA`, `Fet1176AllButtons`, `TubeV76Triode`, `StuderA800Tape`) and DC blocking.
      - `GenreTonalTarget` & `compute_genre_tonal_balance_eq`: Built-in 18-band statistical genre target corridors (`ModernPop`, `HipHopTrap`, `NeoSoulRnB`, `EdmClub`, `RockMetal`, `AcousticJazz` — `iZotope Tonal Balance Control 2` equivalent).
-     - `SHARED_SPECTRUM_SLOTS`, `publish_shared_spectrum`, `read_shared_spectrum`: 8-slot lock-free `AtomicU32` cross-instance IPC bus (`FabFilter Pro-Q 4` / `Neutron 5` wireless instance communication).
+  8. **`spectrum.rs`, 32-Band Display Spectrum & Shared Spectrum Bus:**
+     - One band layout for every analyzer: 32 equal log-frequency bands from `25 Hz` to `18.5 kHz` (about 0.3 octave each) at every sample rate. All levels are dB relative to a full-scale sine, so a full-scale sine centred in a band reads `0 dB`.
+     - `RealtimeSpectrumAnalyzer32`: 32 Cytomic TPT SVF band-passes run at the full sample rate, each scaled to unity gain at its band centre with its `-3 dB` points on the band edges. Band power is integrated over about three periods of the centre (`5-120 ms`), then a peak-hold envelope with a `300 ms` release sets the bars' ballistics.
+     - The OpenSoothe STFT spectrum sums bin powers across each band, corrected for the Hann window's coherent gain and noise bandwidth, and averages the two channels' power.
+     - `SHARED_SPECTRUM_SLOTS`, `publish_shared_spectrum`, `read_shared_spectrum`, `clear_shared_spectrum`: 8-slot lock-free `AtomicU32` cross-instance IPC bus (`FabFilter Pro-Q 4` / `Neutron 5` wireless instance communication). A per-slot sequence counter makes every read one whole frame; publishing never waits and skips a frame if another instance is mid-publish on the same slot. Unpublished and cleared slots read as silence (`-90 dB`). The plugin's bus-slot parameter is `0 = Off`, `1-8 = Slot A-H`, and an instance clears its slot when it moves to another one or is removed.
 
 ---
 

@@ -16,6 +16,10 @@ use crate::loudness_limiter::{
     sanitize_param_f64, sanitize_sample_f32,
 };
 use crate::restoration::{LowBandSplit, MASTERING_18_BANDS_HZ};
+use crate::spectrum::{
+    SPECTRUM_BANDS, SPECTRUM_FLOOR_DB, accumulate_stft_band_power, band_power_to_db,
+    stft_band_bins, stft_band_power_norm,
+};
 
 /// Exponential one-pole parameter smoother to eliminate zipper noise during real-time knob automation.
 #[derive(Debug, Clone, Copy)]
@@ -71,6 +75,8 @@ pub struct RealtimeOpenSoothe {
     hop_size: usize,
     half_bins: usize,
     window: Vec<f64>,
+    /// `stft_band_power_norm(window)`: turns summed bin powers into sine-referenced band power.
+    spectrum_power_norm: f64,
     band_weights: Vec<f64>,
     fft_fwd: Arc<dyn Fft<f64>>,
     fft_inv: Arc<dyn Fft<f64>>,
@@ -107,6 +113,7 @@ impl RealtimeOpenSoothe {
         let window: Vec<f64> = (0..fft_size)
             .map(|i| 0.5 * (1.0 - (2.0 * PI * (i as f64) / (fft_size as f64)).cos()))
             .collect();
+        let spectrum_power_norm = stft_band_power_norm(&window);
 
         let mut proc = Self {
             sample_rate: sample_rate.max(8000.0),
@@ -114,6 +121,7 @@ impl RealtimeOpenSoothe {
             hop_size,
             half_bins,
             window,
+            spectrum_power_norm,
             band_weights: vec![0.0; half_bins],
             fft_fwd,
             fft_inv,
@@ -130,7 +138,7 @@ impl RealtimeOpenSoothe {
             smoothed_gains_l: vec![1.0; half_bins],
             smoothed_gains_r: vec![1.0; half_bins],
             last_gr_db: 0.0,
-            last_spectrum_db: [-90.0; 32],
+            last_spectrum_db: [SPECTRUM_FLOOR_DB; SPECTRUM_BANDS],
             last_band_gr_db: [0.0; 32],
         };
         proc.update_band_weights(1.35, 1.15);
@@ -155,7 +163,7 @@ impl RealtimeOpenSoothe {
         self.ring_pos = 0;
         self.hop_counter = 0;
         self.last_gr_db = 0.0;
-        self.last_spectrum_db = [-90.0; 32];
+        self.last_spectrum_db = [SPECTRUM_FLOOR_DB; SPECTRUM_BANDS];
         self.last_band_gr_db = [0.0; 32];
         self.update_band_weights(1.35, 1.15);
     }
@@ -243,6 +251,8 @@ impl RealtimeOpenSoothe {
         let mask_out = self.fft_size * 2 - 1;
         let frame_start = self.ring_pos.wrapping_sub(self.fft_size);
         let inv_n = 1.0 / (self.fft_size as f64);
+        let bin_hz = self.sample_rate / (self.fft_size as f64);
+        let mut band_pow = [0.0_f64; SPECTRUM_BANDS];
 
         let mut min_g_seen = 1.0_f64;
 
@@ -263,6 +273,13 @@ impl RealtimeOpenSoothe {
             for b in 0..self.half_bins {
                 self.mags_scratch[b] = self.spec_scratch[b].norm().max(1e-12);
             }
+            // Input spectrum for the display, summed over both channels before any gain.
+            accumulate_stft_band_power(
+                &self.mags_scratch,
+                bin_hz,
+                0.5 * self.spectrum_power_norm,
+                &mut band_pow,
+            );
 
             let smoothed = if ch_idx == 0 {
                 &mut self.smoothed_gains_l
@@ -353,25 +370,17 @@ impl RealtimeOpenSoothe {
 
         self.last_gr_db = (-20.0 * min_g_seen.max(1e-6).log10()) as f32;
 
-        // Extract true 32-band log-spaced FFT magnitude spectrum & dynamic Gain Reduction curve
-        let bin_hz = self.sample_rate / (self.fft_size as f64);
-        for band_idx in 0..32 {
-            let f_lo = 25.0 * (740.0_f64).powf((band_idx as f64) / 32.0);
-            let f_hi = 25.0 * (740.0_f64).powf(((band_idx + 1) as f64) / 32.0);
-            let b0 = ((f_lo / bin_hz).floor() as usize).clamp(1, self.half_bins - 2);
-            let b1 = ((f_hi / bin_hz).ceil() as usize).clamp(b0 + 1, self.half_bins - 1);
-            let mut sum_mag = 0.0_f64;
+        // 32-band input power spectrum (L/R power average) and dynamic gain-reduction curve
+        self.last_spectrum_db = band_power_to_db(&band_pow);
+        for band_idx in 0..SPECTRUM_BANDS {
+            let (b0, b1) = stft_band_bins(band_idx, bin_hz, self.half_bins);
             let mut min_band_g = 1.0_f64;
             for b in b0..=b1 {
-                sum_mag += self.mags_scratch[b] * inv_n;
                 let g_lr = 0.5 * (self.smoothed_gains_l[b] + self.smoothed_gains_r[b]);
                 if g_lr < min_band_g {
                     min_band_g = g_lr;
                 }
             }
-            let avg_mag = (sum_mag / ((b1 - b0 + 1) as f64)).max(1.0e-9);
-            self.last_spectrum_db[band_idx] =
-                (20.0 * avg_mag.log10() as f32 + 12.0).clamp(-90.0, 6.0);
             self.last_band_gr_db[band_idx] =
                 (20.0 * min_band_g.max(1.0e-4).log10() as f32).clamp(-24.0, 0.0);
         }

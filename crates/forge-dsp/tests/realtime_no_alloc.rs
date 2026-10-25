@@ -12,8 +12,9 @@
 use assert_no_alloc::{AllocDisabler, assert_no_alloc, reset_violation_count, violation_count};
 use forge_dsp::{
     DrumTriggerNotes, NoteMsg, RealtimeDrumTrigger, RealtimeMasterLimiter, RealtimeMasteringEq18,
-    RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSubAndTapeBus,
-    RealtimeVocalSurgical,
+    RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSpectrumAnalyzer32,
+    RealtimeSubAndTapeBus, RealtimeVocalSurgical, clear_shared_spectrum, publish_shared_spectrum,
+    read_shared_spectrum,
 };
 
 #[global_allocator]
@@ -87,6 +88,25 @@ fn master_limiter_process_and_reset_do_not_allocate() {
         dsp.reset(44_100.0);
         dsp.reset(192_000.0);
         dsp.reset(8_000.0);
+    });
+}
+
+#[test]
+fn spectrum_analyzer_and_shared_bus_do_not_allocate() {
+    let mut analyzer = RealtimeSpectrumAnalyzer32::new(48_000.0);
+    assert_no_allocs("RealtimeSpectrumAnalyzer32 and shared bus", || {
+        for i in 0..FRAMES {
+            let (l, r) = signal(i);
+            analyzer.push_stereo_sample(l, r);
+            if i % 512 == 0 {
+                let bands = analyzer.snapshot_db();
+                std::hint::black_box(publish_shared_spectrum(6, &bands));
+                std::hint::black_box(read_shared_spectrum(6));
+            }
+        }
+        std::hint::black_box(clear_shared_spectrum(6));
+        analyzer.reset(44_100.0);
+        analyzer.reset(96_000.0);
     });
 }
 
