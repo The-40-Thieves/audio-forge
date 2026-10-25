@@ -117,7 +117,7 @@ Sources:
 | Plugins load and behave in hosts | [CI](.github/workflows/ci.yml) runs pluginval (strictness 5) on every VST3 and clap-validator on every CLAP, on Linux, macOS and Windows. |
 | Performance regressions are tracked | [CodSpeed](https://app.codspeed.io/The-40-Thieves/audio-forge) benchmarks [`forge-dsp`](crates/forge-dsp/benches/dsp.rs), [`forge-vocal`](crates/forge-vocal/benches/vocal.rs) and [`forge-theory`](crates/forge-theory/benches/theory.rs). |
 
-Known gap: two clap-validator state tests are excluded in CI because of upstream bugs in nih-plug's state loading. See [SECURITY.md](SECURITY.md).
+nih-plug's CLAP state-loading bugs are patched in a [vendored copy](vendor/nih-plug/PATCHES.md) until [robbert-vdh/nih-plug#280](https://github.com/robbert-vdh/nih-plug/pull/280) is released, so CI runs the full clap-validator suite. See [SECURITY.md](SECURITY.md).
 
 ---
 
