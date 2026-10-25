@@ -114,6 +114,75 @@ fn filter_bank_release_is_time_based_at_every_rate() {
     }
 }
 
+/// Bands whose lower edge the edge tests probe: low, middle and every one of the top bands,
+/// where an unwarped bilinear band-pass is narrowest at 44.1 and 48 kHz.
+const EDGE_BANDS: [usize; 8] = [1, 8, 16, 24, 28, 29, 30, 31];
+
+/// Level of an ideal constant-Q band-pass with -3 dB points on `band`'s edges at `freq`, in
+/// dB: the shape the band layout advertises, independent of the sample rate.
+fn ideal_band_db(band: usize, freq: f64) -> f32 {
+    let (lo, hi) = spectrum_band_edges_hz(band);
+    let fc = (lo * hi).sqrt();
+    let q = fc / (hi - lo);
+    let x = q * (freq / fc - fc / freq);
+    (-10.0 * (1.0 + x * x).log10()) as f32
+}
+
+#[test]
+fn filter_bank_band_edges_are_3_db_down_in_both_neighbours_at_every_rate() {
+    for sr in RATES {
+        for band in EDGE_BANDS {
+            // The edge is also the geometric midpoint between the two band centres.
+            let edge = spectrum_band_edges_hz(band).0;
+            let snap = filter_bank_sine(sr, edge, 1.0, 1.0);
+            for b in [band - 1, band] {
+                assert!(
+                    (snap[b] + 3.01).abs() < 0.5,
+                    "{sr} Hz: the {edge:.0} Hz edge reads {} dB in band {b}, not -3 dB",
+                    snap[b]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn filter_bank_follows_the_band_shape_halfway_between_centre_and_edge() {
+    for sr in RATES {
+        for band in [0, 15, 28, 29, 30, 31] {
+            let (lo, hi) = spectrum_band_edges_hz(band);
+            let fc = spectrum_band_center_hz(band);
+            for freq in [(lo * fc).sqrt(), (fc * hi).sqrt()] {
+                let snap = filter_bank_sine(sr, freq, 1.0, 1.0);
+                // About -1 dB for the ideal shape. Near Nyquist the prewarped band is flatter
+                // in Hz above its centre, but it must stay well inside its -3 dB edges.
+                let expected = ideal_band_db(band, freq);
+                assert!(
+                    (expected - 0.5..-0.25).contains(&snap[band]),
+                    "{sr} Hz band {band}: {freq:.0} Hz reads {} dB, ideal {expected:.2} dB",
+                    snap[band]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn filter_bank_integrates_a_steady_quiet_sine_to_its_level() {
+    // -84 dBFS sits above the -90 dB display floor, but its per-sample power increments at
+    // 96 kHz are far below the old -120 dB state floor.
+    let amp = 10.0_f64.powf(-84.0 / 20.0);
+    let fc = spectrum_band_center_hz(0);
+    for sr in [48_000.0, 96_000.0] {
+        let snap = filter_bank_sine(sr, fc, amp, 2.0);
+        assert!(
+            (snap[0] + 84.0).abs() < 1.0,
+            "{sr} Hz: a -84 dBFS sine at {fc:.1} Hz reads {} dB in band 0",
+            snap[0]
+        );
+    }
+}
+
 /// Feeds `n` frames to OpenSoothe and returns the hop-averaged band power of the last half.
 fn open_soothe_mean_power(sr: f64, n: usize, frame: impl Fn(usize) -> (f32, f32)) -> [f64; 32] {
     let mut dsp = RealtimeOpenSoothe::new(sr);
