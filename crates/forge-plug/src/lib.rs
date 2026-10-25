@@ -1565,48 +1565,26 @@ impl ForgeDrumTriggerPlug {
         if !expand_chords {
             return;
         }
-        match event {
-            NoteEvent::NoteOn {
-                timing,
-                voice_id,
-                channel,
-                note,
-                velocity,
-            } => {
-                for &interval in &[3_u8, 7, 10, 14] {
-                    let harm = note.saturating_add(interval);
-                    if harm <= 120 {
-                        context.send_event(NoteEvent::NoteOn {
-                            timing,
-                            voice_id,
-                            channel,
-                            note: harm,
-                            velocity: (velocity * 0.82).clamp(0.1, 1.0),
-                        });
-                    }
-                }
+        let root = match event {
+            NoteEvent::NoteOn { note, .. } | NoteEvent::NoteOff { note, .. } => note,
+            _ => return,
+        };
+        for &interval in &[3_u8, 7, 10, 14] {
+            let harm = root.saturating_add(interval);
+            if harm > 120 {
+                continue;
             }
-            NoteEvent::NoteOff {
-                timing,
-                voice_id,
-                channel,
-                note,
-                velocity,
-            } => {
-                for &interval in &[3_u8, 7, 10, 14] {
-                    let harm = note.saturating_add(interval);
-                    if harm <= 120 {
-                        context.send_event(NoteEvent::NoteOff {
-                            timing,
-                            voice_id,
-                            channel,
-                            note: harm,
-                            velocity,
-                        });
-                    }
+            // Copy of the incoming event re-pitched to the chord tone; note-ons are softened.
+            let mut voiced = event;
+            match &mut voiced {
+                NoteEvent::NoteOn { note, velocity, .. } => {
+                    *note = harm;
+                    *velocity = (*velocity * 0.82).clamp(0.1, 1.0);
                 }
+                NoteEvent::NoteOff { note, .. } => *note = harm,
+                _ => return,
             }
-            _ => {}
+            context.send_event(voiced);
         }
     }
 }
