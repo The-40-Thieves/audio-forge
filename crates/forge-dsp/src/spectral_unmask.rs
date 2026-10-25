@@ -5,21 +5,34 @@
 //! is active—replacing Wavesfactory Trackspacer / iZotope Neutron Unmasking.
 
 use std::f64::consts::PI;
+use std::sync::Arc;
 
 use forge_core::{AudioBuffer, ForgeError, Result};
-use rustfft::{FftPlanner, num_complex::Complex};
+use rustfft::{Fft, FftPlanner, num_complex::Complex};
 use serde::{Deserialize, Serialize};
 
+use crate::loudness_limiter::{sanitize_param_f64, sanitize_sample_f64};
+
+/// STFT frame length in samples.
+const FFT_SIZE: usize = 2048;
+/// STFT hop between frames in samples.
+const HOP: usize = 512;
+/// Number of non-redundant bins of a real `FFT_SIZE` transform.
+const HALF_BINS: usize = FFT_SIZE / 2 + 1;
+
 /// Configuration for OpenSpacer Sidechain Spectral Unmasking.
+///
+/// Every field is sanitized before use: a non-finite value falls back to the
+/// [`UnmaskConfig::vocal_over_instruments`] value, and a finite one is clamped to its range.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct UnmaskConfig {
     /// Lowest frequency in Hz where sidechain unmasking is active (e.g., `180.0` for Vocal, `30.0` for Kick).
     pub low_cut_hz: f64,
     /// Highest frequency in Hz where sidechain unmasking is active (e.g., `8000.0` for Vocal, `140.0` for Kick).
     pub high_cut_hz: f64,
-    /// Maximum spectral gain reduction in dB (`1.0..=15.0`).
+    /// Maximum spectral gain reduction in dB, clamped to `0.5..=20.0`.
     pub max_reduction_db: f64,
-    /// Sensitivity (`0.1..=2.0`, default `1.0`).
+    /// Sensitivity, clamped to `0.1..=2.0` (default `1.0`).
     pub sensitivity: f64,
 }
 
@@ -45,7 +58,176 @@ impl UnmaskConfig {
     }
 }
 
+/// Sanitized analysis parameters resolved from an [`UnmaskConfig`] at one sample rate.
+#[derive(Debug, Clone, Copy)]
+struct UnmaskBands {
+    b_low: usize,
+    b_high: usize,
+    min_gain: f64,
+    sensitivity: f64,
+}
+
+impl UnmaskBands {
+    /// Routes every config value through [`sanitize_param_f64`] so `NaN` / `±Inf` cannot reach the
+    /// gain curve, then maps the cutoffs onto bins.
+    fn resolve(config: &UnmaskConfig, sample_rate: f64) -> Self {
+        let defaults = UnmaskConfig::vocal_over_instruments();
+        let nyquist = sample_rate / 2.0;
+        let bin_hz = sample_rate / (FFT_SIZE as f64);
+        let low_hz = sanitize_param_f64(config.low_cut_hz, defaults.low_cut_hz, 0.0, nyquist);
+        let high_hz = sanitize_param_f64(config.high_cut_hz, defaults.high_cut_hz, 0.0, nyquist);
+        let max_reduction_db = sanitize_param_f64(
+            config.max_reduction_db,
+            defaults.max_reduction_db,
+            0.5,
+            20.0,
+        );
+        let b_low = ((low_hz / bin_hz).floor() as usize).clamp(1, HALF_BINS - 3);
+        let b_high = ((high_hz / bin_hz).ceil() as usize).clamp(b_low + 1, HALF_BINS - 2);
+        Self {
+            b_low,
+            b_high,
+            min_gain: 10.0_f64.powf(-max_reduction_db / 20.0),
+            sensitivity: sanitize_param_f64(config.sensitivity, defaults.sensitivity, 0.1, 2.0),
+        }
+    }
+
+    /// Instantaneous ducking gain for one sidechain bin at `db` dBFS (active above `-48 dBFS`).
+    fn raw_gain(&self, db: f64) -> f64 {
+        if db > -48.0 {
+            let norm = ((db + 48.0) / 36.0 * self.sensitivity).clamp(0.0, 1.0);
+            1.0 - norm * (1.0 - self.min_gain)
+        } else {
+            1.0
+        }
+    }
+}
+
+/// Forward and inverse plans for the `FFT_SIZE` transform.
+struct StftPlans {
+    fwd: Arc<dyn Fft<f64>>,
+    inv: Arc<dyn Fft<f64>>,
+}
+
+/// Periodic Hann window of length `n`.
+fn hann_window(n: usize) -> Vec<f64> {
+    (0..n)
+        .map(|i| 0.5 * (1.0 - (2.0 * PI * (i as f64) / (n as f64)).cos()))
+        .collect()
+}
+
+/// Copies up to `frames` samples of `src` into a zero buffer padded by `FFT_SIZE` on both sides,
+/// sanitizing each one so a single `NaN` / `±Inf` cannot spread across every frame it touches.
+fn padded_sanitized(src: &[f64], frames: usize) -> Vec<f64> {
+    let mut padded = vec![0.0_f64; frames + FFT_SIZE * 2];
+    for (dst, &x) in padded[FFT_SIZE..FFT_SIZE + frames].iter_mut().zip(src) {
+        *dst = sanitize_sample_f64(x);
+    }
+    padded
+}
+
+/// Fills `spec` with the windowed frame starting at `src[0]`.
+fn load_windowed(spec: &mut [Complex<f64>], src: &[f64], window: &[f64]) {
+    for ((s, &x), &w) in spec.iter_mut().zip(src).zip(window) {
+        *s = Complex::new(x * w, 0.0);
+    }
+}
+
+/// Asymmetric gain envelope: fast attack toward deeper ducking, slow release back to unity.
+fn smooth_gain(env: f64, raw: f64) -> f64 {
+    if raw < env {
+        0.30 * env + 0.70 * raw
+    } else {
+        0.85 * env + 0.15 * raw
+    }
+}
+
+/// Per-frame, per-bin smoothed ducking gains measured from the padded sidechain.
+fn sidechain_gain_frames(
+    sc_padded: &[f64],
+    window: &[f64],
+    fft_fwd: &dyn Fft<f64>,
+    bands: &UnmaskBands,
+) -> Vec<Vec<f64>> {
+    let num_stft_frames = sc_padded.len().saturating_sub(FFT_SIZE) / HOP + 1;
+    let mut gain_frames = Vec::with_capacity(num_stft_frames);
+    let mut spec = vec![Complex::new(0.0, 0.0); FFT_SIZE];
+    let mut env_gains = vec![1.0_f64; HALF_BINS];
+
+    for f_idx in 0..num_stft_frames {
+        load_windowed(&mut spec, &sc_padded[f_idx * HOP..], window);
+        fft_fwd.process(&mut spec);
+
+        let mut frame_gains = vec![1.0_f64; HALF_BINS];
+        for b in bands.b_low..=bands.b_high {
+            let mag = spec[b].norm() / (FFT_SIZE as f64);
+            let raw_g = bands.raw_gain(20.0 * mag.max(1e-9).log10());
+            env_gains[b] = smooth_gain(env_gains[b], raw_g);
+            frame_gains[b] = env_gains[b];
+        }
+        gain_frames.push(frame_gains);
+    }
+    gain_frames
+}
+
+/// Applies the 3-tap smoothed gain curve to the positive bins and mirrors the negative ones.
+fn apply_smoothed_gains(spec: &mut [Complex<f64>], gains: &[f64]) {
+    for b in 1..(HALF_BINS - 1) {
+        let g = 0.25 * gains[b - 1] + 0.50 * gains[b] + 0.25 * gains[b + 1];
+        spec[b] *= g;
+        spec[FFT_SIZE - b] = spec[b].conj();
+    }
+}
+
+/// Runs weighted overlap-add resynthesis of one padded target channel under `gain_frames`.
+fn unmask_channel(
+    padded: &[f64],
+    gain_frames: &[Vec<f64>],
+    window: &[f64],
+    plans: &StftPlans,
+    frames: usize,
+) -> Vec<f64> {
+    let mut out_accum = vec![0.0_f64; padded.len()];
+    let mut norm_accum = vec![0.0_f64; padded.len()];
+    let mut spec = vec![Complex::new(0.0, 0.0); FFT_SIZE];
+    let inv_n = 1.0 / (FFT_SIZE as f64);
+
+    for (f_idx, frame_gains) in gain_frames.iter().enumerate() {
+        let pos = f_idx * HOP;
+        load_windowed(&mut spec, &padded[pos..], window);
+        plans.fwd.process(&mut spec);
+        apply_smoothed_gains(&mut spec, frame_gains);
+        plans.inv.process(&mut spec);
+
+        let out = &mut out_accum[pos..pos + FFT_SIZE];
+        let norm = &mut norm_accum[pos..pos + FFT_SIZE];
+        for (((o, n), s), &w) in out.iter_mut().zip(norm.iter_mut()).zip(&spec).zip(window) {
+            *o += s.re * inv_n * w;
+            *n += w * w;
+        }
+    }
+
+    (FFT_SIZE..FFT_SIZE + frames)
+        .map(|idx| out_accum[idx] / norm_accum[idx].max(1e-9))
+        .collect()
+}
+
+/// Rejects a ragged `target` whose channels do not all hold `frames` samples.
+fn check_equal_channel_lengths(target: &AudioBuffer, frames: usize) -> Result<()> {
+    match target.channels.iter().position(|ch| ch.len() != frames) {
+        Some(idx) => Err(ForgeError::InvalidParameter(format!(
+            "Ragged target buffer: channel 0 has {frames} frames, but channel {idx} has {}",
+            target.channels[idx].len()
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Carves a dynamic spectral pocket in `target` driven by `sidechain`.
+///
+/// Non-finite samples in either buffer are treated as silence, and every [`UnmaskConfig`] field is
+/// sanitized, so the output is always finite. Returns [`ForgeError::InvalidParameter`] when the
+/// sample rates differ or when `target` has channels of different lengths.
 pub fn apply_spectral_unmask(
     target: &AudioBuffer,
     sidechain: &AudioBuffer,
@@ -61,108 +243,34 @@ pub fn apply_spectral_unmask(
     if frames == 0 {
         return Ok(target.clone());
     }
+    check_equal_channel_lengths(target, frames)?;
 
-    let sr = f64::from(target.sample_rate.max(1));
-    let sc_mono = sidechain.to_mono();
-    let fft_size = 2048_usize;
-    let hop = 512_usize;
-    let half_bins = fft_size / 2 + 1;
-    let bin_hz = sr / (fft_size as f64);
+    let bands = UnmaskBands::resolve(config, f64::from(target.sample_rate.max(1)));
+    let window = hann_window(FFT_SIZE);
+    let mut planner = FftPlanner::<f64>::new();
+    let plans = StftPlans {
+        fwd: planner.plan_fft_forward(FFT_SIZE),
+        inv: planner.plan_fft_inverse(FFT_SIZE),
+    };
 
-    let b_low = ((config.low_cut_hz / bin_hz).floor() as usize).clamp(1, half_bins - 3);
-    let b_high = ((config.high_cut_hz / bin_hz).ceil() as usize).clamp(b_low + 1, half_bins - 2);
-    let min_gain = 10.0_f64.powf(-config.max_reduction_db.clamp(0.5, 20.0) / 20.0);
-
-    let window: Vec<f64> = (0..fft_size)
-        .map(|i| 0.5 * (1.0 - (2.0 * PI * (i as f64) / (fft_size as f64)).cos()))
+    let sc_padded = padded_sanitized(&sidechain.to_mono(), frames);
+    let gain_frames = sidechain_gain_frames(&sc_padded, &window, plans.fwd.as_ref(), &bands);
+    let channels = target
+        .channels
+        .iter()
+        .map(|ch| {
+            unmask_channel(
+                &padded_sanitized(ch, frames),
+                &gain_frames,
+                &window,
+                &plans,
+                frames,
+            )
+        })
         .collect();
 
-    // Pre-compute sidechain STFT magnitude frames
-    let padded_len = frames + fft_size * 2;
-    let mut sc_padded = vec![0.0_f64; padded_len];
-    let copy_len = sc_mono.len().min(frames);
-    sc_padded[fft_size..fft_size + copy_len].copy_from_slice(&sc_mono[..copy_len]);
-
-    let mut planner = FftPlanner::<f64>::new();
-    let fft_fwd = planner.plan_fft_forward(fft_size);
-    let fft_inv = planner.plan_fft_inverse(fft_size);
-
-    let num_stft_frames = (padded_len.saturating_sub(fft_size)) / hop + 1;
-    let mut sc_gain_frames = Vec::with_capacity(num_stft_frames);
-    let mut sc_spec = vec![Complex::new(0.0, 0.0); fft_size];
-    let mut env_gains = vec![1.0_f64; half_bins];
-
-    for f_idx in 0..num_stft_frames {
-        let pos = f_idx * hop;
-        for i in 0..fft_size {
-            sc_spec[i] = Complex::new(sc_padded[pos + i] * window[i], 0.0);
-        }
-        fft_fwd.process(&mut sc_spec);
-
-        let mut frame_gains = vec![1.0_f64; half_bins];
-        for b in b_low..=b_high {
-            let mag = sc_spec[b].norm() / (fft_size as f64);
-            let db = 20.0 * mag.max(1e-9).log10();
-            // Activate ducking when sidechain bin exceeds -48 dBFS
-            let raw_g = if db > -48.0 {
-                let norm = ((db + 48.0) / 36.0 * config.sensitivity).clamp(0.0, 1.0);
-                1.0 - norm * (1.0 - min_gain)
-            } else {
-                1.0
-            };
-            if raw_g < env_gains[b] {
-                env_gains[b] = 0.30 * env_gains[b] + 0.70 * raw_g;
-            } else {
-                env_gains[b] = 0.85 * env_gains[b] + 0.15 * raw_g;
-            }
-            frame_gains[b] = env_gains[b];
-        }
-        sc_gain_frames.push(frame_gains);
-    }
-
-    // Apply smoothed sidechain spectral curve to each channel of target
-    let mut out_channels = Vec::with_capacity(target.num_channels());
-    for ch in &target.channels {
-        let mut t_padded = vec![0.0_f64; padded_len];
-        t_padded[fft_size..fft_size + frames].copy_from_slice(ch);
-
-        let mut out_accum = vec![0.0_f64; padded_len];
-        let mut norm_accum = vec![0.0_f64; padded_len];
-        let mut t_spec = vec![Complex::new(0.0, 0.0); fft_size];
-
-        for (f_idx, frame_gains) in sc_gain_frames.iter().enumerate() {
-            let pos = f_idx * hop;
-            for i in 0..fft_size {
-                t_spec[i] = Complex::new(t_padded[pos + i] * window[i], 0.0);
-            }
-            fft_fwd.process(&mut t_spec);
-
-            for b in 1..(half_bins - 1) {
-                let g =
-                    0.25 * frame_gains[b - 1] + 0.50 * frame_gains[b] + 0.25 * frame_gains[b + 1];
-                t_spec[b] *= g;
-                t_spec[fft_size - b] = t_spec[b].conj();
-            }
-
-            fft_inv.process(&mut t_spec);
-            let inv_n = 1.0 / (fft_size as f64);
-            for i in 0..fft_size {
-                let w = window[i];
-                out_accum[pos + i] += t_spec[i].re * inv_n * w;
-                norm_accum[pos + i] += w * w;
-            }
-        }
-
-        let mut ch_out = vec![0.0_f64; frames];
-        for (i, sample_out) in ch_out.iter_mut().enumerate() {
-            let idx = fft_size + i;
-            *sample_out = out_accum[idx] / norm_accum[idx].max(1e-9);
-        }
-        out_channels.push(ch_out);
-    }
-
     Ok(AudioBuffer {
-        channels: out_channels,
+        channels,
         sample_rate: target.sample_rate,
     })
 }
