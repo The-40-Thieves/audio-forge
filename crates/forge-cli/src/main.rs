@@ -153,10 +153,10 @@ enum Commands {
         #[arg(short, long, default_value = "spotify", conflicts_with = "lufs")]
         target: String,
         /// Custom integrated loudness in LUFS (requires --ceiling-dbtp)
-        #[arg(long, requires = "ceiling_dbtp")]
+        #[arg(long, requires = "ceiling_dbtp", allow_negative_numbers = true)]
         lufs: Option<f64>,
         /// Custom true-peak ceiling in dBTP (requires --lufs)
-        #[arg(long, requires = "lufs")]
+        #[arg(long, requires = "lufs", allow_negative_numbers = true)]
         ceiling_dbtp: Option<f64>,
         /// Skip DC removal, de-clip and hum notch
         #[arg(long)]
@@ -183,10 +183,10 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
         /// Target Integrated LUFS (-14.0 for streaming, -9.0 for competitive club/pop)
-        #[arg(long, default_value_t = -14.0)]
+        #[arg(long, default_value_t = -14.0, allow_negative_numbers = true)]
         target_lufs: f64,
         /// True-Peak brickwall ceiling in dBTP (-1.0 dBTP recommended by DistroKid/Spotify)
-        #[arg(long, default_value_t = -1.0)]
+        #[arg(long, default_value_t = -1.0, allow_negative_numbers = true)]
         ceiling_dbtp: f64,
         /// Optional reference track WAV to match spectral balance against
         #[arg(long)]
@@ -848,4 +848,58 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negative_loudness_and_ceiling_values_parse() {
+        let cli = Cli::try_parse_from([
+            "forge",
+            "deliver",
+            "mix.wav",
+            "-o",
+            "out/master.wav",
+            "--lufs",
+            "-10",
+            "--ceiling-dbtp",
+            "-1.5",
+        ])
+        .expect("deliver with negative custom target parses");
+        match cli.command {
+            Commands::Deliver {
+                lufs, ceiling_dbtp, ..
+            } => {
+                assert_eq!(lufs, Some(-10.0));
+                assert_eq!(ceiling_dbtp, Some(-1.5));
+            }
+            _ => panic!("expected deliver"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "forge",
+            "master",
+            "mix.wav",
+            "-o",
+            "master.wav",
+            "--target-lufs",
+            "-14",
+            "--ceiling-dbtp",
+            "-1",
+        ])
+        .expect("master with negative targets parses");
+        match cli.command {
+            Commands::Master {
+                target_lufs,
+                ceiling_dbtp,
+                ..
+            } => {
+                assert_eq!(target_lufs, -14.0);
+                assert_eq!(ceiling_dbtp, -1.0);
+            }
+            _ => panic!("expected master"),
+        }
+    }
 }
