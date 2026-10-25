@@ -3,6 +3,11 @@
 //! Zero-overhead native Rust stdio MCP server exposing all ForgeAudio DSP,
 //! music theory, vocal surgery, GPU worker, and REAPER 7.82 session tools to
 //! AI agents (Antigravity, Claude Code, Cursor, REAPER AI scripts).
+//!
+//! File access is confined: every path argument must resolve inside the roots listed in
+//! `FORGE_MCP_ROOT` (default: the directory the server was launched from). See [`sandbox`].
+
+mod sandbox;
 
 use forge_core::{AudioBuffer, ForgeError};
 use forge_dsp::{
@@ -24,10 +29,13 @@ use forge_vocal::{
     track_vocal_pitch,
 };
 use forge_worker::{WorkerBackend, separate_stems};
+use sandbox::PathSandbox;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::any::Any;
 use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::panic::{self, AssertUnwindSafe};
+use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -55,52 +63,106 @@ struct JsonRpcError {
     message: String,
 }
 
-fn main() {
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
+/// Result of a successful tool call. `success` is false when the tool ran but its outcome
+/// is a failure the caller must act on (e.g. a delivery that is not `ready`).
+struct ToolOutput {
+    value: Value,
+    success: bool,
+}
 
-    for line in stdin.lock().lines() {
-        let Ok(raw) = line else { break };
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let req: JsonRpcRequest = match serde_json::from_str(trimmed) {
-            Ok(r) => r,
-            Err(e) => {
-                let resp = JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id: Value::Null,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32700,
-                        message: format!("Parse error: {e}"),
-                    }),
-                };
-                let _ = writeln!(
-                    stdout,
-                    "{}",
-                    serde_json::to_string(&resp).unwrap_or_default()
-                );
-                let _ = stdout.flush();
-                continue;
-            }
-        };
-
-        let Some(req_id) = req.id.clone() else {
-            continue;
-        };
-
-        let response = handle_request(req_id, &req.method, &req.params);
-        if let Ok(serialized) = serde_json::to_string(&response) {
-            let _ = writeln!(stdout, "{serialized}");
-            let _ = stdout.flush();
+impl From<Value> for ToolOutput {
+    fn from(value: Value) -> Self {
+        Self {
+            value,
+            success: true,
         }
     }
 }
 
-fn handle_request(id: Value, method: &str, params: &Value) -> JsonRpcResponse {
+fn main() {
+    let sandbox = match PathSandbox::from_env() {
+        Ok(sb) => sb,
+        Err(e) => {
+            eprintln!("forge-mcp: cannot set up the file sandbox: {e}");
+            std::process::exit(1);
+        }
+    };
+    let roots: Vec<String> = sandbox.roots().map(|r| r.display().to_string()).collect();
+    eprintln!("forge-mcp: file access confined to {}", roots.join(", "));
+
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    if let Err(e) = serve(stdin.lock(), &mut stdout, &sandbox) {
+        eprintln!("forge-mcp: stdio failure: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Reads newline-delimited JSON-RPC requests until EOF, answering each on `output`.
+/// A malformed line (bad JSON or invalid UTF-8) gets a -32700 reply; the loop keeps going.
+fn serve<R: BufRead, W: Write>(
+    mut input: R,
+    output: &mut W,
+    sandbox: &PathSandbox,
+) -> io::Result<()> {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if input.read_until(b'\n', &mut line)? == 0 {
+            return Ok(());
+        }
+        let response = match std::str::from_utf8(&line) {
+            Ok(text) => process_line(text, sandbox),
+            Err(e) => Some(parse_error(format!("Parse error: invalid UTF-8: {e}"))),
+        };
+        if let Some(resp) = response {
+            let serialized = serde_json::to_string(&resp).map_err(io::Error::other)?;
+            writeln!(output, "{serialized}")?;
+            output.flush()?;
+        }
+    }
+}
+
+/// Handles one request line. Returns `None` for blank lines and notifications (no `id`).
+fn process_line(text: &str, sandbox: &PathSandbox) -> Option<JsonRpcResponse> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let req: JsonRpcRequest = match serde_json::from_str(trimmed) {
+        Ok(r) => r,
+        Err(e) => return Some(parse_error(format!("Parse error: {e}"))),
+    };
+    let id = req.id?;
+    Some(handle_request(id, &req.method, &req.params, sandbox))
+}
+
+fn parse_error(message: String) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: "2.0",
+        id: Value::Null,
+        result: None,
+        error: Some(JsonRpcError {
+            code: -32700,
+            message,
+        }),
+    }
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic")
+}
+
+fn handle_request(
+    id: Value,
+    method: &str,
+    params: &Value,
+    sandbox: &PathSandbox,
+) -> JsonRpcResponse {
     match method {
         "initialize" => JsonRpcResponse {
             jsonrpc: "2.0",
@@ -135,31 +197,32 @@ fn handle_request(id: Value, method: &str, params: &Value) -> JsonRpcResponse {
                 .cloned()
                 .unwrap_or_else(|| json!({}));
 
-            match dispatch_tool(tool_name, &args) {
-                Ok(val) => JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id,
-                    result: Some(json!({
-                        "content": [{
-                            "type": "text",
-                            "text": serde_json::to_string_pretty(&val).unwrap_or_default()
-                        }],
-                        "isError": false
-                    })),
-                    error: None,
-                },
-                Err(err) => JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id,
-                    result: Some(json!({
-                        "content": [{
-                            "type": "text",
-                            "text": format!("ForgeAudio Error: {err}")
-                        }],
-                        "isError": true
-                    })),
-                    error: None,
-                },
+            // A panic in DSP code must fail this call, not take down the server.
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                dispatch_tool(tool_name, &args, sandbox)
+            }));
+            let (text, is_error) = match outcome {
+                Ok(Ok(out)) => (
+                    serde_json::to_string_pretty(&out.value).unwrap_or_default(),
+                    !out.success,
+                ),
+                Ok(Err(err)) => (format!("ForgeAudio Error: {err}"), true),
+                Err(payload) => (
+                    format!(
+                        "ForgeAudio internal error: tool '{tool_name}' panicked: {}",
+                        panic_message(payload.as_ref())
+                    ),
+                    true,
+                ),
+            };
+            JsonRpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: Some(json!({
+                    "content": [{ "type": "text", "text": text }],
+                    "isError": is_error
+                })),
+                error: None,
             }
         }
         _ => JsonRpcResponse {
@@ -343,18 +406,38 @@ fn delivery_target_from_args(args: &Value) -> Result<DeliveryTarget, ForgeError>
     }
 }
 
-fn dispatch_tool(name: &str, args: &Value) -> Result<Value, ForgeError> {
+/// Reads a required path argument and resolves it inside the sandbox.
+fn path_arg(args: &Value, key: &str, sandbox: &PathSandbox) -> Result<PathBuf, ForgeError> {
+    let raw = args
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| ForgeError::InvalidParameter(format!("Missing '{key}'")))?;
+    sandbox.resolve(raw)
+}
+
+/// Reads an optional path argument and resolves it inside the sandbox.
+fn optional_path_arg(
+    args: &Value,
+    key: &str,
+    sandbox: &PathSandbox,
+) -> Result<Option<PathBuf>, ForgeError> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(|raw| sandbox.resolve(raw))
+        .transpose()
+}
+
+/// Runs one tool. All path arguments are resolved through `sandbox` before any file I/O.
+fn dispatch_tool(
+    name: &str,
+    args: &Value,
+    sandbox: &PathSandbox,
+) -> Result<ToolOutput, ForgeError> {
     match name {
         "forge_deliver" => {
-            let input = args
-                .get("input")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ForgeError::InvalidParameter("Missing 'input'".into()))?;
-            let output = PathBuf::from(
-                args.get("output")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| ForgeError::InvalidParameter("Missing 'output'".into()))?,
-            );
+            let input = path_arg(args, "input", sandbox)?;
+            let output = path_arg(args, "output", sandbox)?;
+            let reference = optional_path_arg(args, "reference", sandbox)?;
             let flag = |key: &str, default: bool| {
                 args.get(key).and_then(Value::as_bool).unwrap_or(default)
             };
@@ -362,15 +445,13 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<Value, ForgeError> {
             options.repair = flag("repair", true);
             options.defizz = flag("defizz", true);
             options.vocal = flag("vocal", false);
-            if let Some(reference) = args.get("reference").and_then(Value::as_str) {
-                options.tone_match = Some(ToneMatch::Reference(AudioBuffer::load(Path::new(
-                    reference,
-                ))?));
+            if let Some(reference) = reference {
+                options.tone_match = Some(ToneMatch::Reference(AudioBuffer::load(&reference)?));
             } else if let Some(genre) = args.get("genre").and_then(Value::as_str) {
                 options.tone_match = Some(ToneMatch::Genre(GenreTonalTarget::parse(genre)));
             }
 
-            let buf = AudioBuffer::load(Path::new(input))?;
+            let buf = AudioBuffer::load(&input)?;
             let (master, report) = deliver(&buf, &options)?;
             if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
                 std::fs::create_dir_all(parent)?;
@@ -378,30 +459,24 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<Value, ForgeError> {
             master.save_wav(&output, 24)?;
             let report_path = output.with_extension("delivery.json");
             std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
-            Ok(json!({
-                "output": output,
-                "report_path": report_path,
-                "report": report
-            }))
+            Ok(ToolOutput {
+                success: report.ready,
+                value: json!({
+                    "output": output,
+                    "report_path": report_path,
+                    "report": report
+                }),
+            })
         }
         "forge_audit_audio" => {
-            let path = args
-                .get("path")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ForgeError::InvalidParameter("Missing 'path'".into()))?;
-            let buf = AudioBuffer::load(Path::new(path))?;
+            let path = path_arg(args, "path", sandbox)?;
+            let buf = AudioBuffer::load(&path)?;
             let report = audit_audio(&buf);
-            Ok(serde_json::to_value(report)?)
+            Ok(serde_json::to_value(report)?.into())
         }
         "forge_restore_and_defizz" => {
-            let input = args
-                .get("input")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ForgeError::InvalidParameter("Missing 'input'".into()))?;
-            let output = args
-                .get("output")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ForgeError::InvalidParameter("Missing 'output'".into()))?;
+            let input = path_arg(args, "input", sandbox)?;
+            let output = path_arg(args, "output", sandbox)?;
             let vocal = args.get("vocal").and_then(Value::as_bool).unwrap_or(false);
             let depth = args
                 .get("defizz_depth_db")
@@ -412,7 +487,7 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<Value, ForgeError> {
                 .and_then(Value::as_f64)
                 .unwrap_or(3.5);
 
-            let raw = AudioBuffer::load(Path::new(input))?;
+            let raw = AudioBuffer::load(&input)?;
             let before = audit_audio(&raw);
             let mut stage1 = run_full_restoration_chain(&raw, &RestorationConfig::default())?;
             if vocal {
@@ -427,87 +502,64 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<Value, ForgeError> {
                 },
             )?;
             let after = audit_audio(&cleaned);
-            cleaned.save_wav(Path::new(output), 24)?;
+            cleaned.save_wav(&output, 24)?;
             Ok(json!({
                 "output": output,
                 "before_fizz_index": before.ai_fizz_index,
                 "after_fizz_index": after.ai_fizz_index,
                 "after_lufs": after.integrated_lufs
-            }))
+            })
+            .into())
         }
         "forge_spectral_unmask" => {
-            let target = args
-                .get("target")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ForgeError::InvalidParameter("Missing 'target'".into()))?;
-            let sidechain = args
-                .get("sidechain")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ForgeError::InvalidParameter("Missing 'sidechain'".into()))?;
-            let output = args
-                .get("output")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ForgeError::InvalidParameter("Missing 'output'".into()))?;
+            let target = path_arg(args, "target", sandbox)?;
+            let sidechain = path_arg(args, "sidechain", sandbox)?;
+            let output = path_arg(args, "output", sandbox)?;
             let kick_bass = args
                 .get("kick_bass_mode")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
 
-            let target_buf = AudioBuffer::load(Path::new(target))?;
-            let sc_buf = AudioBuffer::load(Path::new(sidechain))?;
+            let target_buf = AudioBuffer::load(&target)?;
+            let sc_buf = AudioBuffer::load(&sidechain)?;
             let cfg = if kick_bass {
                 UnmaskConfig::kick_over_bass()
             } else {
                 UnmaskConfig::vocal_over_instruments()
             };
             let unmasked = apply_spectral_unmask(&target_buf, &sc_buf, &cfg)?;
-            unmasked.save_wav(Path::new(output), 24)?;
-            Ok(json!({ "output": output, "kick_bass_mode": kick_bass }))
+            unmasked.save_wav(&output, 24)?;
+            Ok(json!({ "output": output, "kick_bass_mode": kick_bass }).into())
         }
         "forge_phase_align" => {
-            let reference = args
-                .get("reference")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ForgeError::InvalidParameter("Missing 'reference'".into()))?;
-            let target = args
-                .get("target")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ForgeError::InvalidParameter("Missing 'target'".into()))?;
-            let output = args
-                .get("output")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ForgeError::InvalidParameter("Missing 'output'".into()))?;
+            let reference = path_arg(args, "reference", sandbox)?;
+            let target = path_arg(args, "target", sandbox)?;
+            let output = path_arg(args, "output", sandbox)?;
             let vocal_dtw = args
                 .get("vocal_dtw")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
 
-            let ref_buf = AudioBuffer::load(Path::new(reference))?;
-            let tgt_buf = AudioBuffer::load(Path::new(target))?;
+            let ref_buf = AudioBuffer::load(&reference)?;
+            let tgt_buf = AudioBuffer::load(&target)?;
             if vocal_dtw {
                 let (warped, markers) = align_vocal_double_dtw(&ref_buf, &tgt_buf, 120.0)?;
-                warped.save_wav(Path::new(output), 24)?;
+                warped.save_wav(&output, 24)?;
                 Ok(json!({
                     "mode": "vocal_dtw",
                     "output": output,
                     "stretch_markers_count": markers.len()
-                }))
+                })
+                .into())
             } else {
                 let (aligned, info) = align_phase_gcc_phat(&ref_buf, &tgt_buf, 35.0)?;
-                aligned.save_wav(Path::new(output), 24)?;
-                Ok(serde_json::to_value(info)?)
+                aligned.save_wav(&output, 24)?;
+                Ok(serde_json::to_value(info)?.into())
             }
         }
         "forge_vocal_suite" => {
-            let input = args
-                .get("input")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ForgeError::InvalidParameter("Missing 'input'".into()))?;
-            let output_dir = PathBuf::from(
-                args.get("output_dir")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| ForgeError::InvalidParameter("Missing 'output_dir'".into()))?,
-            );
+            let input = path_arg(args, "input", sandbox)?;
+            let output_dir = path_arg(args, "output_dir", sandbox)?;
             std::fs::create_dir_all(&output_dir)?;
             let scale_str = args
                 .get("scale")
@@ -522,7 +574,7 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<Value, ForgeError> {
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
 
-            let raw = AudioBuffer::load(Path::new(input))?;
+            let raw = AudioBuffer::load(&input)?;
             let clean = clean_vocal_surgical(&raw, true, true, -12.0)?;
             let scale = VocalScale::parse(scale_str)?;
             let contour = track_vocal_pitch(&clean, &scale, retune);
@@ -553,17 +605,15 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<Value, ForgeError> {
                 "tuned_vocal": tuned_path,
                 "harmonies": harmonies,
                 "frames_tracked": contour.len()
-            }))
+            })
+            .into())
         }
         "forge_music_theory_midi" => {
             let chords_str = args
                 .get("chords")
                 .and_then(Value::as_str)
                 .ok_or_else(|| ForgeError::InvalidParameter("Missing 'chords'".into()))?;
-            let output_midi = args
-                .get("output_midi")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ForgeError::InvalidParameter("Missing 'output_midi'".into()))?;
+            let output_midi = path_arg(args, "output_midi", sandbox)?;
             let bpm = args.get("bpm").and_then(Value::as_f64).unwrap_or(92.0);
             let raw_chords: Vec<String> = chords_str
                 .split_whitespace()
@@ -578,7 +628,7 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<Value, ForgeError> {
                 4,
             )?;
             write_midi_file(
-                Path::new(output_midi),
+                &output_midi,
                 bpm,
                 480,
                 &[("Voiced_Chords", &chord_notes), ("Sub_Bass", &bass_notes)],
@@ -588,17 +638,14 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<Value, ForgeError> {
                 "output_midi": output_midi,
                 "abc_notation": abc,
                 "reharmonized_chords": reharm
-            }))
+            })
+            .into())
         }
         "forge_master_distrokid" => {
-            let input = args
-                .get("input")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ForgeError::InvalidParameter("Missing 'input'".into()))?;
-            let output = args
-                .get("output")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ForgeError::InvalidParameter("Missing 'output'".into()))?;
+            let input = path_arg(args, "input", sandbox)?;
+            // Absolute after resolution, so it can never be read by ffmpeg as an option.
+            let out_path = path_arg(args, "output", sandbox)?;
+            let reference = optional_path_arg(args, "reference", sandbox)?;
             let target_lufs = args
                 .get("target_lufs")
                 .and_then(Value::as_f64)
@@ -608,14 +655,13 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<Value, ForgeError> {
                 .and_then(Value::as_f64)
                 .unwrap_or(-1.0);
 
-            let mut buf = AudioBuffer::load(Path::new(input))?;
-            if let Some(ref_str) = args.get("reference").and_then(Value::as_str) {
-                let ref_buf = AudioBuffer::load(Path::new(ref_str))?;
+            let mut buf = AudioBuffer::load(&input)?;
+            if let Some(reference) = reference {
+                let ref_buf = AudioBuffer::load(&reference)?;
                 let curve = compute_reference_match_eq(&buf, &ref_buf, 4.5);
                 apply_18_band_eq(&mut buf, &curve);
             }
             let mastered = normalize_and_limit(&buf, target_lufs, ceiling_dbtp)?;
-            let out_path = PathBuf::from(output);
             if let Some(raw_isrc) = args.get("isrc").and_then(Value::as_str) {
                 let canonical = validate_isrc(raw_isrc)?;
                 let tmp = out_path.with_extension("pre_tag.wav");
@@ -643,19 +689,11 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<Value, ForgeError> {
                 mastered.save_wav(&out_path, 24)?;
             }
             let report = audit_audio(&mastered);
-            Ok(serde_json::to_value(report)?)
+            Ok(serde_json::to_value(report)?.into())
         }
         "forge_ingest_to_reaper" => {
-            let input = PathBuf::from(
-                args.get("input")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| ForgeError::InvalidParameter("Missing 'input'".into()))?,
-            );
-            let output_dir = PathBuf::from(
-                args.get("output_dir")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| ForgeError::InvalidParameter("Missing 'output_dir'".into()))?,
-            );
+            let input = path_arg(args, "input", sandbox)?;
+            let output_dir = path_arg(args, "output_dir", sandbox)?;
             let target = delivery_target_from_args(args)?;
             let bpm = args.get("bpm").and_then(Value::as_f64).unwrap_or(120.0);
             let scale_str = args
@@ -764,21 +802,233 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<Value, ForgeError> {
             let rpp_path = output_dir.join("ForgeAudio_Session.rpp");
             rpp.save_rpp(&rpp_path)?;
 
-            Ok(json!({
-                "rpp_project": rpp_path,
-                "master_wav": master_path,
-                "midi_file": chords_midi_path,
-                "delivery_report": delivery_path,
-                "target": delivery.target,
-                "ready": delivery.ready,
-                "checks": delivery.checks,
-                "master_lufs": delivery.after.integrated_lufs,
-                "master_true_peak_dbtp": delivery.after.true_peak_dbtp,
-                "ai_fizz_index": delivery.after.ai_fizz_index
-            }))
+            Ok(ToolOutput {
+                success: delivery.ready,
+                value: json!({
+                    "rpp_project": rpp_path,
+                    "master_wav": master_path,
+                    "midi_file": chords_midi_path,
+                    "delivery_report": delivery_path,
+                    "target": delivery.target,
+                    "ready": delivery.ready,
+                    "checks": delivery.checks,
+                    "master_lufs": delivery.after.integrated_lufs,
+                    "master_true_peak_dbtp": delivery.after.true_peak_dbtp,
+                    "ai_fizz_index": delivery.after.ai_fizz_index
+                }),
+            })
         }
         _ => Err(ForgeError::InvalidParameter(format!(
             "Unknown tool: {name}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::f64::consts::PI;
+    use std::path::Path;
+
+    fn sandbox_in(dir: &Path) -> PathSandbox {
+        PathSandbox::new([dir.to_path_buf()]).expect("sandbox")
+    }
+
+    /// 10 s stereo mix-like signal (two tones plus broadband hash), as in the delivery tests.
+    fn write_test_mix(path: &Path, level: f64, sample_rate: u32) {
+        let n = sample_rate as usize * 10;
+        let mut seed = 0x2545_f491_u32;
+        let ch: Vec<f64> = (0..n)
+            .map(|i| {
+                let t = i as f64 / f64::from(sample_rate);
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                let noise = (f64::from(seed) / f64::from(u32::MAX) - 0.5) * 0.2;
+                level
+                    * (0.6 * (2.0 * PI * 110.0 * t).sin()
+                        + 0.3 * (2.0 * PI * 3200.0 * t).sin()
+                        + noise)
+            })
+            .collect();
+        AudioBuffer::from_channels(vec![ch.clone(), ch], sample_rate)
+            .expect("valid buffer")
+            .save_wav(path, 24)
+            .expect("write fixture");
+    }
+
+    /// Runs `tools/call` and returns the MCP result object.
+    fn call_tool(sandbox: &PathSandbox, name: &str, arguments: Value) -> Value {
+        let resp = handle_request(
+            json!(1),
+            "tools/call",
+            &json!({ "name": name, "arguments": arguments }),
+            sandbox,
+        );
+        assert!(resp.error.is_none(), "unexpected JSON-RPC error");
+        resp.result.expect("tool result")
+    }
+
+    fn is_error(result: &Value) -> bool {
+        result["isError"].as_bool().expect("isError present")
+    }
+
+    fn text(result: &Value) -> &str {
+        result["content"][0]["text"].as_str().expect("text content")
+    }
+
+    #[test]
+    fn output_outside_root_is_rejected_before_any_write() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let sb = sandbox_in(root.path());
+        write_test_mix(&root.path().join("mix.wav"), 0.05, 48_000);
+
+        let victim = elsewhere.path().join("victim.wav");
+        let result = call_tool(
+            &sb,
+            "forge_deliver",
+            json!({ "input": "mix.wav", "output": victim.to_string_lossy() }),
+        );
+        assert!(is_error(&result));
+        assert!(
+            text(&result).contains("outside the allowed roots"),
+            "{}",
+            text(&result)
+        );
+        assert!(!victim.exists());
+        assert!(!victim.with_extension("delivery.json").exists());
+    }
+
+    #[test]
+    fn parent_dir_traversal_is_rejected_for_every_path_argument() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sb = sandbox_in(root.path());
+        let cases = [
+            ("forge_audit_audio", json!({ "path": "../secret.wav" })),
+            (
+                "forge_restore_and_defizz",
+                json!({ "input": "in.wav", "output": "../out.wav" }),
+            ),
+            (
+                "forge_spectral_unmask",
+                json!({ "target": "t.wav", "sidechain": "../s.wav", "output": "o.wav" }),
+            ),
+            (
+                "forge_phase_align",
+                json!({ "reference": "../r.wav", "target": "t.wav", "output": "o.wav" }),
+            ),
+            (
+                "forge_vocal_suite",
+                json!({ "input": "v.wav", "output_dir": "stems/../../escape" }),
+            ),
+            (
+                "forge_music_theory_midi",
+                json!({ "chords": "Cmaj7", "output_midi": "../x.mid" }),
+            ),
+            (
+                "forge_master_distrokid",
+                json!({ "input": "in.wav", "output": "o.wav", "reference": "../r.wav" }),
+            ),
+            (
+                "forge_ingest_to_reaper",
+                json!({ "input": "in.wav", "output_dir": "../session" }),
+            ),
+        ];
+        for (tool, args) in cases {
+            let result = call_tool(&sb, tool, args);
+            assert!(is_error(&result), "{tool} accepted a '..' path");
+            assert!(text(&result).contains("'..'"), "{tool}: {}", text(&result));
+        }
+        assert!(!root.path().join("..").join("session").exists());
+    }
+
+    #[test]
+    fn not_ready_delivery_reports_is_error() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sb = sandbox_in(root.path());
+        // 22.05 kHz fails the sample-rate check, so the delivery cannot be `ready`.
+        write_test_mix(&root.path().join("lofi.wav"), 0.05, 22_050);
+
+        let result = call_tool(
+            &sb,
+            "forge_deliver",
+            json!({ "input": "lofi.wav", "output": "out/master.wav" }),
+        );
+        assert!(is_error(&result), "not-ready delivery reported success");
+        let body: Value = serde_json::from_str(text(&result)).expect("JSON body");
+        assert_eq!(body["report"]["ready"], json!(false));
+        assert!(root.path().join("out/master.wav").exists());
+    }
+
+    #[test]
+    fn ready_delivery_reports_success() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sb = sandbox_in(root.path());
+        write_test_mix(&root.path().join("mix.wav"), 0.05, 48_000);
+
+        let result = call_tool(
+            &sb,
+            "forge_deliver",
+            json!({ "input": "mix.wav", "output": "master.wav" }),
+        );
+        assert!(!is_error(&result), "{}", text(&result));
+        let body: Value = serde_json::from_str(text(&result)).expect("JSON body");
+        assert_eq!(body["report"]["ready"], json!(true));
+    }
+
+    #[test]
+    fn invalid_utf8_line_gets_parse_error_and_server_keeps_running() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sb = sandbox_in(root.path());
+        let mut input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"\xff\xfe\"}\n".to_vec();
+        input.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\"}\n");
+
+        let mut output = Vec::new();
+        serve(input.as_slice(), &mut output, &sb).expect("serve");
+        let lines: Vec<Value> = String::from_utf8(output)
+            .expect("utf-8 output")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("JSON line"))
+            .collect();
+
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0]["error"]["code"], json!(-32700));
+        assert!(
+            lines[0]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("invalid UTF-8")
+        );
+        assert_eq!(lines[1]["id"], json!(2));
+        assert_eq!(lines[1]["result"]["serverInfo"]["name"], json!("forge-mcp"));
+    }
+
+    #[test]
+    fn malformed_json_and_notifications_do_not_stop_the_loop() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sb = sandbox_in(root.path());
+        let input = b"not json\n\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/list\"}";
+
+        let mut output = Vec::new();
+        serve(input.as_slice(), &mut output, &sb).expect("serve");
+        let lines: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0]["error"]["code"], json!(-32700));
+        assert_eq!(lines[1]["id"], json!(7));
+        assert!(lines[1]["result"]["tools"].as_array().unwrap().len() >= 9);
+    }
+
+    #[test]
+    fn panic_payloads_are_reported() {
+        let caught = panic::catch_unwind(|| panic!("boom {}", 42)).unwrap_err();
+        assert_eq!(panic_message(caught.as_ref()), "boom 42");
+        let caught = panic::catch_unwind(|| panic!("static")).unwrap_err();
+        assert_eq!(panic_message(caught.as_ref()), "static");
     }
 }

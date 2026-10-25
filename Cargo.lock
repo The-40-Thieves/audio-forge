@@ -1107,6 +1107,7 @@ dependencies = [
  "forge-worker",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]
