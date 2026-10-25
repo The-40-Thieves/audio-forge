@@ -22,8 +22,8 @@ use forge_dsp::{
     RealtimeDensityAndClipper, RealtimeDrumTrigger, RealtimeFdnReverb, RealtimeMasterLimiter,
     RealtimeMasteringEq18, RealtimeNeuralPreamp, RealtimeOpenSoothe, RealtimeOpenSpacer,
     RealtimePhaseAligner, RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus,
-    RealtimeTransientTonalSplit, RealtimeVocalSurgical, publish_shared_spectrum,
-    read_shared_spectrum,
+    RealtimeTransientTonalSplit, RealtimeVocalSurgical, clear_shared_spectrum,
+    publish_shared_spectrum, read_shared_spectrum, shared_spectrum_slot_index,
 };
 use nih_plug::prelude::*;
 use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
@@ -246,6 +246,8 @@ pub struct ForgeOpenSoothePlug {
     limiter_dsp: RealtimeMasterLimiter,
     /// Host sample rate from the last `initialize`, reused by `reset` (which gets none).
     sample_rate: f64,
+    /// Shared-bus slot this instance last published to, cleared when it changes or on drop.
+    published_slot: Option<usize>,
 }
 
 #[derive(Params)]
@@ -327,8 +329,9 @@ impl Default for OpenSootheParams {
             shared_bus_slot: IntParam::new(
                 "Shared Spectrum Bus Slot",
                 0,
-                IntRange::Linear { min: 0, max: 7 },
-            ),
+                IntRange::Linear { min: 0, max: 8 },
+            )
+            .with_value_to_string(Arc::new(bus_slot_to_string)),
         }
     }
 }
@@ -342,11 +345,42 @@ impl Default for ForgeOpenSoothePlug {
             sub_tape_dsp: RealtimeSubAndTapeBus::new(48_000.0, 160.0),
             limiter_dsp: RealtimeMasterLimiter::new(48_000.0),
             sample_rate: 48_000.0,
+            published_slot: None,
+        }
+    }
+}
+
+/// Bus-slot parameter display: `0` is `Off`, `1..=8` are `Slot A..H`.
+fn bus_slot_to_string(value: i32) -> String {
+    match u8::try_from(value) {
+        Ok(v @ 1..=8) => format!("Slot {}", char::from(b'A' + v - 1)),
+        _ => String::from("Off"),
+    }
+}
+
+impl Drop for ForgeOpenSoothePlug {
+    /// A removed instance must not leave its last frame on the bus.
+    fn drop(&mut self) {
+        if let Some(slot) = self.published_slot.take() {
+            clear_shared_spectrum(slot);
         }
     }
 }
 
 impl ForgeOpenSoothePlug {
+    /// Publishes `bands` to the bus slot selected by `bus_param` (`0 = Off`). Moving to another
+    /// slot or to `Off` clears the slot this instance published to before.
+    fn publish_to_bus(&mut self, bus_param: usize, bands: &[f32; 32]) {
+        let slot = shared_spectrum_slot_index(bus_param);
+        if let Some(old) = self.published_slot.filter(|&old| Some(old) != slot) {
+            clear_shared_spectrum(old);
+        }
+        self.published_slot = slot;
+        if let Some(idx) = slot {
+            publish_shared_spectrum(idx, bands);
+        }
+    }
+
     /// Total input-to-output delay. The limiter's lookahead delay stays in the signal path even
     /// when the limiter (or delta listen) is off, so this is constant and the host's delay
     /// compensation never goes stale when those switches change.
@@ -385,13 +419,13 @@ impl Plugin for ForgeOpenSoothePlug {
             |_, _| {},
             move |egui_ctx, setter, _state| {
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
-                    let slot = params.shared_bus_slot.value() as usize;
+                    let slot = shared_spectrum_slot_index(params.shared_bus_slot.value() as usize);
                     draw_forge_studio_header_and_spectrum(
                         ui,
                         "FORGE OPENSOOTHE DE-FIZZ",
                         "2048-pt OLA STFT Dynamic Spectral Resonance & AI Metallic Whistle Suppressor",
                         &telemetry,
-                        Some(slot),
+                        slot,
                     );
                     egui::Grid::new("opensoothe_grid")
                         .num_columns(2)
@@ -511,7 +545,7 @@ impl Plugin for ForgeOpenSoothePlug {
         let bands = self.dsp.last_spectrum_32_db();
         let gr_curve = self.dsp.last_band_gr_32_db();
         self.telemetry.update_spectrum_and_gr(&bands, &gr_curve);
-        publish_shared_spectrum(bus_slot, &bands);
+        self.publish_to_bus(bus_slot, &bands);
 
         ProcessStatus::Normal
     }
@@ -2682,5 +2716,43 @@ mod tests {
         assert!(!p8.params().param_map().is_empty());
         assert!(!p9.params().param_map().is_empty());
         assert!(!p10.params().param_map().is_empty());
+    }
+
+    #[test]
+    fn open_soothe_bus_slot_zero_is_off_and_a_removed_instance_clears_its_slot() {
+        let silent = [forge_dsp::SPECTRUM_FLOOR_DB; 32];
+        let bands = [-20.0_f32; 32];
+        let mut plug = ForgeOpenSoothePlug::default();
+
+        // Off publishes nowhere: every slot keeps its silent default.
+        plug.publish_to_bus(0, &bands);
+        for slot in 0..8 {
+            assert_eq!(
+                read_shared_spectrum(slot),
+                silent,
+                "Off wrote to slot {slot}"
+            );
+        }
+
+        // Slot C is index 2; moving to slot D clears slot C.
+        plug.publish_to_bus(3, &bands);
+        assert_eq!(read_shared_spectrum(2), bands);
+        plug.publish_to_bus(4, &bands);
+        assert_eq!(read_shared_spectrum(2), silent);
+        assert_eq!(read_shared_spectrum(3), bands);
+
+        drop(plug);
+        assert_eq!(
+            read_shared_spectrum(3),
+            silent,
+            "a dropped instance left its frame"
+        );
+    }
+
+    #[test]
+    fn bus_slot_names_match_the_slot_letters() {
+        assert_eq!(bus_slot_to_string(0), "Off");
+        assert_eq!(bus_slot_to_string(1), "Slot A");
+        assert_eq!(bus_slot_to_string(8), "Slot H");
     }
 }
