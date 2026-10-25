@@ -368,43 +368,92 @@ impl CytomicSvf {
     }
 }
 
-/// Computes 4x oversampled Inter-Sample True Peak (`dBTP`) and exact timestamp in seconds.
+/// ITU-R BS.1770-4 Annex 2 4x oversampling interpolation filter: 48-tap FIR split into
+/// 4 polyphase sub-filters of 12 taps each.
+#[rustfmt::skip]
+const TRUE_PEAK_PHASES: [[f64; 12]; 4] = [
+    [
+        0.001_708_984_375_0, 0.010_986_328_125_0, -0.019_653_320_312_5, 0.033_203_125_000_0,
+        -0.059_448_242_187_5, 0.137_329_101_562_5, 0.972_167_968_750_0, -0.102_294_921_875_0,
+        0.047_607_421_875_0, -0.026_611_328_125_0, 0.014_892_578_125_0, -0.008_300_781_250_0,
+    ],
+    [
+        -0.029_174_804_687_5, 0.029_296_875_000_0, -0.051_757_812_500_0, 0.089_111_328_125_0,
+        -0.166_503_906_250_0, 0.465_087_890_625_0, 0.779_785_156_250_0, -0.200_317_382_812_5,
+        0.101_562_500_000_0, -0.058_227_539_062_5, 0.033_081_054_687_5, -0.018_920_898_437_5,
+    ],
+    [
+        -0.018_920_898_437_5, 0.033_081_054_687_5, -0.058_227_539_062_5, 0.101_562_500_000_0,
+        -0.200_317_382_812_5, 0.779_785_156_250_0, 0.465_087_890_625_0, -0.166_503_906_250_0,
+        0.089_111_328_125_0, -0.051_757_812_500_0, 0.029_296_875_000_0, -0.029_174_804_687_5,
+    ],
+    [
+        -0.008_300_781_250_0, 0.014_892_578_125_0, -0.026_611_328_125_0, 0.047_607_421_875_0,
+        -0.102_294_921_875_0, 0.972_167_968_750_0, 0.137_329_101_562_5, -0.059_448_242_187_5,
+        0.033_203_125_000_0, -0.019_653_320_312_5, 0.010_986_328_125_0, 0.001_708_984_375_0,
+    ],
+];
+
+/// Group delay of the Annex 2 interpolation filter, in input samples: the linear-phase
+/// 48-tap prototype is centered on upsampled tap 23.5, i.e. 23.5 / 4 input samples.
+const TRUE_PEAK_FILTER_DELAY: f64 = 23.5 / 4.0;
+
+/// Computes ITU-R BS.1770-4 Annex 2 4x oversampled Inter-Sample True Peak (`dBTP`)
+/// and exact timestamp in seconds.
 pub fn compute_true_peak(buffer: &AudioBuffer) -> (f64, f64, f64) {
-    // 4-phase 12-tap windowed-sinc polyphase FIR coefficients for 4x inter-sample interpolation
-    const PHASES: [[f64; 4]; 3] = [
-        [-0.0625, 0.5625, 0.5625, -0.0625], // t + 0.50 (Catmull-Rom / cubic sinc)
-        [-0.046875, 0.859375, 0.234375, -0.046875], // t + 0.25
-        [-0.046875, 0.234375, 0.859375, -0.046875], // t + 0.75
-    ];
+    const TAPS: usize = 12;
+    // Tap-major, reversed coefficients: `taps[k][p]` multiplies the k-th sample of the
+    // oldest-first window `[x[i - 11], ..., x[i]]` for output phase `p`. Accumulating all four
+    // phases per tap gives four independent add chains the compiler can vectorize, with the
+    // same per-phase summation order (and therefore bit-identical results) as a dot product.
+    let mut taps = [[0.0_f64; 4]; TAPS];
+    for (p, coeffs) in TRUE_PEAK_PHASES.iter().enumerate() {
+        for (k, &c) in coeffs.iter().enumerate() {
+            taps[TAPS - 1 - k][p] = c;
+        }
+    }
 
     let mut max_sample_abs = 1e-12_f64;
     let mut max_true_abs = 1e-12_f64;
-    let mut peak_frame: usize = 0;
+    let mut peak_pos = 0.0_f64;
+    let mut padded = Vec::new();
 
     for ch in &buffer.channels {
         let n = ch.len();
-        for i in 0..n {
-            let s_curr = sanitize_sample_f64(ch[i]);
-            let s_abs = s_curr.abs();
-            if s_abs > max_sample_abs {
-                max_sample_abs = s_abs;
+        let last = n.saturating_sub(1) as f64;
+        // `TAPS - 1` zeros before the start and after the end, so window `i` is
+        // `[x[i - 11], ..., x[i]]` and the filter tail around the final samples is evaluated.
+        padded.clear();
+        padded.extend(std::iter::repeat_n(0.0, TAPS - 1));
+        padded.extend(ch.iter().map(|&x| sanitize_sample_f64(x)));
+        padded.extend(std::iter::repeat_n(0.0, TAPS - 1));
+        for (i, window) in padded.windows(TAPS).enumerate() {
+            if i < n {
+                let s_abs = window[TAPS - 1].abs();
+                if s_abs > max_sample_abs {
+                    max_sample_abs = s_abs;
+                }
+                if s_abs > max_true_abs {
+                    max_true_abs = s_abs;
+                    peak_pos = i as f64;
+                }
             }
-            if s_abs > max_true_abs {
-                max_true_abs = s_abs;
-                peak_frame = i;
+            let mut acc = [0.0_f64; 4];
+            for (tap, &x) in taps.iter().zip(window) {
+                for (a, &c) in acc.iter_mut().zip(tap) {
+                    *a += c * x;
+                }
             }
-            if i >= 1 && i + 2 < n {
-                let s0 = sanitize_sample_f64(ch[i - 1]);
-                let s1 = s_curr;
-                let s2 = sanitize_sample_f64(ch[i + 1]);
-                let s3 = sanitize_sample_f64(ch[i + 2]);
-                for coeffs in &PHASES {
-                    let interp =
-                        (coeffs[0] * s0 + coeffs[1] * s1 + coeffs[2] * s2 + coeffs[3] * s3).abs();
-                    if interp > max_true_abs {
-                        max_true_abs = interp;
-                        peak_frame = i;
-                    }
+            if acc.iter().all(|a| a.abs() <= max_true_abs) {
+                continue;
+            }
+            for (p, a) in acc.iter().enumerate() {
+                let interp = a.abs();
+                if interp > max_true_abs {
+                    max_true_abs = interp;
+                    // Output phase `p` of input step `i` sits at input time `i + p/4 - delay`.
+                    peak_pos =
+                        (i as f64 + p as f64 * 0.25 - TRUE_PEAK_FILTER_DELAY).clamp(0.0, last);
                 }
             }
         }
@@ -412,7 +461,7 @@ pub fn compute_true_peak(buffer: &AudioBuffer) -> (f64, f64, f64) {
 
     let sample_peak_dbfs = 20.0 * max_sample_abs.log10();
     let true_peak_dbtp = 20.0 * max_true_abs.log10();
-    let timestamp = peak_frame as f64 / f64::from(buffer.sample_rate.max(1));
+    let timestamp = peak_pos / f64::from(buffer.sample_rate.max(1));
     (sample_peak_dbfs, true_peak_dbtp, timestamp)
 }
 
