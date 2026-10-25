@@ -773,7 +773,7 @@ mod tests {
             .expect_err("newline in the working directory");
         assert!(err.to_string().contains("line break"), "{err}");
         assert!(rpp.check_media_paths(Path::new("/sessions/ok")).is_ok());
-        let abs = std::env::temp_dir().join("stem.wav");
+        let abs = std::env::current_dir().expect("cwd").join("stem.wav");
         assert_eq!(media_path_under(cwd, &abs), abs);
     }
 
