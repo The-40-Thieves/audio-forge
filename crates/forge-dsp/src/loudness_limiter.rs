@@ -402,33 +402,34 @@ const TRUE_PEAK_FILTER_DELAY: f64 = 23.5 / 4.0;
 /// and exact timestamp in seconds.
 pub fn compute_true_peak(buffer: &AudioBuffer) -> (f64, f64, f64) {
     const TAPS: usize = 12;
-    // Coefficients reversed so each phase is a contiguous dot product against the
-    // oldest-first window `[x[i - 11], ..., x[i]]`.
-    let mut rev = [[0.0_f64; TAPS]; 4];
+    // Tap-major, reversed coefficients: `taps[k][p]` multiplies the k-th sample of the
+    // oldest-first window `[x[i - 11], ..., x[i]]` for output phase `p`. Accumulating all four
+    // phases per tap gives four independent add chains the compiler can vectorize, with the
+    // same per-phase summation order (and therefore bit-identical results) as a dot product.
+    let mut taps = [[0.0_f64; 4]; TAPS];
     for (p, coeffs) in TRUE_PEAK_PHASES.iter().enumerate() {
         for (k, &c) in coeffs.iter().enumerate() {
-            rev[p][TAPS - 1 - k] = c;
+            taps[TAPS - 1 - k][p] = c;
         }
     }
 
     let mut max_sample_abs = 1e-12_f64;
     let mut max_true_abs = 1e-12_f64;
     let mut peak_pos = 0.0_f64;
+    let mut padded = Vec::new();
 
     for ch in &buffer.channels {
         let n = ch.len();
         let last = n.saturating_sub(1) as f64;
-        // Doubled circular history: each sample is written at `head` and `head + TAPS`, so
-        // `history[head + 1..head + 1 + TAPS]` is always the contiguous oldest-first window.
-        // Zero-padded before the start, and fed `TAPS - 1` trailing zeros so the filter tail
-        // around the final samples is evaluated.
-        let mut history = [0.0_f64; 2 * TAPS];
-        let mut head = 0_usize;
-        let padded = ch.iter().copied().chain(std::iter::repeat_n(0.0, TAPS - 1));
-        for (i, raw) in padded.enumerate() {
-            let s_curr = sanitize_sample_f64(raw);
+        // `TAPS - 1` zeros before the start and after the end, so window `i` is
+        // `[x[i - 11], ..., x[i]]` and the filter tail around the final samples is evaluated.
+        padded.clear();
+        padded.extend(std::iter::repeat_n(0.0, TAPS - 1));
+        padded.extend(ch.iter().map(|&x| sanitize_sample_f64(x)));
+        padded.extend(std::iter::repeat_n(0.0, TAPS - 1));
+        for (i, window) in padded.windows(TAPS).enumerate() {
             if i < n {
-                let s_abs = s_curr.abs();
+                let s_abs = window[TAPS - 1].abs();
                 if s_abs > max_sample_abs {
                     max_sample_abs = s_abs;
                 }
@@ -437,19 +438,17 @@ pub fn compute_true_peak(buffer: &AudioBuffer) -> (f64, f64, f64) {
                     peak_pos = i as f64;
                 }
             }
-            history[head] = s_curr;
-            history[head + TAPS] = s_curr;
-            head = (head + 1) % TAPS;
-            let window: &[f64; TAPS] = history[head..head + TAPS]
-                .try_into()
-                .expect("window is TAPS long");
-            for (p, coeffs) in rev.iter().enumerate() {
-                let interp = coeffs
-                    .iter()
-                    .zip(window)
-                    .map(|(c, x)| c * x)
-                    .sum::<f64>()
-                    .abs();
+            let mut acc = [0.0_f64; 4];
+            for (tap, &x) in taps.iter().zip(window) {
+                for (a, &c) in acc.iter_mut().zip(tap) {
+                    *a += c * x;
+                }
+            }
+            if acc.iter().all(|a| a.abs() <= max_true_abs) {
+                continue;
+            }
+            for (p, a) in acc.iter().enumerate() {
+                let interp = a.abs();
                 if interp > max_true_abs {
                     max_true_abs = interp;
                     // Output phase `p` of input step `i` sits at input time `i + p/4 - delay`.
