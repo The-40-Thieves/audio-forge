@@ -685,6 +685,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_yin_parabolic_offset_edge_cases() {
+        // Samples of (x - 0.3)^2 at -1, 0, 1 put the vertex at +0.3.
+        let p = |x: f64| (x - 0.3) * (x - 0.3);
+        assert!((parabolic_offset(p(-1.0), p(0.0), p(1.0)) - 0.3).abs() < 1e-12);
+        assert_eq!(parabolic_offset(1.0, 0.5, 1.0), 0.0, "symmetric dip");
+        assert_eq!(parabolic_offset(1.0, 1.0, 1.0), 0.0, "flat");
+        assert_eq!(parabolic_offset(0.0, 1.0, 0.0), 0.0, "peak, not a dip");
+        assert_eq!(parabolic_offset(f64::NAN, 0.0, 1.0), 0.0, "non-finite");
+        assert_eq!(
+            parabolic_offset(0.0, 0.0, 10.0),
+            -0.5,
+            "clamped to half a lag"
+        );
+    }
+
+    #[test]
+    fn test_yin_pick_period_threshold_and_fallback() {
+        // A dip below the threshold at lag 3 is followed down to its bottom at lag 4.
+        let dip = [1.0, 0.9, 0.5, 0.14, 0.05, 0.2, 0.01, 0.6];
+        assert_eq!(pick_period(&dip, 1, 7), Some(4));
+        // No dip below the threshold: the global minimum, if low enough to call voiced.
+        let shallow = [1.0, 0.9, 0.3, 0.25, 0.4, 0.2, 0.5];
+        assert_eq!(pick_period(&shallow, 1, 6), Some(5));
+        let unvoiced = [1.0, 0.9, 0.5, 0.4, 0.6];
+        assert_eq!(pick_period(&unvoiced, 1, 4), None);
+    }
+
+    #[test]
+    fn test_yin_non_finite_input_is_unvoiced() {
+        let scale = VocalScale::parse("C chromatic").expect("scale");
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut ch: Vec<f64> = steady_phase(48_000, 0.3, 220.0)
+                .iter()
+                .map(|p| 0.5 * p.sin())
+                .collect();
+            for s in ch.iter_mut().step_by(97) {
+                *s = bad;
+            }
+            let buf = AudioBuffer::from_channels(vec![ch], 48_000).expect("valid");
+            for f in track_vocal_pitch(&buf, &scale, 0.0) {
+                assert!(
+                    f.f0_hz.is_finite() && f.midi_pitch.is_finite(),
+                    "{bad}: {f:?}"
+                );
+            }
+        }
+    }
+
     /// M15: descending to the dip and interpolating it puts pure sines within 3 cents.
     #[test]
     fn test_yin_pure_sines_within_3_cents_m15() {
