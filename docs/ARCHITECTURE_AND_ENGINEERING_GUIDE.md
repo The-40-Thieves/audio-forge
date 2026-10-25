@@ -105,9 +105,9 @@ flowchart TD
      - `apply_spectral_defizz`: 2048-point Overlap-Add (`OLA`) Short-Time Fourier Transform (`STFT`, `75%` overlap, `512`-sample hop, complementary Hann window) dynamic resonance and AI metallic whistle suppressor. Compares each bin's log-magnitude against a moving local spectral median (`±8 bins`) inside the `2.2–11 kHz` zone and applies dynamic per-bin attenuation only when sharp resonant peaks exceed the local median. Supports `delta_listen` to solo only the removed harshness.
   4. **`spectral_unmask.rs` — Forge OpenSpacer (`Wavesfactory Trackspacer` / `iZotope Neutron Unmask` Equivalent):**
      - `apply_spectral_unmask`: Dual-stream STFT sidechain unmasker that measures the instantaneous spectrum of a priority sidechain stem (e.g., Lead Vocal `200 Hz–7.5 kHz` or Kick Drum `30–130 Hz`) and carves a proportional, smoothed inverse spectral pocket out of a competing target stem (e.g., Music Bus or Sub-Bass).
-  5. **`phase_align.rs` — GCC-PHAT Multi-Mic Phase Aligner & FastDTW Vocal Double Aligner:**
-     - `align_phase_gcc_phat`: Generalized Cross-Correlation with Phase Transform (`Auto-Align 2` equivalent) that whitens the cross-power spectrum $X_{\text{ref}}(f) X_{\text{tgt}}^*(f) / |X_{\text{ref}}(f) X_{\text{tgt}}^*(f)|$ to find the exact sample delay and $180^\circ$ polarity state unaffected by room resonances.
-     - `align_vocal_double_dtw`: Extracts 4-band log-energy trajectories and runs banded Dynamic Time Warping (`FastDTW`, `VocAlign Pro` equivalent) to emit non-destructive REAPER `SM` Stretch Markers.
+  5. **`phase_align.rs` (GCC-PHAT Multi-Mic Phase Aligner & Banded DTW Vocal Double Aligner):**
+     - `align_phase_gcc_phat`: Generalized Cross-Correlation with Phase Transform (`Auto-Align 2` equivalent) that partially whitens the cross-power spectrum, $X_{\text{tgt}}(f) X_{\text{ref}}^*(f) / |X_{\text{tgt}}(f) X_{\text{ref}}^*(f)|^{1/2}$, to find the sample delay and $180^\circ$ polarity state. It analyzes the highest-energy window of up to 32768 samples, so silent or count-in intros do not hide the material, and reports `correlation_peak` as the energy-normalized correlation $|\sum r[i]\,t[i+\tau]| / \sqrt{E_r E_t}$ at the found lag (near 0 for unrelated signals).
+     - `align_vocal_double_dtw`: Extracts 10 ms log-energy and zero-crossing features and runs Sakoe-Chiba banded Dynamic Time Warping (`VocAlign Pro` equivalent). Only the band of each row is stored (one-byte back-pointers plus two rolling cost rows), so memory is $O(N(2b+1))$ rather than $O(N^2)$: a 10-minute take needs about 1.5 MB at the 120 ms warp the CLI and MCP use, instead of about 86 GB. It renders the warped double, silent past the end of the dub, and emits non-destructive REAPER `SM` Stretch Markers.
   6. **`realtime.rs` — Zero-Allocation Sample-by-Sample Streaming Kernels:**
      - Pre-allocates all ring buffers, STFT workspaces, and filter states inside `new(sample_rate)` so `process_stereo_sample()` performs **zero heap allocations** on the real-time audio thread (`RealtimeOpenSoothe`, `RealtimeOpenSpacer`, `RealtimeVocalSurgical`, `RealtimeSubAndTapeBus`, `RealtimeMasterLimiter`, `RealtimeMasteringEq18`, `RealtimePhaseAligner`, `RealtimeDrumTrigger`).
   7. **`elite_dsp.rs` — Elite Commercial Gap-Closure Kernels:**
@@ -258,7 +258,7 @@ ForgeAudio integrates with REAPER 7.82 at four distinct layers:
    - Automatically configures 4-channel sidechain buses (`NCHAN 4` + `AUXRECV <src> 0 1.0 0.0 0 0 0 0 1024`), routing Lead Vocal (`Ch 1/2`) into the Instrumental Bus (`Ch 3/4`) and Kick (`Ch 1/2`) into the Sub-Bass Bus (`Ch 3/4`).
 3. **Non-Destructive Take Pitch Envelopes (`<PITCHENV`):**
    - `forge-vocal` writes YIN pitch-correction nodes as editable REAPER `<PITCHENV` `PT <time> <semitones> 0` points rather than baking destructive artifacts into the audio item.
-4. **Non-Destructive `FastDTW` Stretch Markers (`SM`):**
+4. **Non-Destructive DTW Stretch Markers (`SM`):**
    - `forge-dsp::align_vocal_double_dtw` writes `SM <timeline_sec> <source_sec> 0.0` markers using REAPER's `élastique 3.3.3 Pro` engine (`PLAYRATE ... 229376`).
 
 ---
