@@ -1475,13 +1475,27 @@ impl RealtimePhaseAligner {
     }
 }
 
+/// Fourth-order 180 Hz to 2.5 kHz snare band: two Butterworth high-passes then two low-passes.
+///
+/// A true band-pass with unity passband, like the kick low-pass and hat high-pass. The old
+/// `peaking_eq - 0.5 * input` left half the broadband input in the band, so kick and hat hits
+/// fired the snare too.
+fn snare_band_pass(sr: f64) -> [Biquad; 4] {
+    [
+        Biquad::highpass(sr, 180.0, FRAC_1_SQRT_2),
+        Biquad::highpass(sr, 180.0, FRAC_1_SQRT_2),
+        Biquad::lowpass(sr, 2500.0, FRAC_1_SQRT_2),
+        Biquad::lowpass(sr, 2500.0, FRAC_1_SQRT_2),
+    ]
+}
+
 /// Real-Time **3-Band Drum Transient-to-MIDI Trigger Detector** (Slate Trigger 2 equivalent).
 ///
 /// Separates incoming audio into Kick (`<115 Hz`), Snare (`180 Hz–2.5 kHz`), and Hi-Hat (`>5.5 kHz`)
 /// bands and emits `(midi_note, velocity_0_to_1)` triggers with refractory holdoff to prevent double-triggering.
 pub struct RealtimeDrumTrigger {
     kick_lp: Biquad,
-    snare_bp: Biquad,
+    snare_band: [Biquad; 4],
     hat_hp: Biquad,
     kick_fast: f64,
     kick_slow: f64,
@@ -1500,7 +1514,7 @@ impl RealtimeDrumTrigger {
         let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
         Self {
             kick_lp: Biquad::lowpass(sr, 115.0, FRAC_1_SQRT_2),
-            snare_bp: Biquad::peaking_eq(sr, 850.0, 0.8, 9.0),
+            snare_band: snare_band_pass(sr),
             hat_hp: Biquad::highpass(sr, 5500.0, FRAC_1_SQRT_2),
             kick_fast: 0.0,
             kick_slow: 1e-5,
@@ -1532,7 +1546,11 @@ impl RealtimeDrumTrigger {
         let min_amp = 10.0_f64.powf(clean_thresh_db / 20.0);
 
         let k_abs = self.kick_lp.process_sample(mono).abs();
-        let s_abs = (self.snare_bp.process_sample(mono) - mono * 0.5).abs();
+        let s_abs = self
+            .snare_band
+            .iter_mut()
+            .fold(mono, |x, stage| stage.process_sample(x))
+            .abs();
         let h_abs = self.hat_hp.process_sample(mono).abs();
 
         self.kick_fast = flush_denormal_f64(0.85 * self.kick_fast + 0.15 * k_abs);
