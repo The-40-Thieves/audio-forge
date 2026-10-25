@@ -195,6 +195,22 @@ impl Biquad {
         Self::new(b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
     }
 
+    /// Audio EQ Cookbook band-pass with a constant 0 dB peak, so its gain is at most 1 everywhere.
+    pub fn bandpass(sample_rate: f64, freq_hz: f64, q: f64) -> Self {
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 100.0, 768_000.0);
+        let f0 = sanitize_param_f64(freq_hz, 1000.0, 20.0, (sr * 0.48).max(20.0));
+        let clean_q = sanitize_param_f64(q, 0.707, 0.1, 50.0);
+        let w0 = 2.0 * PI * f0 / sr;
+        let cos_w0 = w0.cos();
+        let alpha = w0.sin() / (2.0 * clean_q);
+
+        let a0 = 1.0 + alpha;
+        let a1 = -2.0 * cos_w0;
+        let a2 = 1.0 - alpha;
+
+        Self::new(alpha / a0, 0.0, -alpha / a0, a1 / a0, a2 / a0)
+    }
+
     /// Second-order Butterworth Low-Pass Filter.
     pub fn lowpass(sample_rate: f64, freq_hz: f64, q: f64) -> Self {
         let sr = sanitize_param_f64(sample_rate, 48_000.0, 100.0, 768_000.0);

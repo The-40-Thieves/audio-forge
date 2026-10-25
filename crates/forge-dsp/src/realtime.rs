@@ -15,7 +15,7 @@ use crate::loudness_limiter::{
     Biquad, CytomicSvf, LIMITER_LOOKAHEAD_MS, TRUE_PEAK_PHASES, flush_denormal_f64,
     sanitize_param_f64, sanitize_sample_f32,
 };
-use crate::restoration::MASTERING_18_BANDS_HZ;
+use crate::restoration::{LowBandSplit, MASTERING_18_BANDS_HZ};
 
 /// Exponential one-pole parameter smoother to eliminate zipper noise during real-time knob automation.
 #[derive(Debug, Clone, Copy)]
@@ -592,7 +592,10 @@ impl RealtimeOpenSpacer {
 }
 
 /// Real-Time Zero-Latency **Vocal Surgical Channel Strip**
-/// (Slew-Rate Mouth De-Click + `<110 Hz` Dynamic Plosive Suppressor + Breath Gate + Split-Band De-Esser).
+/// (Slew-Rate Mouth De-Click + `<115 Hz` Dynamic Plosive Suppressor + Breath Gate + Split-Band De-Esser).
+///
+/// The plosive bands are complementary and the de-esser subtracts part of a unit-peak band-pass,
+/// so with nothing being ducked the strip passes its input through with a flat response.
 pub struct RealtimeVocalSurgical {
     prev_l: f64,
     prev2_l: f64,
@@ -600,10 +603,8 @@ pub struct RealtimeVocalSurgical {
     prev2_r: f64,
     slew_env_l: f64,
     slew_env_r: f64,
-    plosive_lp_l: Biquad,
-    plosive_hp_l: Biquad,
-    plosive_lp_r: Biquad,
-    plosive_hp_r: Biquad,
+    plosive_split_l: LowBandSplit,
+    plosive_split_r: LowBandSplit,
     low_env: f64,
     mid_env: f64,
     sib_bp_l: Biquad,
@@ -622,14 +623,12 @@ impl RealtimeVocalSurgical {
             prev2_r: 0.0,
             slew_env_l: 1e-4,
             slew_env_r: 1e-4,
-            plosive_lp_l: Biquad::lowpass(sr, 115.0, FRAC_1_SQRT_2),
-            plosive_hp_l: Biquad::highpass(sr, 115.0, FRAC_1_SQRT_2),
-            plosive_lp_r: Biquad::lowpass(sr, 115.0, FRAC_1_SQRT_2),
-            plosive_hp_r: Biquad::highpass(sr, 115.0, FRAC_1_SQRT_2),
+            plosive_split_l: LowBandSplit::new(sr, 115.0),
+            plosive_split_r: LowBandSplit::new(sr, 115.0),
             low_env: 0.0,
             mid_env: 0.0,
-            sib_bp_l: Biquad::peaking_eq(sr, 7200.0, 1.4, 12.0),
-            sib_bp_r: Biquad::peaking_eq(sr, 7200.0, 1.4, 12.0),
+            sib_bp_l: Biquad::bandpass(sr, 7200.0, 1.4),
+            sib_bp_r: Biquad::bandpass(sr, 7200.0, 1.4),
             sib_env: 0.0,
             gate_env: 0.0,
         }
@@ -649,18 +648,28 @@ impl RealtimeVocalSurgical {
         deess_threshold_db: f64,
         breath_gate_db: f64,
     ) -> (f32, f32) {
-        let mut l = sanitize_sample_f32(in_l);
-        let mut r = sanitize_sample_f32(in_r);
+        let l = sanitize_sample_f32(in_l);
+        let r = sanitize_sample_f32(in_r);
         let clean_declick = sanitize_param_f64(declick_sensitivity, 0.5, 0.0, 1.0);
         let clean_deplosive = sanitize_param_f64(deplosive_strength, 0.5, 0.0, 1.0);
         let clean_deess_db = sanitize_param_f64(deess_threshold_db, -20.0, -60.0, 0.0);
         let clean_gate_db = sanitize_param_f64(breath_gate_db, -55.0, -90.0, -10.0);
 
-        // 1. Real-Time Slew-Rate Mouth De-Clicker
-        if clean_declick > 0.01 {
+        let (l, r) = self.declick(l, r, clean_declick);
+        let (l, r) = self.duck_plosives(l, r, clean_deplosive);
+        let (l, r) = self.deess(l, r, clean_deess_db);
+        let (l, r) = self.gate_breaths(l, r, clean_gate_db);
+
+        (flush_denormal_f64(l) as f32, flush_denormal_f64(r) as f32)
+    }
+
+    /// 1. Real-Time Slew-Rate Mouth De-Clicker
+    #[inline]
+    fn declick(&mut self, mut l: f64, mut r: f64, sensitivity: f64) -> (f64, f64) {
+        if sensitivity > 0.01 {
             let slew_l = (l - self.prev_l).abs();
             let slew_r = (r - self.prev_r).abs();
-            let thresh_mult = 12.0 - 7.5 * clean_declick;
+            let thresh_mult = 12.0 - 7.5 * sensitivity;
             if slew_l > self.slew_env_l * thresh_mult && slew_l > 0.015 {
                 l = 0.5 * (self.prev_l + self.prev2_l);
             } else {
@@ -680,52 +689,60 @@ impl RealtimeVocalSurgical {
         self.prev_l = flush_denormal_f64(l);
         self.prev2_r = flush_denormal_f64(self.prev_r);
         self.prev_r = flush_denormal_f64(r);
+        (l, r)
+    }
 
-        // 2. Dynamic <115 Hz Plosive Suppressor
-        let lo_l = self.plosive_lp_l.process_sample(l);
-        let hi_l = self.plosive_hp_l.process_sample(l);
-        let lo_r = self.plosive_lp_r.process_sample(r);
-        let hi_r = self.plosive_hp_r.process_sample(r);
+    /// 2. Dynamic <115 Hz Plosive Suppressor
+    #[inline]
+    fn duck_plosives(&mut self, l: f64, r: f64, strength: f64) -> (f64, f64) {
+        let bands_l = self.plosive_split_l.process(l);
+        let bands_r = self.plosive_split_r.process(r);
 
-        let lo_mag = 0.5 * (lo_l.abs() + lo_r.abs());
-        let hi_mag = 0.5 * (hi_l.abs() + hi_r.abs());
+        let lo_mag = 0.5 * (bands_l.low.abs() + bands_r.low.abs());
+        let hi_mag = 0.5 * (bands_l.detect_high.abs() + bands_r.detect_high.abs());
         self.low_env = flush_denormal_f64(0.985 * self.low_env + 0.015 * lo_mag);
         self.mid_env = flush_denormal_f64(0.985 * self.mid_env + 0.015 * hi_mag) + 1e-7;
 
         let plosive_ratio = self.low_env / self.mid_env;
         let low_gain = if plosive_ratio > 2.2 {
             let raw_g = (2.2 / plosive_ratio).clamp(0.12, 1.0);
-            1.0 - clean_deplosive * (1.0 - raw_g)
+            1.0 - strength * (1.0 - raw_g)
         } else {
             1.0
         };
-        l = hi_l + lo_l * low_gain;
-        r = hi_r + lo_r * low_gain;
+        (bands_l.ducked(low_gain), bands_r.ducked(low_gain))
+    }
 
-        // 3. Split-Band High-Frequency De-Esser (5.5–12 kHz)
-        let sib_l = self.sib_bp_l.process_sample(l) - l;
-        let sib_r = self.sib_bp_r.process_sample(r) - r;
+    /// 3. Split-Band High-Frequency De-Esser around 7.2 kHz. The band-pass peaks at unity, so
+    /// removing `1 - cut` of it leaves the band at a gain between `cut` and 1, never inverted.
+    #[inline]
+    fn deess(&mut self, mut l: f64, mut r: f64, threshold_db: f64) -> (f64, f64) {
+        let sib_l = self.sib_bp_l.process_sample(l);
+        let sib_r = self.sib_bp_r.process_sample(r);
         let sib_lvl = 0.5 * (sib_l.abs() + sib_r.abs());
         self.sib_env = flush_denormal_f64(0.95 * self.sib_env + 0.05 * sib_lvl);
-        let sib_thresh = 10.0_f64.powf(clean_deess_db / 20.0);
+        let sib_thresh = 10.0_f64.powf(threshold_db / 20.0);
         if self.sib_env > sib_thresh {
             let cut = (sib_thresh / self.sib_env).clamp(0.25, 1.0);
             l -= sib_l * (1.0 - cut);
             r -= sib_r * (1.0 - cut);
         }
+        (l, r)
+    }
 
-        // 4. Soft-Knee Breath & Room Gate
+    /// 4. Soft-Knee Breath & Room Gate
+    #[inline]
+    fn gate_breaths(&mut self, mut l: f64, mut r: f64, threshold_db: f64) -> (f64, f64) {
         let abs_lvl = 0.5 * (l.abs() + r.abs());
         self.gate_env = flush_denormal_f64(0.995 * self.gate_env + 0.005 * abs_lvl);
-        let gate_thresh = 10.0_f64.powf(clean_gate_db / 20.0);
+        let gate_thresh = 10.0_f64.powf(threshold_db / 20.0);
         if self.gate_env < gate_thresh {
             let ratio = (self.gate_env / gate_thresh.max(1e-9)).clamp(0.0, 1.0);
             let g = ratio * ratio;
             l *= g;
             r *= g;
         }
-
-        (flush_denormal_f64(l) as f32, flush_denormal_f64(r) as f32)
+        (l, r)
     }
 }
 

@@ -97,7 +97,7 @@ flowchart TD
   2. **`restoration.rs` — Surgical De-Click, De-Plosive, Hum Notch, Mid/Side, 18-Band Match EQ & Analog Tape:**
      - `remove_dc_and_declip`: High-pass DC removal (`15 Hz`) + cubic Hermite spline reconstruction across consecutive clipped samples (`|x| >= 0.998`).
      - `apply_hum_notch_cascade`: 10-harmonic high-$Q$ (`Q = 35..80`) notch cascade removing `50 Hz` or `60 Hz` powerline hum and buzz up to `600 Hz`.
-     - `clean_vocal_surgical`: Median-derivative mouth de-clicker, `<115 Hz` dynamic plosive attenuator, and hysteresis breath gate.
+     - `clean_vocal_surgical`: Median-derivative mouth de-clicker, `<110 Hz` dynamic plosive attenuator on a complementary split (flat when nothing is ducked), and hysteresis breath gate.
      - `apply_mid_side_spatial_cleanup`: Linkwitz-Riley `<160 Hz` bass mono-maker (forcing sub-bass phase correlation $\to +1.0$) + gentle high-shelf air widening.
      - `compute_reference_match_eq` & `apply_18_band_eq`: 18-band ISO 1/3-octave proportional Mastering & Reference Match EQ (`31.5 Hz` to `16 kHz`).
      - `apply_analog_console_and_tape`: Airwindows Console8 summing (`sin` transfer curve) + ChowTape hysteresis saturation with head-bump at `68 Hz`.
