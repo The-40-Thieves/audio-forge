@@ -24,6 +24,7 @@ pub(super) fn field_line(text: &str) -> Option<(u8, &str)> {
 }
 
 pub(super) fn apply_field(ctx: &mut Context, letter: u8, value: &str) -> Parse<()> {
+    let value = strip_comment(value);
     match letter {
         b'K' => {
             ctx.key = parse_key(value)?;
@@ -48,6 +49,22 @@ pub(super) fn apply_field(ctx: &mut Context, letter: u8, value: &str) -> Parse<(
         _ => {}
     }
     Ok(())
+}
+
+/// Cuts a field value at a trailing `%` comment. A `%` inside double quotes or escaped as `\%`
+/// is part of the value.
+fn strip_comment(value: &str) -> &str {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (idx, byte) in value.bytes().enumerate() {
+        match byte {
+            b'%' if !quoted && !escaped => return &value[..idx],
+            b'"' if !escaped => quoted = !quoted,
+            _ => {}
+        }
+        escaped = byte == b'\\' && !escaped;
+    }
+    value
 }
 
 /// `L:` value such as `1/8`, `1/4` or `1`.

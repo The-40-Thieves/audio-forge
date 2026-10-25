@@ -144,6 +144,24 @@ fn test_headers_decorations_annotations_and_voices_are_not_notes() {
 }
 
 #[test]
+fn test_trailing_comments_on_fields_are_ignored() {
+    assert_eq!(pitches("K:C % key\nC"), [60]);
+    assert_eq!(pitches("K:G % key\nF"), [66]);
+    assert_eq!(starts("L:1/8 % length\nC D"), [0, 240]);
+    assert_eq!(starts("M:4/4 % meter\nC D"), [0, 240]);
+    assert_eq!(starts("M:2/4 %meter\nC D"), [0, 120]);
+    assert_eq!(pitches("K:C\nF [K:G % inline] F"), [65, 66]);
+    assert_eq!(pitches("V:1 % lead\nC\nV:2 % bass\nE\nV:1\nD"), [60, 62]);
+    // `%` inside a quoted chord symbol or annotation is not a comment.
+    let (chords, notes) = parse_abc_score("K:C\n\"^100% swing\" C \"C%\"D % B", TPB).unwrap();
+    assert_eq!(chords, ["C%"]);
+    assert_eq!(
+        notes.iter().map(|n| n.midi_note).collect::<Vec<_>>(),
+        [60, 62]
+    );
+}
+
+#[test]
 fn test_unknown_body_characters_are_rejected() {
     // Spacing, continuation, slur ends and one-letter decorations are still skipped.
     assert_eq!(
