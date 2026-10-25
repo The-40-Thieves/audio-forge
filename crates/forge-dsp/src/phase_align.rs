@@ -15,7 +15,8 @@ pub struct PhaseAlignmentResult {
     /// Optimal polarity (`false` = normal `+1`, `true` = invert phase `-1`).
     pub invert_polarity: bool,
     /// Energy-normalized correlation of reference and shifted target over the analysis window
-    /// (`0.0..=1.0`): near 1 for matching signals, near 0 for unrelated ones.
+    /// (`0.0..=1.0`): near 1 for matching signals, near 0 for unrelated ones. Inputs shorter than
+    /// 64 samples are not analyzed and report 0.
     pub correlation_peak: f64,
 }
 
@@ -37,13 +38,14 @@ pub fn align_phase_gcc_phat(
     let tgt_mono = target.to_mono();
     let n = ref_mono.len().min(tgt_mono.len());
     if n < 64 {
+        // Too short to analyze: pass the target through and report no confidence in the result.
         return Ok((
             target.clone(),
             PhaseAlignmentResult {
                 delay_samples: 0,
                 delay_ms: 0.0,
                 invert_polarity: false,
-                correlation_peak: 1.0,
+                correlation_peak: 0.0,
             },
         ));
     }
@@ -529,6 +531,14 @@ mod tests {
         let (_, matched) =
             align_phase_gcc_phat(&mono(a, sr), &mono(target, sr), 20.0).expect("aligned");
         assert!(matched.correlation_peak > 0.9, "{matched:?}");
+    }
+
+    #[test]
+    fn gcc_phat_reports_no_confidence_for_inputs_too_short_to_analyze() {
+        let a = noise(32, 7);
+        let (_, res) =
+            align_phase_gcc_phat(&mono(a.clone(), 48_000), &mono(a, 48_000), 20.0).expect("ok");
+        assert_eq!(res.correlation_peak, 0.0, "{res:?}");
     }
 
     #[test]
