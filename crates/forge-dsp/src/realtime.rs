@@ -713,8 +713,10 @@ impl RealtimeVocalSurgical {
         (bands_l.ducked(low_gain), bands_r.ducked(low_gain))
     }
 
-    /// 3. Split-Band High-Frequency De-Esser around 7.2 kHz. The band-pass peaks at unity, so
-    /// removing `1 - cut` of it leaves the band at a gain between `cut` and 1, never inverted.
+    /// 3. Split-Band High-Frequency De-Esser around 7.2 kHz.
+    ///
+    /// The band-pass peaks at unity, so removing `1 - cut` of it leaves the band at a gain
+    /// between `cut` and 1, never inverted.
     #[inline]
     fn deess(&mut self, mut l: f64, mut r: f64, threshold_db: f64) -> (f64, f64) {
         let sib_l = self.sib_bp_l.process_sample(l);
