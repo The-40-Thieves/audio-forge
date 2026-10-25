@@ -76,8 +76,10 @@ pub fn align_phase_gcc_phat(
 
     let clean_search_ms =
         crate::loudness_limiter::sanitize_param_f64(max_search_ms, 20.0, 0.5, 500.0);
-    let max_lag =
-        (((sr * clean_search_ms / 1000.0).round() as isize).max(1) as usize).min(fft_len / 2 - 1);
+    // `n >= 64` above already keeps `fft_len / 2 >= 32`; saturate anyway so the bound stays
+    // safe if that guard ever changes.
+    let max_lag = (((sr * clean_search_ms / 1000.0).round() as isize).max(1) as usize)
+        .min((fft_len / 2).saturating_sub(1));
 
     let mut best_lag: isize = 0;
     let mut best_val: f64 = 0.0;
