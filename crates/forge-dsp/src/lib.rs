@@ -122,7 +122,7 @@ mod tests {
     fn test_realtime_zero_alloc_streaming_processors() {
         let sr = 48_000.0;
         let mut soothe = RealtimeOpenSoothe::new(sr);
-        assert_eq!(soothe.latency_samples(), 1536);
+        assert_eq!(soothe.latency_samples(), 2048);
 
         let mut limiter = RealtimeMasterLimiter::new(sr);
         let mut vocal_strip = RealtimeVocalSurgical::new(sr);

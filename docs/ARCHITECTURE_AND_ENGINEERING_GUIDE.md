@@ -176,7 +176,7 @@ flowchart TD
 ### 2.7 `forge-plug` — 10 Native Cross-DAW VST3 & CLAP Real-Time Plugins (`nih-plug` + `egui`)
 - **File:** `crates/forge-plug/src/lib.rs`
 - **Architecture:** Built on `nih-plug` (`rev de421011`) and `nih_plug_egui` (`egui 0.31.1` + `egui_glow` + `baseview`). Exports **all 10 plugins** from a single compiled dynamic library into both `forge-plug.vst3` and `forge-plug.clap`:
-  1. **`ForgeOpenSoothePlug`** (`Forge OpenSoothe De-Fizz`) — 2048-pt OLA STFT Dynamic Spectral Resonance & AI Fizz Suppressor (`1536`-sample host PDC, `egui` 60 FPS spectrum GUI, 8-slot Shared Spectrum Bus).
+  1. **`ForgeOpenSoothePlug`** (`Forge OpenSoothe De-Fizz`) — 2048-pt OLA STFT Dynamic Spectral Resonance & AI Fizz Suppressor (`2048`-sample STFT delay plus the limiter lookahead reported to the host for PDC, `egui` 60 FPS spectrum GUI, 8-slot Shared Spectrum Bus).
   2. **`ForgeOpenSpacerPlug`** (`Forge OpenSpacer Unmask`) — 4-Channel Sidechain Spectral Unmasker (`aux_input_ports: &[new_nonzero_u32(2)]`).
   3. **`ForgeVocalSurgicalPlug`** (`Forge Vocal Surgical Strip`) — Zero-Latency Mouth De-Click, `<115 Hz` Plosive Duck, Split-Band De-Esser & Breath Gate.
   4. **`ForgeSubAndTapePlug`** (`Forge SubMono & Console Tape`) — Linkwitz-Riley `<160 Hz` Sub Mono-Maker, Harmonic Bass Reinforcer & Console8/ChowTape Saturation.

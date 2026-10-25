@@ -210,7 +210,7 @@ cargo run --package xtask -- install --all --release         # copy into system 
 
 | Package | What it does |
 | :--- | :--- |
-| `forge-opensoothe` | Dynamic spectral resonance suppressor (STFT, 1536-sample latency compensation, egui GUI) |
+| `forge-opensoothe` | Dynamic spectral resonance suppressor (STFT, 2048-sample latency plus the 3 ms limiter lookahead, egui GUI) |
 | `forge-openspacer` | Sidechain spectral unmasker (vocal over music, kick over bass) |
 | `forge-vocal-surgical` | Zero-latency de-click, plosive suppression below 115 Hz, split-band de-esser and breath gate |
 | `forge-submono-tape` | Linkwitz-Riley sub mono below 160 Hz, harmonic bass reinforcement, console and tape saturation |

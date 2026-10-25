@@ -243,6 +243,8 @@ pub struct ForgeOpenSoothePlug {
     dsp: RealtimeOpenSoothe,
     sub_tape_dsp: RealtimeSubAndTapeBus,
     limiter_dsp: RealtimeMasterLimiter,
+    /// Host sample rate from the last `initialize`, reused by `reset` (which gets none).
+    sample_rate: f64,
 }
 
 #[derive(Params)]
@@ -338,7 +340,17 @@ impl Default for ForgeOpenSoothePlug {
             dsp: RealtimeOpenSoothe::new(48_000.0),
             sub_tape_dsp: RealtimeSubAndTapeBus::new(48_000.0, 160.0),
             limiter_dsp: RealtimeMasterLimiter::new(48_000.0),
+            sample_rate: 48_000.0,
         }
+    }
+}
+
+impl ForgeOpenSoothePlug {
+    /// Total input-to-output delay. The limiter's lookahead delay stays in the signal path even
+    /// when the limiter (or delta listen) is off, so this is constant and the host's delay
+    /// compensation never goes stale when those switches change.
+    fn latency_samples(&self) -> u32 {
+        self.dsp.latency_samples() + self.limiter_dsp.latency_samples()
     }
 }
 
@@ -427,23 +439,18 @@ impl Plugin for ForgeOpenSoothePlug {
         buffer_config: &BufferConfig,
         context: &mut impl InitContext<Self>,
     ) -> bool {
-        let sr = f64::from(buffer_config.sample_rate);
-        self.dsp.reset(sr);
-        self.sub_tape_dsp = RealtimeSubAndTapeBus::new(sr, 160.0);
-        self.limiter_dsp.reset(sr);
-        let total_latency = self.dsp.latency_samples()
-            + if self.params.enable_limiter.value() {
-                self.limiter_dsp.latency_samples()
-            } else {
-                0
-            };
-        context.set_latency_samples(total_latency);
+        self.sample_rate = f64::from(buffer_config.sample_rate);
+        self.reset();
+        context.set_latency_samples(self.latency_samples());
         true
     }
 
+    /// Clears DSP state at the sample rate from `initialize`. May run on the audio thread, and
+    /// none of these resets allocate.
     fn reset(&mut self) {
-        self.dsp.reset(48_000.0);
-        self.limiter_dsp.reset(48_000.0);
+        self.dsp.reset(self.sample_rate);
+        self.sub_tape_dsp.reset(self.sample_rate);
+        self.limiter_dsp.reset(self.sample_rate);
     }
 
     fn process(
@@ -477,11 +484,12 @@ impl Plugin for ForgeOpenSoothePlug {
                     .process_stereo_sample(out_l, out_r, 0.20, 1.06, tape_drive);
             }
 
-            if use_limiter && !delta {
-                (out_l, out_r) = self
-                    .limiter_dsp
-                    .process_stereo_sample(out_l, out_r, 0.0, ceil, 85.0);
-            }
+            (out_l, out_r) = if use_limiter && !delta {
+                self.limiter_dsp
+                    .process_stereo_sample(out_l, out_r, 0.0, ceil, 85.0)
+            } else {
+                self.limiter_dsp.process_delay_only(out_l, out_r)
+            };
 
             let gr_est = 20.0
                 * (out_l.abs().max(out_r.abs()) / in_l.abs().max(in_r.abs()).max(1e-5))

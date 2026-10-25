@@ -62,7 +62,8 @@ impl ParamSmoother {
 /// Real-Time Zero-Allocation **OpenSoothe** OLA-STFT Dynamic Spectral Resonance & AI De-Fizz Processor.
 ///
 /// Uses a 2048-sample Hann-windowed ring buffer with 512-sample hop (`75%` overlap, exact COLA).
-/// Reports `1536` samples (`fft_size - hop`) of latency to the DAW for sample-accurate PDC.
+/// Each input sample reaches the output exactly `fft_size` (2048) samples later, which is the
+/// latency reported to the DAW for sample-accurate PDC.
 pub struct RealtimeOpenSoothe {
     sample_rate: f64,
     fft_size: usize,
@@ -80,6 +81,8 @@ pub struct RealtimeOpenSoothe {
     ring_pos: usize,
     hop_counter: usize,
     spec_scratch: Vec<Complex<f64>>,
+    /// Pre-allocated rustfft scratch, so `process_with_scratch` never allocates per hop.
+    fft_scratch: Vec<Complex<f64>>,
     mags_scratch: Vec<f64>,
     smoothed_gains_l: Vec<f64>,
     smoothed_gains_r: Vec<f64>,
@@ -96,6 +99,9 @@ impl RealtimeOpenSoothe {
         let mut planner = FftPlanner::<f64>::new();
         let fft_fwd = planner.plan_fft_forward(fft_size);
         let fft_inv = planner.plan_fft_inverse(fft_size);
+        let scratch_len = fft_fwd
+            .get_inplace_scratch_len()
+            .max(fft_inv.get_inplace_scratch_len());
 
         let window: Vec<f64> = (0..fft_size)
             .map(|i| 0.5 * (1.0 - (2.0 * PI * (i as f64) / (fft_size as f64)).cos()))
@@ -118,6 +124,7 @@ impl RealtimeOpenSoothe {
             ring_pos: 0,
             hop_counter: 0,
             spec_scratch: vec![Complex::new(0.0, 0.0); fft_size],
+            fft_scratch: vec![Complex::new(0.0, 0.0); scratch_len],
             mags_scratch: vec![0.0; half_bins],
             smoothed_gains_l: vec![1.0; half_bins],
             smoothed_gains_r: vec![1.0; half_bins],
@@ -129,8 +136,10 @@ impl RealtimeOpenSoothe {
         proc
     }
 
+    /// Delay from input to output: a sample written at ring position `k` is overlap-added
+    /// into the output ring at `k + fft_size`, so the delay is the full frame, not `fft_size - hop`.
     pub fn latency_samples(&self) -> u32 {
-        (self.fft_size - self.hop_size) as u32
+        self.fft_size as u32
     }
 
     pub fn reset(&mut self, sample_rate: f64) {
@@ -247,7 +256,8 @@ impl RealtimeOpenSoothe {
                 self.spec_scratch[i] = Complex::new(sample * self.window[i], 0.0);
             }
 
-            self.fft_fwd.process(&mut self.spec_scratch);
+            self.fft_fwd
+                .process_with_scratch(&mut self.spec_scratch, &mut self.fft_scratch);
 
             for b in 0..self.half_bins {
                 self.mags_scratch[b] = self.spec_scratch[b].norm().max(1e-12);
@@ -323,7 +333,8 @@ impl RealtimeOpenSoothe {
                 self.spec_scratch[self.half_bins - 1] = Complex::new(0.0, 0.0);
             }
 
-            self.fft_inv.process(&mut self.spec_scratch);
+            self.fft_inv
+                .process_with_scratch(&mut self.spec_scratch, &mut self.fft_scratch);
 
             let out_base = self.ring_pos;
             for i in 0..self.fft_size {
@@ -389,6 +400,8 @@ pub struct RealtimeOpenSpacer {
     tgt_spec_l: Vec<Complex<f64>>,
     tgt_spec_r: Vec<Complex<f64>>,
     sc_spec: Vec<Complex<f64>>,
+    /// Pre-allocated rustfft scratch, so `process_with_scratch` never allocates per hop.
+    fft_scratch: Vec<Complex<f64>>,
     smoothed_gains: Vec<f64>,
     last_carve_db: f32,
 }
@@ -401,6 +414,9 @@ impl RealtimeOpenSpacer {
         let mut planner = FftPlanner::<f64>::new();
         let fft_fwd = planner.plan_fft_forward(fft_size);
         let fft_inv = planner.plan_fft_inverse(fft_size);
+        let scratch_len = fft_fwd
+            .get_inplace_scratch_len()
+            .max(fft_inv.get_inplace_scratch_len());
         let window: Vec<f64> = (0..fft_size)
             .map(|i| 0.5 * (1.0 - (2.0 * PI * (i as f64) / (fft_size as f64)).cos()))
             .collect();
@@ -424,13 +440,16 @@ impl RealtimeOpenSpacer {
             tgt_spec_l: vec![Complex::new(0.0, 0.0); fft_size],
             tgt_spec_r: vec![Complex::new(0.0, 0.0); fft_size],
             sc_spec: vec![Complex::new(0.0, 0.0); fft_size],
+            fft_scratch: vec![Complex::new(0.0, 0.0); scratch_len],
             smoothed_gains: vec![1.0; half_bins],
             last_carve_db: 0.0,
         }
     }
 
+    /// Delay from input to output: a sample written at ring position `k` is overlap-added
+    /// into the output ring at `k + fft_size`, so the delay is the full frame, not `fft_size - hop`.
     pub fn latency_samples(&self) -> u32 {
-        (self.fft_size - self.hop_size) as u32
+        self.fft_size as u32
     }
 
     pub fn reset(&mut self, sample_rate: f64) {
@@ -512,9 +531,12 @@ impl RealtimeOpenSpacer {
             self.sc_spec[i] = Complex::new(self.sc_ring[idx] * w, 0.0);
         }
 
-        self.fft_fwd.process(&mut self.tgt_spec_l);
-        self.fft_fwd.process(&mut self.tgt_spec_r);
-        self.fft_fwd.process(&mut self.sc_spec);
+        self.fft_fwd
+            .process_with_scratch(&mut self.tgt_spec_l, &mut self.fft_scratch);
+        self.fft_fwd
+            .process_with_scratch(&mut self.tgt_spec_r, &mut self.fft_scratch);
+        self.fft_fwd
+            .process_with_scratch(&mut self.sc_spec, &mut self.fft_scratch);
 
         let mut min_g_seen = 1.0_f64;
 
@@ -550,8 +572,10 @@ impl RealtimeOpenSpacer {
             self.tgt_spec_r[self.fft_size - b] = self.tgt_spec_r[b].conj();
         }
 
-        self.fft_inv.process(&mut self.tgt_spec_l);
-        self.fft_inv.process(&mut self.tgt_spec_r);
+        self.fft_inv
+            .process_with_scratch(&mut self.tgt_spec_l, &mut self.fft_scratch);
+        self.fft_inv
+            .process_with_scratch(&mut self.tgt_spec_r, &mut self.fft_scratch);
 
         let out_base = self.ring_pos;
         for i in 0..self.fft_size {
@@ -707,6 +731,7 @@ impl RealtimeVocalSurgical {
 /// Real-Time Zero-Latency **Sub-Bass Mono-Maker, Allpass Phase Disperser & ChowTape Jiles-Atherton Bus**.
 pub struct RealtimeSubAndTapeBus {
     sample_rate: f64,
+    mono_cutoff_hz: f64,
     side_hp1: Biquad,
     side_hp2: Biquad,
     sub_lp: Biquad,
@@ -730,6 +755,7 @@ impl RealtimeSubAndTapeBus {
         let cutoff = mono_cutoff_hz.clamp(40.0, 350.0);
         Self {
             sample_rate: sr,
+            mono_cutoff_hz: cutoff,
             side_hp1: Biquad::highpass(sr, cutoff, FRAC_1_SQRT_2),
             side_hp2: Biquad::highpass(sr, cutoff, FRAC_1_SQRT_2),
             sub_lp: Biquad::lowpass(sr, 95.0, FRAC_1_SQRT_2),
@@ -748,8 +774,15 @@ impl RealtimeSubAndTapeBus {
         }
     }
 
+    /// Clears all state in place for `sample_rate`, keeping the current mono cutoff. Holds only
+    /// fixed-size state, so this never allocates.
+    pub fn reset(&mut self, sample_rate: f64) {
+        *self = Self::new(sample_rate, self.mono_cutoff_hz);
+    }
+
     pub fn set_mono_cutoff(&mut self, mono_cutoff_hz: f64) {
         let cutoff = mono_cutoff_hz.clamp(40.0, 350.0);
+        self.mono_cutoff_hz = cutoff;
         self.side_hp1 = Biquad::highpass(self.sample_rate, cutoff, FRAC_1_SQRT_2);
         self.side_hp2 = Biquad::highpass(self.sample_rate, cutoff, FRAC_1_SQRT_2);
     }
@@ -853,14 +886,21 @@ pub struct RealtimeMasterLimiter {
 }
 
 impl RealtimeMasterLimiter {
+    /// Upper bound of the lookahead delay. The delay lines are allocated at this size once, so
+    /// `reset` can change sample rate without allocating.
+    const MAX_LOOKAHEAD_SAMPLES: usize = 512;
+
+    fn lookahead_for(sample_rate: f64) -> usize {
+        ((sample_rate * 0.003).round() as usize).clamp(32, Self::MAX_LOOKAHEAD_SAMPLES) // 3 ms lookahead
+    }
+
     pub fn new(sample_rate: f64) -> Self {
         let sr = sample_rate.max(8000.0);
-        let lookahead_samples = ((sr * 0.003).round() as usize).clamp(32, 512); // 3 ms lookahead
-        Self {
+        let mut limiter = Self {
             sample_rate: sr,
-            lookahead_samples,
-            delay_l: vec![0.0; lookahead_samples],
-            delay_r: vec![0.0; lookahead_samples],
+            lookahead_samples: Self::lookahead_for(sr),
+            delay_l: vec![0.0; Self::MAX_LOOKAHEAD_SAMPLES],
+            delay_r: vec![0.0; Self::MAX_LOOKAHEAD_SAMPLES],
             write_pos: 0,
             envelope_gain: 1.0,
             k_shelf_l: Biquad::k_weight_pre_shelf(sr),
@@ -873,15 +913,49 @@ impl RealtimeMasterLimiter {
             last_gr_db: 0.0,
             prev_l: [0.0; 4],
             prev_r: [0.0; 4],
-        }
+        };
+        limiter.reset(sr);
+        limiter
     }
 
     pub fn latency_samples(&self) -> u32 {
         self.lookahead_samples as u32
     }
 
+    /// Clears all state in place for `sample_rate`. Safe to call on the audio thread: it never
+    /// allocates.
     pub fn reset(&mut self, sample_rate: f64) {
-        *self = Self::new(sample_rate);
+        let sr = sample_rate.max(8000.0);
+        self.sample_rate = sr;
+        self.lookahead_samples = Self::lookahead_for(sr);
+        self.delay_l.fill(0.0);
+        self.delay_r.fill(0.0);
+        self.write_pos = 0;
+        self.envelope_gain = 1.0;
+        self.k_shelf_l = Biquad::k_weight_pre_shelf(sr);
+        self.k_r1b_l = Biquad::k_weight_rlb_highpass(sr);
+        self.k_shelf_r = Biquad::k_weight_pre_shelf(sr);
+        self.k_r1b_r = Biquad::k_weight_rlb_highpass(sr);
+        self.momentary_energy = 1e-9;
+        self.last_lufs = -70.0;
+        self.last_true_peak_dbtp = -120.0;
+        self.last_gr_db = 0.0;
+        self.prev_l = [0.0; 4];
+        self.prev_r = [0.0; 4];
+    }
+
+    /// Passes a frame through the lookahead delay without limiting, so a bypassed limiter keeps
+    /// the same latency as an active one and the host's delay compensation stays correct.
+    #[inline]
+    pub fn process_delay_only(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
+        let delayed_l = self.delay_l[self.write_pos];
+        let delayed_r = self.delay_r[self.write_pos];
+        self.delay_l[self.write_pos] = sanitize_sample_f32(in_l) as f32;
+        self.delay_r[self.write_pos] = sanitize_sample_f32(in_r) as f32;
+        self.write_pos = (self.write_pos + 1) % self.lookahead_samples;
+        self.envelope_gain = 1.0;
+        self.last_gr_db = 0.0;
+        (delayed_l, delayed_r)
     }
 
     pub fn telemetry(&self) -> (f32, f32, f32) {
