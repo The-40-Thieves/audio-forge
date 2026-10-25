@@ -18,5 +18,9 @@ Changes from upstream:
     `clap_host_params.rescan(CLAP_PARAM_RESCAN_VALUES)` on the main thread
     (clap-validator `state-reproducibility-basic`, `-binary`, `-buffered`).
 
-Remove this directory and the `[patch]` entry once both fixes are upstream, then
-bump the nih-plug revision in `Cargo.lock`.
+Upstream tracking: issue <https://github.com/robbert-vdh/nih-plug/issues/279>,
+fix PR <https://github.com/robbert-vdh/nih-plug/pull/280> (same two fixes; it
+caps the length at 256 MiB instead of 64 MiB).
+
+Remove this directory and the `[patch]` entry once #280 (or an equivalent fix)
+is merged upstream, then bump the nih-plug revision in `Cargo.lock`.
