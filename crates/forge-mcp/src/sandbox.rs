@@ -140,17 +140,22 @@ fn canonicalize_existing_prefix(path: &Path) -> io::Result<PathBuf> {
 
 /// Drops the Windows verbatim prefix (`\\?\C:\...`) from canonical paths so they stay usable
 /// by tools that do not understand it (REAPER, ffmpeg). UNC verbatim paths are left as is.
+#[cfg(windows)]
 fn simplify(path: PathBuf) -> PathBuf {
-    #[cfg(windows)]
-    {
-        let s = path.to_string_lossy();
-        if let Some(rest) = s.strip_prefix(r"\\?\") {
-            let bytes = rest.as_bytes();
-            if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-                return PathBuf::from(rest);
-            }
+    /// `\\?\`, spelled with escapes: some static analyzers misread a raw string ending in `\`.
+    const VERBATIM_PREFIX: &str = "\\\\?\\";
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(VERBATIM_PREFIX) {
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            return PathBuf::from(rest);
         }
     }
+    path
+}
+
+#[cfg(not(windows))]
+fn simplify(path: PathBuf) -> PathBuf {
     path
 }
 

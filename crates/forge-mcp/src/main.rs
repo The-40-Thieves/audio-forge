@@ -764,25 +764,7 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
 
     let drum_buf = AudioBuffer::load(bundle.drums.as_ref().unwrap_or(&input))?;
     let duration_secs = drum_buf.duration_secs();
-    let (kick_notes, snare_notes, hat_notes) = extract_drum_midi_triggers(&drum_buf, bpm, 480);
-    write_midi_file(
-        &paths.drum_midi,
-        bpm,
-        480,
-        &[
-            ("Kick_Trigger_C1", &kick_notes),
-            ("Snare_Trigger_D1", &snare_notes),
-            ("HiHat_Trigger_F#1", &hat_notes),
-        ],
-    )?;
-
-    let (_, chord_notes, bass_notes) = voice_chords(chords)?;
-    write_midi_file(
-        &paths.chords_midi,
-        bpm,
-        480,
-        &[("Voiced_Chords", &chord_notes), ("Sub_Bass", &bass_notes)],
-    )?;
+    write_ingest_midi(&paths, &drum_buf, bpm, chords)?;
 
     let full_mix = AudioBuffer::load(&input)?;
     let (mastered, delivery) = deliver(&full_mix, &DeliveryOptions::for_target(target))?;
@@ -815,6 +797,33 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
             "ai_fizz_index": delivery.after.ai_fizz_index
         }),
     })
+}
+
+/// Writes the drum-trigger MIDI (from `drum_buf`) and the voice-led chord MIDI.
+fn write_ingest_midi(
+    paths: &IngestPaths,
+    drum_buf: &AudioBuffer,
+    bpm: f64,
+    chords: &str,
+) -> Result<(), ForgeError> {
+    let (kick_notes, snare_notes, hat_notes) = extract_drum_midi_triggers(drum_buf, bpm, 480);
+    write_midi_file(
+        &paths.drum_midi,
+        bpm,
+        480,
+        &[
+            ("Kick_Trigger_C1", &kick_notes),
+            ("Snare_Trigger_D1", &snare_notes),
+            ("HiHat_Trigger_F#1", &hat_notes),
+        ],
+    )?;
+    let (_, chord_notes, bass_notes) = voice_chords(chords)?;
+    write_midi_file(
+        &paths.chords_midi,
+        bpm,
+        480,
+        &[("Voiced_Chords", &chord_notes), ("Sub_Bass", &bass_notes)],
+    )
 }
 
 /// Cleans and de-fizzes the separated vocal in place; returns its pitch contour.
