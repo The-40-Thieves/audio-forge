@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use crate::elite_dsp::{AllpassDisperser, JilesAthertonHysteresis};
 use crate::loudness_limiter::{
-    Biquad, CytomicSvf, LIMITER_LOOKAHEAD_MS, flush_denormal_f64, sanitize_param_f64,
-    sanitize_sample_f32,
+    Biquad, CytomicSvf, LIMITER_LOOKAHEAD_MS, TRUE_PEAK_PHASES, flush_denormal_f64,
+    sanitize_param_f64, sanitize_sample_f32,
 };
 use crate::restoration::MASTERING_18_BANDS_HZ;
 
@@ -867,6 +867,19 @@ impl RealtimeSubAndTapeBus {
 }
 
 /// Real-Time **Lookahead True-Peak Brickwall Limiter & ITU-R BS.1770-4 Loudness Meter**.
+///
+/// The gain path has three stages, all on pre-allocated state:
+///
+/// 1. A 4x polyphase true-peak detector (the ITU-R BS.1770-4 Annex 2 FIR that
+///    `compute_true_peak` uses) turns each input frame into a required gain.
+/// 2. A sliding-window minimum holds that gain for `lookahead + HOLD_AFTER` frames, followed by
+///    a release one-pole that only acts upward.
+/// 3. A moving average of `lookahead - RAMP_MARGIN` frames turns the held gain into a linear
+///    attack ramp.
+///
+/// The ramp finishes before a detected peak leaves the `lookahead` delay line, and the hold keeps
+/// the gain flat across the interpolation filter's neighbourhood, so the output's true peak stays
+/// under the ceiling without the final clamp engaging.
 pub struct RealtimeMasterLimiter {
     sample_rate: f64,
     lookahead_samples: usize,
@@ -882,14 +895,86 @@ pub struct RealtimeMasterLimiter {
     last_lufs: f32,
     last_true_peak_dbtp: f32,
     last_gr_db: f32,
-    prev_l: [f64; 4],
-    prev_r: [f64; 4],
+    tp_hist_l: [f64; TP_TAPS],
+    tp_hist_r: [f64; TP_TAPS],
+    hold: SlidingMin,
+    released_gain: f64,
+    ramp: Vec<f64>,
+    ramp_len: usize,
+    ramp_pos: usize,
+    ramp_sum: f64,
+    last_target_lin: f64,
+    last_release_coeff: f64,
+}
+
+/// Taps per phase of the true-peak interpolation filter.
+const TP_TAPS: usize = 12;
+
+/// Sliding-window minimum over the last `window` values, as a monotonic deque in fixed-size
+/// ring buffers. `push` is amortized O(1) and never allocates.
+struct SlidingMin {
+    vals: Vec<f64>,
+    idx: Vec<u64>,
+    head: usize,
+    len: usize,
+    window: u64,
+    next: u64,
+}
+
+impl SlidingMin {
+    fn new(capacity: usize) -> Self {
+        Self {
+            vals: vec![1.0; capacity],
+            idx: vec![0; capacity],
+            head: 0,
+            len: 0,
+            window: 1,
+            next: 0,
+        }
+    }
+
+    fn reset(&mut self, window: usize) {
+        self.head = 0;
+        self.len = 0;
+        self.window = window.clamp(1, self.vals.len()) as u64;
+        self.next = 0;
+    }
+
+    /// Adds `v` and returns the minimum of the last `window` values pushed.
+    fn push(&mut self, v: f64) -> f64 {
+        let cap = self.vals.len();
+        while self.len > 0 && self.vals[(self.head + self.len - 1) % cap] >= v {
+            self.len -= 1;
+        }
+        let slot = (self.head + self.len) % cap;
+        self.vals[slot] = v;
+        self.idx[slot] = self.next;
+        self.len += 1;
+        while self.idx[self.head] + self.window <= self.next {
+            self.head = (self.head + 1) % cap;
+            self.len -= 1;
+        }
+        self.next += 1;
+        self.vals[self.head]
+    }
 }
 
 impl RealtimeMasterLimiter {
     /// Upper bound of the lookahead delay. The delay lines are allocated at this size once, so
     /// `reset` can change sample rate without allocating.
     const MAX_LOOKAHEAD_SAMPLES: usize = 512;
+
+    /// The detector sees a peak up to `TP_TAPS` frames after the earliest sample whose true peak
+    /// it affects, so the attack ramp must end that many frames before the delay line's exit.
+    const RAMP_MARGIN: usize = TP_TAPS;
+
+    /// Frames past the delay line's exit that the gain stays held, covering the later half of the
+    /// interpolation filter around the peak.
+    const HOLD_AFTER: usize = TP_TAPS / 2 + 1;
+
+    /// Gain is computed against a ceiling this many dB below the requested one, so a fully
+    /// limited sample lands just under the final clamp rather than on it.
+    const CEILING_MARGIN_DB: f64 = 0.05;
 
     fn lookahead_for(sample_rate: f64) -> usize {
         ((sample_rate * LIMITER_LOOKAHEAD_MS / 1000.0).round() as usize)
@@ -913,8 +998,16 @@ impl RealtimeMasterLimiter {
             last_lufs: -70.0,
             last_true_peak_dbtp: -120.0,
             last_gr_db: 0.0,
-            prev_l: [0.0; 4],
-            prev_r: [0.0; 4],
+            tp_hist_l: [0.0; TP_TAPS],
+            tp_hist_r: [0.0; TP_TAPS],
+            hold: SlidingMin::new(Self::MAX_LOOKAHEAD_SAMPLES + Self::HOLD_AFTER),
+            released_gain: 1.0,
+            ramp: vec![1.0; Self::MAX_LOOKAHEAD_SAMPLES],
+            ramp_len: 1,
+            ramp_pos: 0,
+            ramp_sum: 1.0,
+            last_target_lin: 1.0,
+            last_release_coeff: 0.0,
         };
         limiter.reset(sr);
         limiter
@@ -942,95 +1035,109 @@ impl RealtimeMasterLimiter {
         self.last_lufs = -70.0;
         self.last_true_peak_dbtp = -120.0;
         self.last_gr_db = 0.0;
-        self.prev_l = [0.0; 4];
-        self.prev_r = [0.0; 4];
+        self.tp_hist_l = [0.0; TP_TAPS];
+        self.tp_hist_r = [0.0; TP_TAPS];
+        self.hold.reset(self.lookahead_samples + Self::HOLD_AFTER);
+        self.released_gain = 1.0;
+        self.ramp_len = self.lookahead_samples - Self::RAMP_MARGIN;
+        self.ramp.fill(1.0);
+        self.ramp_pos = 0;
+        self.ramp_sum = self.ramp_len as f64;
+        self.last_target_lin = 10.0_f64.powf((-1.0 - Self::CEILING_MARGIN_DB) / 20.0);
+        self.last_release_coeff = Self::release_coeff(sr, 85.0);
     }
 
     /// Passes a frame through the lookahead delay without limiting, so a bypassed limiter keeps
     /// the same latency as an active one and the host's delay compensation stays correct.
+    ///
+    /// The gain path still analyses the frame, with the last active ceiling and release, so the
+    /// frames already in the delay line are covered when limiting resumes.
     #[inline]
     pub fn process_delay_only(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
-        let delayed_l = self.delay_l[self.write_pos];
-        let delayed_r = self.delay_r[self.write_pos];
-        self.delay_l[self.write_pos] = sanitize_sample_f32(in_l) as f32;
-        self.delay_r[self.write_pos] = sanitize_sample_f32(in_r) as f32;
-        self.write_pos = (self.write_pos + 1) % self.lookahead_samples;
+        let xl = sanitize_sample_f32(in_l);
+        let xr = sanitize_sample_f32(in_r);
+        self.advance_gain(xl, xr, self.last_target_lin, self.last_release_coeff);
         self.envelope_gain = 1.0;
         self.last_gr_db = 0.0;
-        (delayed_l, delayed_r)
+        self.swap_delay(xl as f32, xr as f32)
     }
 
     pub fn telemetry(&self) -> (f32, f32, f32) {
         (self.last_lufs, self.last_true_peak_dbtp, self.last_gr_db)
     }
 
-    #[inline]
-    fn estimate_4x_intersample_peak(hist: &mut [f64; 4], x: f64) -> f64 {
-        hist[0] = hist[1];
-        hist[1] = hist[2];
-        hist[2] = hist[3];
-        hist[3] = x;
-        let p0 = (-0.0625 * hist[0] + 0.5625 * hist[1] + 0.5625 * hist[2] - 0.0625 * hist[3]).abs();
-        let p1 = (-0.046875 * hist[0] + 0.328125 * hist[1] + 0.765625 * hist[2]
-            - 0.046875 * hist[3])
-            .abs();
-        x.abs().max(p0).max(p1)
+    fn release_coeff(sample_rate: f64, release_ms: f64) -> f64 {
+        (-1.0 / ((release_ms * 0.001) * sample_rate)).exp()
     }
 
+    /// Pushes `x` into the newest-first history and returns the largest of `|x|` and the four
+    /// interpolated phases of the ITU-R BS.1770-4 Annex 2 filter (the FIR `compute_true_peak`
+    /// uses).
     #[inline]
-    pub fn process_stereo_sample(
+    fn estimate_4x_intersample_peak(hist: &mut [f64; TP_TAPS], x: f64) -> f64 {
+        hist.copy_within(0..TP_TAPS - 1, 1);
+        hist[0] = x;
+        let mut peak = x.abs();
+        for coeffs in &TRUE_PEAK_PHASES {
+            let interp: f64 = coeffs.iter().zip(hist.iter()).map(|(c, h)| c * h).sum();
+            peak = peak.max(interp.abs());
+        }
+        peak
+    }
+
+    /// Runs one frame through the detector, the hold and the attack ramp. Returns the true peak
+    /// detected on this frame and the gain for the frame leaving the delay line now.
+    #[inline]
+    fn advance_gain(
         &mut self,
-        in_l: f32,
-        in_r: f32,
-        input_drive_db: f64,
-        ceiling_dbtp: f64,
-        release_ms: f64,
-    ) -> (f32, f32) {
-        let clean_drive_db = sanitize_param_f64(input_drive_db, 0.0, -24.0, 24.0);
-        let clean_ceil_db = sanitize_param_f64(ceiling_dbtp, -1.0, -12.0, -0.05);
-        let clean_rel_ms = sanitize_param_f64(release_ms, 85.0, 10.0, 1000.0);
-        let drive = 10.0_f64.powf(clean_drive_db / 20.0);
-        let ceiling_lin = 10.0_f64.powf(clean_ceil_db / 20.0);
-
-        let dl = sanitize_sample_f32(in_l) * drive;
-        let dr = sanitize_sample_f32(in_r) * drive;
-
-        // 4x inter-sample True Peak detector
-        let tp_l = Self::estimate_4x_intersample_peak(&mut self.prev_l, dl);
-        let tp_r = Self::estimate_4x_intersample_peak(&mut self.prev_r, dr);
+        xl: f64,
+        xr: f64,
+        target_lin: f64,
+        release_coeff: f64,
+    ) -> (f64, f64) {
+        let tp_l = Self::estimate_4x_intersample_peak(&mut self.tp_hist_l, xl);
+        let tp_r = Self::estimate_4x_intersample_peak(&mut self.tp_hist_r, xr);
         let tp = tp_l.max(tp_r).max(1e-12);
-
-        let required_gain = if tp > ceiling_lin {
-            ceiling_lin / tp
+        let required_gain = if tp > target_lin {
+            target_lin / tp
         } else {
             1.0
         };
 
-        let attack_coeff = (-1.0 / (0.0005 * self.sample_rate)).exp();
-        let release_coeff = (-1.0 / ((clean_rel_ms * 0.001) * self.sample_rate)).exp();
-
-        if required_gain < self.envelope_gain {
-            self.envelope_gain = flush_denormal_f64(
-                attack_coeff * self.envelope_gain + (1.0 - attack_coeff) * required_gain,
-            )
-            .clamp(1e-6, 1.0);
+        let held = self.hold.push(required_gain);
+        self.released_gain = if held < self.released_gain {
+            held
         } else {
-            self.envelope_gain = flush_denormal_f64(
-                release_coeff * self.envelope_gain + (1.0 - release_coeff) * required_gain,
-            )
-            .clamp(1e-6, 1.0);
-        }
+            flush_denormal_f64(release_coeff * self.released_gain + (1.0 - release_coeff) * held)
+                .min(held)
+        };
 
+        self.ramp_sum += self.released_gain - self.ramp[self.ramp_pos];
+        self.ramp[self.ramp_pos] = self.released_gain;
+        self.ramp_pos += 1;
+        if self.ramp_pos == self.ramp_len {
+            self.ramp_pos = 0;
+            // Re-sum once per lap so the running sum cannot drift.
+            self.ramp_sum = self.ramp[..self.ramp_len].iter().sum();
+        }
+        let gain = (self.ramp_sum / self.ramp_len as f64).clamp(1e-6, 1.0);
+        (tp, gain)
+    }
+
+    #[inline]
+    fn swap_delay(&mut self, xl: f32, xr: f32) -> (f32, f32) {
         let delayed_l = self.delay_l[self.write_pos];
         let delayed_r = self.delay_r[self.write_pos];
-        self.delay_l[self.write_pos] = dl as f32;
-        self.delay_r[self.write_pos] = dr as f32;
+        self.delay_l[self.write_pos] = xl;
+        self.delay_r[self.write_pos] = xr;
         self.write_pos = (self.write_pos + 1) % self.lookahead_samples;
+        (delayed_l, delayed_r)
+    }
 
-        let out_l = (f64::from(delayed_l) * self.envelope_gain).clamp(-ceiling_lin, ceiling_lin);
-        let out_r = (f64::from(delayed_r) * self.envelope_gain).clamp(-ceiling_lin, ceiling_lin);
-
-        // ITU-R BS.1770-4 K-weighted momentary loudness tracker (400 ms time constant)
+    /// ITU-R BS.1770-4 K-weighted momentary loudness tracker (400 ms time constant), plus the
+    /// telemetry the editor reads.
+    #[inline]
+    fn update_meter(&mut self, out_l: f64, out_r: f64, tp: f64, ceiling_lin: f64) {
         let kw_l = self
             .k_r1b_l
             .process_sample(self.k_shelf_l.process_sample(out_l));
@@ -1047,6 +1154,37 @@ impl RealtimeMasterLimiter {
         self.last_true_peak_dbtp =
             (20.0 * (tp * self.envelope_gain).min(ceiling_lin).max(1e-9).log10()) as f32;
         self.last_gr_db = (-20.0 * self.envelope_gain.max(1e-6).log10()) as f32;
+    }
+
+    #[inline]
+    pub fn process_stereo_sample(
+        &mut self,
+        in_l: f32,
+        in_r: f32,
+        input_drive_db: f64,
+        ceiling_dbtp: f64,
+        release_ms: f64,
+    ) -> (f32, f32) {
+        let clean_drive_db = sanitize_param_f64(input_drive_db, 0.0, -24.0, 24.0);
+        let clean_ceil_db = sanitize_param_f64(ceiling_dbtp, -1.0, -12.0, -0.05);
+        let clean_rel_ms = sanitize_param_f64(release_ms, 85.0, 10.0, 1000.0);
+        let drive = 10.0_f64.powf(clean_drive_db / 20.0);
+        let ceiling_lin = 10.0_f64.powf(clean_ceil_db / 20.0);
+        let target_lin = 10.0_f64.powf((clean_ceil_db - Self::CEILING_MARGIN_DB) / 20.0);
+        let release_coeff = Self::release_coeff(self.sample_rate, clean_rel_ms);
+        self.last_target_lin = target_lin;
+        self.last_release_coeff = release_coeff;
+
+        let dl = sanitize_sample_f32(in_l) * drive;
+        let dr = sanitize_sample_f32(in_r) * drive;
+        let (tp, gain) = self.advance_gain(dl, dr, target_lin, release_coeff);
+        self.envelope_gain = gain;
+        let (delayed_l, delayed_r) = self.swap_delay(dl as f32, dr as f32);
+
+        // Safety net only: the ramp has already brought every detected peak under `target_lin`.
+        let out_l = (f64::from(delayed_l) * gain).clamp(-ceiling_lin, ceiling_lin);
+        let out_r = (f64::from(delayed_r) * gain).clamp(-ceiling_lin, ceiling_lin);
+        self.update_meter(out_l, out_r, tp, ceiling_lin);
 
         (
             flush_denormal_f64(out_l) as f32,

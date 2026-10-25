@@ -93,7 +93,7 @@ flowchart TD
      - `Biquad`: Direct-Form II Transposed 64-bit biquad filter (`process_sample`, `lowpass`, `highpass`, `bandpass`, `notch`, `peaking_eq`, `low_shelf`, `high_shelf`, `k_weight_stage1`).
      - `audit_audio`: Implements the two-stage ITU-R BS.1770-4 K-weighting cascade (`+4.0 dB` head-diffraction high-shelf at `1681.97 Hz` followed by `38.13 Hz` RLB high-pass), `400 ms` overlapping blocks (`75%` overlap), `-70 LUFS` absolute gate, and `-10 LU` relative gate.
      - `compute_true_peak`: 4x polyphase FIR sinc interpolation to detect inter-sample peaks (`dBTP`) between discrete samples.
-     - `normalize_and_limit`: Lookahead (`3 ms` attack window) 4x True-Peak brickwall limiter with a smooth `50 ms` release and a final true-peak trim, guaranteeing output never exceeds `-1.0 dBTP`.
+     - `normalize_and_limit`: Lookahead (`3 ms` attack window) 4x True-Peak brickwall limiter. The gain is held at the window's minimum and ramps linearly across the window, so it is fully reduced before each peak with no step. A smooth `50 ms` release and a final true-peak trim follow, guaranteeing output never exceeds `-1.0 dBTP`.
   2. **`restoration.rs` — Surgical De-Click, De-Plosive, Hum Notch, Mid/Side, 18-Band Match EQ & Analog Tape:**
      - `remove_dc_and_declip`: High-pass DC removal (`15 Hz`) + cubic Hermite spline reconstruction across consecutive clipped samples (`|x| >= 0.998`).
      - `apply_hum_notch_cascade`: 10-harmonic high-$Q$ (`Q = 35..80`) notch cascade removing `50 Hz` or `60 Hz` powerline hum and buzz up to `600 Hz`.
