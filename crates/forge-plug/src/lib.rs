@@ -18,14 +18,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use forge_dsp::{
-    AnalogHardwareModel, AutoGainCompensator, GenreTonalTarget, RealtimeDensityAndClipper,
-    RealtimeDrumTrigger, RealtimeFdnReverb, RealtimeMasterLimiter, RealtimeMasteringEq18,
-    RealtimeNeuralPreamp, RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner,
-    RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus, RealtimeTransientTonalSplit,
-    RealtimeVocalSurgical, publish_shared_spectrum, read_shared_spectrum,
+    publish_shared_spectrum, read_shared_spectrum, AnalogHardwareModel, AutoGainCompensator,
+    GenreTonalTarget, RealtimeDensityAndClipper, RealtimeDrumTrigger, RealtimeFdnReverb,
+    RealtimeMasterLimiter, RealtimeMasteringEq18, RealtimeNeuralPreamp, RealtimeOpenSoothe,
+    RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus,
+    RealtimeTransientTonalSplit, RealtimeVocalSurgical,
 };
 use nih_plug::prelude::*;
-use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
+use nih_plug_egui::{create_egui_editor, egui, widgets, EguiState};
 
 /// Lock-free 32-band telemetry, dynamic Gain-Reduction / Bode curve, and A/B snapshot indicator
 /// shared between the real-time audio thread and the 60 FPS `nih_plug_egui` OpenGL studio GUI.
@@ -54,20 +54,56 @@ impl Default for GuiTelemetry {
 impl GuiTelemetry {
     #[inline]
     pub fn update_peaks(&self, in_l: f32, in_r: f32, out_l: f32, out_r: f32, gr_db: f32) {
-        let il = if in_l.is_finite() { in_l.abs().min(100.0) } else { 0.0 };
-        let ir = if in_r.is_finite() { in_r.abs().min(100.0) } else { 0.0 };
-        let ol = if out_l.is_finite() { out_l.abs().min(100.0) } else { 0.0 };
-        let or_ = if out_r.is_finite() { out_r.abs().min(100.0) } else { 0.0 };
-        let gr = if gr_db.is_finite() { gr_db.clamp(-90.0, 24.0) } else { 0.0 };
+        let il = if in_l.is_finite() {
+            in_l.abs().min(100.0)
+        } else {
+            0.0
+        };
+        let ir = if in_r.is_finite() {
+            in_r.abs().min(100.0)
+        } else {
+            0.0
+        };
+        let ol = if out_l.is_finite() {
+            out_l.abs().min(100.0)
+        } else {
+            0.0
+        };
+        let or_ = if out_r.is_finite() {
+            out_r.abs().min(100.0)
+        } else {
+            0.0
+        };
+        let gr = if gr_db.is_finite() {
+            gr_db.clamp(-90.0, 24.0)
+        } else {
+            0.0
+        };
 
         let pk_in = 20.0 * il.max(ir).max(1e-5).log10();
         let pk_out = 20.0 * ol.max(or_).max(1e-5).log10();
         let raw_prev_in = f32::from_bits(self.peak_in_db.load(Ordering::Relaxed));
         let raw_prev_out = f32::from_bits(self.peak_out_db.load(Ordering::Relaxed));
-        let prev_in = if raw_prev_in.is_finite() { raw_prev_in.clamp(-100.0, 40.0) } else { -90.0 };
-        let prev_out = if raw_prev_out.is_finite() { raw_prev_out.clamp(-100.0, 40.0) } else { -90.0 };
-        let sm_in = if pk_in > prev_in { pk_in } else { prev_in * 0.9995 + pk_in * 0.0005 };
-        let sm_out = if pk_out > prev_out { pk_out } else { prev_out * 0.9995 + pk_out * 0.0005 };
+        let prev_in = if raw_prev_in.is_finite() {
+            raw_prev_in.clamp(-100.0, 40.0)
+        } else {
+            -90.0
+        };
+        let prev_out = if raw_prev_out.is_finite() {
+            raw_prev_out.clamp(-100.0, 40.0)
+        } else {
+            -90.0
+        };
+        let sm_in = if pk_in > prev_in {
+            pk_in
+        } else {
+            prev_in * 0.9995 + pk_in * 0.0005
+        };
+        let sm_out = if pk_out > prev_out {
+            pk_out
+        } else {
+            prev_out * 0.9995 + pk_out * 0.0005
+        };
         self.peak_in_db.store(sm_in.to_bits(), Ordering::Relaxed);
         self.peak_out_db.store(sm_out.to_bits(), Ordering::Relaxed);
         self.gr_db.store(gr.to_bits(), Ordering::Relaxed);
@@ -103,12 +139,24 @@ fn draw_forge_studio_header_and_spectrum(
 ) {
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
-            ui.heading(egui::RichText::new(title).color(egui::Color32::from_rgb(90, 210, 255)).strong());
-            ui.label(egui::RichText::new(subtitle).color(egui::Color32::from_rgb(165, 175, 195)).small());
+            ui.heading(
+                egui::RichText::new(title)
+                    .color(egui::Color32::from_rgb(90, 210, 255))
+                    .strong(),
+            );
+            ui.label(
+                egui::RichText::new(subtitle)
+                    .color(egui::Color32::from_rgb(165, 175, 195))
+                    .small(),
+            );
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let cur_ab = telemetry.ab_slot.load(Ordering::Relaxed);
-            let ab_label = if cur_ab == 0 { "A/B: [STATE A]" } else { "A/B: [STATE B]" };
+            let ab_label = if cur_ab == 0 {
+                "A/B: [STATE A]"
+            } else {
+                "A/B: [STATE B]"
+            };
             if ui
                 .button(
                     egui::RichText::new(ab_label)
@@ -136,7 +184,8 @@ fn draw_forge_studio_header_and_spectrum(
     ui.add_space(4.0);
 
     // 32-Band Real-Time Spectral + Dynamic GR / Bode Curve Overlay Canvas
-    let (rect, _resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 92.0), egui::Sense::hover());
+    let (rect, _resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 92.0), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(16, 20, 28));
     painter.rect_stroke(
@@ -169,8 +218,10 @@ fn draw_forge_studio_header_and_spectrum(
         painter.rect_filled(bar_rect, 2.0, egui::Color32::from_rgb(56, 189, 248));
 
         // Plot 32-band Dynamic Gain Reduction / EQ Bode response curve point (-18 dB .. +18 dB)
-        let gr_b = f32::from_bits(telemetry.band_gr_db[b].load(Ordering::Relaxed)).clamp(-18.0, 18.0);
-        let y_pt = (mid_y - (gr_b / 18.0) * (rect.height() * 0.40)).clamp(rect.top() + 4.0, rect.bottom() - 4.0);
+        let gr_b =
+            f32::from_bits(telemetry.band_gr_db[b].load(Ordering::Relaxed)).clamp(-18.0, 18.0);
+        let y_pt = (mid_y - (gr_b / 18.0) * (rect.height() * 0.40))
+            .clamp(rect.top() + 4.0, rect.bottom() - 4.0);
         curve_pts.push(egui::pos2(x0 + bar_w * 0.5, y_pt));
     }
     if curve_pts.len() >= 2 {
@@ -242,8 +293,12 @@ impl Default for OpenSootheParams {
             )
             .with_smoother(SmoothingStyle::Linear(20.0))
             .with_unit(" dB"),
-            sharpness_bins: IntParam::new("Sharpness Radius", 8, IntRange::Linear { min: 4, max: 20 })
-                .with_unit(" bins"),
+            sharpness_bins: IntParam::new(
+                "Sharpness Radius",
+                8,
+                IntRange::Linear { min: 4, max: 20 },
+            )
+            .with_unit(" bins"),
             delta_listen: BoolParam::new("Delta Listen (Removed Fizz)", false),
             enable_sub_tape: BoolParam::new("Enable SubMono + Tape Warmth", true),
             tape_drive: FloatParam::new(
@@ -408,9 +463,9 @@ impl Plugin for ForgeOpenSoothePlug {
             let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
             let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
 
-            let (mut out_l, mut out_r) =
-                self.dsp
-                    .process_stereo_sample(in_l, in_r, sens, depth, sharp, delta);
+            let (mut out_l, mut out_r) = self
+                .dsp
+                .process_stereo_sample(in_l, in_r, sens, depth, sharp, delta);
 
             if use_sub_tape && !delta {
                 (out_l, out_r) = self
@@ -428,7 +483,8 @@ impl Plugin for ForgeOpenSoothePlug {
                 * (out_l.abs().max(out_r.abs()) / in_l.abs().max(in_r.abs()).max(1e-5))
                     .clamp(0.05, 1.0)
                     .log10();
-            self.telemetry.update_peaks(in_l, in_r, out_l, out_r, gr_est);
+            self.telemetry
+                .update_peaks(in_l, in_r, out_l, out_r, gr_est);
 
             if let Some(s0) = channel_samples.get_mut(0) {
                 *s0 = out_l;
@@ -450,9 +506,8 @@ impl Plugin for ForgeOpenSoothePlug {
 
 impl ClapPlugin for ForgeOpenSoothePlug {
     const CLAP_ID: &'static str = "org.the40thieves.forge-audio.opensoothe-defizz";
-    const CLAP_DESCRIPTION: Option<&'static str> = Some(
-        "Real-Time 2048-pt OLA STFT Dynamic Spectral Resonance & AI Metallic Fizz Suppressor",
-    );
+    const CLAP_DESCRIPTION: Option<&'static str> =
+        Some("Real-Time 2048-pt OLA STFT Dynamic Spectral Resonance & AI Metallic Fizz Suppressor");
     const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
     const CLAP_SUPPORT_URL: Option<&'static str> = Some(Self::URL);
     const CLAP_FEATURES: &'static [ClapFeature] = &[
@@ -665,16 +720,17 @@ impl Plugin for ForgeOpenSpacerPlug {
                 (0.0, 0.0)
             };
 
-            let (out_l, out_r) =
-                self.dsp
-                    .process_sample(tgt_l, tgt_r, sc_l, sc_r, low_hz, high_hz, amt, max_cut);
+            let (out_l, out_r) = self
+                .dsp
+                .process_sample(tgt_l, tgt_r, sc_l, sc_r, low_hz, high_hz, amt, max_cut);
 
             self.analyzer.push_stereo_sample(out_l, out_r);
             let gr_est = 20.0
                 * (out_l.abs().max(out_r.abs()) / tgt_l.abs().max(tgt_r.abs()).max(1e-5))
                     .clamp(0.05, 1.0)
                     .log10();
-            self.telemetry.update_peaks(tgt_l, tgt_r, out_l, out_r, gr_est);
+            self.telemetry
+                .update_peaks(tgt_l, tgt_r, out_l, out_r, gr_est);
 
             let out_slices = buffer.as_slice();
             if let Some(c0) = out_slices.first_mut() {
@@ -871,15 +927,16 @@ impl Plugin for ForgeVocalSurgicalPlug {
         for mut channel_samples in buffer.iter_samples() {
             let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
             let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
-            let (out_l, out_r) =
-                self.dsp
-                    .process_stereo_sample(in_l, in_r, declick, deplosive, deess, gate);
+            let (out_l, out_r) = self
+                .dsp
+                .process_stereo_sample(in_l, in_r, declick, deplosive, deess, gate);
             self.analyzer.push_stereo_sample(out_l, out_r);
             let gr_est = 20.0
                 * (out_l.abs().max(out_r.abs()) / in_l.abs().max(in_r.abs()).max(1e-5))
                     .clamp(0.05, 1.0)
                     .log10();
-            self.telemetry.update_peaks(in_l, in_r, out_l, out_r, gr_est);
+            self.telemetry
+                .update_peaks(in_l, in_r, out_l, out_r, gr_est);
             if let Some(s0) = channel_samples.get_mut(0) {
                 *s0 = out_l;
             }
@@ -1051,10 +1108,7 @@ impl Plugin for ForgeSubAndTapePlug {
         _context: &mut impl InitContext<Self>,
     ) -> bool {
         let sr = f64::from(buffer_config.sample_rate);
-        self.dsp = RealtimeSubAndTapeBus::new(
-            sr,
-            f64::from(self.params.mono_cutoff_hz.value()),
-        );
+        self.dsp = RealtimeSubAndTapeBus::new(sr, f64::from(self.params.mono_cutoff_hz.value()));
         self.analyzer.reset(sr);
         true
     }
@@ -1801,9 +1855,16 @@ pub struct SplitEqParams {
 impl Default for SplitEqParams {
     fn default() -> Self {
         let mk_db = |name: &'static str, def: f32| {
-            FloatParam::new(name, def, FloatRange::Linear { min: -12.0, max: 12.0 })
-                .with_smoother(SmoothingStyle::Linear(15.0))
-                .with_unit(" dB")
+            FloatParam::new(
+                name,
+                def,
+                FloatRange::Linear {
+                    min: -12.0,
+                    max: 12.0,
+                },
+            )
+            .with_smoother(SmoothingStyle::Linear(15.0))
+            .with_unit(" dB")
         };
         Self {
             editor_state: EguiState::from_size(680, 380),
@@ -1870,22 +1931,40 @@ impl Plugin for ForgeSplitEqPlug {
                         .spacing([16.0, 8.0])
                         .show(ui, |ui| {
                             ui.label("Low Transient (<250 Hz)");
-                            ui.add(widgets::ParamSlider::for_param(&params.trans_low_db, setter));
+                            ui.add(widgets::ParamSlider::for_param(
+                                &params.trans_low_db,
+                                setter,
+                            ));
                             ui.end_row();
                             ui.label("Mid Transient (250-3.5kHz)");
-                            ui.add(widgets::ParamSlider::for_param(&params.trans_mid_db, setter));
+                            ui.add(widgets::ParamSlider::for_param(
+                                &params.trans_mid_db,
+                                setter,
+                            ));
                             ui.end_row();
                             ui.label("High Transient (>3.5kHz)");
-                            ui.add(widgets::ParamSlider::for_param(&params.trans_high_db, setter));
+                            ui.add(widgets::ParamSlider::for_param(
+                                &params.trans_high_db,
+                                setter,
+                            ));
                             ui.end_row();
                             ui.label("Low Tonal Body (<250 Hz)");
-                            ui.add(widgets::ParamSlider::for_param(&params.tonal_low_db, setter));
+                            ui.add(widgets::ParamSlider::for_param(
+                                &params.tonal_low_db,
+                                setter,
+                            ));
                             ui.end_row();
                             ui.label("Mid Tonal Sustain (250-3.5kHz)");
-                            ui.add(widgets::ParamSlider::for_param(&params.tonal_mid_db, setter));
+                            ui.add(widgets::ParamSlider::for_param(
+                                &params.tonal_mid_db,
+                                setter,
+                            ));
                             ui.end_row();
                             ui.label("High Tonal Air (>3.5kHz)");
-                            ui.add(widgets::ParamSlider::for_param(&params.tonal_high_db, setter));
+                            ui.add(widgets::ParamSlider::for_param(
+                                &params.tonal_high_db,
+                                setter,
+                            ));
                             ui.end_row();
                         });
                 });
@@ -1957,9 +2036,8 @@ impl Plugin for ForgeSplitEqPlug {
 
 impl ClapPlugin for ForgeSplitEqPlug {
     const CLAP_ID: &'static str = "org.the40thieves.forge-audio.spliteq-transient-tonal";
-    const CLAP_DESCRIPTION: Option<&'static str> = Some(
-        "Structural 3-Band Transient vs. Tonal Equalizer & Attack/Sustain Shaper",
-    );
+    const CLAP_DESCRIPTION: Option<&'static str> =
+        Some("Structural 3-Band Transient vs. Tonal Equalizer & Attack/Sustain Shaper");
     const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
     const CLAP_SUPPORT_URL: Option<&'static str> = Some(Self::URL);
     const CLAP_FEATURES: &'static [ClapFeature] = &[
@@ -2015,14 +2093,20 @@ impl Default for DensityClipperParams {
             clip_drive_db: FloatParam::new(
                 "3-Band 2x ADAA Clip Drive",
                 2.5,
-                FloatRange::Linear { min: 0.0, max: 12.0 },
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 12.0,
+                },
             )
             .with_smoother(SmoothingStyle::Linear(15.0))
             .with_unit(" dB"),
             ceiling_db: FloatParam::new(
                 "Clipper Output Ceiling",
                 -0.8,
-                FloatRange::Linear { min: -6.0, max: -0.1 },
+                FloatRange::Linear {
+                    min: -6.0,
+                    max: -0.1,
+                },
             )
             .with_unit(" dB"),
         }
@@ -2140,9 +2224,8 @@ impl Plugin for ForgeDensityClipperPlug {
 
 impl ClapPlugin for ForgeDensityClipperPlug {
     const CLAP_ID: &'static str = "org.the40thieves.forge-audio.density-adaa-clipper";
-    const CLAP_DESCRIPTION: Option<&'static str> = Some(
-        "Upward Low-Level Density Compressor & 3-Band 2x-Oversampled ADAA Soft Clipper",
-    );
+    const CLAP_DESCRIPTION: Option<&'static str> =
+        Some("Upward Low-Level Density Compressor & 3-Band 2x-Oversampled ADAA Soft Clipper");
     const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
     const CLAP_SUPPORT_URL: Option<&'static str> = Some(Self::URL);
     const CLAP_FEATURES: &'static [ClapFeature] = &[
@@ -2214,12 +2297,18 @@ impl Default for SpaceVerbAndPreampParams {
             reverb_decay: FloatParam::new(
                 "FDN Reverb Decay",
                 0.65,
-                FloatRange::Linear { min: 0.05, max: 0.98 },
+                FloatRange::Linear {
+                    min: 0.05,
+                    max: 0.98,
+                },
             ),
             reverb_damping: FloatParam::new(
                 "High-Frequency Damping",
                 0.40,
-                FloatRange::Linear { min: 0.0, max: 0.95 },
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 0.95,
+                },
             ),
             shimmer_amount: FloatParam::new(
                 "+12 st Octave Shimmer",
@@ -2356,12 +2445,12 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
             let pdrive = f64::from(self.params.preamp_drive.smoothed.next());
             let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
             let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
-            let (pr_l, pr_r) = self
-                .preamp_dsp
-                .process_stereo_sample(in_l, in_r, pdrive * 12.0, 0.0);
-            let (out_l, out_r) =
-                self.reverb_dsp
-                    .process_stereo_sample(pr_l, pr_r, decay, damp, shimmer, duck, mix);
+            let (pr_l, pr_r) =
+                self.preamp_dsp
+                    .process_stereo_sample(in_l, in_r, pdrive * 12.0, 0.0);
+            let (out_l, out_r) = self
+                .reverb_dsp
+                .process_stereo_sample(pr_l, pr_r, decay, damp, shimmer, duck, mix);
             self.analyzer.push_stereo_sample(out_l, out_r);
             self.telemetry.update_peaks(in_l, in_r, out_l, out_r, 0.0);
             if let Some(s0) = channel_samples.get_mut(0) {
@@ -2487,4 +2576,3 @@ mod tests {
         assert!(!p10.params().param_map().is_empty());
     }
 }
-

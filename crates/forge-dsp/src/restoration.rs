@@ -87,8 +87,7 @@ pub fn remove_dc_and_declip(buffer: &mut AudioBuffer, declip: bool) {
                             let h10 = t3 - 2.0 * t2 + t;
                             let h01 = -2.0 * t3 + 3.0 * t2;
                             let h11 = t3 - t2;
-                            let interp =
-                                h00 * y0 + h10 * m0 * 0.5 + h01 * y1 + h11 * m1 * 0.5;
+                            let interp = h00 * y0 + h10 * m0 * 0.5 + h01 * y1 + h11 * m1 * 0.5;
                             ch[start + k] = interp.clamp(-0.995, 0.995);
                         }
                     }

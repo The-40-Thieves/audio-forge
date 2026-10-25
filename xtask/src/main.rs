@@ -63,7 +63,14 @@ fn main() -> nih_plug_xtask::Result<()> {
         "list" => {
             println!("ForgeAudio Standalone VST3 & CLAP Plugins (10 Individual Packages):");
             for (idx, (pkg, desc)) in STANDALONE_PLUGINS.iter().enumerate() {
-                println!("  {:2}. {:22} -> {}.vst3 / {}.clap\n      {}", idx + 1, pkg, pkg, pkg, desc);
+                println!(
+                    "  {:2}. {:22} -> {}.vst3 / {}.clap\n      {}",
+                    idx + 1,
+                    pkg,
+                    pkg,
+                    pkg,
+                    desc
+                );
             }
             Ok(())
         }
@@ -152,7 +159,10 @@ fn resolve_install_dirs(custom_dest: Option<&Path>) -> (PathBuf, PathBuf) {
         let base = PathBuf::from(home);
         return (base.join(".vst3"), base.join(".clap"));
     }
-    (PathBuf::from("installed-plugins/VST3"), PathBuf::from("installed-plugins/CLAP"))
+    (
+        PathBuf::from("installed-plugins/VST3"),
+        PathBuf::from("installed-plugins/CLAP"),
+    )
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {

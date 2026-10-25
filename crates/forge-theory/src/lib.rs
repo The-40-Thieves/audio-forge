@@ -311,8 +311,9 @@ pub fn extract_drum_midi_triggers(
 
     let detect_band_hits = |sig: &[f64], midi_note: u8, thresh_mult: f64| -> Vec<NoteEvent> {
         let mut events = Vec::new();
-        let global_rms =
-            (sig.iter().map(|&v| v * v).sum::<f64>() / (sig.len() as f64)).sqrt().max(1e-6);
+        let global_rms = (sig.iter().map(|&v| v * v).sum::<f64>() / (sig.len() as f64))
+            .sqrt()
+            .max(1e-6);
         let min_peak = (global_rms * thresh_mult).max(0.02);
 
         let mut last_hit: usize = 0;
@@ -326,7 +327,8 @@ pub fn extract_drum_midi_triggers(
                 && rms > prev_rms * 1.65
                 && (events.is_empty() || start.saturating_sub(last_hit) >= min_retrigger_samples)
             {
-                let norm_vel = ((peak / (global_rms * 5.0)).sqrt() * 115.0).clamp(32.0, 127.0) as u8;
+                let norm_vel =
+                    ((peak / (global_rms * 5.0)).sqrt() * 115.0).clamp(32.0, 127.0) as u8;
                 let tick = (((start as f64) / sr) * ticks_per_sec).round() as u32;
                 events.push(NoteEvent {
                     midi_note,
@@ -456,9 +458,7 @@ pub fn parse_abc_score(abc: &str, ticks_per_beat: u32) -> (Vec<String>, Vec<Note
 
 /// Renders a chord progression and melody into a clean ABC notation lead sheet.
 pub fn export_abc_score(title: &str, key: &str, bpm: u32, chords: &[String]) -> String {
-    let mut out = format!(
-        "X:1\nT:{title}\nM:4/4\nL:1/8\nQ:1/4={bpm}\nK:{key}\n"
-    );
+    let mut out = format!("X:1\nT:{title}\nM:4/4\nL:1/8\nQ:1/4={bpm}\nK:{key}\n");
     for (idx, chord) in chords.iter().enumerate() {
         let root_char = chord.chars().next().unwrap_or('C').to_ascii_uppercase();
         out.push_str(&format!("\"{chord}\"{root_char}4 {root_char}4 | "));
@@ -512,15 +512,17 @@ pub fn write_midi_file<P: AsRef<Path>>(
         let mut raw_events: Vec<(u32, bool, u8, u8, u8)> = Vec::with_capacity(notes.len() * 2);
         for n in notes {
             let start = n.start_tick.min(0x0FFF_0000);
-            let end = start.saturating_add(n.duration_ticks.max(1)).min(0x0FFF_FFFE);
-            raw_events.push((start, true, n.channel & 0x0F, n.midi_note & 0x7F, n.velocity & 0x7F));
+            let end = start
+                .saturating_add(n.duration_ticks.max(1))
+                .min(0x0FFF_FFFE);
             raw_events.push((
-                end,
-                false,
+                start,
+                true,
                 n.channel & 0x0F,
                 n.midi_note & 0x7F,
-                0,
+                n.velocity & 0x7F,
             ));
+            raw_events.push((end, false, n.channel & 0x0F, n.midi_note & 0x7F, 0));
         }
         raw_events.sort_by_key(|&(tick, is_on, _, note, _)| (tick, is_on, note));
 
@@ -658,5 +660,3 @@ mod tests {
         }
     }
 }
-
-

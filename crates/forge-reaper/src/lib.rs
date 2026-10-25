@@ -15,14 +15,18 @@ use serde::{Deserialize, Serialize};
 pub const JSFX_OPENSOOTHE: &str = include_str!("../../../reaper-jsfx/Forge_OpenSoothe_DeFizz.jsfx");
 pub const JSFX_OPENSPACER: &str = include_str!("../../../reaper-jsfx/Forge_OpenSpacer_Unmask.jsfx");
 pub const JSFX_SUBBASS: &str = include_str!("../../../reaper-jsfx/Forge_SubBass_Reinforce.jsfx");
-pub const JSFX_VOCAL_SURGICAL: &str = include_str!("../../../reaper-jsfx/Forge_Vocal_Surgical.jsfx");
+pub const JSFX_VOCAL_SURGICAL: &str =
+    include_str!("../../../reaper-jsfx/Forge_Vocal_Surgical.jsfx");
 
 /// Installs all 4 ForgeAudio JSFX plugins into REAPER's `Effects/ForgeAudio` directory.
 pub fn install_jsfx_plugins(custom_reaper_dir: Option<&Path>) -> Result<Vec<PathBuf>> {
     let base_dir = if let Some(d) = custom_reaper_dir {
         d.to_path_buf()
     } else if let Ok(appdata) = std::env::var("APPDATA") {
-        PathBuf::from(appdata).join("REAPER").join("Effects").join("ForgeAudio")
+        PathBuf::from(appdata)
+            .join("REAPER")
+            .join("Effects")
+            .join("ForgeAudio")
     } else {
         PathBuf::from("reaper-effects-installed")
     };
@@ -281,7 +285,11 @@ impl ReaperProjectBuilder {
         rpp.push_str("  <MASTERFXLIST\n    <JS ForgeAudio/Forge_OpenSoothe_DeFizz.jsfx \"\"\n      3.5 9.0 1.25 1.0 160 0\n    >\n  >\n");
 
         for (idx, tr) in self.tracks.iter().enumerate() {
-            let nchan = if tr.sidechain_from_track.is_some() { 4 } else { 2 };
+            let nchan = if tr.sidechain_from_track.is_some() {
+                4
+            } else {
+                2
+            };
             let safe_tr_name = sanitize_rpp_string(&tr.name);
             let safe_vol = forge_dsp::sanitize_param_f64(tr.volume_lin, 1.0, 0.0, 4.0);
             let safe_pan = forge_dsp::sanitize_param_f64(tr.pan, 0.0, -1.0, 1.0);
@@ -485,5 +493,3 @@ mod tests {
         }
     }
 }
-
-
