@@ -183,3 +183,49 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    fn repo_file(relative: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(relative);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    /// The `edition` set in `[workspace.package]` of the root `Cargo.toml`.
+    fn workspace_edition() -> String {
+        let manifest = repo_file("Cargo.toml");
+        let package = manifest
+            .split("[workspace.package]")
+            .nth(1)
+            .and_then(|rest| rest.split("\n[").next())
+            .expect("root Cargo.toml has a [workspace.package] table");
+        package
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("edition"))
+            .filter_map(|rest| rest.trim_start().strip_prefix('='))
+            .map(|value| value.trim().trim_matches('"').to_string())
+            .next()
+            .expect("[workspace.package] sets edition")
+    }
+
+    #[test]
+    fn docs_state_the_workspace_edition() {
+        let edition = workspace_edition();
+        let readme = repo_file("README.md");
+        let badge = format!("Rust-{edition}%20Edition");
+        assert!(
+            readme.contains(&badge),
+            "README.md badge should read \"{badge}\" to match Cargo.toml"
+        );
+        let guide = repo_file("docs/ARCHITECTURE_AND_ENGINEERING_GUIDE.md");
+        let stated = format!("Rust {edition} Edition");
+        assert!(
+            guide.contains(&stated),
+            "architecture guide should say \"{stated}\" to match Cargo.toml"
+        );
+    }
+}

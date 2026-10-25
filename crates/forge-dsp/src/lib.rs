@@ -21,8 +21,9 @@ pub use elite_dsp::{
     publish_shared_spectrum, read_shared_spectrum,
 };
 pub use loudness_limiter::{
-    Biquad, CytomicSvf, audit_audio, compute_true_peak, flush_denormal_f64, normalize_and_limit,
-    sanitize_param_f64, sanitize_sample_f32, sanitize_sample_f64,
+    Biquad, CytomicSvf, LIMITER_LOOKAHEAD_MS, LIMITER_RELEASE_MS, audit_audio, compute_true_peak,
+    flush_denormal_f64, normalize_and_limit, sanitize_param_f64, sanitize_sample_f32,
+    sanitize_sample_f64,
 };
 pub use phase_align::{
     PhaseAlignmentResult, StretchMarker, align_phase_gcc_phat, align_vocal_double_dtw,

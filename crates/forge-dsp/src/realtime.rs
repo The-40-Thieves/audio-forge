@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use crate::elite_dsp::{AllpassDisperser, JilesAthertonHysteresis};
 use crate::loudness_limiter::{
-    Biquad, CytomicSvf, flush_denormal_f64, sanitize_param_f64, sanitize_sample_f32,
+    Biquad, CytomicSvf, LIMITER_LOOKAHEAD_MS, flush_denormal_f64, sanitize_param_f64,
+    sanitize_sample_f32,
 };
 use crate::restoration::MASTERING_18_BANDS_HZ;
 
@@ -855,7 +856,8 @@ pub struct RealtimeMasterLimiter {
 impl RealtimeMasterLimiter {
     pub fn new(sample_rate: f64) -> Self {
         let sr = sample_rate.max(8000.0);
-        let lookahead_samples = ((sr * 0.003).round() as usize).clamp(32, 512); // 3 ms lookahead
+        let lookahead_samples =
+            ((sr * LIMITER_LOOKAHEAD_MS / 1000.0).round() as usize).clamp(32, 512);
         Self {
             sample_rate: sr,
             lookahead_samples,

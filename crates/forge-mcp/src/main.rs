@@ -1145,4 +1145,58 @@ mod tests {
         let caught = panic::catch_unwind(|| panic!("static")).unwrap_err();
         assert_eq!(panic_message(caught.as_ref()), "static");
     }
+
+    fn repo_doc(relative: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    fn advertised_tool_names() -> Vec<String> {
+        tool_definitions()
+            .iter()
+            .map(|t| t["name"].as_str().expect("tool name").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn readme_tool_table_matches_the_server() {
+        let readme = repo_doc("README.md");
+        let section = readme
+            .split("### MCP tools")
+            .nth(1)
+            .and_then(|rest| rest.split("\n### ").next())
+            .expect("README.md has a '### MCP tools' section");
+        let mut documented: Vec<String> = section
+            .lines()
+            .filter_map(|line| line.strip_prefix("| `"))
+            .filter_map(|rest| rest.split('`').next())
+            .map(str::to_string)
+            .collect();
+        let mut served = advertised_tool_names();
+        documented.sort();
+        served.sort();
+        assert_eq!(
+            documented, served,
+            "README.md '### MCP tools' table is out of sync with tool_definitions()"
+        );
+    }
+
+    #[test]
+    fn architecture_guide_lists_every_tool() {
+        let guide = repo_doc("docs/ARCHITECTURE_AND_ENGINEERING_GUIDE.md");
+        let served = advertised_tool_names();
+        let count = format!("exposing {} structured tools", served.len());
+        assert!(
+            guide.contains(&count),
+            "architecture guide should say \"{count}\" to match tool_definitions()"
+        );
+        for name in &served {
+            assert!(
+                guide.contains(&format!("`{name}`")),
+                "architecture guide does not mention MCP tool `{name}`"
+            );
+        }
+    }
 }
