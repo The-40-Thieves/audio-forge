@@ -281,6 +281,7 @@ impl Default for OpenSootheParams {
                     max: 12.0,
                 },
             )
+            .with_value_to_string(formatters::v2s_f32_rounded(2))
             .with_smoother(SmoothingStyle::Linear(20.0))
             .with_unit(" dB"),
             max_depth_db: FloatParam::new(
@@ -291,6 +292,7 @@ impl Default for OpenSootheParams {
                     max: 20.0,
                 },
             )
+            .with_value_to_string(formatters::v2s_f32_rounded(2))
             .with_smoother(SmoothingStyle::Linear(20.0))
             .with_unit(" dB"),
             sharpness_bins: IntParam::new(
@@ -306,6 +308,7 @@ impl Default for OpenSootheParams {
                 0.20,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
+            .with_value_to_string(formatters::v2s_f32_rounded(3))
             .with_smoother(SmoothingStyle::Linear(20.0)),
             enable_limiter: BoolParam::new("Enable -1.0 dBTP Brickwall", false),
             ceiling_dbtp: FloatParam::new(
@@ -316,6 +319,7 @@ impl Default for OpenSootheParams {
                     max: -0.1,
                 },
             )
+            .with_value_to_string(formatters::v2s_f32_rounded(2))
             .with_unit(" dBTP"),
             shared_bus_slot: IntParam::new(
                 "Shared Spectrum Bus Slot",
@@ -564,6 +568,7 @@ impl Default for OpenSpacerParams {
                 0.50,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
+            .with_value_to_string(formatters::v2s_f32_rounded(3))
             .with_smoother(SmoothingStyle::Linear(15.0)),
             max_cut_db: FloatParam::new(
                 "Max Carve Depth",
@@ -573,6 +578,7 @@ impl Default for OpenSpacerParams {
                     max: 18.0,
                 },
             )
+            .with_value_to_string(formatters::v2s_f32_rounded(2))
             .with_unit(" dB"),
             low_hz: FloatParam::new(
                 "Low Crossover",
@@ -583,6 +589,7 @@ impl Default for OpenSpacerParams {
                     factor: FloatRange::skew_factor(-1.5),
                 },
             )
+            .with_value_to_string(formatters::v2s_f32_rounded(2))
             .with_unit(" Hz"),
             high_hz: FloatParam::new(
                 "High Crossover",
@@ -593,6 +600,7 @@ impl Default for OpenSpacerParams {
                     factor: FloatRange::skew_factor(-1.5),
                 },
             )
+            .with_value_to_string(formatters::v2s_f32_rounded(2))
             .with_unit(" Hz"),
             kick_bass_mode: BoolParam::new("Kick -> Sub-Bass Mode (30-130 Hz)", false),
         }
@@ -803,12 +811,14 @@ impl Default for VocalSurgicalParams {
                 "Mouth De-Click",
                 0.65,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
-            ),
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(3)),
             deplosive_strength: FloatParam::new(
                 "Plosive Duck (<115Hz)",
                 0.75,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
-            ),
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(3)),
             deess_threshold_db: FloatParam::new(
                 "Split-Band De-Esser",
                 -22.0,
@@ -817,6 +827,7 @@ impl Default for VocalSurgicalParams {
                     max: 0.0,
                 },
             )
+            .with_value_to_string(formatters::v2s_f32_rounded(2))
             .with_unit(" dB"),
             breath_gate_db: FloatParam::new(
                 "Breath Gate Threshold",
@@ -826,6 +837,7 @@ impl Default for VocalSurgicalParams {
                     max: -20.0,
                 },
             )
+            .with_value_to_string(formatters::v2s_f32_rounded(2))
             .with_unit(" dB"),
         }
     }
@@ -1011,22 +1023,26 @@ impl Default for SubAndTapeParams {
                     max: 300.0,
                 },
             )
+            .with_value_to_string(formatters::v2s_f32_rounded(2))
             .with_unit(" Hz"),
             sub_reinforce: FloatParam::new(
                 "Sub Harmonic Reinforce",
                 0.25,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
-            ),
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(3)),
             stereo_width: FloatParam::new(
                 "High Stereo Width",
                 1.08,
                 FloatRange::Linear { min: 0.0, max: 2.0 },
-            ),
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(3)),
             tape_drive: FloatParam::new(
                 "Console8 / ChowTape RK4 Drive",
                 0.22,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
-            ),
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(3)),
         }
     }
 }
@@ -1205,6 +1221,7 @@ impl Default for MasterLimiterParams {
                     max: 18.0,
                 },
             )
+            .with_value_to_string(formatters::v2s_f32_rounded(2))
             .with_smoother(SmoothingStyle::Linear(15.0))
             .with_unit(" dB"),
             ceiling_dbtp: FloatParam::new(
@@ -1215,6 +1232,7 @@ impl Default for MasterLimiterParams {
                     max: -0.1,
                 },
             )
+            .with_value_to_string(formatters::v2s_f32_rounded(2))
             .with_unit(" dBTP"),
             release_ms: FloatParam::new(
                 "Release",
@@ -1224,6 +1242,7 @@ impl Default for MasterLimiterParams {
                     max: 400.0,
                 },
             )
+            .with_value_to_string(formatters::v2s_f32_rounded(2))
             .with_unit(" ms"),
         }
     }
@@ -1397,6 +1416,7 @@ impl Default for DrumTriggerParams {
                     max: -6.0,
                 },
             )
+            .with_value_to_string(formatters::v2s_f32_rounded(2))
             .with_unit(" dB"),
             expand_midi_chords: BoolParam::new("1-Finger MIDI -> Neo-Soul 9th Voicing", true),
         }
@@ -1490,58 +1510,20 @@ impl Plugin for ForgeDrumTriggerPlug {
         let thresh = f64::from(self.params.threshold_db.value());
         let expand_chords = self.params.expand_midi_chords.value();
 
-        // 1. Expand incoming 1-finger MIDI notes into rootless Neo-Soul 9th voicings (3, 7, 9, 13)
-        while let Some(event) = context.next_event() {
-            context.send_event(event);
-            if expand_chords {
-                match event {
-                    NoteEvent::NoteOn {
-                        timing,
-                        voice_id,
-                        channel,
-                        note,
-                        velocity,
-                    } => {
-                        for &interval in &[3_u8, 7, 10, 14] {
-                            let harm = note.saturating_add(interval);
-                            if harm <= 120 {
-                                context.send_event(NoteEvent::NoteOn {
-                                    timing,
-                                    voice_id,
-                                    channel,
-                                    note: harm,
-                                    velocity: (velocity * 0.82).clamp(0.1, 1.0),
-                                });
-                            }
-                        }
-                    }
-                    NoteEvent::NoteOff {
-                        timing,
-                        voice_id,
-                        channel,
-                        note,
-                        velocity,
-                    } => {
-                        for &interval in &[3_u8, 7, 10, 14] {
-                            let harm = note.saturating_add(interval);
-                            if harm <= 120 {
-                                context.send_event(NoteEvent::NoteOff {
-                                    timing,
-                                    voice_id,
-                                    channel,
-                                    note: harm,
-                                    velocity,
-                                });
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+        // Output events must be in non-decreasing timing order, so incoming MIDI (1) is forwarded
+        // in step with the audio-detected drum hits (2) rather than all up front.
+        let mut pending = context.next_event();
 
         // 2. Detect sub-sample Kick (C1=36), Snare (D1=38), and HiHat (F#1=42) transients from audio
         for (sample_idx, mut channel_samples) in buffer.iter_samples().enumerate() {
+            while let Some(event) = pending {
+                if event.timing() as usize > sample_idx {
+                    break;
+                }
+                Self::forward_event(context, event, expand_chords);
+                pending = context.next_event();
+            }
+
             let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
             let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
             self.analyzer.push_stereo_sample(in_l, in_r);
@@ -1559,10 +1541,73 @@ impl Plugin for ForgeDrumTriggerPlug {
                 });
             }
         }
+        // Events timed at or past the end of the block (should not happen, but never drop them).
+        while let Some(event) = pending {
+            Self::forward_event(context, event, expand_chords);
+            pending = context.next_event();
+        }
         self.telemetry
             .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &[0.0; 32]);
 
         ProcessStatus::Normal
+    }
+}
+
+impl ForgeDrumTriggerPlug {
+    /// Step 1: forwards an incoming event and, when enabled, expands 1-finger MIDI notes into
+    /// rootless Neo-Soul 9th voicings (3, 7, 9, 13) at the same timing.
+    fn forward_event(
+        context: &mut impl ProcessContext<Self>,
+        event: PluginNoteEvent<Self>,
+        expand_chords: bool,
+    ) {
+        context.send_event(event);
+        if !expand_chords {
+            return;
+        }
+        match event {
+            NoteEvent::NoteOn {
+                timing,
+                voice_id,
+                channel,
+                note,
+                velocity,
+            } => {
+                for &interval in &[3_u8, 7, 10, 14] {
+                    let harm = note.saturating_add(interval);
+                    if harm <= 120 {
+                        context.send_event(NoteEvent::NoteOn {
+                            timing,
+                            voice_id,
+                            channel,
+                            note: harm,
+                            velocity: (velocity * 0.82).clamp(0.1, 1.0),
+                        });
+                    }
+                }
+            }
+            NoteEvent::NoteOff {
+                timing,
+                voice_id,
+                channel,
+                note,
+                velocity,
+            } => {
+                for &interval in &[3_u8, 7, 10, 14] {
+                    let harm = note.saturating_add(interval);
+                    if harm <= 120 {
+                        context.send_event(NoteEvent::NoteOff {
+                            timing,
+                            voice_id,
+                            channel,
+                            note: harm,
+                            velocity,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1635,7 +1680,8 @@ impl Default for PhaseAndMatchParams {
                 "18-Band AI De-Harsh & Genre Target",
                 0.50,
                 FloatRange::Linear { min: 0.0, max: 1.5 },
-            ),
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(3)),
             genre_target_idx: IntParam::new(
                 "Genre Target (0=Pop,1=Trap,2=RnB,3=EDM,4=Rock,5=Jazz)",
                 0,
@@ -1863,6 +1909,7 @@ impl Default for SplitEqParams {
                     max: 12.0,
                 },
             )
+            .with_value_to_string(formatters::v2s_f32_rounded(2))
             .with_smoother(SmoothingStyle::Linear(15.0))
             .with_unit(" dB")
         };
@@ -2089,6 +2136,7 @@ impl Default for DensityClipperParams {
                 0.35,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
+            .with_value_to_string(formatters::v2s_f32_rounded(3))
             .with_smoother(SmoothingStyle::Linear(15.0)),
             clip_drive_db: FloatParam::new(
                 "3-Band 2x ADAA Clip Drive",
@@ -2098,6 +2146,7 @@ impl Default for DensityClipperParams {
                     max: 12.0,
                 },
             )
+            .with_value_to_string(formatters::v2s_f32_rounded(2))
             .with_smoother(SmoothingStyle::Linear(15.0))
             .with_unit(" dB"),
             ceiling_db: FloatParam::new(
@@ -2108,6 +2157,7 @@ impl Default for DensityClipperParams {
                     max: -0.1,
                 },
             )
+            .with_value_to_string(formatters::v2s_f32_rounded(2))
             .with_unit(" dB"),
         }
     }
@@ -2293,6 +2343,7 @@ impl Default for SpaceVerbAndPreampParams {
                 0.30,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
+            .with_value_to_string(formatters::v2s_f32_rounded(3))
             .with_smoother(SmoothingStyle::Linear(15.0)),
             reverb_decay: FloatParam::new(
                 "FDN Reverb Decay",
@@ -2301,7 +2352,8 @@ impl Default for SpaceVerbAndPreampParams {
                     min: 0.05,
                     max: 0.98,
                 },
-            ),
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(3)),
             reverb_damping: FloatParam::new(
                 "High-Frequency Damping",
                 0.40,
@@ -2309,22 +2361,26 @@ impl Default for SpaceVerbAndPreampParams {
                     min: 0.0,
                     max: 0.95,
                 },
-            ),
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(3)),
             shimmer_amount: FloatParam::new(
                 "+12 st Octave Shimmer",
                 0.15,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
-            ),
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(3)),
             vocal_ducking: FloatParam::new(
                 "Vocal Sidechain Ducking",
                 0.55,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
-            ),
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(3)),
             wet_mix: FloatParam::new(
                 "Reverb Wet Mix",
                 0.22,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
-            ),
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(3)),
         }
     }
 }
