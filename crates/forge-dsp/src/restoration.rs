@@ -428,3 +428,68 @@ pub fn run_full_restoration_chain(
 
     Ok(out)
 }
+
+#[cfg(test)]
+mod low_band_split_tests {
+    use super::LowBandSplit;
+    use std::f64::consts::PI;
+
+    fn noise(n: usize) -> impl Iterator<Item = f64> {
+        (0..n as u32).map(|i| f64::from(i.wrapping_mul(2_654_435_761) % 2_001) / 1_000.0 - 1.0)
+    }
+
+    #[test]
+    fn ducked_recombines_the_input_exactly_at_unity() {
+        let mut split = LowBandSplit::new(48_000.0, 110.0);
+        for x in noise(4_096) {
+            let s = split.process(x);
+            assert_eq!(s.ducked(1.0), s.input, "unity gain must return the input");
+            assert_eq!(
+                s.ducked(0.0),
+                s.input - s.low,
+                "zero gain must remove the low band"
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_input_is_sanitized_before_both_bands() {
+        let mut split = LowBandSplit::new(48_000.0, 110.0);
+        for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let s = split.process(x);
+            assert!(s.input.is_finite() && s.low.is_finite() && s.detect_high.is_finite());
+        }
+        // The filters keep working afterwards instead of being stuck at NaN.
+        let s = split.process(0.5);
+        assert!(s.low.is_finite() && s.detect_high.is_finite());
+    }
+
+    /// Steady-state peak of the low band and the detector band for a sine at `freq_hz`.
+    fn band_peaks(freq_hz: f64) -> (f64, f64) {
+        let sr = 48_000.0;
+        let mut split = LowBandSplit::new(sr, 110.0);
+        let (mut low, mut high) = (0.0_f64, 0.0_f64);
+        for i in 0..48_000 {
+            let s = split.process((2.0 * PI * freq_hz * f64::from(i) / sr).sin());
+            if i >= 24_000 {
+                low = low.max(s.low.abs());
+                high = high.max(s.detect_high.abs());
+            }
+        }
+        (low, high)
+    }
+
+    #[test]
+    fn low_band_and_detector_band_cover_opposite_ends() {
+        let (low, high) = band_peaks(30.0);
+        assert!(
+            low > 0.9 && high < 0.1,
+            "30 Hz: low {low:.3}, detector {high:.3}"
+        );
+        let (low, high) = band_peaks(5_000.0);
+        assert!(
+            low < 0.01 && high > 0.99,
+            "5 kHz: low {low:.3}, detector {high:.3}"
+        );
+    }
+}
