@@ -1159,6 +1159,7 @@ dependencies = [
  "proptest",
  "rosc",
  "serde",
+ "tempfile",
 ]
 
 [[package]]
