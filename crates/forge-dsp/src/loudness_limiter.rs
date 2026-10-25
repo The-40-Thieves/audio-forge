@@ -804,6 +804,13 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
     }
 }
 
+/// Lookahead window of the mastering limiters, in milliseconds. The README and the
+/// architecture guide quote this value; `tests/docs_consistency.rs` keeps them in sync.
+pub const LIMITER_LOOKAHEAD_MS: f64 = 3.0;
+
+/// Release time of the `normalize_and_limit` gain envelope, in milliseconds.
+pub const LIMITER_RELEASE_MS: f64 = 50.0;
+
 /// Masters an `AudioBuffer` to a target Integrated LUFS and strict True-Peak ceiling (`-1.0 dBTP`).
 pub fn normalize_and_limit(
     buffer: &AudioBuffer,
@@ -858,10 +865,10 @@ pub fn normalize_and_limit(
         }
     }
 
-    // 3ms lookahead window + smooth 50ms release envelope
+    // Lookahead window + smooth release envelope
     let sr = f64::from(out.sample_rate.max(1));
-    let lookahead = ((sr * 0.003).round() as usize).max(4);
-    let release_coeff = (-1.0 / (sr * 0.050)).exp();
+    let lookahead = ((sr * LIMITER_LOOKAHEAD_MS / 1000.0).round() as usize).max(4);
+    let release_coeff = (-1.0 / (sr * LIMITER_RELEASE_MS / 1000.0)).exp();
 
     let mut gain_env = vec![1.0_f64; frames];
     let mut current_gain = 1.0_f64;

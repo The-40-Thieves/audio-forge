@@ -2,7 +2,7 @@
 
 **Repository:** [`https://github.com/The-40-Thieves/audio-forge`](https://github.com/The-40-Thieves/audio-forge)  
 **License:** Apache-2.0  
-**Language & Stack:** Rust 2021 Edition (9 Workspace Crates) + `nih-plug` / `nih_plug_egui` (10 VST3 & CLAP Plugins) + REAPER 7.82 EEL2 `JSFX` & `.RPP` Engine + Hybrid GPU Sidecar (`uv` + PyTorch / Google Colab A100 / Google Lyria 3.5)
+**Language & Stack:** Rust 2024 Edition (9 Workspace Crates) + `nih-plug` / `nih_plug_egui` (10 VST3 & CLAP Plugins) + REAPER 7.82 EEL2 `JSFX` & `.RPP` Engine + Hybrid GPU Sidecar (`uv` + PyTorch / Google Colab A100 / Google Lyria 3.5)
 
 ---
 
@@ -93,7 +93,7 @@ flowchart TD
      - `Biquad`: Direct-Form II Transposed 64-bit biquad filter (`process_sample`, `lowpass`, `highpass`, `bandpass`, `notch`, `peaking_eq`, `low_shelf`, `high_shelf`, `k_weight_stage1`).
      - `audit_audio`: Implements the two-stage ITU-R BS.1770-4 K-weighting cascade (`+4.0 dB` head-diffraction high-shelf at `1681.97 Hz` followed by `38.13 Hz` RLB high-pass), `400 ms` overlapping blocks (`75%` overlap), `-70 LUFS` absolute gate, and `-10 LU` relative gate.
      - `compute_true_peak`: 4x polyphase FIR sinc interpolation to detect inter-sample peaks (`dBTP`) between discrete samples.
-     - `normalize_and_limit`: Lookahead (`5 ms` attack window) 4x True-Peak brickwall limiter with smooth two-stage release (`85 ms`), guaranteeing output never exceeds `-1.0 dBTP`.
+     - `normalize_and_limit`: Lookahead (`3 ms` attack window) 4x True-Peak brickwall limiter with a smooth `50 ms` release and a final true-peak trim, guaranteeing output never exceeds `-1.0 dBTP`.
   2. **`restoration.rs` — Surgical De-Click, De-Plosive, Hum Notch, Mid/Side, 18-Band Match EQ & Analog Tape:**
      - `remove_dc_and_declip`: High-pass DC removal (`15 Hz`) + cubic Hermite spline reconstruction across consecutive clipped samples (`|x| >= 0.998`).
      - `apply_hum_notch_cascade`: 10-harmonic high-$Q$ (`Q = 35..80`) notch cascade removing `50 Hz` or `60 Hz` powerline hum and buzz up to `600 Hz`.
@@ -191,7 +191,7 @@ flowchart TD
 
 ### 2.8 `forge-cli` & `forge-mcp` — Unified CLI Binary & JSON-RPC 2.0 MCP Agent Server
 - **`crates/forge-cli/src/main.rs` (`forge` binary):** Exposes 9 subcommands (`audit`, `restore`, `unmask`, `phase-align`, `vocal`, `theory`, `master`, `ingest`, `samples`) via `clap` derive macros.
-- **`crates/forge-mcp/src/main.rs` (`forge-mcp` binary):** Implements the Model Context Protocol (`protocolVersion: "2024-11-05"`) over `stdin`/`stdout` JSON-RPC 2.0, exposing 8 structured tools (`forge_audit_audio`, `forge_restore_and_defizz`, `forge_spectral_unmask`, `forge_phase_align`, `forge_vocal_suite`, `forge_music_theory_midi`, `forge_master_distrokid`, `forge_ingest_to_reaper`) to Claude Code, Antigravity, Cursor, or custom studio agents.
+- **`crates/forge-mcp/src/main.rs` (`forge-mcp` binary):** Implements the Model Context Protocol (`protocolVersion: "2024-11-05"`) over `stdin`/`stdout` JSON-RPC 2.0, exposing 9 structured tools (`forge_deliver`, `forge_audit_audio`, `forge_restore_and_defizz`, `forge_spectral_unmask`, `forge_phase_align`, `forge_vocal_suite`, `forge_music_theory_midi`, `forge_master_distrokid`, `forge_ingest_to_reaper`) to Claude Code, Antigravity, Cursor, or custom studio agents.
 
 ---
 
