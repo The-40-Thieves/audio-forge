@@ -93,6 +93,20 @@ fn unmask_rejects_a_ragged_target_instead_of_panicking() {
     }
 }
 
+#[test]
+fn unmask_rejects_a_ragged_target_whose_first_channel_is_empty() {
+    let target = AudioBuffer {
+        channels: vec![Vec::new(), vec![0.1; 2000]],
+        sample_rate: SR,
+    };
+    let sidechain = AudioBuffer::from_channels(vec![vec![0.1; 2000]], SR).unwrap();
+    let result = apply_spectral_unmask(&target, &sidechain, &UnmaskConfig::kick_over_bass());
+    match result {
+        Err(ForgeError::InvalidParameter(msg)) => assert!(msg.contains("Ragged"), "{msg}"),
+        other => panic!("expected a ragged-buffer error, got {other:?}"),
+    }
+}
+
 /// Restoration config with only the DC and de-clip stages enabled.
 fn dc_declip_only(remove_dc: bool, declip: bool) -> RestorationConfig {
     RestorationConfig {

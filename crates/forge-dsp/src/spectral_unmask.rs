@@ -240,10 +240,10 @@ pub fn apply_spectral_unmask(
         )));
     }
     let frames = target.num_frames();
+    check_equal_channel_lengths(target, frames)?;
     if frames == 0 {
         return Ok(target.clone());
     }
-    check_equal_channel_lengths(target, frames)?;
 
     let bands = UnmaskBands::resolve(config, f64::from(target.sample_rate.max(1)));
     let window = hann_window(FFT_SIZE);
