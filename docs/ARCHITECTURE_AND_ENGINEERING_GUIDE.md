@@ -165,8 +165,13 @@ flowchart TD
 ### 2.6 `forge-worker` — Hybrid AI Model Dispatcher (Local RTX GPU + Colab A100 + Lyria 3.5)
 - **Files:** `crates/forge-worker/src/lib.rs`, `python-worker/forge_gpu_worker.py`, `notebooks/ForgeAudio_Colab_A100_Worker.ipynb`
 - **Key Components:**
-  - `separate_stems`: Supports 4 backends (`WorkerBackend::Auto`, `LocalGpu`, `RemoteColab`, `PureRustDsp`).
-    - When `LocalGpu` is selected, spawns an ephemeral `uv run python-worker/forge_gpu_worker.py separate` subprocess running **`Mel-Band-RoFormer` (Kim Vocal)** + **`BS-RoFormer` De-Reverb**, writing stems to disk and exiting immediately so **0 MB of VRAM** remains occupied while mixing in REAPER.
+  - `separate_stems`: Supports 4 backends (`WorkerBackend::Auto`, `LocalGpu`, `RemoteColab`, `PureRustDsp`). `forge-mcp` and `forge-cli` build a `SeparationConfig::from_env()`:
+    - `FORGE_WORKER_BACKEND` picks the backend: `auto` (default), `local_gpu`, `colab` or `dsp`.
+    - `Auto` tries the local GPU worker, then the Colab worker when `FORGE_COLAB_WORKER_URL` is set, then the Rust DSP splitter. `LocalGpu` and `RemoteColab` fall back to the Rust DSP splitter if they fail.
+    - Every skipped or failed backend is logged to stderr with its reason. The returned `SeparationReport` names the backend that ran (`local_gpu`, `remote_colab` or `pure_rust_dsp`) and lists the fallback reasons; `forge_ingest_to_reaper` returns both as `stem_separation`.
+    - The local worker is an ephemeral `uv run --no-sync --project python-worker python-worker/forge_gpu_worker.py separate` subprocess running **`Mel-Band-RoFormer` (Kim Vocal)** + **`BS-RoFormer` De-Reverb**, writing stems to disk and exiting immediately so **0 MB of VRAM** remains occupied while mixing in REAPER. The script is found from `FORGE_GPU_WORKER_SCRIPT` or by searching upward from the executable's directory, never from the working directory. A run that exceeds `FORGE_GPU_WORKER_TIMEOUT_SECS` (default 900) has its process tree killed and is reported as a timeout.
+    - The Colab worker receives the input as base64 in `POST /api/v1/execute` (`task: separate_stems`) and returns base64 WAV stems, which are written to `colab_<stem>.wav`. Requests are limited by `FORGE_COLAB_TIMEOUT_SECS` (default 900).
+    - The Python worker picks each stem by the `_(<Stem>)_` tag that `audio-separator` writes, so the input file name cannot change which file is returned as the vocal.
     - When `PureRustDsp` (or fallback) runs, executes a `<80 ms`, 0-VRAM Mid/Side + 4th-order Linkwitz-Riley + transient-mask 4-stem separator (`Vocals`, `Drums`, `Bass`, `Other`).
   - `generate_music_lyria`: Native async Rust client calling Google DeepMind's `Lyria 3.5` (`lyria-3.5`) or `Lyria 3 Clip` via `https://generativelanguage.googleapis.com/v1beta/interactions` using `GEMINI_API_KEY`.
   - `index_drum_sample_library`: Scans local `.wav` drum sample folders and classifies every one-shot (`Kick`, `Snare`, `HiHat`) by `<120 Hz` sub-energy ratio, zero-crossing spectral centroid, and crest factor (`XLN Audio XO` / `Algonaut Atlas` equivalent).

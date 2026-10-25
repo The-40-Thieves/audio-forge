@@ -9,7 +9,7 @@
 
 mod sandbox;
 
-use forge_core::{AudioBuffer, ForgeError};
+use forge_core::{AudioBuffer, ForgeError, StemBundle};
 use forge_dsp::{
     DeFizzConfig, DeliveryOptions, DeliveryTarget, GenreTonalTarget, RestorationConfig, ToneMatch,
     UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw, apply_18_band_eq,
@@ -28,14 +28,14 @@ use forge_vocal::{
     PitchFrame, VocalScale, generate_vocal_harmony_stack, shift_vocal_pitch_formant_preserved,
     track_vocal_pitch,
 };
-use forge_worker::{WorkerBackend, separate_stems};
+use forge_worker::{SeparationConfig, separate_stems};
 use sandbox::PathSandbox;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::any::Any;
 use std::io::{self, BufRead, Write};
 use std::panic::{self, AssertUnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -756,7 +756,7 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
     std::fs::create_dir_all(&paths.stems_dir)?;
     std::fs::create_dir_all(&paths.midi_dir)?;
 
-    let bundle = separate_stems(&input, &paths.stems_dir, &WorkerBackend::Auto)?;
+    let (bundle, stem_separation) = separate_ingest_stems(&input, &paths.stems_dir)?;
     let vocal_pitch_frames = match bundle.vocals {
         Some(ref voc_path) => clean_ingested_vocal(&sandbox.check(voc_path)?, &scale)?,
         None => Vec::new(),
@@ -794,9 +794,21 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
             "checks": delivery.checks,
             "master_lufs": delivery.after.integrated_lufs,
             "master_true_peak_dbtp": delivery.after.true_peak_dbtp,
-            "ai_fizz_index": delivery.after.ai_fizz_index
+            "ai_fizz_index": delivery.after.ai_fizz_index,
+            "stem_separation": stem_separation
         }),
     })
+}
+
+/// Separates stems on the backend the environment selects (`FORGE_WORKER_BACKEND`) and
+/// returns them with `{"backend", "fallbacks"}` so callers can see which backend ran.
+fn separate_ingest_stems(
+    input: &Path,
+    stems_dir: &Path,
+) -> Result<(StemBundle, Value), ForgeError> {
+    let report = separate_stems(input, stems_dir, &SeparationConfig::from_env())?;
+    let info = json!({ "backend": report.backend, "fallbacks": report.fallbacks });
+    Ok((report.bundle, info))
 }
 
 /// Writes the drum-trigger MIDI (from `drum_buf`) and the voice-led chord MIDI.
