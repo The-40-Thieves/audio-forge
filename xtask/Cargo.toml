@@ -7,3 +7,6 @@ publish = false
 
 [dependencies]
 nih_plug_xtask.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
