@@ -91,7 +91,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff z3-solver
+      - run: pip install ruff==0.17.2 z3-solver==5.3.1.0
       - run: ruff check python-worker scripts
       - run: ruff format --check python-worker scripts
       - run: python scripts/verify_dsp_invariants_z3.py
