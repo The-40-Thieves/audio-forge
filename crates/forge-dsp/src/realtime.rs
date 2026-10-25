@@ -729,10 +729,29 @@ impl RealtimeVocalSurgical {
     }
 }
 
+/// Time constant of the mono-cutoff glide, in milliseconds.
+const MONO_CUTOFF_SMOOTHING_MS: f64 = 20.0;
+/// Samples between side high-pass coefficient updates while the cutoff glides.
+const MONO_CUTOFF_CONTROL_SAMPLES: u32 = 16;
+/// Once the glide is this close to the target (Hz), the target is applied exactly.
+const MONO_CUTOFF_SNAP_HZ: f64 = 0.01;
+/// Length of the crossfade into and out of the tape branch, in milliseconds.
+const TAPE_CROSSFADE_MS: f64 = 5.0;
+/// Tape drive at or below which the tape branch fades out and stops running.
+const TAPE_BYPASS_DRIVE: f64 = 0.001;
+
 /// Real-Time Zero-Latency **Sub-Bass Mono-Maker, Allpass Phase Disperser & ChowTape Jiles-Atherton Bus**.
+///
+/// The mono cutoff glides to each new target and the side high-passes are retuned in place every
+/// `MONO_CUTOFF_CONTROL_SAMPLES` samples while it moves, so their state survives a cutoff change.
+/// The tape branch crossfades in and out over `TAPE_CROSSFADE_MS`, and starts from cleared state
+/// each time it re-engages instead of from whatever it held when it was bypassed.
 pub struct RealtimeSubAndTapeBus {
     sample_rate: f64,
     mono_cutoff_hz: f64,
+    applied_cutoff_hz: f64,
+    cutoff_smoother: ParamSmoother,
+    cutoff_control_count: u32,
     side_hp1: Biquad,
     side_hp2: Biquad,
     sub_lp: Biquad,
@@ -746,6 +765,8 @@ pub struct RealtimeSubAndTapeBus {
     flutter_buf_r: [f64; 64],
     flutter_pos: usize,
     flutter_phase: f64,
+    tape_mix: f64,
+    tape_mix_step: f64,
     sub_phase_flip: f64,
     prev_sub_sample: f64,
 }
@@ -757,6 +778,9 @@ impl RealtimeSubAndTapeBus {
         Self {
             sample_rate: sr,
             mono_cutoff_hz: cutoff,
+            applied_cutoff_hz: cutoff,
+            cutoff_smoother: ParamSmoother::new(cutoff, sr, MONO_CUTOFF_SMOOTHING_MS),
+            cutoff_control_count: 0,
             side_hp1: Biquad::highpass(sr, cutoff, FRAC_1_SQRT_2),
             side_hp2: Biquad::highpass(sr, cutoff, FRAC_1_SQRT_2),
             sub_lp: Biquad::lowpass(sr, 95.0, FRAC_1_SQRT_2),
@@ -770,6 +794,9 @@ impl RealtimeSubAndTapeBus {
             flutter_buf_r: [0.0; 64],
             flutter_pos: 0,
             flutter_phase: 0.0,
+            // Starts fully wet so a freshly built bus behaves as before when the drive is on.
+            tape_mix: 1.0,
+            tape_mix_step: 1.0 / (TAPE_CROSSFADE_MS * 0.001 * sr).max(1.0),
             sub_phase_flip: 1.0,
             prev_sub_sample: 0.0,
         }
@@ -781,11 +808,40 @@ impl RealtimeSubAndTapeBus {
         *self = Self::new(sample_rate, self.mono_cutoff_hz);
     }
 
+    /// Sets the mono cutoff target. The side high-passes glide to it while processing, keeping
+    /// their state, so calling this every block with an unchanged value costs nothing.
     pub fn set_mono_cutoff(&mut self, mono_cutoff_hz: f64) {
-        let cutoff = mono_cutoff_hz.clamp(40.0, 350.0);
+        let cutoff = if mono_cutoff_hz.is_finite() {
+            mono_cutoff_hz.clamp(40.0, 350.0)
+        } else {
+            self.mono_cutoff_hz
+        };
         self.mono_cutoff_hz = cutoff;
-        self.side_hp1 = Biquad::highpass(self.sample_rate, cutoff, FRAC_1_SQRT_2);
-        self.side_hp2 = Biquad::highpass(self.sample_rate, cutoff, FRAC_1_SQRT_2);
+        self.cutoff_smoother.set_target(cutoff);
+    }
+
+    /// Advances the cutoff glide by one sample and retunes the side high-passes in place every
+    /// `MONO_CUTOFF_CONTROL_SAMPLES` samples, only when the applied cutoff would change.
+    #[inline]
+    fn advance_mono_cutoff(&mut self) {
+        let smoothed = self.cutoff_smoother.next_val();
+        self.cutoff_control_count += 1;
+        if self.cutoff_control_count < MONO_CUTOFF_CONTROL_SAMPLES {
+            return;
+        }
+        self.cutoff_control_count = 0;
+        let target = self.mono_cutoff_hz;
+        let next = if (smoothed - target).abs() < MONO_CUTOFF_SNAP_HZ {
+            target
+        } else {
+            smoothed
+        };
+        if (next - self.applied_cutoff_hz).abs() > f64::EPSILON {
+            self.applied_cutoff_hz = next;
+            let design = Biquad::highpass(self.sample_rate, next, FRAC_1_SQRT_2);
+            self.side_hp1.set_coeffs(&design);
+            self.side_hp2.set_coeffs(&design);
+        }
     }
 
     #[inline]
@@ -802,6 +858,7 @@ impl RealtimeSubAndTapeBus {
         let clean_sub = sanitize_param_f64(sub_reinforce, 0.25, 0.0, 1.0);
         let clean_width = sanitize_param_f64(stereo_width, 1.0, 0.0, 2.0);
         let amt = sanitize_param_f64(tape_drive, 0.2, 0.0, 1.0);
+        self.advance_mono_cutoff();
 
         // 1. Mid/Side decomposition & 4th-order Linkwitz-Riley <cutoff Side high-pass (Sub Mono-Maker)
         let mid = 0.5 * (l + r);
@@ -812,56 +869,103 @@ impl RealtimeSubAndTapeBus {
             * clean_width;
 
         // 2. Sub-harmonic & 2nd-harmonic bass reinforcement + Allpass Phase Disperser (diopser punch)
+        let reinforced_mid = mid + self.sub_octave(mid) * clean_sub * 0.35;
+        let disp_amt = clean_sub * 0.45;
+        let out_l = self.disperser_l.process_sample(
+            reinforced_mid + clean_side,
+            self.sample_rate,
+            135.0,
+            disp_amt,
+        );
+        let out_r = self.disperser_r.process_sample(
+            reinforced_mid - clean_side,
+            self.sample_rate,
+            135.0,
+            disp_amt,
+        );
+
+        // 3. ChowTape branch, crossfaded in and out around the bypass threshold
+        let (out_l, out_r) = self.tape_crossfade(out_l, out_r, amt);
+        (
+            flush_denormal_f64(out_l) as f32,
+            flush_denormal_f64(out_r) as f32,
+        )
+    }
+
+    /// Sub-octave plus 2nd-harmonic reinforcement signal derived from the mid channel.
+    #[inline]
+    fn sub_octave(&mut self, mid: f64) -> f64 {
         let sub_sig = self.sub_lp.process_sample(mid);
         if self.prev_sub_sample <= 0.0 && sub_sig > 0.0 {
             self.sub_phase_flip = -self.sub_phase_flip;
         }
         self.prev_sub_sample = flush_denormal_f64(sub_sig);
-        let sub_oct = sub_sig.abs() * self.sub_phase_flip * 0.45 + (sub_sig * 1.6).tanh() * 0.55;
-        let reinforced_mid = mid + sub_oct * clean_sub * 0.35;
+        sub_sig.abs() * self.sub_phase_flip * 0.45 + (sub_sig * 1.6).tanh() * 0.55
+    }
 
-        let mut out_l = self.disperser_l.process_sample(
-            reinforced_mid + clean_side,
-            self.sample_rate,
-            135.0,
-            clean_sub * 0.45,
-        );
-        let mut out_r = self.disperser_r.process_sample(
-            reinforced_mid - clean_side,
-            self.sample_rate,
-            135.0,
-            clean_sub * 0.45,
-        );
-
-        // 3. ChowTapeModel Jiles-Atherton RK4 Ferromagnetic Hysteresis + 72Hz TPT Head Bump + Tape Flutter
-        if amt > 0.001 {
-            let xl = self.head_bump_l.process_sample(out_l);
-            let xr = self.head_bump_r.process_sample(out_r);
-
-            let hyst_l = self.ja_hyst_l.process(xl, amt, 0.45 + 0.45 * amt);
-            let hyst_r = self.ja_hyst_r.process(xr, amt, 0.45 + 0.45 * amt);
-
-            // Subtle 5.8 Hz tape transport flutter fractional delay line
-            let w_pos = self.flutter_pos & 63;
-            self.flutter_buf_l[w_pos] = hyst_l;
-            self.flutter_buf_r[w_pos] = hyst_r;
-            self.flutter_phase = (self.flutter_phase + 5.8 / self.sample_rate).fract();
-            let delay_samps = 2.0 + 1.2 * amt * (2.0 * PI * self.flutter_phase).sin();
-            let d_int = delay_samps.floor() as usize;
-            let d_frac = delay_samps - (d_int as f64);
-            let r0 = (w_pos + 64 - d_int) & 63;
-            let r1 = (w_pos + 64 - (d_int + 1)) & 63;
-            let fl_l = self.flutter_buf_l[r0] * (1.0 - d_frac) + self.flutter_buf_l[r1] * d_frac;
-            let fl_r = self.flutter_buf_r[r0] * (1.0 - d_frac) + self.flutter_buf_r[r1] * d_frac;
-            self.flutter_pos = self.flutter_pos.wrapping_add(1);
-
-            out_l = (1.0 - amt * 0.60) * xl + (amt * 0.60) * fl_l;
-            out_r = (1.0 - amt * 0.60) * xr + (amt * 0.60) * fl_r;
+    /// Moves the tape wet mix one step toward on or off and blends the tape branch with the dry
+    /// signal. The branch only runs while the mix is above zero, and its state is cleared when it
+    /// re-engages from fully bypassed, so stale buffers never reach the output.
+    #[inline]
+    fn tape_crossfade(&mut self, dry_l: f64, dry_r: f64, amt: f64) -> (f64, f64) {
+        let engaged = amt > TAPE_BYPASS_DRIVE;
+        if !engaged && self.tape_mix <= 0.0 {
+            return (dry_l, dry_r);
         }
+        if engaged && self.tape_mix <= 0.0 {
+            self.clear_tape_state();
+        }
+        let step = if engaged {
+            self.tape_mix_step
+        } else {
+            -self.tape_mix_step
+        };
+        self.tape_mix = (self.tape_mix + step).clamp(0.0, 1.0);
+        let (wet_l, wet_r) = self.process_tape(dry_l, dry_r, amt);
+        (
+            dry_l + self.tape_mix * (wet_l - dry_l),
+            dry_r + self.tape_mix * (wet_r - dry_r),
+        )
+    }
+
+    /// Clears the head bump, hysteresis and flutter state of the tape branch.
+    fn clear_tape_state(&mut self) {
+        self.head_bump_l.reset();
+        self.head_bump_r.reset();
+        self.ja_hyst_l = JilesAthertonHysteresis::default();
+        self.ja_hyst_r = JilesAthertonHysteresis::default();
+        self.flutter_buf_l = [0.0; 64];
+        self.flutter_buf_r = [0.0; 64];
+        self.flutter_pos = 0;
+        self.flutter_phase = 0.0;
+    }
+
+    /// ChowTapeModel Jiles-Atherton RK4 Ferromagnetic Hysteresis + 72Hz TPT Head Bump + Tape Flutter.
+    #[inline]
+    fn process_tape(&mut self, in_l: f64, in_r: f64, amt: f64) -> (f64, f64) {
+        let xl = self.head_bump_l.process_sample(in_l);
+        let xr = self.head_bump_r.process_sample(in_r);
+
+        let hyst_l = self.ja_hyst_l.process(xl, amt, 0.45 + 0.45 * amt);
+        let hyst_r = self.ja_hyst_r.process(xr, amt, 0.45 + 0.45 * amt);
+
+        // Subtle 5.8 Hz tape transport flutter fractional delay line
+        let w_pos = self.flutter_pos & 63;
+        self.flutter_buf_l[w_pos] = hyst_l;
+        self.flutter_buf_r[w_pos] = hyst_r;
+        self.flutter_phase = (self.flutter_phase + 5.8 / self.sample_rate).fract();
+        let delay_samps = 2.0 + 1.2 * amt * (2.0 * PI * self.flutter_phase).sin();
+        let d_int = delay_samps.floor() as usize;
+        let d_frac = delay_samps - (d_int as f64);
+        let r0 = (w_pos + 64 - d_int) & 63;
+        let r1 = (w_pos + 64 - (d_int + 1)) & 63;
+        let fl_l = self.flutter_buf_l[r0] * (1.0 - d_frac) + self.flutter_buf_l[r1] * d_frac;
+        let fl_r = self.flutter_buf_r[r0] * (1.0 - d_frac) + self.flutter_buf_r[r1] * d_frac;
+        self.flutter_pos = self.flutter_pos.wrapping_add(1);
 
         (
-            flush_denormal_f64(out_l) as f32,
-            flush_denormal_f64(out_r) as f32,
+            (1.0 - amt * 0.60) * xl + (amt * 0.60) * fl_l,
+            (1.0 - amt * 0.60) * xr + (amt * 0.60) * fl_r,
         )
     }
 }
@@ -1195,12 +1299,27 @@ impl RealtimeMasterLimiter {
     }
 }
 
+/// Time constant of the 18-band gain glide, in milliseconds.
+const EQ18_GAIN_SMOOTHING_MS: f64 = 20.0;
+/// Samples between band coefficient updates while the gains glide.
+const EQ18_CONTROL_SAMPLES: u32 = 32;
+/// Once a band's glide is this close to its target (dB), the target is applied exactly.
+const EQ18_GAIN_SNAP_DB: f64 = 0.001;
+
 /// Real-Time **18-Band Mastering & Reference Match EQ** Bank.
+///
+/// `set_gains` only sets targets. While processing, each band glides toward its target and is
+/// retuned in place every `EQ18_CONTROL_SAMPLES` samples, keeping its filter state, so automating
+/// the amount or switching genre does not click. Bands already at their target are not recomputed.
 pub struct RealtimeMasteringEq18 {
     sample_rate: f64,
     bands_l: [Biquad; 18],
     bands_r: [Biquad; 18],
     current_gains_db: [f64; 18],
+    target_gains_db: [f64; 18],
+    glide_coeff: f64,
+    control_count: u32,
+    gliding: bool,
 }
 
 impl RealtimeMasteringEq18 {
@@ -1210,35 +1329,60 @@ impl RealtimeMasteringEq18 {
             std::array::from_fn(|i| Biquad::peaking_eq(sr, MASTERING_18_BANDS_HZ[i], 1.4, 0.0));
         let bands_r =
             std::array::from_fn(|i| Biquad::peaking_eq(sr, MASTERING_18_BANDS_HZ[i], 1.4, 0.0));
+        let tick_s = f64::from(EQ18_CONTROL_SAMPLES) / sr;
         Self {
             sample_rate: sr,
             bands_l,
             bands_r,
             current_gains_db: [0.0; 18],
+            target_gains_db: [0.0; 18],
+            glide_coeff: 1.0 - (-tick_s / (EQ18_GAIN_SMOOTHING_MS * 0.001)).exp(),
+            control_count: 0,
+            gliding: false,
         }
     }
 
+    /// Sets each band's target gain to `gains_db[i] * amount`, clamped to +/-15 dB.
     pub fn set_gains(&mut self, gains_db: &[f64; 18], amount: f64) {
         let amt = sanitize_param_f64(amount, 1.0, 0.0, 2.0);
-        for i in 0..18 {
-            let g_in = if gains_db[i].is_finite() {
-                gains_db[i]
-            } else {
-                0.0
-            };
-            let g = (g_in * amt).clamp(-15.0, 15.0);
-            if (g - self.current_gains_db[i]).abs() > 0.02 {
-                self.current_gains_db[i] = g;
-                self.bands_l[i] =
-                    Biquad::peaking_eq(self.sample_rate, MASTERING_18_BANDS_HZ[i], 1.4, g);
-                self.bands_r[i] =
-                    Biquad::peaking_eq(self.sample_rate, MASTERING_18_BANDS_HZ[i], 1.4, g);
-            }
+        for (target, &g_in) in self.target_gains_db.iter_mut().zip(gains_db) {
+            let g = if g_in.is_finite() { g_in } else { 0.0 };
+            *target = (g * amt).clamp(-15.0, 15.0);
         }
+        self.gliding = self.target_gains_db != self.current_gains_db;
+    }
+
+    /// Moves every band one control step toward its target and retunes the bands that moved.
+    fn glide_gains(&mut self) {
+        let mut still_gliding = false;
+        for (i, &band_hz) in MASTERING_18_BANDS_HZ.iter().enumerate() {
+            let diff = self.target_gains_db[i] - self.current_gains_db[i];
+            if diff == 0.0 {
+                continue;
+            }
+            let g = if diff.abs() < EQ18_GAIN_SNAP_DB {
+                self.target_gains_db[i]
+            } else {
+                still_gliding = true;
+                self.current_gains_db[i] + self.glide_coeff * diff
+            };
+            self.current_gains_db[i] = g;
+            let design = Biquad::peaking_eq(self.sample_rate, band_hz, 1.4, g);
+            self.bands_l[i].set_coeffs(&design);
+            self.bands_r[i].set_coeffs(&design);
+        }
+        self.gliding = still_gliding;
     }
 
     #[inline]
     pub fn process_stereo_sample(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
+        if self.gliding {
+            self.control_count += 1;
+            if self.control_count >= EQ18_CONTROL_SAMPLES {
+                self.control_count = 0;
+                self.glide_gains();
+            }
+        }
         let mut l = sanitize_sample_f32(in_l);
         let mut r = sanitize_sample_f32(in_r);
         for i in 0..18 {

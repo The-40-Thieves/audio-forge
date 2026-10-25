@@ -84,6 +84,17 @@ impl Biquad {
         self.z2 = 0.0;
     }
 
+    /// Copies the coefficients of `design` while keeping this filter's `z1`/`z2` state, so a
+    /// running filter can be retuned without the click that rebuilding it from scratch causes.
+    #[inline]
+    pub fn set_coeffs(&mut self, design: &Self) {
+        self.b0 = design.b0;
+        self.b1 = design.b1;
+        self.b2 = design.b2;
+        self.a1 = design.a1;
+        self.a2 = design.a2;
+    }
+
     #[inline]
     pub fn process_sample(&mut self, x_raw: f64) -> f64 {
         let x = sanitize_sample_f64(x_raw);

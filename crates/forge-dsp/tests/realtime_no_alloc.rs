@@ -110,3 +110,26 @@ fn other_realtime_processors_do_not_allocate() {
         drums.reset(96_000.0);
     });
 }
+
+#[test]
+fn retuning_and_bypass_paths_do_not_allocate() {
+    let mut tape = RealtimeSubAndTapeBus::new(48_000.0, 160.0);
+    let mut eq = RealtimeMasteringEq18::new(48_000.0);
+    let gains = [3.0; 18];
+    assert_no_allocs("tape/eq retuning and bypass", || {
+        for i in 0..FRAMES {
+            if i % 64 == 0 {
+                // Cutoff glide, EQ gain glide, and tape and disperser bypass then re-engage.
+                let block = i / 64;
+                tape.set_mono_cutoff(60.0 + 4.0 * block as f64);
+                eq.set_gains(&gains, if block % 2 == 0 { 1.5 } else { 0.0 });
+            }
+            let on = (i / 1024) % 2 == 0;
+            let (l, r) = signal(i);
+            let (sub, drive) = if on { (0.4, 0.5) } else { (0.0, 0.0) };
+            std::hint::black_box(tape.process_stereo_sample(l, r, sub, 1.06, drive));
+            std::hint::black_box(eq.process_stereo_sample(l, r));
+        }
+        tape.reset(96_000.0);
+    });
+}

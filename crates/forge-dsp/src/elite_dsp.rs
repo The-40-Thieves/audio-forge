@@ -1025,10 +1025,14 @@ impl JilesAthertonHysteresis {
 /// Satisfies exact unit magnitude response $|H(e^{j\omega})| \equiv 1.0$ across all frequencies
 /// while introducing non-linear group delay around `pinch_hz` (`40 Hz .. 1000 Hz`) to smear
 /// high crest-factor peaks and inject liquid sub-bass punch into kicks and 808s.
+///
+/// While `amount` is at or below the bypass threshold the stages do not run, so their state is
+/// cleared on entering bypass and the disperser re-engages from silence rather than stale state.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AllpassDisperser {
     x1: [f64; 8],
     y1: [f64; 8],
+    bypassed: bool,
 }
 
 impl AllpassDisperser {
@@ -1049,8 +1053,13 @@ impl AllpassDisperser {
         let amt = sanitize_param_f64(amount, 0.0, 0.0, 1.0);
         let x0 = sanitize_sample_f64(x_raw);
         if amt <= 1.0e-4 {
+            if !self.bypassed {
+                self.reset();
+                self.bypassed = true;
+            }
             return x0;
         }
+        self.bypassed = false;
         let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
         let f0 = sanitize_param_f64(pinch_hz, 140.0, 30.0, (sr * 0.45).max(30.0));
         let t = (PI * f0 / sr).tan();
