@@ -6,6 +6,10 @@ use super::{Context, Element, Lexer, Parse};
 
 /// Semitones above C for the letters `C D E F G A B`.
 const LETTER_SEMIS: [i32; 7] = [0, 2, 4, 5, 7, 9, 11];
+/// Body bytes that carry no pitch or timing: spacing (space, tab, backquote and `y`), line
+/// continuation `\`, the slur end `)`, and the one-letter decorations `.~HLMOPSTuv`.
+/// Any other unrecognised character is an error.
+const SKIPPED: &[u8] = b" \t`y\\).~HLMOPSTuv";
 
 pub(super) fn parse_body_line(
     ctx: &mut Context,
@@ -75,10 +79,16 @@ fn parse_note_or_rest(ctx: &mut Context, lx: &mut Lexer, out: &mut Vec<Element>)
                 len: f64::from(bars) * meter,
             });
         }
-        // Spacing, line continuation and one-letter decorations (`~`, `.`, `H`, `T`, ...)
-        _ => lx.bump(),
+        Some(byte) if SKIPPED.contains(&byte) => lx.bump(),
+        _ => return Err(unexpected_character(lx)),
     }
     Ok(())
+}
+
+/// Names the character at the cursor, which may start a multi-byte UTF-8 sequence.
+fn unexpected_character(lx: &Lexer) -> String {
+    let found = lx.text[lx.pos..].chars().next().unwrap_or(' ');
+    format!("unexpected character '{found}' in the music")
 }
 
 fn parse_quoted(lx: &mut Lexer, out: &mut Vec<Element>) -> Parse<()> {

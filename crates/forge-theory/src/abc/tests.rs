@@ -122,6 +122,28 @@ fn test_headers_decorations_annotations_and_voices_are_not_notes() {
 }
 
 #[test]
+fn test_unknown_body_characters_are_rejected() {
+    // Spacing, continuation, slur ends and one-letter decorations are still skipped.
+    assert_eq!(
+        pitches("C `D y E \\\n.F ~G HA (B c) uC vD\tE"),
+        [60, 62, 64, 65, 67, 69, 71, 72, 60, 62, 64]
+    );
+    let cases = [
+        (
+            "K:C\nC Q D",
+            "ABC line 2: unexpected character 'Q' in the music",
+        ),
+        ("C ; D", "ABC line 1: unexpected character ';'"),
+        ("C\nD é E", "ABC line 2: unexpected character 'é'"),
+        ("C # D", "unexpected character '#'"),
+    ];
+    for (abc, needle) in cases {
+        let err = parse_abc_score(abc, TPB).expect_err(abc).to_string();
+        assert!(err.contains(needle), "{abc:?}: {err}");
+    }
+}
+
+#[test]
 fn test_malformed_abc_is_rejected_with_the_line_number() {
     let cases = [
         ("C\n\"Dm9 C", "ABC line 2: unterminated quoted chord symbol"),
