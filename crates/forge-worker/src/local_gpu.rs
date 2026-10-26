@@ -245,7 +245,9 @@ mod tests {
             .arg(r#"sleep 60 & echo $! > "$1"; wait"#)
             .arg("sh")
             .arg(&pid_file);
-        let err = run_with_timeout(cmd, Duration::from_millis(500)).expect_err("timeout");
+        let Err(err) = run_with_timeout(cmd, Duration::from_millis(500)) else {
+            panic!("worker finished before the timeout");
+        };
         assert!(err.to_string().contains("timed out"), "{err}");
 
         let pid = std::fs::read_to_string(&pid_file).expect("pid file");
