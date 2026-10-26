@@ -223,6 +223,7 @@ mod tests {
                 colab_url: None,
                 local_timeout: Duration::from_secs(1),
                 http_timeout: Duration::from_secs(1),
+                require_neural: false,
             };
             let report = separate_stems(&input_wav, &stems_dir, &config).unwrap();
             prop_assert_eq!(report.backend, BackendUsed::PureRustDsp);

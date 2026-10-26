@@ -224,6 +224,10 @@ enum Commands {
         /// Optional 12-character ISO 3901 ISRC code
         #[arg(long)]
         isrc: Option<String>,
+        /// Fail instead of falling back to the DSP stem split when no GPU or Colab worker
+        /// produces stems (same as FORGE_WORKER_REQUIRE_NEURAL=1)
+        #[arg(long)]
+        require_neural: bool,
     },
 
     /// Install native ForgeAudio JSFX plugins into REAPER 7.82 or send live UDP OSC commands
@@ -601,6 +605,7 @@ async fn main() -> anyhow::Result<()> {
             scale,
             chords,
             isrc,
+            require_neural,
         } => {
             std::fs::create_dir_all(&output_dir)?;
             let stems_dir = output_dir.join("stems");
@@ -609,7 +614,10 @@ async fn main() -> anyhow::Result<()> {
             std::fs::create_dir_all(&midi_dir)?;
 
             // 1. Separate stems
-            let bundle = separate_stems(&input, &stems_dir, &SeparationConfig::from_env())?.bundle;
+            let mut config = SeparationConfig::from_env();
+            config.require_neural |= require_neural;
+            let separation = separate_stems(&input, &stems_dir, &config)?;
+            let bundle = separation.bundle;
 
             // 2. Clean & Spectral De-Fizz the Vocal and Instrumental stems
             let mut vocal_pitch_frames = Vec::new();
@@ -807,6 +815,10 @@ async fn main() -> anyhow::Result<()> {
             rpp.save_rpp(&rpp_path)?;
 
             println!("=== ForgeAudio 1-Command Studio Ingest Complete ===");
+            println!("Stem separation     : {}", separation.backend.as_str());
+            for reason in &separation.fallbacks {
+                println!("  fallback          : {reason}");
+            }
             println!("REAPER 7.82 Project : {}", rpp_path.display());
             println!("DistroKid Master WAV: {}", master_path.display());
             println!("ABC Lead Sheet      : {}", abc_path.display());

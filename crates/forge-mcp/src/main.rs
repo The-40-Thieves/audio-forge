@@ -384,7 +384,8 @@ fn tool_definitions() -> Vec<Value> {
                     "ceiling_dbtp": { "type": "number", "description": "Required when target is 'custom'" },
                     "bpm": { "type": "number", "default": 120.0 },
                     "scale": { "type": "string", "default": "D minor" },
-                    "chords": { "type": "string", "default": "Dm9 Bbmaj7 Gm9 A7b13" }
+                    "chords": { "type": "string", "default": "Dm9 Bbmaj7 Gm9 A7b13" },
+                    "require_neural": { "type": "boolean", "default": false, "description": "Fail instead of falling back to the DSP stem split when no GPU or Colab worker produces stems" }
                 },
                 "required": ["input", "output_dir"]
             }
@@ -768,7 +769,9 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
     sandbox.create_dir_all(&paths.output_dir)?;
     sandbox.create_dir_all(&paths.midi_dir)?;
 
-    let (bundle, stem_separation) = separate_ingest_stems(sandbox, &input, &paths.stems_dir)?;
+    let require_neural = bool_arg(args, "require_neural", false);
+    let (bundle, stem_separation) =
+        separate_ingest_stems(sandbox, &input, &paths.stems_dir, require_neural)?;
     let vocal_pitch_frames = ingest_vocal_frames(sandbox, bundle.vocals.as_deref(), &scale)?;
 
     let drum_buf = sandbox.load_audio(&sandbox.check(bundle.drums.as_ref().unwrap_or(&input))?)?;
@@ -817,8 +820,10 @@ fn separate_ingest_stems(
     sandbox: &PathSandbox,
     input: &Path,
     stems_dir: &Path,
+    require_neural: bool,
 ) -> Result<(StemBundle, Value), ForgeError> {
-    let config = SeparationConfig::from_env();
+    let mut config = SeparationConfig::from_env();
+    config.require_neural |= require_neural;
     let report = external::separate_stems_checked(sandbox, input, stems_dir, &config)?;
     let info = json!({ "backend": report.backend, "fallbacks": report.fallbacks });
     Ok((report.bundle, info))

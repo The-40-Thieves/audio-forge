@@ -21,6 +21,7 @@ fn config(backend: WorkerBackend) -> SeparationConfig {
         colab_url: None,
         local_timeout: Duration::from_secs(10),
         http_timeout: Duration::from_secs(10),
+        require_neural: false,
     }
 }
 
@@ -170,6 +171,30 @@ fn auto_reports_local_gpu_failure_and_falls_back_to_dsp() {
             .any(|r| r.starts_with("remote_colab skipped"))
     );
     assert!(report.bundle.vocals.as_ref().is_some_and(|p| p.exists()));
+}
+
+#[test]
+fn require_neural_fails_instead_of_falling_back_to_dsp() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(WorkerBackend::Auto);
+    cfg.require_neural = true;
+    cfg.local_worker = Some(LocalWorkerCommand {
+        program: "forge-no-such-gpu-worker".into(),
+        args: Vec::new(),
+    });
+    let stems = dir.path().join("stems");
+    let err = separate_stems(&write_mix(dir.path()), &stems, &cfg).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("local_gpu failed"), "{msg}");
+    assert!(msg.contains("remote_colab skipped"), "{msg}");
+    assert!(!stems.join("vocals.wav").exists(), "DSP stems were written");
+
+    let mut dsp_only = config(WorkerBackend::PureRustDsp);
+    dsp_only.require_neural = true;
+    let msg = separate_stems(&write_mix(dir.path()), &stems, &dsp_only)
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("pure_rust_dsp"), "{msg}");
 }
 
 #[test]
