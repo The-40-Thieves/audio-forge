@@ -129,8 +129,8 @@ flowchart TD
 ### 2.3 `forge-vocal` — YIN F0 Pitch Tracker, Sibilant Bypass & Levinson-Durbin LPC Formant Shifter
 - **File:** `crates/forge-vocal/src/lib.rs`
 - **Key Components:**
-  - `VocalScale`: Parses keys (`"D minor"`, `"F# major"`) into a 12-semitone pitch-class mask and computes continuous MIDI pitch quantization (`snap_midi`) and diatonic scale-degree transposition (`diatonic_shift_semitones`, e.g., `+2` degrees = diatonic 3rd above).
-  - `track_vocal_pitch`: Implements the **de Cheveigné & Kawahara (2002) YIN** cumulative mean normalized difference function $d'(\tau)$ on `20 ms` hops (`75 Hz` to `900 Hz` range) with threshold `0.15` to extract sub-semitone $F_0$ pitch contours without octave-jumping errors.
+  - `VocalScale`: Parses keys (`"D minor"`, `"F# major"`, `"Am"`, `"G mixolydian"`, `"A minor pentatonic"`; major, minor, the church modes, harmonic/melodic minor, pentatonic, blues and chromatic, with unknown modes rejected) into a 12-semitone pitch-class mask and computes continuous MIDI pitch quantization (`snap_midi`) and diatonic scale-degree transposition (`diatonic_shift_semitones`, e.g., `+2` degrees = diatonic 3rd above).
+  - `track_vocal_pitch`: Implements the **de Cheveigné & Kawahara (2002) YIN** cumulative mean normalized difference function $d'(\tau)$ on `20 ms` hops (`75 Hz` to `900 Hz` range). It takes the first dip below the `0.15` threshold, follows it to the bottom of the dip and refines the lag by parabolic interpolation, so synthetic sines and sawtooths at 44.1, 48 and 96 kHz track within 3 cents. Every lag compares samples centred on the analysis window, and each frame is timestamped at that centre.
   - `estimate_lpc_formant_tilt_db`: 10th-order **Levinson-Durbin recursion** solving the Toeplitz autocorrelation equations in $O(p^2)$ time to measure the vocal tract's spectral tilt and F1/F2 resonance balance.
   - `is_unvoiced_sibilant_frame`: Zero-Crossing Rate (`ZCR > 2200 Hz`) + first-difference HF energy detector that identifies unvoiced consonants and sibilants (`s`, `sh`, `t`, `k`, `f`, breath).
   - `shift_vocal_pitch_formant_preserved`: Combines **Melodyne 5-style Sibilant Separation** (keeping unvoiced consonants `100%` dry and unshifted so they never sound lispy) with dual-grain Hanning crossfade PSOLA pitch shifting on voiced vowels and LPC F1 (`650 Hz`) / F2 (`2150 Hz`) formant envelope restoration.
@@ -142,12 +142,12 @@ flowchart TD
 ### 2.4 `forge-theory` — Minimal-Motion Voice Leading, Neo-Soul Reharmonizer, Dilla Groove & MIDI/ABC
 - **File:** `crates/forge-theory/src/lib.rs`
 - **Key Components:**
-  - `parse_chord_symbol`: Parses 25+ jazz, pop, and cinematic chord qualities (`maj9`, `m11`, `13`, `7alt`, `7#9`, `m7b5`, `dim7`, `sus4`, etc.) into pitch-class intervals.
+  - `parse_chord_symbol` / `parse_chord`: Parses 25+ common jazz, pop, and cinematic chord qualities (`maj9`, `m11`, `13`, `7alt`, `7#9`, `m7b5`, `dim7`, `sus4`, etc.) into pitch-class intervals, and spells any other quality from its family, extension and modifiers (`maj7#11`, `7b5`, `9sus4`, `13b9`, `7(b9,#11)`, `6/9`). `parse_chord` also returns the slash bass (`C/E`). Unknown qualities and invalid slash basses are errors, not guesses.
   - `reharmonize_progression`: Upgrades plain triads/7ths into lush Neo-Soul / Jazz extended voicings (`Dm7 -> Dm9`, `G7 -> G13`, `Cmaj7 -> Cmaj9`).
   - `solve_voice_leading`: Splits harmony into a phase-pure Sub-Bass root track (`C2..B2`, MIDI `36..47`) and an upper-structure voicing (`C3..G5`) whose inversions are chosen to **minimize $L_1$ semitone distance** from the previous chord's pitch centroid. Supports `Close`, `Drop2`, `NeoSoulRootless` (3rd, 7th, 9th, 13th), and `CinematicSpread`.
   - `GrooveStyle`: Applies micro-timing pocket and velocity humanization (`NeoSoulDilla` lays back chords `+12 ticks` with `8-tick` upward finger strum; `MpcSwing58`; `AcousticStrum`).
   - `extract_drum_midi_triggers`: 3-band (`<130 Hz` Kick, `160–2500 Hz` Snare, `>4500 Hz` Hi-Hat) transient detector with `75 ms` debounce that converts audio drums into velocity-sensitive General MIDI Channel 10 triggers (`C1 = 36`, `D1 = 38`, `F#1 = 42` — `Slate Trigger 2` equivalent).
-  - `parse_abc_score`, `export_abc_score`, and `write_midi_file`: Bi-directional bridge between symbolic ABC notation (`YuE2-3B` / `SheetSage2` lead sheets) and multi-track Type-1 Standard MIDI Files (`.mid`) via `midly`.
+  - `parse_abc_score`, `export_abc_score`, and `write_midi_file`: Bi-directional bridge between symbolic ABC notation (`YuE2-3B` / `SheetSage2` lead sheets) and multi-track Type-1 Standard MIDI Files (`.mid`) via `midly`. The ABC reader (`crates/forge-theory/src/abc/`) applies `K:` keys and modes, `L:`/`M:` unit lengths, bar accidentals, fractional and multi-digit lengths, rests, ties, broken rhythm, tuplets and `[CEG]` chords, reads only the first voice, and returns an error naming the line for malformed input.
 
 ---
 
