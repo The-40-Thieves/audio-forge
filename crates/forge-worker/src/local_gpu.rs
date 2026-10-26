@@ -196,8 +196,10 @@ fn own_process_group(_cmd: &mut Command) {}
 
 #[cfg(unix)]
 fn kill_tree(child: &mut Child) {
+    // `--` ends option parsing: procps-ng `kill` otherwise reads `-<pgid>` as an option,
+    // exits 0 and leaves the group alive.
     let _ = Command::new("kill")
-        .args(["-KILL", &format!("-{}", child.id())])
+        .args(["-s", "KILL", "--", &format!("-{}", child.id())])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -220,4 +222,38 @@ fn kill_tree(child: &mut Child) {
 fn kill_tree(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn alive(pid: &str) -> bool {
+        Command::new("kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    #[test]
+    fn timeout_kills_the_workers_grandchildren() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("grandchild.pid");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(r#"sleep 60 & echo $! > "$1"; wait"#)
+            .arg("sh")
+            .arg(&pid_file);
+        let err = run_with_timeout(cmd, Duration::from_millis(500)).expect_err("timeout");
+        assert!(err.to_string().contains("timed out"), "{err}");
+
+        let pid = std::fs::read_to_string(&pid_file).expect("pid file");
+        let pid = pid.trim();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alive(pid), "grandchild {pid} survived the timeout");
+    }
 }
