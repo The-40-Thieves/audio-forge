@@ -103,11 +103,17 @@ mod tests {
     fn pre_tag_render_is_removed_when_a_check_fails_before_ffmpeg() {
         let root = tempfile::tempdir().expect("tempdir");
         let sandbox = PathSandbox::new([root.path().to_path_buf()]).expect("sandbox");
-        let tmp = root.path().join("master.pre_tag.wav");
+        // Checked before it exists, as the server does, so the path matches the canonical root.
+        let tmp = sandbox
+            .check(&root.path().join("master.pre_tag.wav"))
+            .expect("tmp");
         std::fs::write(&tmp, b"render").expect("write");
         // A regular file where the output's parent directory should be fails `create_dir_all`.
         std::fs::write(root.path().join("blocker"), b"").expect("write");
-        let out = root.path().join("blocker").join("master.wav");
+        let out = sandbox
+            .check(&root.path().join("blocker"))
+            .expect("out")
+            .join("master.wav");
 
         assert!(tag_master(&sandbox, &tmp, &out, &meta()).is_err());
         assert!(!tmp.exists(), "pre-tag render was left behind");
@@ -120,10 +126,15 @@ mod tests {
         let sandbox = PathSandbox::new([root.path().to_path_buf()]).expect("sandbox");
         let victim = root.path().join("victim.wav");
         std::fs::write(&victim, b"keep me").expect("write");
-        let tmp = root.path().join("master.pre_tag.wav");
+        let tmp = sandbox
+            .check(&root.path().join("master.pre_tag.wav"))
+            .expect("tmp");
         std::os::unix::fs::symlink(&victim, &tmp).expect("symlink");
         std::fs::write(root.path().join("blocker"), b"").expect("write");
-        let out = root.path().join("blocker").join("master.wav");
+        let out = sandbox
+            .check(&root.path().join("blocker"))
+            .expect("out")
+            .join("master.wav");
 
         assert!(tag_master(&sandbox, &tmp, &out, &meta()).is_err());
         assert!(
