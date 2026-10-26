@@ -208,9 +208,9 @@ impl Attempt<'_> {
     }
 }
 
-/// Separates an audio file into a 4/6-stem `StemBundle` (`Vocals`, `Drums`, `Bass`, `Other`).
-/// Uses `Mel-Band-RoFormer (Kim Vocal)` + `BS-RoFormer` when a GPU worker runs, otherwise
-/// the instant Pure-Rust Mid/Side + Linkwitz-Riley frequency/transient separation.
+/// Separates an audio file into a `StemBundle`. The local GPU and Colab workers return two
+/// stems (`Vocals` and `Other`, the instrumental); the Pure-Rust Mid/Side + Linkwitz-Riley
+/// fallback returns four (`Vocals`, `Drums`, `Bass`, `Other`).
 pub fn separate_stems(
     input_path: &Path,
     output_dir: &Path,

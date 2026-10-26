@@ -1,7 +1,7 @@
 [project]
 name = "forge-gpu-worker"
 version = "0.1.0"
-description = "Ephemeral PyTorch/ONNX GPU worker for ForgeAudio (Mel-Band-RoFormer, BS-RoFormer De-Reverb, Apollo, Seed-VC, SheetSage2, Basic Pitch, ACE-Step 1.5, YuE2-3B)"
+description = "Ephemeral PyTorch/ONNX GPU worker for ForgeAudio (Mel-Band-RoFormer vocal separation, BS-RoFormer de-reverb, remote YuE2-3B)"
 readme = "../README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
