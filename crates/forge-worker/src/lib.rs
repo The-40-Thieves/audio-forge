@@ -6,142 +6,22 @@
 //! - XO / Atlas-style Local Drum Sample Spectral Indexer & Matcher
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use base64::Engine as _;
-use forge_core::{AudioBuffer, ForgeError, Result, StemBundle};
+use forge_core::{AudioBuffer, ForgeError, Result};
 use forge_dsp::{Biquad, sanitize_sample_f64};
 use serde::{Deserialize, Serialize};
 
-/// Execution backend selection for neural separation, restoration, and generation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum WorkerBackend {
-    /// Automatically tries Remote Colab URL (if set), then local RTX GPU worker, then fast Rust DSP.
-    Auto,
-    /// Forces local ephemeral `uv` Python GPU worker (frees 100% VRAM immediately on exit).
-    LocalGpu,
-    /// Routes to a remote Google Colab A100/L4 worker endpoint.
-    RemoteColab { base_url: String },
-    /// Pure-Rust zero-dependency spectral/Mid-Side stem separator (instant, 0 VRAM).
-    PureRustDsp,
-}
+mod colab;
+mod dsp_split;
+mod local_gpu;
+mod routing;
 
-/// Separates an audio file into a 4/6-stem `StemBundle` (`Vocals`, `Drums`, `Bass`, `Other`).
-/// Uses `Mel-Band-RoFormer (Kim Vocal)` + `BS-RoFormer` when the GPU worker is invoked, or
-/// performs instant Pure-Rust Mid/Side + 4th-order Linkwitz-Riley frequency/transient separation.
-pub fn separate_stems(
-    input_path: &Path,
-    output_dir: &Path,
-    backend: &WorkerBackend,
-) -> Result<StemBundle> {
-    std::fs::create_dir_all(output_dir)?;
-
-    if matches!(backend, WorkerBackend::LocalGpu)
-        && let Ok(bundle) = invoke_local_python_separator(input_path, output_dir)
-    {
-        return Ok(bundle);
-    }
-
-    // Pure-Rust deterministic Mid/Side + Linkwitz-Riley stem decomposition (runs in <80ms, 0 MB VRAM)
-    let buf = AudioBuffer::load(input_path)?.to_stereo();
-    let sr = f64::from(buf.sample_rate.max(1));
-    let frames = buf.num_frames();
-
-    let mut vocals = AudioBuffer::new(2, frames, buf.sample_rate)?;
-    let mut bass = AudioBuffer::new(2, frames, buf.sample_rate)?;
-    let mut drums = AudioBuffer::new(2, frames, buf.sample_rate)?;
-    let mut other = AudioBuffer::new(2, frames, buf.sample_rate)?;
-
-    // Filters for Bass (<155 Hz), Vocal Center (220 Hz - 5.5 kHz Mid), and Instruments (Side + Highs)
-    let q_butterworth = std::f64::consts::FRAC_1_SQRT_2;
-    let mut bass_lp_l = Biquad::lowpass(sr, 155.0, q_butterworth);
-    let mut bass_lp_r = Biquad::lowpass(sr, 155.0, q_butterworth);
-    let mut voc_hp = Biquad::highpass(sr, 220.0, q_butterworth);
-    let mut voc_lp = Biquad::lowpass(sr, 5800.0, q_butterworth);
-
-    let mut env_fast = 0.0_f64;
-    let mut env_slow = 0.0_f64;
-
-    for i in 0..frames {
-        let l = sanitize_sample_f64(buf.channels[0][i]);
-        let r = sanitize_sample_f64(buf.channels[1][i]);
-        let mid = 0.5 * (l + r);
-        let side = 0.5 * (l - r);
-
-        // 1. Sub & Bass stem (<155 Hz)
-        let b_l = bass_lp_l.process_sample(l);
-        let b_r = bass_lp_r.process_sample(r);
-        bass.channels[0][i] = b_l;
-        bass.channels[1][i] = b_r;
-
-        let rem_l = l - b_l;
-        let rem_r = r - b_r;
-
-        // 2. Transient envelope detector for Percussive/Drum separation
-        let abs_m = mid.abs();
-        env_fast = 0.90 * env_fast + 0.10 * abs_m;
-        env_slow = 0.996 * env_slow + 0.004 * abs_m + 1e-7;
-        let transient_mask = ((env_fast / env_slow - 1.15) * 1.4).clamp(0.0, 1.0);
-
-        // 3. Center-panned harmonic vocal band
-        let v_mid =
-            voc_lp.process_sample(voc_hp.process_sample(mid)) * (1.0 - transient_mask * 0.7);
-        vocals.channels[0][i] = v_mid;
-        vocals.channels[1][i] = v_mid;
-
-        // 4. Percussive Drum stem
-        let d_l = rem_l * transient_mask;
-        let d_r = rem_r * transient_mask;
-        drums.channels[0][i] = d_l;
-        drums.channels[1][i] = d_r;
-
-        // 5. Residual Harmonic Instrumentation (Guitars/Keys/Synths + Stereo Side)
-        other.channels[0][i] = (rem_l - v_mid - d_l) + side * 0.35;
-        other.channels[1][i] = (rem_r - v_mid - d_r) - side * 0.35;
-    }
-
-    let vocals_path = output_dir.join("01_Vocals_Clean.wav");
-    let drums_path = output_dir.join("02_Drums_Stem.wav");
-    let bass_path = output_dir.join("03_Bass_Stem.wav");
-    let other_path = output_dir.join("04_Instruments_Other.wav");
-
-    vocals.save_wav(&vocals_path, 24)?;
-    drums.save_wav(&drums_path, 24)?;
-    bass.save_wav(&bass_path, 24)?;
-    other.save_wav(&other_path, 24)?;
-
-    Ok(StemBundle {
-        vocals: Some(vocals_path),
-        drums: Some(drums_path),
-        bass: Some(bass_path),
-        other: Some(other_path),
-        ..StemBundle::default()
-    })
-}
-
-fn invoke_local_python_separator(input_path: &Path, output_dir: &Path) -> Result<StemBundle> {
-    let status = Command::new("uv")
-        .args([
-            "run",
-            "python-worker/forge_gpu_worker.py",
-            "separate",
-            "--input",
-            &input_path.to_string_lossy(),
-            "--output-dir",
-            &output_dir.to_string_lossy(),
-        ])
-        .output()
-        .map_err(|e| ForgeError::WorkerError(format!("Failed to launch uv GPU worker: {e}")))?;
-
-    if !status.status.success() {
-        return Err(ForgeError::WorkerError(
-            String::from_utf8_lossy(&status.stderr).trim().to_string(),
-        ));
-    }
-    let parsed: StemBundle = serde_json::from_slice(&status.stdout)?;
-    Ok(parsed)
-}
+pub use local_gpu::{BUILD_SOURCE_ROOT, LocalWorkerCommand, resolve_worker_script};
+pub use routing::{
+    BackendUsed, SeparationConfig, SeparationReport, WorkerBackend, parse_backend, separate_stems,
+};
 
 /// Calls Google DeepMind `Lyria 3.5` (`lyria-3.5`) or `Lyria 3 Clip` (`lyria-3-clip-preview`)
 /// via the official Gemini `v1beta/interactions` endpoint to generate 44.1 kHz stereo WAV/MP3 audio.
@@ -337,7 +217,16 @@ mod tests {
             let buf = AudioBuffer::from_channels(vec![l, r], sr).unwrap();
             buf.save_wav(&input_wav, 24).unwrap();
 
-            let bundle = separate_stems(&input_wav, &stems_dir, &WorkerBackend::PureRustDsp).unwrap();
+            let config = SeparationConfig {
+                backend: WorkerBackend::PureRustDsp,
+                local_worker: None,
+                colab_url: None,
+                local_timeout: Duration::from_secs(1),
+                http_timeout: Duration::from_secs(1),
+            };
+            let report = separate_stems(&input_wav, &stems_dir, &config).unwrap();
+            prop_assert_eq!(report.backend, BackendUsed::PureRustDsp);
+            let bundle = report.bundle;
             prop_assert!(bundle.vocals.as_ref().unwrap().exists());
             prop_assert!(bundle.drums.as_ref().unwrap().exists());
             prop_assert!(bundle.bass.as_ref().unwrap().exists());

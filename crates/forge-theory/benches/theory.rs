@@ -59,7 +59,7 @@ fn abc_export_and_parse(bencher: Bencher) {
     let chords = progression(32);
     bencher.bench(|| {
         let abc = export_abc_score("Bench", "C", 92, black_box(&chords));
-        parse_abc_score(&abc, 480)
+        parse_abc_score(&abc, 480).expect("abc")
     });
 }
 

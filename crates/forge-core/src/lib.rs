@@ -1,9 +1,8 @@
 //! Core 64-bit planar audio buffer, studio telemetry contracts, and file I/O for ForgeAudio.
 
+use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -36,6 +35,15 @@ pub enum ForgeError {
 }
 
 pub type Result<T> = std::result::Result<T, ForgeError>;
+
+mod wav_io;
+
+fn open_for_read(path: &Path) -> Result<std::fs::File> {
+    std::fs::File::open(path).map_err(|e| ForgeError::AudioIo {
+        path: path.display().to_string(),
+        message: e.to_string(),
+    })
+}
 
 /// 64-bit double-precision planar studio audio buffer (`channels[ch][frame]`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +169,7 @@ impl AudioBuffer {
     }
 
     /// Loads an `AudioBuffer` from WAV natively or decodes FLAC/MP3/OGG/M4A/AIFF via FFmpeg.
+    /// Opens `path` and delegates to [`AudioBuffer::load_from_reader`].
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_ref = path.as_ref();
         if !path_ref.exists() {
@@ -169,93 +178,27 @@ impl AudioBuffer {
                 message: "File does not exist".to_string(),
             });
         }
-        let ext = path_ref
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-
-        if ext == "wav"
-            && let Ok(buf) = Self::load_wav(path_ref)
-        {
-            return Ok(buf);
-        }
-
-        // Fallback to FFmpeg decoding into a temporary 32-bit float WAV
-        let tmp = tempfile::Builder::new()
-            .prefix("forge_decode_")
-            .suffix(".wav")
-            .tempfile()?;
-        let status = Command::new("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                &path_ref.to_string_lossy(),
-                "-c:a",
-                "pcm_f32le",
-                &tmp.path().to_string_lossy(),
-            ])
-            .output()
-            .map_err(|e| ForgeError::AudioIo {
-                path: path_ref.display().to_string(),
-                message: format!("Failed to invoke ffmpeg decoder: {e}"),
-            })?;
-
-        if !status.status.success() {
-            return Err(ForgeError::AudioIo {
-                path: path_ref.display().to_string(),
-                message: String::from_utf8_lossy(&status.stderr).trim().to_string(),
-            });
-        }
-
-        Self::load_wav(tmp.path())
+        let file = open_for_read(path_ref)?;
+        Self::load_from_reader(file, path_ref)
     }
 
     /// Native WAV loader supporting 8/16/24/32-bit PCM and 32-bit IEEE float.
+    ///
+    /// Every returned channel has the same length. A file whose sample data does not end on a
+    /// whole frame is rejected with [`ForgeError::AudioIo`] rather than loaded as ragged channels:
+    /// `hound` already refuses a data chunk whose length is not a whole number of frames, and
+    /// the loader repeats that check itself so the invariant never depends on `hound`.
+    ///
+    /// Opens `path` and delegates to [`AudioBuffer::load_wav_from_reader`].
     pub fn load_wav<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_ref = path.as_ref();
-        let mut reader = WavReader::open(path_ref).map_err(|e| ForgeError::AudioIo {
-            path: path_ref.display().to_string(),
-            message: e.to_string(),
-        })?;
-        let spec = reader.spec();
-        let ch_count = usize::from(spec.channels.max(1));
-        let total_samples = reader.len() as usize;
-        let frames = total_samples / ch_count;
-        let mut channels = vec![Vec::with_capacity(frames); ch_count];
-
-        match (spec.sample_format, spec.bits_per_sample) {
-            (SampleFormat::Float, _) => {
-                for (idx, sample) in reader.samples::<f32>().enumerate() {
-                    let val = sample.map_err(|e| ForgeError::AudioIo {
-                        path: path_ref.display().to_string(),
-                        message: e.to_string(),
-                    })?;
-                    channels[idx % ch_count].push(f64::from(val));
-                }
-            }
-            (SampleFormat::Int, bits) => {
-                let scale = 1.0 / ((1_i64 << (bits.saturating_sub(1))) as f64);
-                for (idx, sample) in reader.samples::<i32>().enumerate() {
-                    let val = sample.map_err(|e| ForgeError::AudioIo {
-                        path: path_ref.display().to_string(),
-                        message: e.to_string(),
-                    })?;
-                    channels[idx % ch_count].push(f64::from(val) * scale);
-                }
-            }
-        }
-
-        Ok(Self {
-            channels,
-            sample_rate: spec.sample_rate,
-        })
+        let file = open_for_read(path_ref)?;
+        Self::load_wav_from_reader(BufReader::new(file), &path_ref.display().to_string())
     }
 
     /// Writes the `AudioBuffer` as a 24-bit PCM WAV file with TPDF dithering or 32-bit float WAV.
+    /// Creates `path` (and its parent directories) and delegates to
+    /// [`AudioBuffer::save_wav_to_writer`].
     pub fn save_wav<P: AsRef<Path>>(&self, path: P, bits_per_sample: u16) -> Result<()> {
         let path_ref = path.as_ref();
         if let Some(parent) = path_ref.parent()
@@ -263,108 +206,46 @@ impl AudioBuffer {
         {
             std::fs::create_dir_all(parent)?;
         }
-        let ch_count = self.num_channels();
-        let frames = self.num_frames();
-
-        let (sample_format, bits) = if bits_per_sample == 32 {
-            (SampleFormat::Float, 32)
-        } else if bits_per_sample == 16 {
-            (SampleFormat::Int, 16)
-        } else {
-            (SampleFormat::Int, 24)
-        };
-
-        let spec = WavSpec {
-            channels: ch_count as u16,
-            sample_rate: self.sample_rate,
-            bits_per_sample: bits,
-            sample_format,
-        };
-
-        let mut writer = WavWriter::create(path_ref, spec).map_err(|e| ForgeError::AudioIo {
-            path: path_ref.display().to_string(),
+        let origin = path_ref.display().to_string();
+        let file = std::fs::File::create(path_ref).map_err(|e| ForgeError::AudioIo {
+            path: origin.clone(),
             message: e.to_string(),
         })?;
-
-        // Deterministic high-quality PRNG for TPDF dither on integer exports
-        let mut rng_state: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut next_uniform = || -> f64 {
-            rng_state ^= rng_state >> 12;
-            rng_state ^= rng_state << 25;
-            rng_state ^= rng_state >> 27;
-            let u = rng_state.wrapping_mul(0x2545_F491_4F6C_DD1D);
-            (u >> 11) as f64 * (1.0 / ((1_u64 << 53) as f64)) - 0.5
-        };
-
-        let clean_unit = |x: f64| -> f64 {
-            if x.is_finite() {
-                x.clamp(-1.0, 1.0)
-            } else {
-                0.0
-            }
-        };
-
-        match (sample_format, bits) {
-            (SampleFormat::Float, _) => {
-                for f in 0..frames {
-                    for ch in 0..ch_count {
-                        let raw = self.channels[ch].get(f).copied().unwrap_or(0.0);
-                        let s = if raw.is_finite() {
-                            raw.clamp(-1.0e6, 1.0e6) as f32
-                        } else {
-                            0.0_f32
-                        };
-                        writer.write_sample(s).map_err(|e| ForgeError::AudioIo {
-                            path: path_ref.display().to_string(),
-                            message: e.to_string(),
-                        })?;
-                    }
-                }
-            }
-            (SampleFormat::Int, 16) => {
-                let scale = 32767.0_f64;
-                let mut err_state = vec![0.0_f64; ch_count];
-                for f in 0..frames {
-                    for (ch, err_prev) in err_state.iter_mut().enumerate().take(ch_count) {
-                        let raw = self.channels[ch].get(f).copied().unwrap_or(0.0);
-                        let tpdf = next_uniform() + next_uniform();
-                        let shaped = clean_unit(raw) * scale - 0.5 * (*err_prev);
-                        let q = (shaped + tpdf).round().clamp(-32768.0, 32767.0);
-                        *err_prev = (q - shaped).clamp(-1.5, 1.5);
-                        let s = q as i16;
-                        writer.write_sample(s).map_err(|e| ForgeError::AudioIo {
-                            path: path_ref.display().to_string(),
-                            message: e.to_string(),
-                        })?;
-                    }
-                }
-            }
-            (SampleFormat::Int, _) => {
-                let scale = 8_388_607.0_f64;
-                let mut err_state = vec![0.0_f64; ch_count];
-                for f in 0..frames {
-                    for (ch, err_prev) in err_state.iter_mut().enumerate().take(ch_count) {
-                        let raw = self.channels[ch].get(f).copied().unwrap_or(0.0);
-                        let tpdf = next_uniform() + next_uniform();
-                        let shaped = clean_unit(raw) * scale - 0.5 * (*err_prev);
-                        let q = (shaped + tpdf).round().clamp(-8_388_608.0, 8_388_607.0);
-                        *err_prev = (q - shaped).clamp(-1.5, 1.5);
-                        let s = q as i32;
-                        writer.write_sample(s).map_err(|e| ForgeError::AudioIo {
-                            path: path_ref.display().to_string(),
-                            message: e.to_string(),
-                        })?;
-                    }
-                }
-            }
-        }
-
-        writer.finalize().map_err(|e| ForgeError::AudioIo {
-            path: path_ref.display().to_string(),
-            message: e.to_string(),
-        })?;
-        Ok(())
+        self.save_wav_to_writer(BufWriter::new(file), bits_per_sample, &origin)
     }
+}
+
+/// Splits interleaved `samples` into `ch_count` planar channels of equal length.
+///
+/// Returns [`ForgeError::AudioIo`] for a decode error, or when the sample count is not a whole
+/// number of frames, so a truncated last frame can never produce ragged channels.
+pub(crate) fn deinterleave_whole_frames<I>(
+    samples: I,
+    ch_count: usize,
+    origin: &str,
+) -> Result<Vec<Vec<f64>>>
+where
+    I: Iterator<Item = std::result::Result<f64, hound::Error>>,
+{
+    let io_error = |message: String| ForgeError::AudioIo {
+        path: origin.to_string(),
+        message,
+    };
+    let ch_count = ch_count.max(1);
+    let frames_hint = samples.size_hint().0 / ch_count;
+    let mut channels = vec![Vec::with_capacity(frames_hint); ch_count];
+    let mut total = 0_usize;
+    for (idx, sample) in samples.enumerate() {
+        let val = sample.map_err(|e| io_error(e.to_string()))?;
+        channels[idx % ch_count].push(val);
+        total = idx + 1;
+    }
+    if !total.is_multiple_of(ch_count) {
+        return Err(io_error(format!(
+            "WAV data ends mid-frame: {total} samples is not a whole number of {ch_count}-channel frames"
+        )));
+    }
+    Ok(channels)
 }
 
 /// Comprehensive studio loudness, phase, electrical, and AI-artifact telemetry report.
@@ -490,5 +371,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Hand-built 16-bit PCM WAV: a valid RIFF/fmt header whose data chunk declares
+    /// `data_len_field` bytes and carries `data`.
+    fn pcm16_wav_bytes(channels: u16, data_len_field: u32, data: &[u8]) -> Vec<u8> {
+        let sample_rate = 48_000_u32;
+        let block_align = channels * 2;
+        let mut wav = Vec::new();
+        wav.extend_from_slice("RIFF".as_bytes());
+        wav.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        wav.extend_from_slice("WAVEfmt ".as_bytes());
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&channels.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
+        wav.extend_from_slice(&block_align.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice("data".as_bytes());
+        wav.extend_from_slice(&data_len_field.to_le_bytes());
+        wav.extend_from_slice(data);
+        wav
+    }
+
+    fn assert_load_wav_rejects(bytes: &[u8], expected_fragment: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("malformed.wav");
+        std::fs::write(&path, bytes).unwrap();
+        match AudioBuffer::load_wav(&path) {
+            Ok(buf) => {
+                let lens: Vec<usize> = buf.channels.iter().map(Vec::len).collect();
+                panic!("malformed WAV loaded with channel lengths {lens:?}");
+            }
+            Err(ForgeError::AudioIo { message, .. }) => assert!(
+                message.contains(expected_fragment),
+                "unexpected error message: {message}"
+            ),
+            Err(other) => panic!("expected AudioIo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_wav_rejects_data_chunk_that_is_not_whole_frames() {
+        // Stereo, 3 samples (6 bytes) = 1.5 frames. hound 3.5 refuses this at open time.
+        let bytes = pcm16_wav_bytes(2, 6, &[0, 16, 0, 32, 0, 48]);
+        assert_load_wav_rejects(&bytes, "invalid data chunk length");
+    }
+
+    #[test]
+    fn load_wav_rejects_file_truncated_mid_frame() {
+        // Header declares 2 stereo frames (8 bytes), but the file stops after 3 samples.
+        let bytes = pcm16_wav_bytes(2, 8, &[0, 16, 0, 32, 0, 48]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.wav");
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            AudioBuffer::load_wav(&path),
+            Err(ForgeError::AudioIo { .. })
+        ));
+    }
+
+    #[test]
+    fn deinterleave_rejects_a_partial_trailing_frame() {
+        let samples = [0.1, 0.2, 0.3, 0.4, 0.5].into_iter().map(Ok);
+        let err = deinterleave_whole_frames(samples, 2, "x.wav").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not a whole number of 2-channel frames"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn deinterleave_splits_whole_frames_into_equal_channels() {
+        let samples = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6].into_iter().map(Ok);
+        let channels = deinterleave_whole_frames(samples, 3, "x.wav").unwrap();
+        assert_eq!(
+            channels,
+            vec![vec![0.1, 0.4], vec![0.2, 0.5], vec![0.3, 0.6]]
+        );
     }
 }

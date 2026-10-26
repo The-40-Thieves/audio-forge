@@ -19,9 +19,13 @@ use crate::restoration::{
 };
 use crate::spectral_defizz::{DeFizzConfig, apply_spectral_defizz};
 
-/// Integrated loudness may land within this many LU of the target and still pass. The limiter
-/// can only reduce level, so dense material often lands slightly under the target.
+/// Default integrated-loudness tolerance, in LU, for targets whose spec does not set a tighter
+/// one. The limiter can only reduce level, so dense material often lands slightly under the
+/// target. See [`DeliveryTarget::loudness_tolerance_lu`] for the per-target value.
 pub const LOUDNESS_TOLERANCE_LU: f64 = 1.0;
+
+/// EBU R128 tolerance for programmes where an exact normalization target is practicable.
+pub const EBU_R128_LOUDNESS_TOLERANCE_LU: f64 = 0.5;
 
 /// Lowest sample rate accepted as a delivery master.
 pub const MIN_DELIVERY_SAMPLE_RATE: u32 = 44_100;
@@ -72,6 +76,16 @@ impl DeliveryTarget {
             Self::EbuR128 => -23.0,
             Self::AtscA85 => -24.0,
             Self::Custom { lufs, .. } => lufs,
+        }
+    }
+
+    /// How far, in LU, integrated loudness may land from [`Self::loudness_lufs`] and still pass.
+    /// EBU R128 allows +/- 0.5 LU where an exact target is practicable. The other targets keep
+    /// the default [`LOUDNESS_TOLERANCE_LU`].
+    pub fn loudness_tolerance_lu(self) -> f64 {
+        match self {
+            Self::EbuR128 => EBU_R128_LOUDNESS_TOLERANCE_LU,
+            _ => LOUDNESS_TOLERANCE_LU,
         }
     }
 
@@ -256,12 +270,13 @@ pub fn deliver(
 /// Checks an audit against a target's objective delivery requirements.
 pub fn delivery_checks(audit: &AuditReport, target: DeliveryTarget) -> Vec<DeliveryCheck> {
     let lufs_delta = audit.integrated_lufs - target.loudness_lufs();
+    let tolerance_lu = target.loudness_tolerance_lu();
     vec![
         DeliveryCheck {
             name: "integrated_loudness".to_string(),
-            passed: lufs_delta.abs() <= LOUDNESS_TOLERANCE_LU,
+            passed: lufs_delta.abs() <= tolerance_lu,
             detail: format!(
-                "{:.2} LUFS (target {:.1} +/- {LOUDNESS_TOLERANCE_LU:.1} LU)",
+                "{:.2} LUFS (target {:.1} +/- {tolerance_lu:.1} LU)",
                 audit.integrated_lufs,
                 target.loudness_lufs()
             ),
@@ -374,6 +389,32 @@ mod tests {
         assert!(report.before.true_peak_dbtp > -1.0);
         assert!(report.after.true_peak_dbtp <= -1.0, "{:#?}", report.checks);
         assert!(report.ready, "{:#?}", report.checks);
+    }
+
+    #[test]
+    fn ebu_r128_uses_its_half_lu_tolerance() {
+        let mut audit = audit_audio(&test_mix(0.05, 48_000));
+        audit.true_peak_dbtp = -6.0;
+        let loudness_passed = |audit: &AuditReport, target| {
+            delivery_checks(audit, target)
+                .into_iter()
+                .find(|c| c.name == "integrated_loudness")
+                .unwrap()
+                .passed
+        };
+
+        audit.integrated_lufs = -23.4;
+        assert!(loudness_passed(&audit, DeliveryTarget::EbuR128));
+        audit.integrated_lufs = -23.9;
+        assert!(!loudness_passed(&audit, DeliveryTarget::EbuR128));
+        audit.integrated_lufs = -22.4;
+        assert!(!loudness_passed(&audit, DeliveryTarget::EbuR128));
+
+        // Targets without a tighter spec keep +/- 1.0 LU.
+        audit.integrated_lufs = -14.9;
+        assert!(loudness_passed(&audit, DeliveryTarget::Spotify));
+        audit.integrated_lufs = -15.1;
+        assert!(!loudness_passed(&audit, DeliveryTarget::Spotify));
     }
 
     #[test]

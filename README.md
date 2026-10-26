@@ -131,8 +131,8 @@ These are independent implementations of well-known techniques. They are not clo
 | :--- | :--- | :--- | :--- |
 | Spectral de-fizz | 2048-point overlap-add STFT. Detects narrow resonances against a smoothed spectral envelope and attenuates them dynamically, with a capped depth. | oeksound Soothe | [`spectral_defizz.rs`](crates/forge-dsp/src/spectral_defizz.rs) and its unit test (suppresses a harsh whistle) |
 | Spectral unmask | Sidechain-keyed per-band attenuation of a target stem, in vocal (200 Hz to 7.5 kHz) or kick (30 to 130 Hz) mode. | Wavesfactory Trackspacer | [`spectral_unmask.rs`](crates/forge-dsp/src/spectral_unmask.rs), proptest totality |
-| Phase align | GCC-PHAT cross-correlation finds the delay and polarity between two stems. | Sound Radix Auto-Align | [`phase_align.rs`](crates/forge-dsp/src/phase_align.rs) and its unit test (recovers an exact delay and an inverted polarity) |
-| Vocal double align | MFCC features plus FastDTW. Emits REAPER stretch markers instead of rendering audio. | Synchro Arts VocAlign | [`phase_align.rs`](crates/forge-dsp/src/phase_align.rs) |
+| Phase align | GCC-PHAT cross-correlation over the highest-energy window finds the delay and polarity between two stems. The reported confidence is the energy-normalized correlation at that delay. | Sound Radix Auto-Align | [`phase_align.rs`](crates/forge-dsp/src/phase_align.rs) and its unit tests (exact delay and inverted polarity, a 2 s silent intro, confidence on uncorrelated noise) |
+| Vocal double align | 10 ms log-energy and zero-crossing features, aligned with banded (Sakoe-Chiba) DTW whose memory grows linearly with length. Renders the warped double (silent past the end of the dub) and emits REAPER stretch markers. | Synchro Arts VocAlign | [`dtw_align.rs`](crates/forge-dsp/src/dtw_align.rs) and its unit tests (a known stretch, a 10-minute memory bound, a shorter dub) |
 | Pitch and formant | YIN F0 tracking with a bypass for unvoiced consonants, LPC formant preservation, diatonic harmonies, and REAPER `<PITCHENV` output. | Melodyne, Auto-Tune | [`forge-vocal`](crates/forge-vocal/src/lib.rs): YIN unit test and proptests |
 | Restoration | DC removal, cubic Hermite de-clip, a 50/60 Hz hum notch across 10 harmonics, and vocal de-click, de-plosive and breath gate. | iZotope RX | [`restoration.rs`](crates/forge-dsp/src/restoration.rs), proptest totality |
 | Loudness and limiter | BS.1770-4 metering, then gain to target and a 3 ms lookahead true-peak limiter with a final true-peak trim. | FabFilter Pro-L, loudness meters | [`loudness_limiter.rs`](crates/forge-dsp/src/loudness_limiter.rs), EBU reference tests |
@@ -141,7 +141,7 @@ These are independent implementations of well-known techniques. They are not clo
 | Density and clipper | Upward low-level compression and a 3-band, 2x oversampled, first-order ADAA `tanh` clipper. | oeksound Bloom, multiband clippers | [`elite_dsp.rs`](crates/forge-dsp/src/elite_dsp.rs), ADAA proptests |
 | SpaceVerb and preamp | An 8x8 Walsh-Hadamard FDN reverb with ducking and shimmer, plus a small dilated causal WaveNet preamp model. | Valhalla reverbs, NAM-style amp modeling | [`elite_dsp.rs`](crates/forge-dsp/src/elite_dsp.rs), FDN decay and hysteresis proptests |
 | Music theory | A voice-leading solver, Neo-Soul and jazz reharmonization, Dilla/MPC micro-timing, audio-to-MIDI drum triggers, and ABC export. | Scaler, Slate Trigger | [`forge-theory`](crates/forge-theory/src/lib.rs): unit test and proptests |
-| Stem separation | Dispatches to a local or Colab GPU worker that runs Mel-Band-RoFormer. Not pure Rust; it needs the Python worker. | Stem-splitting services | [`forge-worker`](crates/forge-worker/), [`python-worker/`](python-worker/) |
+| Stem separation | Dispatches to a local or Colab GPU worker that runs Mel-Band-RoFormer (`FORGE_WORKER_BACKEND`, `FORGE_COLAB_WORKER_URL`). Without a worker it falls back to a basic Rust DSP band split and reports which backend ran. | Stem-splitting services | [`forge-worker`](crates/forge-worker/), [`python-worker/`](python-worker/) |
 
 ---
 
@@ -210,7 +210,7 @@ cargo run --package xtask -- install --all --release         # copy into system 
 
 | Package | What it does |
 | :--- | :--- |
-| `forge-opensoothe` | Dynamic spectral resonance suppressor (STFT, 1536-sample latency compensation, egui GUI) |
+| `forge-opensoothe` | Dynamic spectral resonance suppressor (STFT, 2048-sample latency plus the 3 ms limiter lookahead, egui GUI) |
 | `forge-openspacer` | Sidechain spectral unmasker (vocal over music, kick over bass) |
 | `forge-vocal-surgical` | Zero-latency de-click, plosive suppression below 115 Hz, split-band de-esser and breath gate |
 | `forge-submono-tape` | Linkwitz-Riley sub mono below 160 Hz, harmonic bass reinforcement, console and tape saturation |

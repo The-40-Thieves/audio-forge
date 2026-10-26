@@ -9,13 +9,18 @@ on:
   # performance analysis in order to generate initial data.
   workflow_dispatch:
 
+# Nothing in this workflow gets an OIDC token by default. Only the `codspeed`
+# job below asks for `id-token: write`, because CodSpeedHQ/action measures the
+# benchmarks and uploads the results in a single step and uses OIDC to
+# authenticate that upload. GitHub permissions can't be granted per step, so
+# the build (which runs every build script and proc macro in the dependency
+# graph) happens in a separate `build` job that has no OIDC access.
 permissions:
   contents: read
-  id-token: write # for OpenID Connect authentication with CodSpeed
 
 jobs:
-  codspeed:
-    name: Run benchmarks
+  build:
+    name: Build benchmarks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -29,6 +34,43 @@ jobs:
 
       - name: Build the benchmark target(s)
         run: cargo codspeed build -m simulation -p forge-dsp -p forge-vocal -p forge-theory
+
+      # upload-artifact drops the executable bit, so ship the binaries as a tarball.
+      - name: Pack the benchmark binaries
+        run: tar -cf codspeed-bins.tar target/codspeed
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: codspeed-bins
+          path: codspeed-bins.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  codspeed:
+    name: Run benchmarks
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # for OpenID Connect authentication with CodSpeed
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # `cargo codspeed run` needs cargo and cargo-codspeed, but builds nothing.
+      # No cache here, so this job never writes a cache entry.
+      - name: Setup rust toolchain and cargo-codspeed binary
+        uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3 # v1.3.0
+        with:
+          channel: stable
+          cache: false
+          bins: cargo-codspeed
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: codspeed-bins
+
+      - name: Unpack the benchmark binaries
+        run: tar -xf codspeed-bins.tar && rm codspeed-bins.tar
 
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@78102a468f96d8e0ccb92d0ec49425753fc42062 # v5.6.0

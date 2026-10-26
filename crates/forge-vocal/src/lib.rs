@@ -4,7 +4,7 @@
 //! - Chord-Aware Multi-Part Harmony Stack Generator (3rd above, 5th below, octave double)
 //! - Native REAPER Take Pitch Envelope (`<PITCHENV`) & `ReaPitch` curve compiler
 
-use forge_core::{AudioBuffer, Result};
+use forge_core::{AudioBuffer, ForgeError, Result};
 use forge_theory::parse_pitch_class;
 use serde::{Deserialize, Serialize};
 
@@ -31,51 +31,29 @@ pub struct VocalScale {
 }
 
 impl VocalScale {
-    /// Parses a scale descriptor such as `"D minor"`, `"C major"`, `"F# minor"`.
+    /// Parses a scale descriptor: a root note followed by an optional mode, written attached or
+    /// after a space (`"D minor"`, `"Am"`, `"F#m"`, `"F# dorian"`, `"A minor pentatonic"`, `"C"`).
+    ///
+    /// Modes: major/ionian, minor/aeolian, dorian, phrygian, lydian, mixolydian, locrian, harmonic
+    /// and melodic minor, major and minor pentatonic, blues and chromatic, with the usual
+    /// abbreviations (`m`, `min`, `maj`, `dor`, `mix`, `pent`, ...). Anything else is an error.
     pub fn parse(scale_str: &str) -> Result<Self> {
-        let parts: Vec<&str> = scale_str.split_whitespace().collect();
-        let root_token = parts.first().copied().unwrap_or("C");
-        let (root_pc, _) = parse_pitch_class(root_token)?;
-        let mode_str = parts
-            .get(1)
-            .copied()
-            .unwrap_or("major")
-            .to_ascii_lowercase();
-        let is_minor = mode_str.contains("min")
-            || mode_str == "m"
-            || mode_str.contains("aeolian")
-            || mode_str.contains("dorian");
-
+        let trimmed = scale_str.trim();
+        let (root_pc, mode) = parse_pitch_class(trimmed)
+            .map_err(|_| ForgeError::TheoryError(format!("Invalid scale root in '{trimmed}'")))?;
+        let intervals = scale_intervals(mode).ok_or_else(|| {
+            ForgeError::TheoryError(format!(
+                "Unknown scale mode '{}' in '{trimmed}'",
+                mode.trim()
+            ))
+        })?;
         let mut allowed_pcs = [false; 12];
-        if mode_str.contains("chrom") {
-            allowed_pcs = [true; 12];
-        } else if mode_str.contains("dorian") {
-            for &iv in &[0_u8, 2, 3, 5, 7, 9, 10] {
-                allowed_pcs[((root_pc + iv) % 12) as usize] = true;
-            }
-        } else if mode_str.contains("pent") {
-            let pent: [u8; 5] = if is_minor {
-                [0, 3, 5, 7, 10]
-            } else {
-                [0, 2, 4, 7, 9]
-            };
-            for &iv in &pent {
-                allowed_pcs[((root_pc + iv) % 12) as usize] = true;
-            }
-        } else {
-            let intervals: [u8; 7] = if is_minor {
-                [0, 2, 3, 5, 7, 8, 10]
-            } else {
-                [0, 2, 4, 5, 7, 9, 11]
-            };
-            for &iv in &intervals {
-                allowed_pcs[((root_pc + iv) % 12) as usize] = true;
-            }
+        for &iv in intervals {
+            allowed_pcs[usize::from((root_pc + iv) % 12)] = true;
         }
-
         Ok(Self {
             root_pc,
-            is_minor,
+            is_minor: intervals.contains(&3) && !intervals.contains(&4),
             allowed_pcs,
         })
     }
@@ -131,98 +109,221 @@ impl VocalScale {
     }
 }
 
-/// Extracts a 20ms-hop F0 pitch contour using normalized difference (YIN estimator) and computes
+const MAJOR: [u8; 7] = [0, 2, 4, 5, 7, 9, 11];
+const NATURAL_MINOR: [u8; 7] = [0, 2, 3, 5, 7, 8, 10];
+const DORIAN: [u8; 7] = [0, 2, 3, 5, 7, 9, 10];
+const PHRYGIAN: [u8; 7] = [0, 1, 3, 5, 7, 8, 10];
+const LYDIAN: [u8; 7] = [0, 2, 4, 6, 7, 9, 11];
+const MIXOLYDIAN: [u8; 7] = [0, 2, 4, 5, 7, 9, 10];
+const LOCRIAN: [u8; 7] = [0, 1, 3, 5, 6, 8, 10];
+const HARMONIC_MINOR: [u8; 7] = [0, 2, 3, 5, 7, 8, 11];
+const MELODIC_MINOR: [u8; 7] = [0, 2, 3, 5, 7, 9, 11];
+const MAJOR_PENTATONIC: [u8; 5] = [0, 2, 4, 7, 9];
+const MINOR_PENTATONIC: [u8; 5] = [0, 3, 5, 7, 10];
+const BLUES: [u8; 6] = [0, 3, 5, 6, 7, 10];
+const CHROMATIC: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+
+/// Maps the mode text after the root to scale intervals; word order does not matter.
+fn scale_intervals(mode: &str) -> Option<&'static [u8]> {
+    // `CM` is C major, so check the capital before folding case.
+    if mode.trim() == "M" {
+        return Some(&MAJOR);
+    }
+    let mut words = mode
+        .split_whitespace()
+        .map(canonical_scale_word)
+        .collect::<Option<Vec<_>>>()?;
+    words.sort_unstable();
+    SCALES
+        .iter()
+        .find(|(spelling, _)| *spelling == words.as_slice())
+        .map(|&(_, intervals)| intervals)
+}
+
+/// Canonical mode words, sorted, and the scale they name.
+const SCALES: [(&[&str], &[u8]); 16] = [
+    (&[], &MAJOR),
+    (&["major"], &MAJOR),
+    (&["minor"], &NATURAL_MINOR),
+    (&["dorian"], &DORIAN),
+    (&["phrygian"], &PHRYGIAN),
+    (&["lydian"], &LYDIAN),
+    (&["mixolydian"], &MIXOLYDIAN),
+    (&["locrian"], &LOCRIAN),
+    (&["harmonic", "minor"], &HARMONIC_MINOR),
+    (&["melodic", "minor"], &MELODIC_MINOR),
+    (&["pentatonic"], &MAJOR_PENTATONIC),
+    (&["major", "pentatonic"], &MAJOR_PENTATONIC),
+    (&["minor", "pentatonic"], &MINOR_PENTATONIC),
+    (&["blues"], &BLUES),
+    (&["blues", "minor"], &BLUES),
+    (&["chromatic"], &CHROMATIC),
+];
+
+fn canonical_scale_word(word: &str) -> Option<&'static str> {
+    Some(match word.to_ascii_lowercase().as_str() {
+        "maj" | "major" | "ion" | "ionian" => "major",
+        "m" | "min" | "minor" | "aeo" | "aeolian" => "minor",
+        "dor" | "dorian" => "dorian",
+        "phr" | "phrygian" => "phrygian",
+        "lyd" | "lydian" => "lydian",
+        "mix" | "mixolydian" => "mixolydian",
+        "loc" | "locrian" => "locrian",
+        "harm" | "harmonic" => "harmonic",
+        "mel" | "melodic" => "melodic",
+        "pent" | "pentatonic" => "pentatonic",
+        "blues" => "blues",
+        "chrom" | "chromatic" => "chromatic",
+        _ => return None,
+    })
+}
+
+/// YIN absolute threshold: the first dip of `d'(tau)` below it is taken as the period.
+const YIN_THRESHOLD: f64 = 0.15;
+/// A frame with no dip below the threshold is still voiced if its global minimum is below this.
+const YIN_VOICING_LIMIT: f64 = 0.35;
+const YIN_MIN_F0_HZ: f64 = 75.0;
+const YIN_MAX_F0_HZ: f64 = 900.0;
+/// Frames quieter than this RMS are treated as silence.
+const YIN_SILENCE_RMS: f64 = 0.012;
+
+/// Frame geometry and lag search range for one sample rate.
+struct Yin {
+    sr: f64,
+    hop: usize,
+    win: usize,
+    half: usize,
+    tau_min: usize,
+    tau_max: usize,
+}
+
+impl Yin {
+    fn new(sample_rate: u32) -> Self {
+        let sr = f64::from(sample_rate.max(1));
+        let hop = ((sr * 0.020).round() as usize).max(128);
+        let win = (hop * 2).max(512);
+        let half = win / 2;
+        Self {
+            sr,
+            hop,
+            win,
+            half,
+            tau_min: ((sr / YIN_MAX_F0_HZ).floor() as usize).max(8),
+            // `tau_max + 1` is still needed beside the integration window for interpolation.
+            tau_max: ((sr / YIN_MIN_F0_HZ).ceil() as usize).min(win - half - 1),
+        }
+    }
+
+    /// F0 of one window, or `None` when it is silent or unvoiced. `diff` and `cmnd` are scratch
+    /// buffers of length `tau_max + 2`.
+    fn estimate_f0(&self, slice: &[f64], diff: &mut [f64], cmnd: &mut [f64]) -> Option<f64> {
+        let rms = (slice.iter().map(|&x| x * x).sum::<f64>() / (slice.len() as f64)).sqrt();
+        if !rms.is_finite() || rms < YIN_SILENCE_RMS || self.tau_min >= self.tau_max {
+            return None;
+        }
+        centered_difference(slice, self.half, diff);
+        cumulative_mean_normalize(diff, cmnd);
+        let tau = pick_period(cmnd, self.tau_min, self.tau_max)?;
+        let refined = (tau as f64) + parabolic_offset(diff[tau - 1], diff[tau], diff[tau + 1]);
+        Some(self.sr / refined)
+    }
+}
+
+/// YIN difference function `d(tau)` for every lag in `1..diff.len()`. Each lag compares `half`
+/// sample pairs centred on the middle of `slice`, so every lag measures the same instant.
+fn centered_difference(slice: &[f64], half: usize, diff: &mut [f64]) {
+    diff[0] = 0.0;
+    for tau in 1..diff.len() {
+        let start = (slice.len() - half - tau) / 2;
+        let early = &slice[start..start + half];
+        let late = &slice[start + tau..start + tau + half];
+        diff[tau] = early.iter().zip(late).map(|(a, b)| (a - b) * (a - b)).sum();
+    }
+}
+
+/// YIN cumulative mean normalized difference `d'(tau)`, with `d'(0) = 1`.
+fn cumulative_mean_normalize(diff: &[f64], cmnd: &mut [f64]) {
+    cmnd[0] = 1.0;
+    let mut running_sum = 0.0_f64;
+    for tau in 1..diff.len() {
+        running_sum += diff[tau];
+        cmnd[tau] = if running_sum > 1e-12 {
+            diff[tau] * (tau as f64) / running_sum
+        } else {
+            1.0
+        };
+    }
+}
+
+/// The first lag whose `d'` dips below the threshold, followed down to the bottom of that dip.
+/// Without such a dip, the global minimum if it is low enough to call the frame voiced.
+fn pick_period(cmnd: &[f64], tau_min: usize, tau_max: usize) -> Option<usize> {
+    if let Some(mut tau) = (tau_min..=tau_max).find(|&t| cmnd[t] < YIN_THRESHOLD) {
+        while tau < tau_max && cmnd[tau + 1] < cmnd[tau] {
+            tau += 1;
+        }
+        return Some(tau);
+    }
+    let best = (tau_min..=tau_max).min_by(|&a, &b| cmnd[a].total_cmp(&cmnd[b]))?;
+    (cmnd[best] < YIN_VOICING_LIMIT).then_some(best)
+}
+
+/// Offset in lags of the vertex of the parabola through three evenly spaced points.
+fn parabolic_offset(left: f64, mid: f64, right: f64) -> f64 {
+    let curvature = left - 2.0 * mid + right;
+    if curvature > 0.0 {
+        (0.5 * (left - right) / curvature).clamp(-0.5, 0.5)
+    } else {
+        0.0
+    }
+}
+
+fn pitch_frame(time_secs: f64, f0_hz: f64, scale: &VocalScale, retune: f64) -> PitchFrame {
+    if f0_hz <= 0.0 {
+        return PitchFrame {
+            time_secs,
+            f0_hz: 0.0,
+            midi_pitch: 0.0,
+            target_midi_pitch: 0.0,
+            correction_semitones: 0.0,
+        };
+    }
+    let midi_pitch = 69.0 + 12.0 * (f0_hz / 440.0).log2();
+    let target_midi_pitch = scale.snap_midi(midi_pitch, retune);
+    PitchFrame {
+        time_secs,
+        f0_hz,
+        midi_pitch,
+        target_midi_pitch,
+        correction_semitones: (target_midi_pitch - midi_pitch).clamp(-6.0, 6.0),
+    }
+}
+
+/// Extracts a 20 ms-hop F0 contour (75 Hz to 900 Hz) with the YIN estimator and computes
 /// scale-locked pitch correction envelopes.
+///
+/// Each period is the first dip of the cumulative mean normalized difference below `0.15`,
+/// taken at the bottom of that dip and refined by parabolic interpolation, so the pitch is not
+/// quantized to whole-sample lags. `time_secs` is the centre of the analysis window, the instant
+/// every lag's comparisons are centred on. Silent and unvoiced frames have `f0_hz == 0.0`.
 pub fn track_vocal_pitch(
     buffer: &AudioBuffer,
     scale: &VocalScale,
     retune_strength: f64,
 ) -> Vec<PitchFrame> {
-    let sr = f64::from(buffer.sample_rate.max(1));
+    let yin = Yin::new(buffer.sample_rate);
     let mono = buffer.to_mono();
-    let n = mono.len();
-    let hop = ((sr * 0.020).round() as usize).max(128);
-    let win = (hop * 2).max(512);
-    let tau_min = ((sr / 900.0).floor() as usize).max(8); // Max F0 = 900 Hz
-    let tau_max = ((sr / 75.0).ceil() as usize).min(win / 2); // Min F0 = 75 Hz
-
+    let mut diff = vec![0.0_f64; yin.tau_max + 2];
+    let mut cmnd = vec![0.0_f64; yin.tau_max + 2];
     let mut frames = Vec::new();
     let mut pos = 0_usize;
-
-    while pos + win <= n {
-        let slice = &mono[pos..pos + win];
-        let time_secs = (pos as f64) / sr;
-        let rms = (slice.iter().map(|&x| x * x).sum::<f64>() / (win as f64)).sqrt();
-
-        if rms < 0.012 || tau_min >= tau_max {
-            frames.push(PitchFrame {
-                time_secs,
-                f0_hz: 0.0,
-                midi_pitch: 0.0,
-                target_midi_pitch: 0.0,
-                correction_semitones: 0.0,
-            });
-            pos += hop;
-            continue;
-        }
-
-        // YIN cumulative mean normalized difference function d'(tau)
-        let half = win / 2;
-        let mut d = vec![0.0_f64; tau_max + 1];
-        let mut running_sum = 0.0_f64;
-        for tau in 1..=tau_max {
-            let mut diff_sq = 0.0;
-            for i in 0..half {
-                let delta = slice[i] - slice[i + tau];
-                diff_sq += delta * delta;
-            }
-            running_sum += diff_sq;
-            d[tau] = if running_sum > 1e-12 {
-                diff_sq * (tau as f64) / running_sum
-            } else {
-                1.0
-            };
-        }
-
-        let mut best_tau = 0_usize;
-        let mut min_val = 1.0_f64;
-        for (tau, &d_val) in d.iter().enumerate().take(tau_max + 1).skip(tau_min) {
-            if d_val < min_val {
-                min_val = d_val;
-                best_tau = tau;
-            }
-            if d_val < 0.15 {
-                best_tau = tau;
-                min_val = d_val;
-                break;
-            }
-        }
-
-        if best_tau > 0 && min_val < 0.35 {
-            let f0_hz = sr / (best_tau as f64);
-            let midi_pitch = 69.0 + 12.0 * (f0_hz / 440.0).log2();
-            let target_midi_pitch = scale.snap_midi(midi_pitch, retune_strength);
-            let correction_semitones = (target_midi_pitch - midi_pitch).clamp(-6.0, 6.0);
-            frames.push(PitchFrame {
-                time_secs,
-                f0_hz,
-                midi_pitch,
-                target_midi_pitch,
-                correction_semitones,
-            });
-        } else {
-            frames.push(PitchFrame {
-                time_secs,
-                f0_hz: 0.0,
-                midi_pitch: 0.0,
-                target_midi_pitch: 0.0,
-                correction_semitones: 0.0,
-            });
-        }
-
-        pos += hop;
+    while pos + yin.win <= mono.len() {
+        let slice = &mono[pos..pos + yin.win];
+        let time_secs = ((pos as f64) + ((yin.win - 1) as f64) / 2.0) / yin.sr;
+        let f0_hz = yin.estimate_f0(slice, &mut diff, &mut cmnd).unwrap_or(0.0);
+        frames.push(pitch_frame(time_secs, f0_hz, scale, retune_strength));
+        pos += yin.hop;
     }
-
     frames
 }
 
@@ -526,7 +627,305 @@ mod tests {
         assert!(env.contains("PT "));
     }
 
+    const RATES: [u32; 3] = [44_100, 48_000, 96_000];
+    const PITCHES: [f64; 7] = [82.41, 110.0, 196.0, 261.63, 445.0, 659.26, 880.0];
+
+    /// Sum of `amp * sin(k * phase)` partials over a phase track, as a mono buffer.
+    fn additive(sr: u32, phase: &[f64], partials: &[(f64, f64)]) -> AudioBuffer {
+        let ch = phase
+            .iter()
+            .map(|&p| partials.iter().map(|&(k, a)| a * (k * p).sin()).sum())
+            .collect();
+        AudioBuffer::from_channels(vec![ch], sr).expect("valid")
+    }
+
+    /// Phase of a steady tone at `f0` Hz lasting `secs` seconds.
+    fn steady_phase(sr: u32, secs: f64, f0: f64) -> Vec<f64> {
+        let n = (f64::from(sr) * secs) as usize;
+        (0..n)
+            .map(|i| 2.0 * PI * f0 * (i as f64) / f64::from(sr))
+            .collect()
+    }
+
+    /// Band-limited sawtooth partials (`1/k`, below 0.45 * sr), scaled to roughly 0.5 peak.
+    fn sawtooth_partials(sr: u32, f0: f64) -> Vec<(f64, f64)> {
+        let top = (0.45 * f64::from(sr) / f0).floor() as usize;
+        (1..=top.max(1))
+            .map(|k| (k as f64, 0.3 / (k as f64)))
+            .collect()
+    }
+
+    fn cents(measured: f64, truth: f64) -> f64 {
+        1200.0 * (measured / truth).log2()
+    }
+
+    /// Largest cents error over the contour; panics if any frame is unvoiced.
+    fn worst_cents(buf: &AudioBuffer, f0: f64) -> f64 {
+        let scale = VocalScale::parse("C chromatic").expect("scale");
+        let contour = track_vocal_pitch(buf, &scale, 0.0);
+        assert!(contour.len() >= 5, "too few frames");
+        contour
+            .iter()
+            .map(|f| {
+                assert!(
+                    f.f0_hz > 0.0,
+                    "unvoiced frame at {} s for {f0} Hz",
+                    f.time_secs
+                );
+                cents(f.f0_hz, f0).abs()
+            })
+            .fold(0.0, f64::max)
+    }
+
+    fn assert_tracks_within(label: &str, f0: f64, partials: impl Fn(u32) -> Vec<(f64, f64)>) {
+        for sr in RATES {
+            let buf = additive(sr, &steady_phase(sr, 0.3, f0), &partials(sr));
+            let err = worst_cents(&buf, f0);
+            assert!(err <= 3.0, "{label} {f0} Hz @ {sr} Hz: {err:.2} cents off");
+        }
+    }
+
+    #[test]
+    fn test_yin_parabolic_offset_edge_cases() {
+        // Samples of (x - 0.3)^2 at -1, 0, 1 put the vertex at +0.3.
+        let p = |x: f64| (x - 0.3) * (x - 0.3);
+        assert!((parabolic_offset(p(-1.0), p(0.0), p(1.0)) - 0.3).abs() < 1e-12);
+        assert_eq!(parabolic_offset(1.0, 0.5, 1.0), 0.0, "symmetric dip");
+        assert_eq!(parabolic_offset(1.0, 1.0, 1.0), 0.0, "flat");
+        assert_eq!(parabolic_offset(0.0, 1.0, 0.0), 0.0, "peak, not a dip");
+        assert_eq!(parabolic_offset(f64::NAN, 0.0, 1.0), 0.0, "non-finite");
+        assert_eq!(
+            parabolic_offset(0.0, 0.0, 10.0),
+            -0.5,
+            "clamped to half a lag"
+        );
+    }
+
+    #[test]
+    fn test_yin_pick_period_threshold_and_fallback() {
+        // A dip below the threshold at lag 3 is followed down to its bottom at lag 4.
+        let dip = [1.0, 0.9, 0.5, 0.14, 0.05, 0.2, 0.01, 0.6];
+        assert_eq!(pick_period(&dip, 1, 7), Some(4));
+        // No dip below the threshold: the global minimum, if low enough to call voiced.
+        let shallow = [1.0, 0.9, 0.3, 0.25, 0.4, 0.2, 0.5];
+        assert_eq!(pick_period(&shallow, 1, 6), Some(5));
+        let unvoiced = [1.0, 0.9, 0.5, 0.4, 0.6];
+        assert_eq!(pick_period(&unvoiced, 1, 4), None);
+    }
+
+    #[test]
+    fn test_yin_non_finite_input_is_unvoiced() {
+        let scale = VocalScale::parse("C chromatic").expect("scale");
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut ch: Vec<f64> = steady_phase(48_000, 0.3, 220.0)
+                .iter()
+                .map(|p| 0.5 * p.sin())
+                .collect();
+            for s in ch.iter_mut().step_by(97) {
+                *s = bad;
+            }
+            let buf = AudioBuffer::from_channels(vec![ch], 48_000).expect("valid");
+            for f in track_vocal_pitch(&buf, &scale, 0.0) {
+                assert!(
+                    f.f0_hz.is_finite() && f.midi_pitch.is_finite(),
+                    "{bad}: {f:?}"
+                );
+            }
+        }
+    }
+
+    /// M15: descending to the dip and interpolating it puts pure sines within 3 cents.
+    #[test]
+    fn test_yin_pure_sines_within_3_cents_m15() {
+        for f0 in PITCHES {
+            assert_tracks_within("sine", f0, |_| vec![(1.0, 0.5)]);
+        }
+    }
+
+    /// M15: harmonic-rich sawtooths track the fundamental within 3 cents at every rate.
+    #[test]
+    fn test_yin_sawtooth_within_3_cents_m15() {
+        for f0 in PITCHES {
+            assert_tracks_within("sawtooth", f0, |sr| sawtooth_partials(sr, f0));
+        }
+    }
+
+    /// A tone with no energy at f0 (partials 2 to 6) still reports f0, not 2 * f0.
+    #[test]
+    fn test_yin_missing_fundamental_m15() {
+        for f0 in [110.0, 196.0, 261.63] {
+            assert_tracks_within("missing fundamental", f0, |_| {
+                (2..=6).map(|k| (f64::from(k), 0.12)).collect()
+            });
+        }
+    }
+
+    /// Octave traps: a dominant 2nd partial and a low sawtooth, whose dips at 2T, 3T, ... are as
+    /// deep as the one at T, must not jump an octave either way.
+    #[test]
+    fn test_yin_octave_traps_m15() {
+        for f0 in [98.0, 146.83, 220.0] {
+            assert_tracks_within("strong 2nd partial", f0, |_| vec![(1.0, 0.25), (2.0, 0.5)]);
+            assert_tracks_within("low sawtooth", f0, |sr| sawtooth_partials(sr, f0));
+        }
+    }
+
+    /// Silence, sub-gate signals and white noise give unvoiced frames and no envelope points.
+    #[test]
+    fn test_yin_silence_and_noise_are_unvoiced_m15() {
+        let scale = VocalScale::parse("A minor").expect("scale");
+        for sr in RATES {
+            let n = (f64::from(sr) * 0.3) as usize;
+            let mut state = 0x2545_F491_u32;
+            let noise: Vec<f64> = (0..n)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    (f64::from(state) / f64::from(u32::MAX)) - 0.5
+                })
+                .collect();
+            let quiet = additive(sr, &steady_phase(sr, 0.3, 220.0), &[(1.0, 0.005)]);
+            for (label, ch) in [
+                ("silence", vec![0.0; n]),
+                ("noise", noise),
+                ("quiet", quiet.channels[0].clone()),
+            ] {
+                let buf = AudioBuffer::from_channels(vec![ch], sr).expect("valid");
+                let contour = track_vocal_pitch(&buf, &scale, 1.0);
+                assert!(!contour.is_empty(), "{label} @ {sr}");
+                for f in &contour {
+                    assert_eq!(
+                        f.f0_hz, 0.0,
+                        "{label} @ {sr} Hz voiced at {} s",
+                        f.time_secs
+                    );
+                    assert_eq!(f.midi_pitch, 0.0, "{label} @ {sr}");
+                    assert_eq!(f.correction_semitones, 0.0, "{label} @ {sr}");
+                }
+                assert!(
+                    !compile_reaper_take_pitch_envelope(&contour).contains("PT "),
+                    "{label}"
+                );
+            }
+        }
+    }
+
+    /// M15: each frame is stamped where its pitch was measured. On a 2 octave/s glide the pitch
+    /// read back from a frame names the moment it was sung, within 1 ms of `time_secs`.
+    #[test]
+    fn test_yin_timestamps_match_glide_m15() {
+        const RATE_OCT_PER_SEC: f64 = 2.0;
+        const START_HZ: f64 = 150.0;
+        let scale = VocalScale::parse("C chromatic").expect("scale");
+        for sr in RATES {
+            let n = (f64::from(sr) * 0.6) as usize;
+            let k = RATE_OCT_PER_SEC * std::f64::consts::LN_2;
+            let phase: Vec<f64> = (0..n)
+                .map(|i| {
+                    let t = (i as f64) / f64::from(sr);
+                    2.0 * PI * START_HZ * ((k * t).exp() - 1.0) / k
+                })
+                .collect();
+            let buf = additive(sr, &phase, &[(1.0, 0.5)]);
+            let contour = track_vocal_pitch(&buf, &scale, 0.0);
+            assert!(contour.len() >= 10, "@ {sr}");
+            for f in &contour {
+                assert!(f.f0_hz > 0.0, "unvoiced at {} s @ {sr}", f.time_secs);
+                let sung_at = (f.f0_hz / START_HZ).log2() / RATE_OCT_PER_SEC;
+                let err_ms = (sung_at - f.time_secs) * 1000.0;
+                assert!(
+                    err_ms.abs() <= 1.0,
+                    "@ {sr} Hz frame {} s: {err_ms:.2} ms off",
+                    f.time_secs
+                );
+            }
+        }
+    }
+
+    fn mask(root: u8, intervals: &[u8]) -> [bool; 12] {
+        let mut allowed = [false; 12];
+        for &iv in intervals {
+            allowed[usize::from((root + iv) % 12)] = true;
+        }
+        allowed
+    }
+
+    /// M14: the mode after the root is read, attached or not, and never silently dropped.
+    #[test]
+    fn test_scale_modes_m14() {
+        let cases: &[(&str, u8, &[u8], bool)] = &[
+            ("Am", 9, &NATURAL_MINOR, true),
+            ("F#m", 6, &NATURAL_MINOR, true),
+            ("Bbmin", 10, &NATURAL_MINOR, true),
+            ("A minor pentatonic", 9, &MINOR_PENTATONIC, true),
+            ("A pentatonic minor", 9, &MINOR_PENTATONIC, true),
+            ("Am pent", 9, &MINOR_PENTATONIC, true),
+            ("C pentatonic", 0, &MAJOR_PENTATONIC, false),
+            ("G mixolydian", 7, &MIXOLYDIAN, false),
+            ("Gmix", 7, &MIXOLYDIAN, false),
+            ("F lydian", 5, &LYDIAN, false),
+            ("E phrygian", 4, &PHRYGIAN, true),
+            ("B locrian", 11, &LOCRIAN, true),
+            ("D Dorian", 2, &DORIAN, true),
+            ("A harmonic minor", 9, &HARMONIC_MINOR, true),
+            ("A melodic minor", 9, &MELODIC_MINOR, true),
+            ("E blues", 4, &BLUES, true),
+            ("C chromatic", 0, &CHROMATIC, false),
+            ("C", 0, &MAJOR, false),
+            ("CM", 0, &MAJOR, false),
+            ("Db major", 1, &MAJOR, false),
+            ("C# minor", 1, &NATURAL_MINOR, true),
+            ("  d minor  ", 2, &NATURAL_MINOR, true),
+        ];
+        for &(text, root, intervals, is_minor) in cases {
+            let scale = VocalScale::parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(scale.root_pc, root, "{text}");
+            assert_eq!(scale.allowed_pcs, mask(root, intervals), "{text}");
+            assert_eq!(scale.is_minor, is_minor, "{text}");
+        }
+    }
+
+    #[test]
+    fn test_malformed_scales_are_rejected() {
+        let cases = [
+            ("", "Invalid scale root"),
+            ("H minor", "Invalid scale root"),
+            ("A minorx", "Unknown scale mode 'minorx'"),
+            ("Ammm", "Unknown scale mode 'mmm'"),
+            ("A minor pentatonic blues", "Unknown scale mode"),
+            ("C majr", "Unknown scale mode 'majr'"),
+        ];
+        for (text, needle) in cases {
+            let err = VocalScale::parse(text).expect_err(text).to_string();
+            assert!(err.contains(needle), "{text}: {err}");
+        }
+    }
+
     proptest! {
+        /// Every mode spelling gives the same mask attached (`Amix`) or spaced (`A mix`).
+        #[test]
+        fn prop_scale_mode_spellings(
+            root in "[A-G][#b]?",
+            mode_idx in 0usize..8,
+            attached in any::<bool>(),
+        ) {
+            let modes: [(&str, &[u8]); 8] = [
+                ("m", &NATURAL_MINOR),
+                ("minor", &NATURAL_MINOR),
+                ("dorian", &DORIAN),
+                ("phrygian", &PHRYGIAN),
+                ("lydian", &LYDIAN),
+                ("mix", &MIXOLYDIAN),
+                ("locrian", &LOCRIAN),
+                ("minor pentatonic", &MINOR_PENTATONIC),
+            ];
+            let (mode, intervals) = modes[mode_idx];
+            let text = if attached { format!("{root}{mode}") } else { format!("{root} {mode}") };
+            let scale = VocalScale::parse(&text).unwrap();
+            prop_assert_eq!(scale.allowed_pcs, mask(scale.root_pc, intervals));
+        }
+
         #[test]
         fn prop_vocal_scale_snap_and_diatonic_shift_totality(
             arb_str in ".*",

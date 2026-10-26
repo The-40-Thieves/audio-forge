@@ -10,6 +10,7 @@
 //! - `cargo run --package xtask -- list`
 //!   Lists all 10 standalone VST3/CLAP plugins and their descriptions.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub const STANDALONE_PLUGINS: [(&str, &str); 10] = [
@@ -81,55 +82,126 @@ fn main() -> nih_plug_xtask::Result<()> {
             }
             Ok(())
         }
-        "install" => {
-            let is_release = args.iter().any(|a| a == "--release");
-            let install_all = args.iter().any(|a| a == "--all");
-            let custom_dest = args
-                .windows(2)
-                .find(|w| w[0] == "--dest")
-                .map(|w| PathBuf::from(&w[1]));
-
-            let targets: Vec<&str> = if install_all {
-                STANDALONE_PLUGINS.iter().map(|&(p, _)| p).collect()
-            } else if let Some(pkg_arg) = args.get(1) {
-                if pkg_arg.starts_with("--") {
-                    eprintln!(
-                        "Usage: cargo run --package xtask -- install <plugin-name|--all> [--release] [--dest <dir>]"
-                    );
-                    return Ok(());
-                }
-                vec![pkg_arg.as_str()]
-            } else {
-                eprintln!(
-                    "Usage: cargo run --package xtask -- install <plugin-name|--all> [--release] [--dest <dir>]"
-                );
-                return Ok(());
-            };
-
-            let (vst3_dir, clap_dir) = resolve_install_dirs(custom_dest.as_deref());
-            std::fs::create_dir_all(&vst3_dir)?;
-            std::fs::create_dir_all(&clap_dir)?;
-
-            for pkg in targets {
-                bundle_single_package(pkg, is_release)?;
-                let bundled_root = PathBuf::from("target").join("bundled");
-                let src_vst3 = bundled_root.join(format!("{pkg}.vst3"));
-                let src_clap = bundled_root.join(format!("{pkg}.clap"));
-
-                if src_vst3.exists() {
-                    let dst_vst3 = vst3_dir.join(format!("{pkg}.vst3"));
-                    copy_dir_recursive(&src_vst3, &dst_vst3)?;
-                    println!("Installed VST3 -> {}", dst_vst3.display());
-                }
-                if src_clap.exists() {
-                    let dst_clap = clap_dir.join(format!("{pkg}.clap"));
-                    std::fs::copy(&src_clap, &dst_clap)?;
-                    println!("Installed CLAP -> {}", dst_clap.display());
-                }
-            }
-            Ok(())
-        }
+        "install" => run_install(&args[1..]),
         _ => nih_plug_xtask::main_with_args("cargo xtask", args),
+    }
+}
+
+const INSTALL_USAGE: &str =
+    "Usage: cargo run --package xtask -- install <plugin-name|--all> [--release] [--dest <dir>]";
+
+/// A malformed `install` command line. Returned from `main`, so it exits nonzero.
+#[derive(Debug, PartialEq, Eq)]
+struct UsageError(String);
+
+impl fmt::Display for UsageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}
+{INSTALL_USAGE}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for UsageError {}
+
+/// Parsed arguments of the `install` subcommand.
+#[derive(Debug, PartialEq, Eq)]
+struct InstallArgs {
+    targets: Vec<String>,
+    is_release: bool,
+    dest: Option<PathBuf>,
+}
+
+/// Parses the arguments that follow `install`.
+///
+/// Exactly one of a plugin name or `--all` is required, `--dest` must be followed
+/// by a directory, and any other flag is rejected.
+fn parse_install_args(args: &[String]) -> Result<InstallArgs, UsageError> {
+    let mut is_release = false;
+    let mut install_all = false;
+    let mut dest = None;
+    let mut plugin: Option<&str> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--release" => is_release = true,
+            "--all" => install_all = true,
+            "--dest" => dest = Some(take_dest_value(iter.next())?),
+            flag if flag.starts_with("--") => {
+                return Err(UsageError(format!("unknown argument `{flag}`")));
+            }
+            name => plugin = Some(take_plugin_name(plugin, name)?),
+        }
+    }
+    let targets = resolve_targets(install_all, plugin)?;
+    Ok(InstallArgs {
+        targets,
+        is_release,
+        dest,
+    })
+}
+
+fn take_dest_value(value: Option<&String>) -> Result<PathBuf, UsageError> {
+    match value {
+        Some(dir) if !dir.is_empty() && !dir.starts_with("--") => Ok(PathBuf::from(dir)),
+        _ => Err(UsageError("`--dest` requires a directory".to_string())),
+    }
+}
+
+fn take_plugin_name<'a>(previous: Option<&str>, name: &'a str) -> Result<&'a str, UsageError> {
+    match previous {
+        Some(first) => Err(UsageError(format!(
+            "expected one plugin name, got `{first}` and `{name}`"
+        ))),
+        None => Ok(name),
+    }
+}
+
+fn resolve_targets(install_all: bool, plugin: Option<&str>) -> Result<Vec<String>, UsageError> {
+    match (install_all, plugin) {
+        (true, None) => Ok(STANDALONE_PLUGINS
+            .iter()
+            .map(|&(p, _)| p.to_string())
+            .collect()),
+        (false, Some(name)) => Ok(vec![name.to_string()]),
+        (true, Some(name)) => Err(UsageError(format!(
+            "`--all` cannot be combined with a plugin name (`{name}`)"
+        ))),
+        (false, None) => Err(UsageError("missing plugin name or `--all`".to_string())),
+    }
+}
+
+fn run_install(args: &[String]) -> nih_plug_xtask::Result<()> {
+    let install = parse_install_args(args)?;
+    let (vst3_dir, clap_dir) = resolve_install_dirs(install.dest.as_deref());
+    std::fs::create_dir_all(&vst3_dir)?;
+    std::fs::create_dir_all(&clap_dir)?;
+
+    let bundled_root = PathBuf::from("target").join("bundled");
+    for pkg in &install.targets {
+        bundle_single_package(pkg, install.is_release)?;
+        for (ext, dir) in [("vst3", &vst3_dir), ("clap", &clap_dir)] {
+            let src = bundled_root.join(format!("{pkg}.{ext}"));
+            if src.exists() {
+                let dst = dir.join(format!("{pkg}.{ext}"));
+                copy_bundle(&src, &dst)?;
+                println!("Installed {} -> {}", ext.to_uppercase(), dst.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Copies a plugin bundle, which is a directory on macOS (and for VST3 everywhere)
+/// but a single file for CLAP on Windows and Linux.
+fn copy_bundle(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if src.is_dir() {
+        copy_dir_recursive(src, dst)
+    } else {
+        std::fs::copy(src, dst).map(|_| ())
     }
 }
 
@@ -182,4 +254,157 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn repo_file(relative: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(relative);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    /// The `edition` set in `[workspace.package]` of the root `Cargo.toml`.
+    fn workspace_edition() -> String {
+        let manifest = repo_file("Cargo.toml");
+        let package = manifest
+            .split("[workspace.package]")
+            .nth(1)
+            .and_then(|rest| rest.split("\n[").next())
+            .expect("root Cargo.toml has a [workspace.package] table");
+        package
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("edition"))
+            .filter_map(|rest| rest.trim_start().strip_prefix('='))
+            .map(|value| value.trim().trim_matches('"').to_string())
+            .next()
+            .expect("[workspace.package] sets edition")
+    }
+
+    #[test]
+    fn docs_state_the_workspace_edition() {
+        let edition = workspace_edition();
+        let readme = repo_file("README.md");
+        let badge = format!("Rust-{edition}%20Edition");
+        assert!(
+            readme.contains(&badge),
+            "README.md badge should read \"{badge}\" to match Cargo.toml"
+        );
+        let guide = repo_file("docs/ARCHITECTURE_AND_ENGINEERING_GUIDE.md");
+        let stated = format!("Rust {edition} Edition");
+        assert!(
+            guide.contains(&stated),
+            "architecture guide should say \"{stated}\" to match Cargo.toml"
+        );
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn valid_install_call_parses() {
+        let parsed =
+            parse_install_args(&args(&["forge-spliteq", "--release", "--dest", "out"])).unwrap();
+        assert_eq!(
+            parsed,
+            InstallArgs {
+                targets: vec!["forge-spliteq".to_string()],
+                is_release: true,
+                dest: Some(PathBuf::from("out")),
+            }
+        );
+    }
+
+    #[test]
+    fn install_all_selects_every_standalone_plugin() {
+        let parsed = parse_install_args(&args(&["--all"])).unwrap();
+        assert_eq!(parsed.targets.len(), STANDALONE_PLUGINS.len());
+        assert!(!parsed.is_release);
+        assert_eq!(parsed.dest, None);
+    }
+
+    #[test]
+    fn missing_dest_value_is_an_error() {
+        let err = parse_install_args(&args(&["forge-spliteq", "--dest"])).unwrap_err();
+        assert!(err.0.contains("--dest"), "{err}");
+    }
+
+    #[test]
+    fn dest_followed_by_a_flag_is_an_error() {
+        let err = parse_install_args(&args(&["--all", "--dest", "--release"])).unwrap_err();
+        assert!(err.0.contains("--dest"), "{err}");
+    }
+
+    #[test]
+    fn unknown_argument_is_an_error() {
+        let err = parse_install_args(&args(&["forge-spliteq", "--relase"])).unwrap_err();
+        assert!(err.0.contains("--relase"), "{err}");
+    }
+
+    #[test]
+    fn missing_target_is_an_error() {
+        assert!(parse_install_args(&args(&["--release"])).is_err());
+        assert!(parse_install_args(&[]).is_err());
+    }
+
+    #[test]
+    fn all_together_with_a_plugin_name_is_an_error() {
+        assert!(parse_install_args(&args(&["--all", "forge-spliteq"])).is_err());
+        assert!(parse_install_args(&args(&["forge-spliteq", "--all"])).is_err());
+    }
+
+    #[test]
+    fn two_plugin_names_are_an_error() {
+        let err = parse_install_args(&args(&["forge-spliteq", "forge-opensoothe"])).unwrap_err();
+        assert!(
+            err.0.contains("forge-spliteq") && err.0.contains("forge-opensoothe"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn usage_error_fails_main_with_usage_text() {
+        let err: nih_plug_xtask::Result<()> = run_install(&args(&["--bogus"]));
+        let text = err.unwrap_err().to_string();
+        assert!(
+            text.contains("--bogus") && text.contains(INSTALL_USAGE),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn copy_bundle_copies_directory_bundles_recursively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("forge-test.clap");
+        let macos = src.join("Contents").join("MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        std::fs::write(src.join("Contents").join("Info.plist"), "plist").unwrap();
+        std::fs::write(macos.join("forge-test"), "binary").unwrap();
+
+        let dst = tmp.path().join("installed").join("forge-test.clap");
+        copy_bundle(&src, &dst).unwrap();
+
+        let copied = dst.join("Contents");
+        assert_eq!(
+            std::fs::read_to_string(copied.join("Info.plist")).unwrap(),
+            "plist"
+        );
+        let binary = copied.join("MacOS").join("forge-test");
+        assert_eq!(std::fs::read_to_string(binary).unwrap(), "binary");
+    }
+
+    #[test]
+    fn copy_bundle_copies_single_file_bundles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("forge-test.clap");
+        std::fs::write(&src, "clap").unwrap();
+        let dst = tmp.path().join("copy.clap");
+        copy_bundle(&src, &dst).unwrap();
+        assert_eq!(std::fs::read_to_string(dst).unwrap(), "clap");
+    }
 }
