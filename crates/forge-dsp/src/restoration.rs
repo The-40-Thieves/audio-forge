@@ -49,6 +49,12 @@ impl Default for RestorationConfig {
 
 /// Removes DC offset and reconstructs clipped plateaus via cubic Hermite interpolation.
 pub fn remove_dc_and_declip(buffer: &mut AudioBuffer, declip: bool) {
+    remove_dc_and_or_declip(buffer, true, declip);
+}
+
+/// Sanitizes every channel, then subtracts its mean only when `remove_dc` is set and repairs
+/// clipped plateaus only when `declip` is set, so each flag controls its own step.
+fn remove_dc_and_or_declip(buffer: &mut AudioBuffer, remove_dc: bool, declip: bool) {
     for ch in &mut buffer.channels {
         if ch.is_empty() {
             continue;
@@ -56,45 +62,51 @@ pub fn remove_dc_and_declip(buffer: &mut AudioBuffer, declip: bool) {
         for s in ch.iter_mut() {
             *s = sanitize_sample_f64(*s);
         }
-        let mean = ch.iter().sum::<f64>() / (ch.len() as f64);
-        for s in ch.iter_mut() {
-            *s -= mean;
-        }
-
-        if declip {
-            let n = ch.len();
-            let clip_thresh = 0.985_f64;
-            let mut i = 1_usize;
-            while i + 2 < n {
-                if ch[i].abs() >= clip_thresh {
-                    let start = i;
-                    while i + 1 < n && ch[i].abs() >= clip_thresh {
-                        i += 1;
-                    }
-                    let end = i;
-                    let span = end.saturating_sub(start);
-                    if (1..=64).contains(&span) && start >= 2 && end + 2 < n {
-                        let y0 = ch[start - 1];
-                        let y1 = ch[end];
-                        let m0 = y0 - ch[start - 2];
-                        let m1 = ch[end + 1] - y1;
-                        let steps = (span + 1) as f64;
-                        for k in 0..span {
-                            let t = ((k + 1) as f64) / steps;
-                            let t2 = t * t;
-                            let t3 = t2 * t;
-                            let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
-                            let h10 = t3 - 2.0 * t2 + t;
-                            let h01 = -2.0 * t3 + 3.0 * t2;
-                            let h11 = t3 - t2;
-                            let interp = h00 * y0 + h10 * m0 * 0.5 + h01 * y1 + h11 * m1 * 0.5;
-                            ch[start + k] = interp.clamp(-0.995, 0.995);
-                        }
-                    }
-                }
-                i += 1;
+        if remove_dc {
+            let mean = ch.iter().sum::<f64>() / (ch.len() as f64);
+            for s in ch.iter_mut() {
+                *s -= mean;
             }
         }
+        if declip {
+            declip_plateaus(ch);
+        }
+    }
+}
+
+/// Reconstructs runs of up to 64 clipped samples (`|x| >= 0.985`) via cubic Hermite interpolation.
+fn declip_plateaus(ch: &mut [f64]) {
+    let n = ch.len();
+    let clip_thresh = 0.985_f64;
+    let mut i = 1_usize;
+    while i + 2 < n {
+        if ch[i].abs() >= clip_thresh {
+            let start = i;
+            while i + 1 < n && ch[i].abs() >= clip_thresh {
+                i += 1;
+            }
+            let end = i;
+            let span = end.saturating_sub(start);
+            if (1..=64).contains(&span) && start >= 2 && end + 2 < n {
+                let y0 = ch[start - 1];
+                let y1 = ch[end];
+                let m0 = y0 - ch[start - 2];
+                let m1 = ch[end + 1] - y1;
+                let steps = (span + 1) as f64;
+                for k in 0..span {
+                    let t = ((k + 1) as f64) / steps;
+                    let t2 = t * t;
+                    let t3 = t2 * t;
+                    let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+                    let h10 = t3 - 2.0 * t2 + t;
+                    let h01 = -2.0 * t3 + 3.0 * t2;
+                    let h11 = t3 - t2;
+                    let interp = h00 * y0 + h10 * m0 * 0.5 + h01 * y1 + h11 * m1 * 0.5;
+                    ch[start + k] = interp.clamp(-0.995, 0.995);
+                }
+            }
+        }
+        i += 1;
     }
 }
 
@@ -401,7 +413,7 @@ pub fn run_full_restoration_chain(
     let mut out = buffer.clone();
 
     if config.remove_dc || config.declip {
-        remove_dc_and_declip(&mut out, config.declip);
+        remove_dc_and_or_declip(&mut out, config.remove_dc, config.declip);
     }
 
     if let Some(hum_hz) = config.hum_fundamental_hz {
