@@ -16,6 +16,7 @@ forge-theory = { path = "../forge-theory" }
 forge-vocal = { path = "../forge-vocal" }
 forge-reaper = { path = "../forge-reaper" }
 forge-worker = { path = "../forge-worker" }
+cap-std.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

@@ -347,6 +347,10 @@ Add the following entry to your MCP configuration (`mcp_config.json` or `.mcp.js
 ```
 `FORGE_MCP_ROOT` lists the directories the server may read and write (separated like `PATH`). If it is unset, the server's launch directory is used. Any tool path that resolves outside these roots, or contains `..`, is rejected before any file I/O.
 
+**MCP file-access security.** The path check runs when a request arrives; the I/O itself is anchored so a later swap cannot redirect it. At startup the server opens each root once as a `cap-std` directory handle (`crates/forge-mcp/src/sandbox.rs`). Every read, write, `mkdir` and remove then goes through that handle by root-relative path (`crates/forge-mcp/src/anchored.rs`), and `cap-std` refuses `..` and any symlink that leads out of the root. A directory or file that a local process swaps for an escaping symlink after the check therefore fails to open instead of being followed. `forge-mcp` opens the files itself and passes the handles to the reader/writer APIs of the library crates (`AudioBuffer::load_from_reader` / `save_wav_to_writer`, `write_midi_to_writer`, `ReaperProjectBuilder::write_rpp`). Non-WAV input is decoded by FFmpeg from a private copy of the opened file, never from the client path.
+
+Two steps still hand path names to code the server cannot anchor: ISRC tagging in `forge_master_distrokid` (FFmpeg writes the tagged master) and stem separation in `forge_ingest_to_reaper` (the worker reads the input and writes the stems). For these the server creates the directories through the root handle, re-checks every path immediately before the call, and afterwards opens every produced file through the root handle before reporting success (`crates/forge-mcp/src/external.rs`). A swap that lands inside that short window can still make the external step write outside the root; the call then fails. The threat model is a local process that already has write access inside the root; a tool argument alone cannot do this.
+
 ### Step 5: Optional GPU Sidecar Setup (`Mel-Band-RoFormer` / `Apollo` / `YuE2-3B`)
 ```bash
 cd python-worker

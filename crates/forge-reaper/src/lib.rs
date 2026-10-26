@@ -518,8 +518,9 @@ impl ReaperProjectBuilder {
     }
 
     /// Checks every track's media path as it will be written: resolved against `cwd`, so a
-    /// working directory that cannot be represented is caught too.
-    fn check_media_paths(&self, cwd: &Path) -> Result<()> {
+    /// working directory that cannot be represented is caught too. [`Self::save_rpp`] runs
+    /// this itself; callers that write through [`Self::write_rpp`] run it first.
+    pub fn check_media_paths(&self, cwd: &Path) -> Result<()> {
         for media in self.tracks.iter().filter_map(|tr| tr.file_path.as_deref()) {
             check_media_path(&media_path_under(cwd, media))?;
         }
@@ -536,8 +537,16 @@ impl ReaperProjectBuilder {
         {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(p, self.build_rpp_string())?;
+        self.write_rpp(std::fs::File::create(p)?)?;
         Ok(p.to_path_buf())
+    }
+
+    /// Writes the `.RPP` project text to `writer` and flushes it. [`Self::save_rpp`] creates
+    /// the file and delegates here.
+    pub fn write_rpp<W: std::io::Write>(&self, mut writer: W) -> Result<()> {
+        writer.write_all(self.build_rpp_string().as_bytes())?;
+        writer.flush()?;
+        Ok(())
     }
 }
 
@@ -605,6 +614,16 @@ pub fn send_reaper_osc(host_port: &str, address: &str, value: Option<f32>) -> Re
         .map_err(|e| ForgeError::ReaperError(format!("OSC send failed to {host_port}: {e}")))?;
     Ok(())
 }
+
+/// Every bundled JSFX plugin as `(file name, source)`, the set [`install_jsfx_plugins`]
+/// writes (a test keeps the two in sync). Callers that must create the files themselves (through a directory handle, for
+/// example) can write these entries directly.
+pub const JSFX_PLUGINS: [(&str, &str); 4] = [
+    ("Forge_OpenSoothe_DeFizz.jsfx", JSFX_OPENSOOTHE),
+    ("Forge_OpenSpacer_Unmask.jsfx", JSFX_OPENSPACER),
+    ("Forge_SubBass_Reinforce.jsfx", JSFX_SUBBASS),
+    ("Forge_Vocal_Surgical.jsfx", JSFX_VOCAL_SURGICAL),
+];
 
 #[cfg(test)]
 mod tests {
@@ -942,6 +961,27 @@ mod tests {
             let open_chunks = out.lines().filter(|l| l.trim_start().starts_with('<')).count();
             let close_chunks = out.lines().filter(|l| l.trim() == ">").count();
             prop_assert_eq!(open_chunks, close_chunks);
+        }
+    }
+
+    #[test]
+    fn rpp_writer_matches_save_rpp_and_jsfx_list_matches_install() {
+        let rpp = ReaperProjectBuilder::new("Writer Session", 96.0, 48_000);
+        let mut bytes = Vec::new();
+        rpp.write_rpp(&mut bytes).expect("write");
+        assert_eq!(bytes, rpp.build_rpp_string().into_bytes());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let saved = rpp
+            .save_rpp(dir.path().join("nested").join("s.rpp"))
+            .expect("save");
+        assert_eq!(std::fs::read(&saved).expect("read"), bytes);
+
+        let installed = install_jsfx_plugins(Some(&dir.path().join("fx"))).expect("install");
+        assert_eq!(installed.len(), JSFX_PLUGINS.len());
+        for (path, (name, source)) in installed.iter().zip(JSFX_PLUGINS) {
+            assert!(path.ends_with(name));
+            assert_eq!(std::fs::read_to_string(path).expect("read"), source);
         }
     }
 }

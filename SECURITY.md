@@ -75,6 +75,16 @@ Out of scope:
 
 We track these openly because no fix is available from this repository yet:
 
+- **`forge-mcp` external steps (low severity).** `forge-mcp` opens client files through
+  directory handles anchored at each `FORGE_MCP_ROOT`, so a path swapped for an escaping
+  symlink after it was checked fails to open. Two steps still pass path names to code that
+  opens them itself: FFmpeg ISRC tagging (`forge_master_distrokid`) and stem separation
+  (`forge_ingest_to_reaper`). The server re-checks those paths right before the call and
+  verifies every produced file through the root handle afterwards, but a local process that
+  already has write access inside the root could, within that short window, make the step
+  write outside it (the call then reports an error). See the MCP file-access section of
+  [`docs/ARCHITECTURE_AND_ENGINEERING_GUIDE.md`](docs/ARCHITECTURE_AND_ENGINEERING_GUIDE.md).
+
 - **RUSTSEC-2021-0145 / GHSA-g98v-hv3f-hcfr (`atty`, low severity).** This is pulled in
   through `nih_plug → nih_log`, and no patched version exists. It only affects Windows builds
   that use a custom global allocator returning under-aligned memory, which ForgeAudio does not
