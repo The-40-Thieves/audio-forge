@@ -17,6 +17,32 @@ use serde::{Deserialize, Serialize};
 
 pub use abc::parse_abc_score;
 
+/// Tempo range every BPM argument is validated against at the CLI and MCP boundary.
+pub const BPM_RANGE: std::ops::RangeInclusive<f64> = 30.0..=300.0;
+
+/// Accepts a finite tempo inside [`BPM_RANGE`].
+pub fn validate_bpm(bpm: f64) -> Result<f64> {
+    if bpm.is_finite() && BPM_RANGE.contains(&bpm) {
+        Ok(bpm)
+    } else {
+        Err(ForgeError::InvalidParameter(format!(
+            "bpm ({bpm}) must be between {} and {}",
+            BPM_RANGE.start(),
+            BPM_RANGE.end()
+        )))
+    }
+}
+
+/// Library-level fallback for callers that skip validation: the same range as
+/// [`validate_bpm`], and 120 BPM for a non-finite tempo.
+fn clamp_bpm(bpm: f64) -> f64 {
+    if bpm.is_finite() {
+        bpm.clamp(*BPM_RANGE.start(), *BPM_RANGE.end())
+    } else {
+        120.0
+    }
+}
+
 /// A discrete MIDI note event with micro-timing in ticks (or seconds) and velocity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NoteEvent {
@@ -348,11 +374,7 @@ pub fn extract_drum_midi_triggers(
         return (Vec::new(), Vec::new(), Vec::new());
     }
 
-    let clean_bpm = if bpm.is_finite() {
-        bpm.clamp(40.0, 300.0)
-    } else {
-        120.0
-    };
+    let clean_bpm = clamp_bpm(bpm);
     let safe_tpb = ticks_per_beat.clamp(24, 19_200);
     let ticks_per_sec = (clean_bpm / 60.0) * f64::from(safe_tpb);
     let win = ((sr * 0.012).round() as usize).max(32); // 12ms transient analysis window
@@ -479,11 +501,7 @@ pub fn write_midi_to_writer<W: Write>(
 
 /// The conductor track: one tempo event, then end of track.
 fn tempo_track(bpm: f64) -> Vec<TrackEvent<'static>> {
-    let clean_bpm = if bpm.is_finite() {
-        bpm.clamp(30.0, 300.0)
-    } else {
-        120.0
-    };
+    let clean_bpm = clamp_bpm(bpm);
     let us_per_qn = (60_000_000.0 / clean_bpm).round() as u32;
     vec![
         TrackEvent {
@@ -556,6 +574,19 @@ fn note_track(notes: &[NoteEvent]) -> Vec<TrackEvent<'static>> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn bpm_validation_and_library_clamp_share_one_range() {
+        for bad in [0.0, -5.0, 29.9, 300.1, f64::NAN, f64::INFINITY] {
+            assert!(validate_bpm(bad).is_err(), "{bad} accepted");
+        }
+        for good in [30.0, 92.0, 300.0] {
+            assert_eq!(validate_bpm(good).expect("valid"), good);
+        }
+        assert_eq!(clamp_bpm(0.0), 30.0);
+        assert_eq!(clamp_bpm(1_000.0), 300.0);
+        assert_eq!(clamp_bpm(f64::NAN), 120.0);
+    }
 
     #[test]
     fn test_voice_leading_and_neosoul_reharmonizer() {

@@ -81,6 +81,17 @@ mod tests {
     }
 
     #[test]
+    fn out_of_range_ceiling_is_rejected_instead_of_clamped() {
+        let buf = AudioBuffer::from_channels(vec![vec![0.1; 48_000]; 2], 48_000).expect("buffer");
+        for bad in [6.0, 0.5, -30.0, f64::NAN, f64::INFINITY] {
+            let err = normalize_and_limit(&buf, -14.0, bad).expect_err("ceiling accepted");
+            assert!(err.to_string().contains("ceiling_dbtp"), "{err}");
+        }
+        assert!(normalize_and_limit(&buf, -14.0, 0.0).is_ok());
+        assert!(normalize_and_limit(&buf, -14.0, -24.0).is_ok());
+    }
+
+    #[test]
     fn test_opensoothe_spectral_defizz_suppresses_harsh_whistle() {
         let sr = 48_000_u32;
         let frames = sr as usize; // 1 second

@@ -28,7 +28,7 @@ use forge_reaper::{
 };
 use forge_theory::{
     GrooveStyle, NoteEvent, VoicingStyle, export_abc_score, extract_drum_midi_triggers,
-    reharmonize_progression, solve_voice_leading,
+    reharmonize_progression, solve_voice_leading, validate_bpm,
 };
 use forge_vocal::{
     PitchFrame, VocalScale, generate_vocal_harmony_stack, shift_vocal_pitch_formant_preserved,
@@ -657,7 +657,7 @@ fn voice_chords(chords: &str) -> Result<VoicedChords, ForgeError> {
 fn tool_music_theory_midi(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
     let chords = str_arg(args, "chords")?;
     let output_midi = path_arg(args, "output_midi", sandbox)?;
-    let bpm = f64_arg(args, "bpm", 92.0);
+    let bpm = validate_bpm(f64_arg(args, "bpm", 92.0))?;
     let (reharm, chord_notes, bass_notes) = voice_chords(chords)?;
     sandbox.write_midi(
         &output_midi,
@@ -761,7 +761,7 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
     let input = path_arg(args, "input", sandbox)?;
     let target = delivery_target_from_args(args)?;
     let paths = IngestPaths::new(path_arg(args, "output_dir", sandbox)?, target, sandbox)?;
-    let bpm = f64_arg(args, "bpm", 120.0);
+    let bpm = validate_bpm(f64_arg(args, "bpm", 120.0))?;
     let scale = VocalScale::parse(str_arg_or(args, "scale", "D minor"))?;
     let chords = str_arg_or(args, "chords", "Dm9 Bbmaj7 Gm9 A7b13");
 
@@ -1041,6 +1041,30 @@ mod tests {
             assert!(text(&result).contains("'..'"), "{tool}: {}", text(&result));
         }
         assert!(!root.path().join("..").join("session").exists());
+    }
+
+    #[test]
+    fn out_of_range_bpm_and_ceiling_are_tool_errors() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sb = sandbox_in(root.path());
+        write_test_mix(&root.path().join("mix.wav"), 0.05, 48_000);
+
+        let theory = call_tool(
+            &sb,
+            "forge_music_theory_midi",
+            json!({ "chords": "Dm9 G13", "output_midi": "x.mid", "bpm": 0 }),
+        );
+        assert!(is_error(&theory), "{}", text(&theory));
+        assert!(text(&theory).contains("bpm"), "{}", text(&theory));
+        assert!(!root.path().join("x.mid").exists());
+
+        let master = call_tool(
+            &sb,
+            "forge_master_distrokid",
+            json!({ "input": "mix.wav", "output": "master.wav", "ceiling_dbtp": 6.0 }),
+        );
+        assert!(is_error(&master), "{}", text(&master));
+        assert!(text(&master).contains("ceiling_dbtp"), "{}", text(&master));
     }
 
     #[test]

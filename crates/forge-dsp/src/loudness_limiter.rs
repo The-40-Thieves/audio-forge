@@ -975,7 +975,12 @@ pub fn normalize_and_limit(
             "target_lufs ({target_lufs}) must be between -40.0 and -4.0 LUFS"
         )));
     }
-    let clean_ceiling_dbtp = sanitize_param_f64(ceiling_dbtp, -1.0, -24.0, 0.0);
+    if !ceiling_dbtp.is_finite() || !(-24.0..=0.0).contains(&ceiling_dbtp) {
+        return Err(ForgeError::InvalidParameter(format!(
+            "ceiling_dbtp ({ceiling_dbtp}) must be between -24.0 and 0.0 dBTP"
+        )));
+    }
+    let clean_ceiling_dbtp = ceiling_dbtp;
     let initial = audit_audio(buffer);
     let makeup_db = if initial.integrated_lufs <= -65.0 {
         0.0
