@@ -154,7 +154,7 @@ flowchart TD
 ### 2.5 `forge-reaper` — REAPER 7.82 `.RPP` AST Compiler, EEL2 JSFX Installer, OSC & ISO 3901 ISRC
 - **File:** `crates/forge-reaper/src/lib.rs` & `reaper-jsfx/*.jsfx`
 - **Key Components:**
-  - `install_jsfx_plugins`: Embeds all 4 EEL2 `JSFX` plugins at compile time via `include_str!` and installs them into `%APPDATA%/REAPER/Effects/ForgeAudio`.
+  - `install_jsfx_plugins`: Embeds all 4 EEL2 `JSFX` plugins at compile time via `include_str!` and installs them into `Effects/ForgeAudio` under REAPER's resource folder (`%APPDATA%\REAPER` on Windows, `~/Library/Application Support/REAPER` on macOS, `$XDG_CONFIG_HOME/REAPER` or `~/.config/REAPER` on Linux), where the session's `<JS "ForgeAudio/...">` references resolve. It returns an error when that folder cannot be found, instead of writing somewhere REAPER never looks. `forge_ingest_to_reaper` installs there too and reports the outcome in its `jsfx` result field.
   - `ReaperProjectBuilder`: Generates complete REAPER 7.82 `.RPP` project files containing:
     - Song structure timeline markers (`[Intro]`, `[Verse 1]`, `[Chorus]`, etc.)
     - Master bus `<MASTERFXLIST>` with `Forge_OpenSoothe_DeFizz.jsfx`
@@ -162,7 +162,8 @@ flowchart TD
     - Non-destructive `élastique 3.3.3 Pro` pitch-preserving playback (`PLAYRATE 1.0 1 0.0 229376`)
     - Embedded `SM` Stretch Markers and `<PITCHENV` Take Pitch Envelopes
     - `<RENDER_METADATA>` chunks with `ISRC` and `ID3:TSRC`
-  - `send_reaper_osc`: Sends live UDP Open Sound Control (`OSC`) packets (`rosc`) to `127.0.0.1:9000` for real-time transport, fader, and action triggering.
+    - Absolute `FILE` media paths (REAPER resolves relative paths against the `.rpp` folder), quoted with whichever of `"`, `'` or a backtick the string does not contain, as REAPER does; `save_rpp` rejects paths it cannot represent (line breaks, NULs, all three quote characters, non-UTF-8)
+  - `send_reaper_osc`: Sends live UDP Open Sound Control (`OSC`) packets (`rosc`) to `127.0.0.1:9000` for real-time transport, fader, and action triggering. It rejects addresses that are not OSC patterns (must start with `/`) and hosts that do not resolve, and sends from the unspecified address for a non-loopback host. UDP has no acknowledgement, so success means the packet was sent.
   - `validate_isrc` & `write_distrokid_metadata`: Enforces ISO 3901 12-character ISRC syntax (`CC-XXX-YY-NNNNN`) and writes `ID3v2.3` (`TSRC`, `TIT2`, `TPE1`, `TBPM`, `TKEY`) tags to WAV/FLAC/MP3 files via `ffmpeg`.
 
 ---
@@ -329,7 +330,7 @@ This produces individual standalone `.vst3` and `.clap` bundles in `target/bundl
   --chords "Dm7 G7 Cmaj7 A7" \
   --isrc "US-S1Z-26-00001"
 ```
-This single command separates stems, cleans & de-fizzes vocals, tracks YIN pitch contours, extracts Kick/Snare/Hat MIDI triggers, solves Neo-Soul voice-led chords + Sub-Bass MIDI, renders a `-14.0 LUFS / -1.0 dBTP` 24-bit DistroKid master with ISO 3901 ISRC tags, installs the 4 `JSFX` plugins into REAPER, and writes `studio_session/ForgeAudio_Session.rpp`.
+This single command separates stems, cleans & de-fizzes vocals, tracks YIN pitch contours, extracts Kick/Snare/Hat MIDI triggers, solves Neo-Soul voice-led chords + Sub-Bass MIDI, renders a `-14.0 LUFS / -1.0 dBTP` 24-bit DistroKid master with ISO 3901 ISRC tags, and writes `studio_session/ForgeAudio_Session.rpp`. It does not install the `JSFX` plugins; run `forge reaper --install-jsfx` once so the session's FX references resolve.
 
 ### Step 4: Register `forge-mcp` with Claude Code / Antigravity / Cursor
 Add the following entry to your MCP configuration (`mcp_config.json` or `.mcp.json`):

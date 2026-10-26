@@ -17,8 +17,8 @@ use forge_dsp::{
     compute_reference_match_eq, deliver, normalize_and_limit, run_full_restoration_chain,
 };
 use forge_reaper::{
-    ReaperProjectBuilder, ReaperTrackSpec, ReleaseMetadata, install_jsfx_plugins, validate_isrc,
-    write_distrokid_metadata,
+    ReaperProjectBuilder, ReaperTrackSpec, ReleaseMetadata, TempFileGuard, install_jsfx_plugins,
+    jsfx_install_dir, reaper_resource_dir, validate_isrc, write_distrokid_metadata,
 };
 use forge_theory::{
     GrooveStyle, NoteEvent, VoicingStyle, export_abc_score, extract_drum_midi_triggers,
@@ -699,9 +699,9 @@ fn tool_master_distrokid(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
             key: None,
             year: Some(2026),
         };
-        mastered.save_wav(&tmp, 24)?;
-        write_distrokid_metadata(&tmp, &out_path, &meta)?;
-        let _ = std::fs::remove_file(&tmp);
+        let tmp = TempFileGuard::new(tmp);
+        mastered.save_wav(tmp.path(), 24)?;
+        write_distrokid_metadata(tmp.path(), out_path.as_path(), &meta)?;
     } else {
         mastered.save_wav(&out_path, 24)?;
     }
@@ -718,7 +718,6 @@ struct IngestPaths {
     chords_midi: PathBuf,
     master: PathBuf,
     delivery: PathBuf,
-    jsfx_dir: PathBuf,
     rpp: PathBuf,
 }
 
@@ -737,10 +736,22 @@ impl IngestPaths {
             chords_midi: check("midi/02_Voiced_Chords.mid")?,
             delivery: sandbox.check(&master.with_extension("delivery.json"))?,
             master,
-            jsfx_dir: check("Effects")?,
             rpp: check("ForgeAudio_Session.rpp")?,
             output_dir,
         })
+    }
+}
+
+/// Installs the JSFX into `Effects/ForgeAudio` under REAPER's resource folder, the only
+/// place the session's `<JS "ForgeAudio/...">` references resolve. These are fixed files at
+/// a fixed location, not a client path, so they are not confined to the sandbox. A missing
+/// REAPER install is reported rather than failing the rest of the ingest.
+fn install_session_jsfx(resource_dir: Result<PathBuf, ForgeError>) -> Value {
+    let installed =
+        resource_dir.and_then(|dir| install_jsfx_plugins(Some(&jsfx_install_dir(&dir))));
+    match installed {
+        Ok(files) => json!({ "installed": true, "files": files }),
+        Err(e) => json!({ "installed": false, "error": e.to_string() }),
     }
 }
 
@@ -771,7 +782,6 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
     mastered.save_wav(&paths.master, 24)?;
     std::fs::write(&paths.delivery, serde_json::to_string_pretty(&delivery)?)?;
 
-    let _ = install_jsfx_plugins(Some(&paths.jsfx_dir))?;
     let session = SessionSpec {
         bpm,
         sample_rate: full_mix.sample_rate,
@@ -789,6 +799,7 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
             "master_wav": paths.master,
             "midi_file": paths.chords_midi,
             "delivery_report": paths.delivery,
+            "jsfx": install_session_jsfx(reaper_resource_dir()),
             "target": delivery.target,
             "ready": delivery.ready,
             "checks": delivery.checks,
@@ -1210,5 +1221,62 @@ mod tests {
                 "architecture guide does not mention MCP tool `{name}`"
             );
         }
+    }
+
+    #[test]
+    fn pre_tag_render_is_removed_when_tagging_fails() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sb = sandbox_in(root.path());
+        write_test_mix(&root.path().join("mix.wav"), 0.05, 48_000);
+        // A directory at the output path makes ffmpeg fail (as does ffmpeg being absent).
+        std::fs::create_dir(root.path().join("master.wav")).expect("mkdir");
+
+        let result = call_tool(
+            &sb,
+            "forge_master_distrokid",
+            json!({ "input": "mix.wav", "output": "master.wav", "isrc": "US-S1Z-26-00001" }),
+        );
+        assert!(is_error(&result), "{}", text(&result));
+        assert!(!root.path().join("master.pre_tag.wav").exists());
+    }
+
+    #[test]
+    fn session_jsfx_is_installed_where_the_rpp_references_it() {
+        let resource = tempfile::tempdir().expect("tempdir");
+        let report = install_session_jsfx(Ok(resource.path().to_path_buf()));
+        assert_eq!(report["installed"], true, "{report}");
+
+        let session = build_session(SessionSpec {
+            bpm: 120.0,
+            sample_rate: 48_000,
+            duration_secs: 10.0,
+            vocal: Some(resource.path().join("vocals.wav")),
+            vocal_pitch_frames: Vec::new(),
+            chords_midi: resource.path().join("chords.mid"),
+        });
+        let effects = resource.path().join("Effects");
+        let mut refs = 0;
+        for line in session.build_rpp_string().lines() {
+            let Some(rest) = line.trim_start().strip_prefix("<JS \"") else {
+                continue;
+            };
+            let fx = &rest[..rest.find('"').expect("closing quote")];
+            assert!(
+                effects.join(fx).is_file(),
+                "{fx} is not under {}",
+                effects.display()
+            );
+            refs += 1;
+        }
+        assert_eq!(refs, 3);
+
+        let missing = install_session_jsfx(Err(ForgeError::ReaperError("no REAPER".into())));
+        assert_eq!(missing["installed"], false);
+        assert!(
+            missing["error"]
+                .as_str()
+                .expect("error")
+                .contains("no REAPER")
+        );
     }
 }
