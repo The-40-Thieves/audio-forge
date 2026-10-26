@@ -67,12 +67,15 @@ pub struct SeparationConfig {
     pub colab_url: Option<String>,
     pub local_timeout: Duration,
     pub http_timeout: Duration,
+    /// Fail instead of falling back to the DSP split when no neural backend produced stems
+    /// (`FORGE_WORKER_REQUIRE_NEURAL`).
+    pub require_neural: bool,
 }
 
 impl SeparationConfig {
     /// Reads `FORGE_WORKER_BACKEND` (`auto`, `local_gpu`, `colab`, `dsp`; default `auto`),
     /// `FORGE_COLAB_WORKER_URL`, `FORGE_GPU_WORKER_SCRIPT`, `FORGE_GPU_WORKER_TIMEOUT_SECS`
-    /// and `FORGE_COLAB_TIMEOUT_SECS`.
+    /// `FORGE_COLAB_TIMEOUT_SECS` and `FORGE_WORKER_REQUIRE_NEURAL` (`1` or `true`).
     pub fn from_env() -> Self {
         let colab_url = env_nonempty("FORGE_COLAB_WORKER_URL");
         let script = resolve_worker_script(
@@ -91,6 +94,8 @@ impl SeparationConfig {
             colab_url,
             local_timeout: env_secs("FORGE_GPU_WORKER_TIMEOUT_SECS", DEFAULT_LOCAL_TIMEOUT),
             http_timeout: env_secs("FORGE_COLAB_TIMEOUT_SECS", DEFAULT_HTTP_TIMEOUT),
+            require_neural: env_nonempty("FORGE_WORKER_REQUIRE_NEURAL")
+                .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true")),
         }
     }
 }
@@ -203,9 +208,9 @@ impl Attempt<'_> {
     }
 }
 
-/// Separates an audio file into a 4/6-stem `StemBundle` (`Vocals`, `Drums`, `Bass`, `Other`).
-/// Uses `Mel-Band-RoFormer (Kim Vocal)` + `BS-RoFormer` when a GPU worker runs, otherwise
-/// the instant Pure-Rust Mid/Side + Linkwitz-Riley frequency/transient separation.
+/// Separates an audio file into a `StemBundle`. The local GPU and Colab workers return two
+/// stems (`Vocals` and `Other`, the instrumental); the Pure-Rust Mid/Side + Linkwitz-Riley
+/// fallback returns four (`Vocals`, `Drums`, `Bass`, `Other`).
 pub fn separate_stems(
     input_path: &Path,
     output_dir: &Path,
@@ -220,6 +225,17 @@ pub fn separate_stems(
             Ok(bundle) => return Ok(finish(bundle, backend, fallbacks, skipped)),
             Err(e) => fallbacks.push(format!("{} failed: {e}", backend.as_str())),
         }
+    }
+    if config.require_neural {
+        fallbacks.extend(skipped);
+        return Err(ForgeError::WorkerError(format!(
+            "no neural stem-separation backend succeeded and a neural backend is required: {}",
+            if fallbacks.is_empty() {
+                "the selected backend is pure_rust_dsp".to_string()
+            } else {
+                fallbacks.join("; ")
+            }
+        )));
     }
     let bundle = dsp_split::separate_stems_dsp(input_path, output_dir)?;
     Ok(finish(bundle, BackendUsed::PureRustDsp, fallbacks, skipped))

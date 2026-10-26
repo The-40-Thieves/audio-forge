@@ -28,7 +28,7 @@ use forge_reaper::{
 };
 use forge_theory::{
     GrooveStyle, NoteEvent, VoicingStyle, export_abc_score, extract_drum_midi_triggers,
-    reharmonize_progression, solve_voice_leading,
+    reharmonize_progression, solve_voice_leading, validate_bpm,
 };
 use forge_vocal::{
     PitchFrame, VocalScale, generate_vocal_harmony_stack, shift_vocal_pitch_formant_preserved,
@@ -384,7 +384,8 @@ fn tool_definitions() -> Vec<Value> {
                     "ceiling_dbtp": { "type": "number", "description": "Required when target is 'custom'" },
                     "bpm": { "type": "number", "default": 120.0 },
                     "scale": { "type": "string", "default": "D minor" },
-                    "chords": { "type": "string", "default": "Dm9 Bbmaj7 Gm9 A7b13" }
+                    "chords": { "type": "string", "default": "Dm9 Bbmaj7 Gm9 A7b13" },
+                    "require_neural": { "type": "boolean", "default": false, "description": "Fail instead of falling back to the DSP stem split when no GPU or Colab worker produces stems" }
                 },
                 "required": ["input", "output_dir"]
             }
@@ -657,7 +658,7 @@ fn voice_chords(chords: &str) -> Result<VoicedChords, ForgeError> {
 fn tool_music_theory_midi(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
     let chords = str_arg(args, "chords")?;
     let output_midi = path_arg(args, "output_midi", sandbox)?;
-    let bpm = f64_arg(args, "bpm", 92.0);
+    let bpm = validate_bpm(f64_arg(args, "bpm", 92.0))?;
     let (reharm, chord_notes, bass_notes) = voice_chords(chords)?;
     sandbox.write_midi(
         &output_midi,
@@ -761,14 +762,16 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
     let input = path_arg(args, "input", sandbox)?;
     let target = delivery_target_from_args(args)?;
     let paths = IngestPaths::new(path_arg(args, "output_dir", sandbox)?, target, sandbox)?;
-    let bpm = f64_arg(args, "bpm", 120.0);
+    let bpm = validate_bpm(f64_arg(args, "bpm", 120.0))?;
     let scale = VocalScale::parse(str_arg_or(args, "scale", "D minor"))?;
     let chords = str_arg_or(args, "chords", "Dm9 Bbmaj7 Gm9 A7b13");
 
     sandbox.create_dir_all(&paths.output_dir)?;
     sandbox.create_dir_all(&paths.midi_dir)?;
 
-    let (bundle, stem_separation) = separate_ingest_stems(sandbox, &input, &paths.stems_dir)?;
+    let require_neural = bool_arg(args, "require_neural", false);
+    let (bundle, stem_separation) =
+        separate_ingest_stems(sandbox, &input, &paths.stems_dir, require_neural)?;
     let vocal_pitch_frames = ingest_vocal_frames(sandbox, bundle.vocals.as_deref(), &scale)?;
 
     let drum_buf = sandbox.load_audio(&sandbox.check(bundle.drums.as_ref().unwrap_or(&input))?)?;
@@ -817,8 +820,10 @@ fn separate_ingest_stems(
     sandbox: &PathSandbox,
     input: &Path,
     stems_dir: &Path,
+    require_neural: bool,
 ) -> Result<(StemBundle, Value), ForgeError> {
-    let config = SeparationConfig::from_env();
+    let mut config = SeparationConfig::from_env();
+    config.require_neural |= require_neural;
     let report = external::separate_stems_checked(sandbox, input, stems_dir, &config)?;
     let info = json!({ "backend": report.backend, "fallbacks": report.fallbacks });
     Ok((report.bundle, info))
@@ -1041,6 +1046,30 @@ mod tests {
             assert!(text(&result).contains("'..'"), "{tool}: {}", text(&result));
         }
         assert!(!root.path().join("..").join("session").exists());
+    }
+
+    #[test]
+    fn out_of_range_bpm_and_ceiling_are_tool_errors() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sb = sandbox_in(root.path());
+        write_test_mix(&root.path().join("mix.wav"), 0.05, 48_000);
+
+        let theory = call_tool(
+            &sb,
+            "forge_music_theory_midi",
+            json!({ "chords": "Dm9 G13", "output_midi": "x.mid", "bpm": 0 }),
+        );
+        assert!(is_error(&theory), "{}", text(&theory));
+        assert!(text(&theory).contains("bpm"), "{}", text(&theory));
+        assert!(!root.path().join("x.mid").exists());
+
+        let master = call_tool(
+            &sb,
+            "forge_master_distrokid",
+            json!({ "input": "mix.wav", "output": "master.wav", "ceiling_dbtp": 6.0 }),
+        );
+        assert!(is_error(&master), "{}", text(&master));
+        assert!(text(&master).contains("ceiling_dbtp"), "{}", text(&master));
     }
 
     #[test]

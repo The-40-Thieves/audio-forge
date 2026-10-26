@@ -25,9 +25,9 @@ pub use elite_dsp::{
     RealtimeTransientTonalSplit, compute_genre_tonal_balance_eq,
 };
 pub use loudness_limiter::{
-    Biquad, CytomicSvf, LIMITER_LOOKAHEAD_MS, LIMITER_RELEASE_MS, audit_audio, compute_true_peak,
-    flush_denormal_f64, normalize_and_limit, sanitize_param_f64, sanitize_sample_f32,
-    sanitize_sample_f64,
+    Biquad, CytomicSvf, LIMITER_LOOKAHEAD_MS, LIMITER_RELEASE_MS, SILENCE_RMS_DBFS, SILENT_BAND_DB,
+    audit_audio, compute_true_peak, flush_denormal_f64, normalize_and_limit, sanitize_param_f64,
+    sanitize_sample_f32, sanitize_sample_f64,
 };
 pub use phase_align::{PhaseAlignmentResult, align_phase_gcc_phat};
 pub use realtime::{
@@ -78,6 +78,17 @@ mod tests {
             "True peak {} exceeded ceiling",
             post.true_peak_dbtp
         );
+    }
+
+    #[test]
+    fn out_of_range_ceiling_is_rejected_instead_of_clamped() {
+        let buf = AudioBuffer::from_channels(vec![vec![0.1; 48_000]; 2], 48_000).expect("buffer");
+        for bad in [6.0, 0.5, -30.0, f64::NAN, f64::INFINITY] {
+            let err = normalize_and_limit(&buf, -14.0, bad).expect_err("ceiling accepted");
+            assert!(err.to_string().contains("ceiling_dbtp"), "{err}");
+        }
+        assert!(normalize_and_limit(&buf, -14.0, 0.0).is_ok());
+        assert!(normalize_and_limit(&buf, -14.0, -24.0).is_ok());
     }
 
     #[test]

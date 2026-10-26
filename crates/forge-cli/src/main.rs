@@ -17,7 +17,7 @@ use forge_reaper::{
 };
 use forge_theory::{
     GrooveStyle, VoicingStyle, export_abc_score, extract_drum_midi_triggers,
-    reharmonize_progression, solve_voice_leading, write_midi_file,
+    reharmonize_progression, solve_voice_leading, validate_bpm, write_midi_file,
 };
 use forge_vocal::{
     VocalScale, generate_vocal_harmony_stack, shift_vocal_pitch_formant_preserved,
@@ -131,8 +131,8 @@ enum Commands {
         /// Groove micro-timing feel: `dilla`, `mpc58`, `strum`, `straight`
         #[arg(long, default_value = "dilla")]
         groove: String,
-        /// Tempo in BPM
-        #[arg(long, default_value_t = 92.0)]
+        /// Tempo in BPM (30 to 300)
+        #[arg(long, default_value_t = 92.0, value_parser = parse_bpm)]
         bpm: f64,
         /// Output multi-track MIDI file (.mid)
         #[arg(short, long)]
@@ -185,7 +185,7 @@ enum Commands {
         /// Target Integrated LUFS (-14.0 for streaming, -9.0 for competitive club/pop)
         #[arg(long, default_value_t = -14.0, allow_negative_numbers = true)]
         target_lufs: f64,
-        /// True-Peak brickwall ceiling in dBTP (-1.0 dBTP recommended by DistroKid/Spotify)
+        /// True-Peak brickwall ceiling in dBTP, -24.0 to 0.0 (-1.0 recommended by DistroKid/Spotify)
         #[arg(long, default_value_t = -1.0, allow_negative_numbers = true)]
         ceiling_dbtp: f64,
         /// Optional reference track WAV to match spectral balance against
@@ -212,8 +212,8 @@ enum Commands {
         /// Output project folder for stems, MIDI, master WAV, and REAPER .RPP session
         #[arg(short, long)]
         output_dir: PathBuf,
-        /// Project tempo in BPM
-        #[arg(long, default_value_t = 120.0)]
+        /// Project tempo in BPM (30 to 300)
+        #[arg(long, default_value_t = 120.0, value_parser = parse_bpm)]
         bpm: f64,
         /// Song key/scale (e.g. "D minor")
         #[arg(long, default_value = "D minor")]
@@ -224,6 +224,10 @@ enum Commands {
         /// Optional 12-character ISO 3901 ISRC code
         #[arg(long)]
         isrc: Option<String>,
+        /// Fail instead of falling back to the DSP stem split when no GPU or Colab worker
+        /// produces stems (same as FORGE_WORKER_REQUIRE_NEURAL=1)
+        #[arg(long)]
+        require_neural: bool,
     },
 
     /// Install native ForgeAudio JSFX plugins into REAPER 7.82 or send live UDP OSC commands
@@ -601,6 +605,7 @@ async fn main() -> anyhow::Result<()> {
             scale,
             chords,
             isrc,
+            require_neural,
         } => {
             std::fs::create_dir_all(&output_dir)?;
             let stems_dir = output_dir.join("stems");
@@ -609,7 +614,10 @@ async fn main() -> anyhow::Result<()> {
             std::fs::create_dir_all(&midi_dir)?;
 
             // 1. Separate stems
-            let bundle = separate_stems(&input, &stems_dir, &SeparationConfig::from_env())?.bundle;
+            let mut config = SeparationConfig::from_env();
+            config.require_neural |= require_neural;
+            let separation = separate_stems(&input, &stems_dir, &config)?;
+            let bundle = separation.bundle;
 
             // 2. Clean & Spectral De-Fizz the Vocal and Instrumental stems
             let mut vocal_pitch_frames = Vec::new();
@@ -807,6 +815,10 @@ async fn main() -> anyhow::Result<()> {
             rpp.save_rpp(&rpp_path)?;
 
             println!("=== ForgeAudio 1-Command Studio Ingest Complete ===");
+            println!("Stem separation     : {}", separation.backend.as_str());
+            for reason in &separation.fallbacks {
+                println!("  fallback          : {reason}");
+            }
             println!("REAPER 7.82 Project : {}", rpp_path.display());
             println!("DistroKid Master WAV: {}", master_path.display());
             println!("ABC Lead Sheet      : {}", abc_path.display());
@@ -852,9 +864,30 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Parses a `--bpm` value and rejects tempos outside `forge_theory::BPM_RANGE`.
+fn parse_bpm(raw: &str) -> Result<f64, String> {
+    let bpm: f64 = raw.parse().map_err(|e| format!("{e}"))?;
+    validate_bpm(bpm).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bpm_outside_the_supported_range_is_rejected() {
+        for bad in ["0", "-5", "29.9", "301", "NaN", "inf"] {
+            let theory: &[&str] = &["forge", "theory", "-o", "x.mid", "--bpm", bad];
+            let ingest: &[&str] = &["forge", "ingest", "mix.wav", "-o", "out", "--bpm", bad];
+            for cmd in [theory, ingest] {
+                assert!(Cli::try_parse_from(cmd).is_err(), "{cmd:?} was accepted");
+            }
+        }
+        for good in ["30", "92", "300"] {
+            let cmd = ["forge", "theory", "-o", "x.mid", "--bpm", good];
+            assert!(Cli::try_parse_from(cmd).is_ok(), "{cmd:?} was rejected");
+        }
+    }
 
     #[test]
     fn negative_loudness_and_ceiling_values_parse() {

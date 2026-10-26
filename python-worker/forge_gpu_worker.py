@@ -6,10 +6,12 @@ and exits immediately after writing artifacts to disk so 100% of VRAM and system
 are returned to REAPER 7.82.
 
 Supported tasks:
-- `separate`: Mel-Band-RoFormer (Kim Vocal, MIT) + BS-RoFormer 6-Stem + BS-RoFormer De-Reverb
-- `apollo`: JusperLee/Apollo Band-Split GAN High-Frequency & Codec Restoration
-- `transcribe`: SheetSage2 / Basic Pitch / YourMT3+ Audio-to-MIDI
-- `yue2-remote`: Calls mrfakename/yue2-3b or custom Colab YuE2-3B endpoint
+- `separate`: Mel-Band-RoFormer (Kim Vocal, MIT), then an optional BS-RoFormer de-reverb of
+  the vocal. Returns two stems, `vocals` and `other` (the instrumental); drums, bass, guitar
+  and keys are always `None`.
+- `yue2-remote`: Calls mrfakename/yue2-3b or a custom Colab YuE2-3B endpoint.
+
+There is no 6-stem separation, Apollo restoration or audio-to-MIDI transcription task.
 """
 
 from __future__ import annotations

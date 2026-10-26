@@ -309,3 +309,58 @@ fn true_peak_catches_inter_sample_peak_at_buffer_end() {
         ts * f64::from(SR)
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Short-term max and silence (issues #19 and #16)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn short_term_max_is_not_set_by_a_single_momentary_burst() {
+    // A 400 ms burst 20 dB over a quiet bed: it sets the momentary max, but every 3 s window
+    // averages it with 2.6 s of the bed.
+    let r = audit_audio(&stereo_sine_segments(&[
+        (-40.0, 5.0),
+        (-20.0, 0.4),
+        (-40.0, 5.0),
+    ]));
+    assert!(
+        r.short_term_max_lufs < r.momentary_max_lufs - 5.0,
+        "short-term max {:.2} LUFS follows momentary max {:.2} LUFS",
+        r.short_term_max_lufs,
+        r.momentary_max_lufs
+    );
+}
+
+#[test]
+fn digital_silence_has_no_fizz_or_band_readings() {
+    let silence = AudioBuffer::from_channels(vec![vec![0.0; 10 * SR as usize]; 2], SR)
+        .expect("valid stereo buffer");
+    let r = audit_audio(&silence);
+    assert_eq!(r.ai_fizz_index, 0.0);
+    for (name, db) in [
+        ("hum", r.hum_50_60hz_db),
+        ("mud", r.box_mud_200_500hz_db),
+        ("harshness", r.harshness_2_6khz_db),
+        ("sibilance", r.sibilance_5_14khz_db),
+    ] {
+        assert_eq!(db, forge_dsp::SILENT_BAND_DB, "{name}");
+    }
+    assert!(r.recommendations.is_empty(), "{:?}", r.recommendations);
+}
+
+#[test]
+fn a_loud_clip_shorter_than_one_gating_block_is_not_treated_as_silence() {
+    // 50 ms of a 4.2 kHz whistle: no 100 ms block, so integrated loudness reads -70 LUFS, but
+    // the clip is loud and long enough for the 2048-point spectral analysis.
+    let frames = (0.05 * f64::from(SR)) as usize;
+    let ch: Vec<f64> = (0..frames)
+        .map(|n| 0.5 * (2.0 * PI * 4200.0 * n as f64 / f64::from(SR)).sin())
+        .collect();
+    let r = audit_audio(&AudioBuffer::from_channels(vec![ch.clone(), ch], SR).expect("buffer"));
+    assert!(
+        r.harshness_2_6khz_db > forge_dsp::SILENT_BAND_DB + 50.0,
+        "{}",
+        r.harshness_2_6khz_db
+    );
+    assert!(r.ai_fizz_index > 0.0, "fizz index {}", r.ai_fizz_index);
+}
