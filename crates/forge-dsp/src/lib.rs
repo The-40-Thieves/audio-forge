@@ -1,6 +1,7 @@
 //! `forge-dsp` — Studio DSP, Restoration, Spectral Suppression, Unmasking, Alignment & Mastering.
 
 pub mod delivery;
+pub mod drum_midi;
 pub mod elite_dsp;
 pub mod loudness_limiter;
 pub mod phase_align;
@@ -8,21 +9,23 @@ pub mod realtime;
 pub mod restoration;
 pub mod spectral_defizz;
 pub mod spectral_unmask;
+pub mod spectrum;
 
 pub use delivery::{
     DeliveryCheck, DeliveryOptions, DeliveryReport, DeliveryTarget, ToneMatch, deliver,
     delivery_checks,
 };
+pub use drum_midi::{DrumTriggerNotes, NoteMsg};
 pub use elite_dsp::{
     AdaaSin, AdaaTanh, AllpassDisperser, AnalogHardwareModel, AutoGainCompensator,
     GenreTonalTarget, JilesAthertonHysteresis, NamWaveNetProfile, Oversampler2x,
-    RealtimeDensityAndClipper, RealtimeFdnReverb, RealtimeNeuralPreamp, RealtimeSpectrumAnalyzer32,
-    RealtimeTransientTonalSplit, SHARED_SPECTRUM_SLOTS, compute_genre_tonal_balance_eq,
-    publish_shared_spectrum, read_shared_spectrum,
+    RealtimeDensityAndClipper, RealtimeFdnReverb, RealtimeNeuralPreamp,
+    RealtimeTransientTonalSplit, compute_genre_tonal_balance_eq,
 };
 pub use loudness_limiter::{
-    Biquad, CytomicSvf, audit_audio, compute_true_peak, flush_denormal_f64, normalize_and_limit,
-    sanitize_param_f64, sanitize_sample_f32, sanitize_sample_f64,
+    Biquad, CytomicSvf, LIMITER_LOOKAHEAD_MS, LIMITER_RELEASE_MS, audit_audio, compute_true_peak,
+    flush_denormal_f64, normalize_and_limit, sanitize_param_f64, sanitize_sample_f32,
+    sanitize_sample_f64,
 };
 pub use phase_align::{
     PhaseAlignmentResult, StretchMarker, align_phase_gcc_phat, align_vocal_double_dtw,
@@ -39,6 +42,12 @@ pub use restoration::{
 };
 pub use spectral_defizz::{DeFizzConfig, apply_spectral_defizz};
 pub use spectral_unmask::{UnmaskConfig, apply_spectral_unmask};
+pub use spectrum::{
+    RealtimeSpectrumAnalyzer32, SHARED_SPECTRUM_SLOT_COUNT, SHARED_SPECTRUM_SLOTS, SPECTRUM_BANDS,
+    SPECTRUM_CEIL_DB, SPECTRUM_FLOOR_DB, SpectrumBusOwner, clear_shared_spectrum,
+    publish_shared_spectrum, read_shared_spectrum, shared_spectrum_owner,
+    shared_spectrum_slot_index, spectrum_band_center_hz, spectrum_band_edges_hz,
+};
 
 #[cfg(test)]
 mod tests {
@@ -122,7 +131,7 @@ mod tests {
     fn test_realtime_zero_alloc_streaming_processors() {
         let sr = 48_000.0;
         let mut soothe = RealtimeOpenSoothe::new(sr);
-        assert_eq!(soothe.latency_samples(), 1536);
+        assert_eq!(soothe.latency_samples(), 2048);
 
         let mut limiter = RealtimeMasterLimiter::new(sr);
         let mut vocal_strip = RealtimeVocalSurgical::new(sr);
@@ -180,7 +189,7 @@ mod tests {
         // Verify Cross-Instance Shared Spectrum Bus
         let mut test_bands = [0.0_f32; 32];
         test_bands[5] = -12.5;
-        publish_shared_spectrum(2, &test_bands);
+        publish_shared_spectrum(SpectrumBusOwner::unique(), 2, &test_bands);
         let read_back = read_shared_spectrum(2);
         assert!((read_back[5] - (-12.5)).abs() < 1e-4);
     }

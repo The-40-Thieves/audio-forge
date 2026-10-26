@@ -1,12 +1,11 @@
 //! # `elite_dsp` — Next-Generation Studio DSP Kernels (ADAA, Structural Transient/Tonal Split,
 //! Upward Density + 3-Band Clipper, 8x8 Hadamard FDN Ducking/Shimmer Reverb, Neural Preamp,
-//! Genre Tonal Balance Targets & Lock-Free Cross-Instance Spectrum IPC).
+//! Genre Tonal Balance Targets). The spectrum analyzer and shared spectrum bus live in `spectrum`.
 //!
 //! Designed with **zero audio-thread heap allocations** for real-time VST3/CLAP execution
 //! and 64-bit studio mastering.
 
 use std::f64::consts::{FRAC_1_SQRT_2, PI};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -861,57 +860,6 @@ pub fn compute_genre_tonal_balance_eq(
 }
 
 // ============================================================================
-// 7. LOCK-FREE CROSS-INSTANCE SHARED ATOMIC SPECTRUM BUS (Pro-Q 4 / Neutron 5 IPC)
-// ============================================================================
-
-/// 8 Process-Wide Named Inter-Plugin Spectrum Slots (`0 = Off`, `1..=8 = Slot A..H`).
-/// Allows any ForgeAudio VST3/CLAP instance to broadcast its 32-band Bark spectrum to any
-/// other instance in the DAW session with **zero locking** and **zero DAW sidechain routing**.
-pub static SHARED_SPECTRUM_SLOTS: [[AtomicU32; 32]; 8] = [
-    [const { AtomicU32::new(0) }; 32],
-    [const { AtomicU32::new(0) }; 32],
-    [const { AtomicU32::new(0) }; 32],
-    [const { AtomicU32::new(0) }; 32],
-    [const { AtomicU32::new(0) }; 32],
-    [const { AtomicU32::new(0) }; 32],
-    [const { AtomicU32::new(0) }; 32],
-    [const { AtomicU32::new(0) }; 32],
-];
-
-/// Publishes a 32-band magnitude spectrum into cross-instance slot `slot_idx` (`0..8`).
-/// Non-finite (`NaN` / `±Inf`) or subnormal values are sanitized to `0.0` before atomic storage.
-#[inline]
-pub fn publish_shared_spectrum(slot_idx: usize, bands_32: &[f32; 32]) {
-    if slot_idx < 8 {
-        for (atom, &val) in SHARED_SPECTRUM_SLOTS[slot_idx].iter().zip(bands_32.iter()) {
-            let clean = if val.is_finite() && val.abs() >= 1e-30 {
-                val
-            } else {
-                0.0_f32
-            };
-            atom.store(clean.to_bits(), Ordering::Relaxed);
-        }
-    }
-}
-
-/// Reads a 32-band magnitude spectrum from cross-instance slot `slot_idx` (`0..8`).
-#[inline]
-pub fn read_shared_spectrum(slot_idx: usize) -> [f32; 32] {
-    let mut out = [0.0_f32; 32];
-    if slot_idx < 8 {
-        for (dst, atom) in out.iter_mut().zip(SHARED_SPECTRUM_SLOTS[slot_idx].iter()) {
-            let v = f32::from_bits(atom.load(Ordering::Relaxed));
-            *dst = if v.is_finite() && v.abs() >= 1e-30 {
-                v
-            } else {
-                0.0_f32
-            };
-        }
-    }
-    out
-}
-
-// ============================================================================
 // 8. JILES-ATHERTON FERROMAGNETIC HYSTERESIS RK4 SOLVER (ChowTapeModel Standard)
 // ============================================================================
 
@@ -1025,10 +973,14 @@ impl JilesAthertonHysteresis {
 /// Satisfies exact unit magnitude response $|H(e^{j\omega})| \equiv 1.0$ across all frequencies
 /// while introducing non-linear group delay around `pinch_hz` (`40 Hz .. 1000 Hz`) to smear
 /// high crest-factor peaks and inject liquid sub-bass punch into kicks and 808s.
+///
+/// While `amount` is at or below the bypass threshold the stages do not run, so their state is
+/// cleared on entering bypass and the disperser re-engages from silence rather than stale state.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AllpassDisperser {
     x1: [f64; 8],
     y1: [f64; 8],
+    bypassed: bool,
 }
 
 impl AllpassDisperser {
@@ -1049,8 +1001,13 @@ impl AllpassDisperser {
         let amt = sanitize_param_f64(amount, 0.0, 0.0, 1.0);
         let x0 = sanitize_sample_f64(x_raw);
         if amt <= 1.0e-4 {
+            if !self.bypassed {
+                self.reset();
+                self.bypassed = true;
+            }
             return x0;
         }
+        self.bypassed = false;
         let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
         let f0 = sanitize_param_f64(pinch_hz, 140.0, 30.0, (sr * 0.45).max(30.0));
         let t = (PI * f0 / sr).tan();
@@ -1131,67 +1088,5 @@ impl AutoGainCompensator {
             flush_denormal_f64(ol * self.gain_lin) as f32,
             flush_denormal_f64(or_ * self.gain_lin) as f32,
         )
-    }
-}
-
-// ============================================================================
-// 11. REAL-TIME 32-BAND LOG-SPACED SPECTRUM ANALYZER (Zero Audio-Thread Alloc)
-// ============================================================================
-
-/// Zero-allocation 32-band Log/ERB Real-Time Spectrum Analyzer (`25 Hz .. 18.5 kHz`)
-/// using 32 parallel resonant Cytomic TPT SVF bandpass detectors.
-pub struct RealtimeSpectrumAnalyzer32 {
-    filters: [crate::CytomicSvf; 32],
-    env_sq: [f64; 32],
-    sub_counter: usize,
-}
-
-impl RealtimeSpectrumAnalyzer32 {
-    pub fn new(sample_rate: f64) -> Self {
-        let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
-        let filters = std::array::from_fn(|b| {
-            let frac = (b as f64) / 31.0;
-            let fc = (25.0 * (740.0_f64).powf(frac)).min(sr * 0.46);
-            crate::CytomicSvf::lowpass(sr, fc, 3.2)
-        });
-        Self {
-            filters,
-            env_sq: [1.0e-9; 32],
-            sub_counter: 0,
-        }
-    }
-
-    pub fn reset(&mut self, sample_rate: f64) {
-        *self = Self::new(sample_rate);
-    }
-
-    /// Updates the 32 bandpass energy envelopes (decimated 4x on the audio thread for <0.08% CPU load).
-    #[inline]
-    pub fn push_stereo_sample(&mut self, l: f32, r: f32) {
-        self.sub_counter = self.sub_counter.wrapping_add(1);
-        if (self.sub_counter & 3) != 0 {
-            return;
-        }
-        let mono = 0.5 * (sanitize_sample_f32(l) + sanitize_sample_f32(r));
-        for (b, flt) in self.filters.iter_mut().enumerate() {
-            let (_lp, bp, _hp) = flt.process_multimode(mono);
-            let pwr = bp * bp;
-            let prev = self.env_sq[b];
-            self.env_sq[b] = if pwr > prev {
-                0.85 * prev + 0.15 * pwr
-            } else {
-                0.985 * prev + 0.015 * pwr
-            }
-            .max(1.0e-9);
-        }
-    }
-
-    /// Exports the current 32-band magnitude spectrum in dBFS (`[-90.0, 6.0]`).
-    #[inline]
-    pub fn snapshot_db(&self) -> [f32; 32] {
-        std::array::from_fn(|b| {
-            let db = 10.0 * self.env_sq[b].max(1.0e-9).log10() + 6.0;
-            (db as f32).clamp(-90.0, 6.0)
-        })
     }
 }

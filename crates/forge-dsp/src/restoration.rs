@@ -243,6 +243,53 @@ pub fn compute_reference_match_eq(
     delta
 }
 
+/// One sample of a [`LowBandSplit`]: the sanitized input, its low band, and the detector's high band.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LowSplitSample {
+    pub input: f64,
+    pub low: f64,
+    pub detect_high: f64,
+}
+
+impl LowSplitSample {
+    /// Recombines the bands with the low band scaled by `gain`. The audio high band is
+    /// `input - low`, so this is `input - (1 - gain) * low` and returns `input` exactly at gain 1.
+    #[inline]
+    pub(crate) fn ducked(&self, gain: f64) -> f64 {
+        self.input - (1.0 - gain) * self.low
+    }
+}
+
+/// Complementary low-band split shared by the offline and realtime de-plosive stages.
+///
+/// A Butterworth low-pass and high-pass at the same cutoff sum to a notch at that cutoff, so the
+/// audio path never adds them: its high band is `input - low` instead. The Butterworth high-pass
+/// only feeds the plosive detector, which compares low-band energy against it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LowBandSplit {
+    low_lp: Biquad,
+    detect_hp: Biquad,
+}
+
+impl LowBandSplit {
+    pub(crate) fn new(sample_rate: f64, cutoff_hz: f64) -> Self {
+        Self {
+            low_lp: Biquad::lowpass(sample_rate, cutoff_hz, std::f64::consts::FRAC_1_SQRT_2),
+            detect_hp: Biquad::highpass(sample_rate, cutoff_hz, std::f64::consts::FRAC_1_SQRT_2),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn process(&mut self, x: f64) -> LowSplitSample {
+        let input = sanitize_sample_f64(x);
+        LowSplitSample {
+            input,
+            low: self.low_lp.process_sample(input),
+            detect_high: self.detect_hp.process_sample(input),
+        }
+    }
+}
+
 /// Surgical vocal cleanup strip: Mouth De-Click, Dynamic Plosive Suppressor, and Smart De-Breath.
 pub fn clean_vocal_surgical(
     buffer: &AudioBuffer,
@@ -254,87 +301,96 @@ pub fn clean_vocal_surgical(
     let sr = f64::from(out.sample_rate.max(1));
 
     for ch in &mut out.channels {
-        let n = ch.len();
-        if n < 64 {
+        if ch.len() < 64 {
             continue;
         }
-
-        // 1. Mouth De-Click: detect 1-2ms high-slew spikes and replace via local median interpolation
         if declick {
-            let win = ((sr * 0.0015).round() as usize).clamp(4, 96);
-            let mut i = win + 1;
-            while i + win < n {
-                let diff = (ch[i] - ch[i - 1]).abs();
-                let mut local_diff_sum = 0.0;
-                for k in (i - win)..(i + win) {
-                    if k != i && k > 0 {
-                        local_diff_sum += (ch[k] - ch[k - 1]).abs();
-                    }
-                }
-                let avg_diff = (local_diff_sum / ((2 * win - 1) as f64)).max(1e-7);
-                if diff > avg_diff * 8.5 && diff > 0.02 {
-                    let y0 = ch[i - 2];
-                    let y1 = ch[i + 2];
-                    ch[i - 1] = 0.75 * y0 + 0.25 * y1;
-                    ch[i] = 0.50 * y0 + 0.50 * y1;
-                    ch[i + 1] = 0.25 * y0 + 0.75 * y1;
-                    i += 3;
-                    continue;
-                }
-                i += 1;
-            }
+            remove_mouth_clicks(ch, sr);
         }
-
-        // 2. Dynamic Plosive Suppressor: track <110 Hz vs >300 Hz ratio and duck sub-110 Hz pops
         if deplosive {
-            let mut low_lp = Biquad::lowpass(sr, 110.0, 0.707);
-            let mut high_hp = Biquad::highpass(sr, 110.0, 0.707);
-            let mut low_env = 0.0_f64;
-            let mut mid_env = 0.0_f64;
-
-            for s in ch.iter_mut() {
-                let lo = low_lp.process_sample(*s);
-                let hi = high_hp.process_sample(*s);
-                low_env = 0.992 * low_env + 0.008 * lo.abs();
-                mid_env = 0.992 * mid_env + 0.008 * hi.abs();
-
-                // If low energy dominates mid energy by >3x, dynamically attenuate the low band
-                let plosive_gain = if low_env > mid_env * 2.8 && low_env > 0.015 {
-                    ((mid_env * 2.8) / low_env).clamp(0.15, 1.0)
-                } else {
-                    1.0
-                };
-                *s = hi + lo * plosive_gain;
-            }
+            duck_plosives(ch, sr);
         }
-
-        // 3. Smart De-Breath: attenuate low-level high-ZCR unvoiced breath segments between phrases
         if debreath_db < -0.5 {
-            let breath_gain = 10.0_f64.powf(debreath_db.clamp(-24.0, 0.0) / 20.0);
-            let block = ((sr * 0.020).round() as usize).max(64);
-            let mut smoothed_g = 1.0_f64;
-            for b_start in (0..n).step_by(block) {
-                let b_end = (b_start + block).min(n);
-                let slice = &ch[b_start..b_end];
-                let rms = (slice.iter().map(|&x| x * x).sum::<f64>() / (slice.len() as f64)).sqrt();
-                let mut zcr = 0_usize;
-                for k in 1..slice.len() {
-                    if (slice[k] >= 0.0) != (slice[k - 1] >= 0.0) {
-                        zcr += 1;
-                    }
-                }
-                let zcr_rate = (zcr as f64) / (slice.len() as f64);
-                let is_breath = (0.003..0.045).contains(&rms) && zcr_rate > 0.14;
-                let target_g = if is_breath { breath_gain } else { 1.0 };
-                for s in &mut ch[b_start..b_end] {
-                    smoothed_g = 0.995 * smoothed_g + 0.005 * target_g;
-                    *s *= smoothed_g;
-                }
-            }
+            attenuate_breaths(ch, sr, debreath_db);
         }
     }
 
     Ok(out)
+}
+
+/// Mouth De-Click: detect 1-2ms high-slew spikes and replace via local median interpolation.
+fn remove_mouth_clicks(ch: &mut [f64], sr: f64) {
+    let n = ch.len();
+    let win = ((sr * 0.0015).round() as usize).clamp(4, 96);
+    let mut i = win + 1;
+    while i + win < n {
+        let diff = (ch[i] - ch[i - 1]).abs();
+        let mut local_diff_sum = 0.0;
+        for k in (i - win)..(i + win) {
+            if k != i && k > 0 {
+                local_diff_sum += (ch[k] - ch[k - 1]).abs();
+            }
+        }
+        let avg_diff = (local_diff_sum / ((2 * win - 1) as f64)).max(1e-7);
+        if diff > avg_diff * 8.5 && diff > 0.02 {
+            let y0 = ch[i - 2];
+            let y1 = ch[i + 2];
+            ch[i - 1] = 0.75 * y0 + 0.25 * y1;
+            ch[i] = 0.50 * y0 + 0.50 * y1;
+            ch[i + 1] = 0.25 * y0 + 0.75 * y1;
+            i += 3;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// Dynamic Plosive Suppressor: track the <110 Hz vs >110 Hz ratio and duck sub-110 Hz pops.
+/// The bands are complementary, so the output equals the input wherever nothing is ducked.
+fn duck_plosives(ch: &mut [f64], sr: f64) {
+    let mut split = LowBandSplit::new(sr, 110.0);
+    let mut low_env = 0.0_f64;
+    let mut mid_env = 0.0_f64;
+
+    for s in ch.iter_mut() {
+        let bands = split.process(*s);
+        low_env = 0.992 * low_env + 0.008 * bands.low.abs();
+        mid_env = 0.992 * mid_env + 0.008 * bands.detect_high.abs();
+
+        // If low energy dominates mid energy by >3x, dynamically attenuate the low band
+        let plosive_gain = if low_env > mid_env * 2.8 && low_env > 0.015 {
+            ((mid_env * 2.8) / low_env).clamp(0.15, 1.0)
+        } else {
+            1.0
+        };
+        *s = bands.ducked(plosive_gain);
+    }
+}
+
+/// Smart De-Breath: attenuate low-level high-ZCR unvoiced breath segments between phrases.
+fn attenuate_breaths(ch: &mut [f64], sr: f64, debreath_db: f64) {
+    let n = ch.len();
+    let breath_gain = 10.0_f64.powf(debreath_db.clamp(-24.0, 0.0) / 20.0);
+    let block = ((sr * 0.020).round() as usize).max(64);
+    let mut smoothed_g = 1.0_f64;
+    for b_start in (0..n).step_by(block) {
+        let b_end = (b_start + block).min(n);
+        let slice = &ch[b_start..b_end];
+        let rms = (slice.iter().map(|&x| x * x).sum::<f64>() / (slice.len() as f64)).sqrt();
+        let mut zcr = 0_usize;
+        for k in 1..slice.len() {
+            if (slice[k] >= 0.0) != (slice[k - 1] >= 0.0) {
+                zcr += 1;
+            }
+        }
+        let zcr_rate = (zcr as f64) / (slice.len() as f64);
+        let is_breath = (0.003..0.045).contains(&rms) && zcr_rate > 0.14;
+        let target_g = if is_breath { breath_gain } else { 1.0 };
+        for s in &mut ch[b_start..b_end] {
+            smoothed_g = 0.995 * smoothed_g + 0.005 * target_g;
+            *s *= smoothed_g;
+        }
+    }
 }
 
 /// Runs the complete corrective restoration pipeline in strict studio signal-chain order.
@@ -371,4 +427,69 @@ pub fn run_full_restoration_chain(
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod low_band_split_tests {
+    use super::LowBandSplit;
+    use std::f64::consts::PI;
+
+    fn noise(n: usize) -> impl Iterator<Item = f64> {
+        (0..n as u32).map(|i| f64::from(i.wrapping_mul(2_654_435_761) % 2_001) / 1_000.0 - 1.0)
+    }
+
+    #[test]
+    fn ducked_recombines_the_input_exactly_at_unity() {
+        let mut split = LowBandSplit::new(48_000.0, 110.0);
+        for x in noise(4_096) {
+            let s = split.process(x);
+            assert_eq!(s.ducked(1.0), s.input, "unity gain must return the input");
+            assert_eq!(
+                s.ducked(0.0),
+                s.input - s.low,
+                "zero gain must remove the low band"
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_input_is_sanitized_before_both_bands() {
+        let mut split = LowBandSplit::new(48_000.0, 110.0);
+        for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let s = split.process(x);
+            assert!(s.input.is_finite() && s.low.is_finite() && s.detect_high.is_finite());
+        }
+        // The filters keep working afterwards instead of being stuck at NaN.
+        let s = split.process(0.5);
+        assert!(s.low.is_finite() && s.detect_high.is_finite());
+    }
+
+    /// Steady-state peak of the low band and the detector band for a sine at `freq_hz`.
+    fn band_peaks(freq_hz: f64) -> (f64, f64) {
+        let sr = 48_000.0;
+        let mut split = LowBandSplit::new(sr, 110.0);
+        let (mut low, mut high) = (0.0_f64, 0.0_f64);
+        for i in 0..48_000 {
+            let s = split.process((2.0 * PI * freq_hz * f64::from(i) / sr).sin());
+            if i >= 24_000 {
+                low = low.max(s.low.abs());
+                high = high.max(s.detect_high.abs());
+            }
+        }
+        (low, high)
+    }
+
+    #[test]
+    fn low_band_and_detector_band_cover_opposite_ends() {
+        let (low, high) = band_peaks(30.0);
+        assert!(
+            low > 0.9 && high < 0.1,
+            "30 Hz: low {low:.3}, detector {high:.3}"
+        );
+        let (low, high) = band_peaks(5_000.0);
+        assert!(
+            low < 0.01 && high > 0.99,
+            "5 kHz: low {low:.3}, detector {high:.3}"
+        );
+    }
 }

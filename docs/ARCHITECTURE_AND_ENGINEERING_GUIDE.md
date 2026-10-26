@@ -2,7 +2,7 @@
 
 **Repository:** [`https://github.com/The-40-Thieves/audio-forge`](https://github.com/The-40-Thieves/audio-forge)  
 **License:** Apache-2.0  
-**Language & Stack:** Rust 2021 Edition (9 Workspace Crates) + `nih-plug` / `nih_plug_egui` (10 VST3 & CLAP Plugins) + REAPER 7.82 EEL2 `JSFX` & `.RPP` Engine + Hybrid GPU Sidecar (`uv` + PyTorch / Google Colab A100 / Google Lyria 3.5)
+**Language & Stack:** Rust 2024 Edition (9 Workspace Crates) + `nih-plug` / `nih_plug_egui` (10 VST3 & CLAP Plugins) + REAPER 7.82 EEL2 `JSFX` & `.RPP` Engine + Hybrid GPU Sidecar (`uv` + PyTorch / Google Colab A100 / Google Lyria 3.5)
 
 ---
 
@@ -93,11 +93,11 @@ flowchart TD
      - `Biquad`: Direct-Form II Transposed 64-bit biquad filter (`process_sample`, `lowpass`, `highpass`, `bandpass`, `notch`, `peaking_eq`, `low_shelf`, `high_shelf`, `k_weight_stage1`).
      - `audit_audio`: Implements the two-stage ITU-R BS.1770-4 K-weighting cascade (`+4.0 dB` head-diffraction high-shelf at `1681.97 Hz` followed by `38.13 Hz` RLB high-pass), `400 ms` overlapping blocks (`75%` overlap), `-70 LUFS` absolute gate, and `-10 LU` relative gate.
      - `compute_true_peak`: 4x polyphase FIR sinc interpolation to detect inter-sample peaks (`dBTP`) between discrete samples.
-     - `normalize_and_limit`: Lookahead (`5 ms` attack window) 4x True-Peak brickwall limiter with smooth two-stage release (`85 ms`), guaranteeing output never exceeds `-1.0 dBTP`.
+     - `normalize_and_limit`: Lookahead (`3 ms` attack window) 4x True-Peak brickwall limiter. The gain is held at the window's minimum and ramps linearly across the window, so it is fully reduced before each peak with no step. A smooth `50 ms` release and a final true-peak trim follow, guaranteeing output never exceeds `-1.0 dBTP`.
   2. **`restoration.rs` — Surgical De-Click, De-Plosive, Hum Notch, Mid/Side, 18-Band Match EQ & Analog Tape:**
      - `remove_dc_and_declip`: High-pass DC removal (`15 Hz`) + cubic Hermite spline reconstruction across consecutive clipped samples (`|x| >= 0.998`).
      - `apply_hum_notch_cascade`: 10-harmonic high-$Q$ (`Q = 35..80`) notch cascade removing `50 Hz` or `60 Hz` powerline hum and buzz up to `600 Hz`.
-     - `clean_vocal_surgical`: Median-derivative mouth de-clicker, `<115 Hz` dynamic plosive attenuator, and hysteresis breath gate.
+     - `clean_vocal_surgical`: Median-derivative mouth de-clicker, `<110 Hz` dynamic plosive attenuator on a complementary split (flat when nothing is ducked), and hysteresis breath gate.
      - `apply_mid_side_spatial_cleanup`: Linkwitz-Riley `<160 Hz` bass mono-maker (forcing sub-bass phase correlation $\to +1.0$) + gentle high-shelf air widening.
      - `compute_reference_match_eq` & `apply_18_band_eq`: 18-band ISO 1/3-octave proportional Mastering & Reference Match EQ (`31.5 Hz` to `16 kHz`).
      - `apply_analog_console_and_tape`: Airwindows Console8 summing (`sin` transfer curve) + ChowTape hysteresis saturation with head-bump at `68 Hz`.
@@ -117,7 +117,12 @@ flowchart TD
      - `RealtimeFdnReverb`: **Forge SpaceVerb** — 8x8 Fast Walsh-Hadamard Feedback Delay Network (`FDN`) reverb with LFO modulation, `<180 Hz` mud cut, automatic **Vocal Sidechain Ducking**, and **+12 st Octave Shimmer** (`Valhalla VintageVerb` / `Shimmer` / `Pro-R 2` equivalent).
      - `RealtimeNeuralPreamp`: Dilated causal WaveNet hardware modeler (`NAM` / `RTNeural` architecture) with 4 analog models (`Neve1073ClassA`, `Fet1176AllButtons`, `TubeV76Triode`, `StuderA800Tape`) and DC blocking.
      - `GenreTonalTarget` & `compute_genre_tonal_balance_eq`: Built-in 18-band statistical genre target corridors (`ModernPop`, `HipHopTrap`, `NeoSoulRnB`, `EdmClub`, `RockMetal`, `AcousticJazz` — `iZotope Tonal Balance Control 2` equivalent).
-     - `SHARED_SPECTRUM_SLOTS`, `publish_shared_spectrum`, `read_shared_spectrum`: 8-slot lock-free `AtomicU32` cross-instance IPC bus (`FabFilter Pro-Q 4` / `Neutron 5` wireless instance communication).
+  8. **`spectrum.rs`, 32-Band Display Spectrum & Shared Spectrum Bus:**
+     - One band layout for every analyzer: 32 equal log-frequency bands from `25 Hz` to `18.5 kHz` (about 0.3 octave each) at every sample rate. All levels are dB relative to a full-scale sine, so a full-scale sine centred in a band reads `0 dB`.
+     - `RealtimeSpectrumAnalyzer32`: 32 Cytomic TPT SVF band-passes run at the full sample rate, each scaled to unity gain at its centre with its `-3 dB` points on the band edges at every sample rate. Each band's centre and Q come from its edges prewarped for the bilinear transform: `w = tan(pi * f / sr)` for both edges, analog centre `w0 = sqrt(w_lo * w_hi)`, `Q = w0 / (w_hi - w_lo)`, and the SVF is configured at `atan(w0) * sr / pi`. A constant analog Q would make the top bands too narrow at 44.1 and 48 kHz (about `-4 dB` at the band 27/28 edge and worse above). Band power is integrated over about three periods of the centre (`5-120 ms`), then a peak-hold envelope with a `300 ms` release sets the bars' ballistics. The `-90 dB` floor applies only to the displayed level; the integrators keep small contributions (only state below `1e-30` flushes), so a steady quiet signal reads its true level at every sample rate.
+     - The OpenSoothe STFT spectrum sums bin powers across each band, corrected for the Hann window's coherent gain and noise bandwidth, and averages the two channels' power.
+     - `SHARED_SPECTRUM_SLOTS`, `publish_shared_spectrum`, `read_shared_spectrum`, `clear_shared_spectrum`: 8-slot lock-free `AtomicU32` cross-instance IPC bus (`FabFilter Pro-Q 4` / `Neutron 5` wireless instance communication). A per-slot sequence counter makes every read one whole frame; publishing never waits and skips a frame if another instance is mid-publish on the same slot. Unpublished and cleared slots read as silence (`-90 dB`). The plugin's bus-slot parameter is `0 = Off`, `1-8 = Slot A-H` (its text also parses back from `Off`, `Slot A`, a bare letter or the plain number, case-insensitively).
+     - Slot ownership: each instance holds a `SpectrumBusOwner` (a unique id from a global `AtomicU64` counter). A successful publish records its owner in the slot under the seqlock, so the last writer owns the slot. `clear_shared_spectrum(owner, slot)` empties the slot only if `owner` is still its owner, checked again under the seqlock; it retries a bounded number of times while another writer holds the slot. An instance clears its slot when it moves to another one or is removed, so when two instances share a slot, the one that leaves never silences the other. When the owner itself leaves, the slot reads as silence until the other instance's next publish. All of it is lock-free, allocation-free and `unsafe`-free.
 
 ---
 
@@ -176,22 +181,22 @@ flowchart TD
 ### 2.7 `forge-plug` — 10 Native Cross-DAW VST3 & CLAP Real-Time Plugins (`nih-plug` + `egui`)
 - **File:** `crates/forge-plug/src/lib.rs`
 - **Architecture:** Built on `nih-plug` (`rev de421011`) and `nih_plug_egui` (`egui 0.31.1` + `egui_glow` + `baseview`). Exports **all 10 plugins** from a single compiled dynamic library into both `forge-plug.vst3` and `forge-plug.clap`:
-  1. **`ForgeOpenSoothePlug`** (`Forge OpenSoothe De-Fizz`) — 2048-pt OLA STFT Dynamic Spectral Resonance & AI Fizz Suppressor (`1536`-sample host PDC, `egui` 60 FPS spectrum GUI, 8-slot Shared Spectrum Bus).
+  1. **`ForgeOpenSoothePlug`** (`Forge OpenSoothe De-Fizz`) — 2048-pt OLA STFT Dynamic Spectral Resonance & AI Fizz Suppressor (`2048`-sample STFT delay plus the limiter lookahead reported to the host for PDC, `egui` 60 FPS spectrum GUI, 8-slot Shared Spectrum Bus).
   2. **`ForgeOpenSpacerPlug`** (`Forge OpenSpacer Unmask`) — 4-Channel Sidechain Spectral Unmasker (`aux_input_ports: &[new_nonzero_u32(2)]`).
-  3. **`ForgeVocalSurgicalPlug`** (`Forge Vocal Surgical Strip`) — Zero-Latency Mouth De-Click, `<115 Hz` Plosive Duck, Split-Band De-Esser & Breath Gate.
+  3. **`ForgeVocalSurgicalPlug`** (`Forge Vocal Surgical Strip`): Zero-Latency Mouth De-Click, `<115 Hz` Plosive Duck, Split-Band De-Esser & Breath Gate. All four controls ramp linearly over `20 ms` through `nih-plug` smoothers read every sample, so automation never steps.
   4. **`ForgeSubAndTapePlug`** (`Forge SubMono & Console Tape`) — Linkwitz-Riley `<160 Hz` Sub Mono-Maker, Harmonic Bass Reinforcer & Console8/ChowTape Saturation.
   5. **`ForgeMasterLimiterPlug`** (`Forge Master True-Peak Limiter`) — Lookahead 4x Inter-Sample True-Peak `-1.0 dBTP` Brickwall Limiter.
-  6. **`ForgeDrumTriggerPlug`** (`Forge Drum Trigger & Theory MIDI`) — Real-Time Audio-to-MIDI 3-Band Drum Replacer (`C1/D1/F#1`) + 1-Finger MIDI-to-Neo-Soul 9th Chord Voicer (`NoteEvent::NoteOn` / `NoteOff`).
+  6. **`ForgeDrumTriggerPlug`** (`Forge Drum Trigger & Theory MIDI`): Real-Time Audio-to-MIDI 3-Band Drum Replacer (`C1/D1/F#1`, each hit gated to a `20 ms` note with its own `NoteOff`) + 1-Finger MIDI-to-Neo-Soul 9th Chord Voicer (`NoteEvent::NoteOn` / `NoteOff`). `forge_dsp::DrumTriggerNotes` tracks every forwarded root and generated note in one occupancy count per channel and key: a NoteOn on a sounding key re-articulates it, and the key's `NoteOff` reaches the host only when its last holder releases, so a chord tone never cuts off a held root and shared chord tones never stack. Each root instance is matched by voice ID (a `NoteOff` without one releases every voice on that key), so it releases only the chord it started, even if voicing is toggled mid-note. Up to 64 root instances are held at once (the oldest is released early to make room), and reset or transport stop releases everything still held, forwarded roots included.
   7. **`ForgePhaseAndMatchPlug`** (`Forge PhaseAlign & 18-Band EQ`) — Sample-Accurate Phase/Polarity Aligner + 18-Band AI De-Harsh EQ + 6 Built-In Genre Tonal Balance Target Curves.
   8. **`ForgeSplitEqPlug`** (`Forge SplitEQ Transient & Tonal`) — 3-Band Structural Transient Attack vs. Tonal Sustain Equalizer & Shaper with 60 FPS `egui` GUI.
   9. **`ForgeDensityClipperPlug`** (`Forge Density & 3-Band ADAA Clipper`) — Upward Low-Level Density Compressor + 3-Band 2x-Oversampled 1st-Order ADAA Soft Clipper with 60 FPS `egui` GUI.
-  10. **`ForgeSpaceVerbAndPreampPlug`** (`Forge SpaceVerb FDN & Neural Preamp`) — Dilated Causal WaveNet Hardware Preamp (`Neve 1073`, `1176 All-Buttons`, `V76 Triode`, `Studer A800`) + 8x8 Walsh-Hadamard FDN Reverb with Vocal Auto-Ducking & `+12 st` Octave Shimmer + 60 FPS `egui` GUI.
+  10. **`ForgeSpaceVerbAndPreampPlug`** (`Forge SpaceVerb FDN & Neural Preamp`): Dilated Causal WaveNet Hardware Preamp (`Neve 1073`, `1176 All-Buttons`, `V76 Triode`, `Studer A800`) + 8x8 Walsh-Hadamard FDN Reverb with Vocal Auto-Ducking & `+12 st` Octave Shimmer + 60 FPS `egui` GUI. The stored `decay` knob keeps its `0.05` to `0.98` range (same ID, same saved state) and maps onto an RT60 of `0.2` to `20 s` on a log curve; the host and GUI show the value in seconds. The FDN's `0.985` feedback-gain ceiling holds the measured tail at about `13.5 s` at the top of the knob with default damping.
 
 ---
 
 ### 2.8 `forge-cli` & `forge-mcp` — Unified CLI Binary & JSON-RPC 2.0 MCP Agent Server
 - **`crates/forge-cli/src/main.rs` (`forge` binary):** Exposes 9 subcommands (`audit`, `restore`, `unmask`, `phase-align`, `vocal`, `theory`, `master`, `ingest`, `samples`) via `clap` derive macros.
-- **`crates/forge-mcp/src/main.rs` (`forge-mcp` binary):** Implements the Model Context Protocol (`protocolVersion: "2024-11-05"`) over `stdin`/`stdout` JSON-RPC 2.0, exposing 8 structured tools (`forge_audit_audio`, `forge_restore_and_defizz`, `forge_spectral_unmask`, `forge_phase_align`, `forge_vocal_suite`, `forge_music_theory_midi`, `forge_master_distrokid`, `forge_ingest_to_reaper`) to Claude Code, Antigravity, Cursor, or custom studio agents.
+- **`crates/forge-mcp/src/main.rs` (`forge-mcp` binary):** Implements the Model Context Protocol (`protocolVersion: "2024-11-05"`) over `stdin`/`stdout` JSON-RPC 2.0, exposing 9 structured tools (`forge_deliver`, `forge_audit_audio`, `forge_restore_and_defizz`, `forge_spectral_unmask`, `forge_phase_align`, `forge_vocal_suite`, `forge_music_theory_midi`, `forge_master_distrokid`, `forge_ingest_to_reaper`) to Claude Code, Antigravity, Cursor, or custom studio agents.
 
 ---
 

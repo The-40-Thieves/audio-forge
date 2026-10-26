@@ -15,6 +15,10 @@ serde_json.workspace = true
 [dev-dependencies]
 divan = { version = "6.0.0", package = "codspeed-divan-compat" }
 proptest.workspace = true
+# Allocation guard for tests/realtime_no_alloc.rs. Same source nih-plug pins for its
+# `assert_process_allocs` feature; warn_debug counts violations instead of aborting. Its
+# default `disable_release` (which nih-plug also gets) removes the allocator in release builds.
+assert_no_alloc = { git = "https://github.com/robbert-vdh/rust-assert-no-alloc.git", branch = "feature/nested-permit-forbid", features = ["warn_debug"] }
 
 [[bench]]
 name = "dsp"

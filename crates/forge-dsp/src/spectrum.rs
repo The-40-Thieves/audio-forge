@@ -1,0 +1,398 @@
+//! 32-band display spectrum: the band layout every analyzer shares, the real-time filter-bank
+//! analyzer the plugin GUIs draw, the STFT band reduction OpenSoothe uses, and the lock-free
+//! cross-instance spectrum bus.
+//!
+//! All levels are dB relative to a full-scale sine: a sine of amplitude `A` centred in a band
+//! reads `20 * log10(A)` in that band, so a full-scale sine reads 0 dB.
+
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
+
+use crate::loudness_limiter::{CytomicSvf, sanitize_param_f64, sanitize_sample_f32};
+
+/// Number of display bands.
+pub const SPECTRUM_BANDS: usize = 32;
+/// Lower edge of band 0, in Hz.
+pub const SPECTRUM_LOW_HZ: f64 = 25.0;
+/// Upper edge of band 31, in Hz.
+pub const SPECTRUM_HIGH_HZ: f64 = 18_500.0;
+/// Level of a silent or unpublished band, in dB. It is finite (unlike `-inf`) so `max`, the
+/// meters and the shared-bus sanitizer stay well defined, and it sits below the GUI's -72 dB floor.
+pub const SPECTRUM_FLOOR_DB: f32 = -90.0;
+/// Highest level a band reports, in dB.
+pub const SPECTRUM_CEIL_DB: f32 = 6.0;
+
+/// Power below which a band displays as silent (-120 dB). It applies only to the displayed
+/// level; the integrators keep integrating smaller contributions.
+const POWER_FLOOR: f64 = 1.0e-12;
+/// Integrator and envelope state below this power (-300 dB) flushes to zero, which keeps it out
+/// of the subnormal range without discarding any signal the display could show.
+const STATE_FLUSH: f64 = 1.0e-30;
+/// Highest band edge, as a fraction of the sample rate, a band-pass is designed for. Bands above
+/// it (only at sample rates below about 41 kHz) are squeezed under it with their log width.
+const MAX_EDGE_RATIO: f64 = 0.45;
+/// Release time constant of the display envelope (about 14 dB/s of fall).
+const RELEASE_TAU_S: f64 = 0.3;
+/// Bounds of the per-band power integration time: three periods of the band centre.
+const MIN_AVG_TAU_S: f64 = 0.005;
+const MAX_AVG_TAU_S: f64 = 0.12;
+
+/// Lower and upper edge of `band`, in Hz. The 32 bands split 25 Hz to 18.5 kHz into equal
+/// log-frequency steps (about 0.3 octave each) at every sample rate.
+pub fn spectrum_band_edges_hz(band: usize) -> (f64, f64) {
+    let ratio = SPECTRUM_HIGH_HZ / SPECTRUM_LOW_HZ;
+    let edge = |i: usize| SPECTRUM_LOW_HZ * ratio.powf(i as f64 / SPECTRUM_BANDS as f64);
+    (edge(band), edge(band + 1))
+}
+
+/// Geometric centre of `band`, in Hz.
+pub fn spectrum_band_center_hz(band: usize) -> f64 {
+    let (lo, hi) = spectrum_band_edges_hz(band);
+    (lo * hi).sqrt()
+}
+
+/// Centre frequency (Hz) and Q of `band`'s band-pass at `sr`, chosen so that after the SVF's
+/// bilinear transform its -3 dB points land exactly on the band edges.
+///
+/// The SVF is the bilinear transform of the analog band-pass `s / (s^2 + s/Q + 1)` with its
+/// frequency axis prewarped at the centre, so digital frequency `f` sits at analog frequency
+/// `w = tan(pi * f / sr)`. An analog band-pass with -3 dB points `w_lo` and `w_hi` has centre
+/// `w0 = sqrt(w_lo * w_hi)` and `Q = w0 / (w_hi - w_lo)`; mapping `w0` back gives the centre
+/// `f0 = atan(w0) * sr / pi` to configure, whose `tan(pi * f0 / sr)` is `w0` again.
+fn band_pass_design(band: usize, sr: f64) -> (f64, f64) {
+    let (lo, hi) = spectrum_band_edges_hz(band);
+    let hi_capped = hi.min(MAX_EDGE_RATIO * sr);
+    let lo_capped = lo.min(hi_capped * lo / hi);
+    let warp = |f: f64| (std::f64::consts::PI * f / sr).tan();
+    let (w_lo, w_hi) = (warp(lo_capped), warp(hi_capped));
+    let w0 = (w_lo * w_hi).sqrt();
+    (w0.atan() * sr / std::f64::consts::PI, w0 / (w_hi - w_lo))
+}
+
+/// Keeps a power state value unless it has decayed into the subnormal range.
+fn flush_state(power: f64) -> f64 {
+    if power > STATE_FLUSH { power } else { 0.0 }
+}
+
+/// Converts a sine-referenced band power to a clamped display level.
+fn power_to_db(power: f64) -> f32 {
+    if power > POWER_FLOOR {
+        ((10.0 * power.log10()) as f32).clamp(SPECTRUM_FLOOR_DB, SPECTRUM_CEIL_DB)
+    } else {
+        SPECTRUM_FLOOR_DB
+    }
+}
+
+/// One-pole coefficient for time constant `tau_s` at `sr`.
+fn one_pole_coeff(tau_s: f64, sr: f64) -> f64 {
+    1.0 - (-1.0 / (tau_s * sr)).exp()
+}
+
+// ============================================================================
+// REAL-TIME FILTER-BANK ANALYZER
+// ============================================================================
+
+/// Zero-allocation 32-band real-time spectrum analyzer (25 Hz to 18.5 kHz).
+///
+/// Each band is a Cytomic TPT SVF band-pass run at the full sample rate and scaled to unity
+/// gain at its centre. Its centre and Q come from the band edges prewarped for the sample
+/// rate (see `band_pass_design`), so its -3 dB points sit on the band edges at every rate,
+/// the top bands at 44.1 kHz included. Its output power is integrated over about three periods
+/// of the centre frequency, then a peak-hold envelope with a 300 ms release sets the bar's
+/// ballistics. The -90 dB display floor applies only to the snapshot, so a steady quiet
+/// signal integrates to its true level at every sample rate.
+pub struct RealtimeSpectrumAnalyzer32 {
+    filters: [CytomicSvf; SPECTRUM_BANDS],
+    /// `1/Q` per band: the SVF band-pass output has gain `Q` at its centre.
+    bp_gain: [f64; SPECTRUM_BANDS],
+    avg_coeff: [f64; SPECTRUM_BANDS],
+    release_coeff: f64,
+    avg_pow: [f64; SPECTRUM_BANDS],
+    env_pow: [f64; SPECTRUM_BANDS],
+}
+
+impl RealtimeSpectrumAnalyzer32 {
+    pub fn new(sample_rate: f64) -> Self {
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
+        let design: [(f64, f64); SPECTRUM_BANDS] = std::array::from_fn(|b| band_pass_design(b, sr));
+        Self {
+            filters: design.map(|(centre, q)| CytomicSvf::lowpass(sr, centre, q)),
+            bp_gain: design.map(|(_, q)| 1.0 / q),
+            avg_coeff: design.map(|(centre, _)| {
+                let tau = (3.0 / centre).clamp(MIN_AVG_TAU_S, MAX_AVG_TAU_S);
+                one_pole_coeff(tau, sr)
+            }),
+            release_coeff: one_pole_coeff(RELEASE_TAU_S, sr),
+            avg_pow: [0.0; SPECTRUM_BANDS],
+            env_pow: [0.0; SPECTRUM_BANDS],
+        }
+    }
+
+    pub fn reset(&mut self, sample_rate: f64) {
+        *self = Self::new(sample_rate);
+    }
+
+    /// Feeds one stereo frame (analysed as the mid signal `(l + r) / 2`).
+    #[inline]
+    pub fn push_stereo_sample(&mut self, l: f32, r: f32) {
+        let mono = 0.5 * (sanitize_sample_f32(l) + sanitize_sample_f32(r));
+        for b in 0..SPECTRUM_BANDS {
+            let (_lp, bp, _hp) = self.filters[b].process_multimode(mono);
+            let band = bp * self.bp_gain[b];
+            // Twice the mean square, so a sine of amplitude A integrates to A^2.
+            let avg = flush_state(
+                self.avg_pow[b] + self.avg_coeff[b] * (2.0 * band * band - self.avg_pow[b]),
+            );
+            self.avg_pow[b] = avg;
+            let env = self.env_pow[b];
+            self.env_pow[b] = if avg >= env {
+                avg
+            } else {
+                flush_state(env + self.release_coeff * (avg - env))
+            };
+        }
+    }
+
+    /// Current 32-band levels in dB re full-scale sine, clamped to `[-90, 6]`.
+    #[inline]
+    pub fn snapshot_db(&self) -> [f32; SPECTRUM_BANDS] {
+        std::array::from_fn(|b| power_to_db(self.env_pow[b]))
+    }
+}
+
+// ============================================================================
+// STFT BAND REDUCTION
+// ============================================================================
+
+/// Power normalization for an `n`-point STFT frame windowed by `window`: `4 / (n * sum(w^2))`.
+///
+/// It corrects for the window's coherent gain and its equivalent noise bandwidth together, so
+/// the sum of one-sided bin powers `|X[k]|^2` across a sine's main lobe comes to `A^2`.
+pub fn stft_band_power_norm(window: &[f64]) -> f64 {
+    let sum_sq: f64 = window.iter().map(|w| w * w).sum();
+    4.0 / ((window.len() as f64) * sum_sq).max(f64::MIN_POSITIVE)
+}
+
+/// First and last bin (inclusive) of `band` for an STFT with `bin_hz` spacing and `half_bins`
+/// one-sided bins. It always spans at least three bins around the band centre, enough for a
+/// Hann main lobe, and never includes DC or Nyquist.
+pub fn stft_band_bins(band: usize, bin_hz: f64, half_bins: usize) -> (usize, usize) {
+    let (lo, hi) = spectrum_band_edges_hz(band);
+    let centre = (spectrum_band_center_hz(band) / bin_hz).round() as usize;
+    let last_bin = half_bins.saturating_sub(2).max(1);
+    let b0 = ((lo / bin_hz).floor() as usize).min(centre.saturating_sub(1));
+    let b1 = ((hi / bin_hz).ceil() as usize).max(centre + 1);
+    (b0.clamp(1, last_bin), b1.clamp(1, last_bin))
+}
+
+/// Adds the power of the one-sided magnitudes `mags` in each band to `band_pow`, scaled by
+/// `norm` from [`stft_band_power_norm`].
+pub fn accumulate_stft_band_power(
+    mags: &[f64],
+    bin_hz: f64,
+    norm: f64,
+    band_pow: &mut [f64; SPECTRUM_BANDS],
+) {
+    for (band, acc) in band_pow.iter_mut().enumerate() {
+        let (b0, b1) = stft_band_bins(band, bin_hz, mags.len());
+        let sum: f64 = mags[b0..=b1].iter().map(|m| m * m).sum();
+        *acc += sum * norm;
+    }
+}
+
+/// Converts summed band powers (already averaged over channels) to display levels.
+pub fn band_power_to_db(band_pow: &[f64; SPECTRUM_BANDS]) -> [f32; SPECTRUM_BANDS] {
+    std::array::from_fn(|b| power_to_db(band_pow[b]))
+}
+
+// ============================================================================
+// LOCK-FREE CROSS-INSTANCE SHARED SPECTRUM BUS
+// ============================================================================
+
+/// Number of shared slots (`Slot A..H`).
+pub const SHARED_SPECTRUM_SLOT_COUNT: usize = 8;
+const FLOOR_BITS: u32 = SPECTRUM_FLOOR_DB.to_bits();
+/// How many times a reader retries a slot a writer is updating before giving up.
+const READ_RETRIES: usize = 64;
+/// How many times a clear retries a slot another writer is updating before giving up.
+const WRITE_RETRIES: usize = 64;
+/// Owner id of a slot nobody has published to since it was last cleared.
+const NO_OWNER: u64 = 0;
+
+/// Process-wide shared spectrum slots, holding 32 band levels in dB each. Every band starts at
+/// [`SPECTRUM_FLOOR_DB`], so a slot nobody has published to reads as silence.
+///
+/// Read and write them only through [`publish_shared_spectrum`], [`clear_shared_spectrum`] and
+/// [`read_shared_spectrum`], which guard each slot with a sequence counter so a reader never
+/// sees half of one frame and half of another.
+pub static SHARED_SPECTRUM_SLOTS: [[AtomicU32; SPECTRUM_BANDS]; SHARED_SPECTRUM_SLOT_COUNT] =
+    [const { [const { AtomicU32::new(FLOOR_BITS) }; SPECTRUM_BANDS] }; SHARED_SPECTRUM_SLOT_COUNT];
+
+/// Per-slot seqlock counter: odd while a writer is storing a frame.
+static SHARED_SPECTRUM_SEQ: [AtomicU32; SHARED_SPECTRUM_SLOT_COUNT] =
+    [const { AtomicU32::new(0) }; SHARED_SPECTRUM_SLOT_COUNT];
+
+/// Per-slot owner: the [`SpectrumBusOwner`] id of the last successful publish, or [`NO_OWNER`].
+/// Written only while holding the slot's seqlock.
+static SHARED_SPECTRUM_OWNER: [AtomicU64; SHARED_SPECTRUM_SLOT_COUNT] =
+    [const { AtomicU64::new(NO_OWNER) }; SHARED_SPECTRUM_SLOT_COUNT];
+
+/// Source of [`SpectrumBusOwner`] ids. It starts at 1 because 0 is [`NO_OWNER`].
+static NEXT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Identity of one publisher (one plugin instance) on the shared spectrum bus.
+///
+/// Ownership rule: the last instance to publish to a slot owns it. Clearing a slot only
+/// empties it when the clearing instance is still the owner, so when two instances share a
+/// slot, the one that moves away or is removed never silences the other's frame. When the
+/// owner itself leaves, the slot reads as silence until the other instance's next publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SpectrumBusOwner(u64);
+
+impl SpectrumBusOwner {
+    /// A process-wide unique owner id. Allocation-free and lock-free.
+    pub fn unique() -> Self {
+        Self(NEXT_OWNER_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// The atomics behind one slot.
+struct BusSlot {
+    seq: &'static AtomicU32,
+    owner: &'static AtomicU64,
+    bands: &'static [AtomicU32; SPECTRUM_BANDS],
+}
+
+fn bus_slot(slot_idx: usize) -> Option<BusSlot> {
+    Some(BusSlot {
+        seq: SHARED_SPECTRUM_SEQ.get(slot_idx)?,
+        owner: SHARED_SPECTRUM_OWNER.get(slot_idx)?,
+        bands: SHARED_SPECTRUM_SLOTS.get(slot_idx)?,
+    })
+}
+
+/// Takes a slot's seqlock without waiting: returns the even counter value it started from, or
+/// `None` if another writer holds it.
+fn try_lock_slot(seq: &AtomicU32) -> Option<u32> {
+    let start = seq.load(Ordering::Relaxed);
+    if start & 1 == 1 {
+        return None;
+    }
+    seq.compare_exchange(
+        start,
+        start.wrapping_add(1),
+        Ordering::Acquire,
+        Ordering::Relaxed,
+    )
+    .ok()?;
+    fence(Ordering::Release);
+    Some(start)
+}
+
+fn store_frame(slot: &[AtomicU32; SPECTRUM_BANDS], bands_32: &[f32; SPECTRUM_BANDS]) {
+    for (atom, &val) in slot.iter().zip(bands_32.iter()) {
+        atom.store(sanitize_bus_db(val).to_bits(), Ordering::Relaxed);
+    }
+}
+
+/// Maps a plugin's bus-slot parameter (`0 = Off`, `1..=8 = Slot A..H`) to a slot index.
+pub fn shared_spectrum_slot_index(bus_param: usize) -> Option<usize> {
+    bus_param
+        .checked_sub(1)
+        .filter(|&i| i < SHARED_SPECTRUM_SLOT_COUNT)
+}
+
+/// Non-finite levels become the floor; subnormal ones flush to 0 dB.
+fn sanitize_bus_db(v: f32) -> f32 {
+    if !v.is_finite() {
+        SPECTRUM_FLOOR_DB
+    } else if v.abs() < 1e-30 {
+        0.0
+    } else {
+        v
+    }
+}
+
+/// Publishes a 32-band spectrum (dB) into slot `slot_idx` (`0..8`) as one consistent frame and
+/// makes `owner` the slot's owner.
+///
+/// Wait-free: if another instance is writing to the same slot at that moment, this frame is
+/// skipped, ownership does not change, and `false` is returned. Out-of-range slots are ignored
+/// and also return `false`.
+#[inline]
+pub fn publish_shared_spectrum(
+    owner: SpectrumBusOwner,
+    slot_idx: usize,
+    bands_32: &[f32; SPECTRUM_BANDS],
+) -> bool {
+    let Some(bus) = bus_slot(slot_idx) else {
+        return false;
+    };
+    let Some(start) = try_lock_slot(bus.seq) else {
+        return false;
+    };
+    bus.owner.store(owner.0, Ordering::Relaxed);
+    store_frame(bus.bands, bands_32);
+    bus.seq.store(start.wrapping_add(2), Ordering::Release);
+    true
+}
+
+/// Resets slot `slot_idx` to silence if `owner` still owns it, as when its publishing instance
+/// moves to another slot or goes away. Returns `true` if it cleared the slot.
+///
+/// If another instance published to the slot since `owner` last did, that instance owns it and
+/// its frame stays. Lock-free and bounded: while another writer holds the slot it retries, and
+/// a publisher holding the slot takes it over, which ends the retries.
+#[inline]
+pub fn clear_shared_spectrum(owner: SpectrumBusOwner, slot_idx: usize) -> bool {
+    let Some(bus) = bus_slot(slot_idx) else {
+        return false;
+    };
+    for _ in 0..WRITE_RETRIES {
+        if bus.owner.load(Ordering::Relaxed) != owner.0 {
+            return false;
+        }
+        if let Some(start) = try_lock_slot(bus.seq) {
+            // Authoritative under the lock: the acquire on `seq` sees every earlier owner.
+            let owned = bus.owner.load(Ordering::Relaxed) == owner.0;
+            if owned {
+                bus.owner.store(NO_OWNER, Ordering::Relaxed);
+                store_frame(bus.bands, &[SPECTRUM_FLOOR_DB; SPECTRUM_BANDS]);
+            }
+            bus.seq.store(start.wrapping_add(2), Ordering::Release);
+            return owned;
+        }
+        std::hint::spin_loop();
+    }
+    false
+}
+
+/// Current owner of slot `slot_idx`, or `None` if nobody has published to it since it was last
+/// cleared (and for out-of-range slots).
+pub fn shared_spectrum_owner(slot_idx: usize) -> Option<SpectrumBusOwner> {
+    let id = bus_slot(slot_idx)?.owner.load(Ordering::Acquire);
+    (id != NO_OWNER).then_some(SpectrumBusOwner(id))
+}
+
+/// Reads one consistent 32-band frame (dB) from slot `slot_idx` (`0..8`).
+///
+/// Out-of-range slots, and a slot still being written after a bounded number of retries,
+/// read as silence ([`SPECTRUM_FLOOR_DB`]).
+#[inline]
+pub fn read_shared_spectrum(slot_idx: usize) -> [f32; SPECTRUM_BANDS] {
+    let Some(bus) = bus_slot(slot_idx) else {
+        return [SPECTRUM_FLOOR_DB; SPECTRUM_BANDS];
+    };
+    for _ in 0..READ_RETRIES {
+        let before = bus.seq.load(Ordering::Acquire);
+        if before & 1 == 0 {
+            let frame: [f32; SPECTRUM_BANDS] =
+                std::array::from_fn(|b| f32::from_bits(bus.bands[b].load(Ordering::Relaxed)));
+            fence(Ordering::Acquire);
+            if bus.seq.load(Ordering::Relaxed) == before {
+                return frame.map(sanitize_bus_db);
+            }
+        }
+        std::hint::spin_loop();
+    }
+    [SPECTRUM_FLOOR_DB; SPECTRUM_BANDS]
+}

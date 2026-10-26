@@ -24,10 +24,11 @@ use forge_dsp::{
     RealtimeDensityAndClipper, RealtimeDrumTrigger, RealtimeFdnReverb, RealtimeMasterLimiter,
     RealtimeMasteringEq18, RealtimeNeuralPreamp, RealtimeOpenSoothe, RealtimeOpenSpacer,
     RealtimePhaseAligner, RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus,
-    RealtimeTransientTonalSplit, RealtimeVocalSurgical, RestorationConfig, UnmaskConfig,
-    align_phase_gcc_phat, align_vocal_double_dtw, apply_spectral_defizz, apply_spectral_unmask,
-    audit_audio, compute_reference_match_eq, normalize_and_limit, publish_shared_spectrum,
-    read_shared_spectrum, remove_dc_and_declip, run_full_restoration_chain,
+    RealtimeTransientTonalSplit, RealtimeVocalSurgical, RestorationConfig, SPECTRUM_FLOOR_DB,
+    SpectrumBusOwner, UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw,
+    apply_spectral_defizz, apply_spectral_unmask, audit_audio, compute_reference_match_eq,
+    normalize_and_limit, publish_shared_spectrum, read_shared_spectrum, remove_dc_and_declip,
+    run_full_restoration_chain,
 };
 use proptest::prelude::*;
 
@@ -334,18 +335,22 @@ proptest! {
         for (i, b) in bands.iter_mut().enumerate() {
             *b = if i % 2 == 0 { f_val } else { -18.5_f32 };
         }
-        publish_shared_spectrum(slot, &bands);
+        publish_shared_spectrum(SpectrumBusOwner::unique(), slot, &bands);
         let read_back = read_shared_spectrum(slot);
         for &v in &read_back {
             prop_assert!(is_clean_audio_f32(v));
         }
         if slot < 8 && f_val.is_finite() && f_val.abs() >= 1.0e-30 {
             prop_assert_eq!(read_back[0].to_bits(), f_val.to_bits());
-        } else if slot < 8 {
+        } else if slot < 8 && f_val.is_finite() {
+            // Subnormal levels flush to 0 dB.
             prop_assert_eq!(read_back[0], 0.0_f32);
+        } else if slot < 8 {
+            // NaN and infinite levels read as silence.
+            prop_assert_eq!(read_back[0], SPECTRUM_FLOOR_DB);
         } else {
-            // Out-of-bounds slot >= 8 must safely return all zeros
-            prop_assert!(read_back.iter().all(|&x| x == 0.0));
+            // Out-of-bounds slot >= 8 must safely read as silence
+            prop_assert!(read_back.iter().all(|&x| x == SPECTRUM_FLOOR_DB));
         }
     }
 

@@ -84,6 +84,17 @@ impl Biquad {
         self.z2 = 0.0;
     }
 
+    /// Copies the coefficients of `design` while keeping this filter's `z1`/`z2` state, so a
+    /// running filter can be retuned without the click that rebuilding it from scratch causes.
+    #[inline]
+    pub fn set_coeffs(&mut self, design: &Self) {
+        self.b0 = design.b0;
+        self.b1 = design.b1;
+        self.b2 = design.b2;
+        self.a1 = design.a1;
+        self.a2 = design.a2;
+    }
+
     #[inline]
     pub fn process_sample(&mut self, x_raw: f64) -> f64 {
         let x = sanitize_sample_f64(x_raw);
@@ -182,6 +193,22 @@ impl Biquad {
         let a2 = 1.0 - alpha;
 
         Self::new(b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+    }
+
+    /// Audio EQ Cookbook band-pass with a constant 0 dB peak, so its gain is at most 1 everywhere.
+    pub fn bandpass(sample_rate: f64, freq_hz: f64, q: f64) -> Self {
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 100.0, 768_000.0);
+        let f0 = sanitize_param_f64(freq_hz, 1000.0, 20.0, (sr * 0.48).max(20.0));
+        let clean_q = sanitize_param_f64(q, 0.707, 0.1, 50.0);
+        let w0 = 2.0 * PI * f0 / sr;
+        let cos_w0 = w0.cos();
+        let alpha = w0.sin() / (2.0 * clean_q);
+
+        let a0 = 1.0 + alpha;
+        let a1 = -2.0 * cos_w0;
+        let a2 = 1.0 - alpha;
+
+        Self::new(alpha / a0, 0.0, -alpha / a0, a1 / a0, a2 / a0)
     }
 
     /// Second-order Butterworth Low-Pass Filter.
@@ -371,7 +398,7 @@ impl CytomicSvf {
 /// ITU-R BS.1770-4 Annex 2 4x oversampling interpolation filter: 48-tap FIR split into
 /// 4 polyphase sub-filters of 12 taps each.
 #[rustfmt::skip]
-const TRUE_PEAK_PHASES: [[f64; 12]; 4] = [
+pub(crate) const TRUE_PEAK_PHASES: [[f64; 12]; 4] = [
     [
         0.001_708_984_375_0, 0.010_986_328_125_0, -0.019_653_320_312_5, 0.033_203_125_000_0,
         -0.059_448_242_187_5, 0.137_329_101_562_5, 0.972_167_968_750_0, -0.102_294_921_875_0,
@@ -804,6 +831,116 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
     }
 }
 
+/// Lookahead window of the mastering limiters, in milliseconds. The README and the
+/// architecture guide quote this value; `tests/docs_consistency.rs` keeps them in sync.
+pub const LIMITER_LOOKAHEAD_MS: f64 = 3.0;
+
+/// Release time of the `normalize_and_limit` gain envelope, in milliseconds.
+pub const LIMITER_RELEASE_MS: f64 = 50.0;
+
+/// Frames the offline limiter holds its gain flat on each side of a peak, so the 12-tap
+/// interpolation filter around the peak sees a constant gain.
+const LIMITER_HOLD_FRAMES: usize = 8;
+
+/// Per-frame true peak across all channels: the larger of `|x|` and the four interpolated phases
+/// of the ITU-R BS.1770-4 Annex 2 filter. An interpolated value is charged to both frames it
+/// falls between.
+fn true_peak_per_frame(channels: &[Vec<f64>], frames: usize) -> Vec<f64> {
+    const TAPS: usize = 12;
+    // Phase outputs at input step `i` sit at times `i - 5.875 .. i - 5.125`.
+    const LAG: usize = 6;
+    let mut peaks = vec![0.0_f64; frames];
+    for ch in channels {
+        let mut hist = [0.0_f64; TAPS];
+        for i in 0..frames + TAPS - 1 {
+            let x = ch.get(i).copied().unwrap_or(0.0);
+            hist.copy_within(0..TAPS - 1, 1);
+            hist[0] = x;
+            if i < frames {
+                peaks[i] = peaks[i].max(x.abs());
+            }
+            let interp = TRUE_PEAK_PHASES
+                .iter()
+                .map(|c| c.iter().zip(&hist).map(|(c, h)| c * h).sum::<f64>().abs())
+                .fold(0.0_f64, f64::max);
+            for frame in [i.checked_sub(LAG), i.checked_sub(LAG - 1)]
+                .into_iter()
+                .flatten()
+            {
+                if frame < frames {
+                    peaks[frame] = peaks[frame].max(interp);
+                }
+            }
+        }
+    }
+    peaks
+}
+
+/// `out[i] = min(values[i .. i + window])`, via a monotonic deque in O(n).
+fn forward_window_min(values: &[f64], window: usize) -> Vec<f64> {
+    let mut out = vec![1.0_f64; values.len()];
+    let mut deque = std::collections::VecDeque::with_capacity(window + 1);
+    for j in (0..values.len()).rev() {
+        while deque
+            .back()
+            .is_some_and(|&k: &usize| values[k] >= values[j])
+        {
+            deque.pop_back();
+        }
+        deque.push_back(j);
+        while deque.front().is_some_and(|&k| k >= j + window) {
+            deque.pop_front();
+        }
+        out[j] = values[deque[0]];
+    }
+    out
+}
+
+/// Gain envelope for `peaks`: the minimum required gain over a window that reaches
+/// `lookahead + LIMITER_HOLD_FRAMES` frames ahead and `LIMITER_HOLD_FRAMES` behind, a release
+/// one-pole that only acts upward, then a `lookahead`-frame moving average. The average turns
+/// each gain drop into a linear ramp that completes `LIMITER_HOLD_FRAMES` frames before the peak.
+fn limiter_gain_envelope(
+    peaks: &[f64],
+    ceiling_lin: f64,
+    lookahead: usize,
+    release_coeff: f64,
+) -> Vec<f64> {
+    let required: Vec<f64> = peaks
+        .iter()
+        .map(|&p| {
+            if p > ceiling_lin {
+                ceiling_lin / p
+            } else {
+                1.0
+            }
+        })
+        .collect();
+    let ahead_min = forward_window_min(&required, lookahead + 2 * LIMITER_HOLD_FRAMES + 1);
+
+    // Prime the release and the moving average as if the first window's gain had been held for
+    // a full lookahead before the file starts, so an over in the first frames is fully reduced
+    // where it occurs instead of leaving the whole-file trim to catch it.
+    let start = ahead_min.first().copied().unwrap_or(1.0);
+    let mut released = start;
+    let mut ring = vec![start; lookahead];
+    let mut sum = start * lookahead as f64;
+    let mut gain_env = vec![1.0_f64; peaks.len()];
+    for (i, g) in gain_env.iter_mut().enumerate() {
+        let held = ahead_min[i.saturating_sub(LIMITER_HOLD_FRAMES)];
+        released = if held < released {
+            held
+        } else {
+            (release_coeff * released + (1.0 - release_coeff) * held).min(held)
+        };
+        let slot = i % lookahead;
+        sum += released - ring[slot];
+        ring[slot] = released;
+        *g = (sum / lookahead as f64).min(1.0);
+    }
+    gain_env
+}
+
 /// Masters an `AudioBuffer` to a target Integrated LUFS and strict True-Peak ceiling (`-1.0 dBTP`).
 pub fn normalize_and_limit(
     buffer: &AudioBuffer,
@@ -839,54 +976,11 @@ pub fn normalize_and_limit(
         }
     }
 
-    // Compute per-frame peak envelope including 4x inter-sample peaks
-    let mut inst_peak = vec![0.0_f64; frames];
-    for ch in &out.channels {
-        for i in 0..frames {
-            let mut pk = ch[i].abs();
-            if i >= 1 && i + 2 < frames {
-                let interp = (-0.0625 * ch[i - 1] + 0.5625 * ch[i] + 0.5625 * ch[i + 1]
-                    - 0.0625 * ch[i + 2])
-                    .abs();
-                if interp > pk {
-                    pk = interp;
-                }
-            }
-            if pk > inst_peak[i] {
-                inst_peak[i] = pk;
-            }
-        }
-    }
-
-    // 3ms lookahead window + smooth 50ms release envelope
     let sr = f64::from(out.sample_rate.max(1));
-    let lookahead = ((sr * 0.003).round() as usize).max(4);
-    let release_coeff = (-1.0 / (sr * 0.050)).exp();
-
-    let mut gain_env = vec![1.0_f64; frames];
-    let mut current_gain = 1.0_f64;
-
-    for i in 0..frames {
-        let win_end = (i + lookahead).min(frames);
-        let mut max_future = inst_peak[i];
-        for &p in &inst_peak[i..win_end] {
-            if p > max_future {
-                max_future = p;
-            }
-        }
-        let target_g = if max_future > ceiling_lin {
-            ceiling_lin / max_future
-        } else {
-            1.0
-        };
-        if target_g < current_gain {
-            // Fast lookahead attack
-            current_gain = target_g;
-        } else {
-            current_gain = release_coeff * current_gain + (1.0 - release_coeff) * target_g;
-        }
-        gain_env[i] = current_gain;
-    }
+    let lookahead = ((sr * LIMITER_LOOKAHEAD_MS / 1000.0).round() as usize).max(4);
+    let release_coeff = (-1.0 / (sr * LIMITER_RELEASE_MS / 1000.0)).exp();
+    let peaks = true_peak_per_frame(&out.channels, frames);
+    let gain_env = limiter_gain_envelope(&peaks, ceiling_lin, lookahead, release_coeff);
 
     for ch in 0..ch_count {
         for (s, &g) in out.channels[ch].iter_mut().zip(gain_env.iter()) {
@@ -894,16 +988,19 @@ pub fn normalize_and_limit(
         }
     }
 
-    // Final safety trim if 4x true-peak slightly exceeds clean_ceiling_dbtp
-    let (_, post_tp_db, _) = compute_true_peak(&out);
-    if post_tp_db > clean_ceiling_dbtp {
-        let trim = 10.0_f64.powf((clean_ceiling_dbtp - post_tp_db - 0.02) / 20.0);
+    apply_true_peak_trim(&mut out, clean_ceiling_dbtp);
+    Ok(out)
+}
+
+/// Final safety trim if the 4x true peak still slightly exceeds `ceiling_dbtp`.
+fn apply_true_peak_trim(out: &mut AudioBuffer, ceiling_dbtp: f64) {
+    let (_, post_tp_db, _) = compute_true_peak(out);
+    if post_tp_db > ceiling_dbtp {
+        let trim = 10.0_f64.powf((ceiling_dbtp - post_tp_db - 0.02) / 20.0);
         for ch in &mut out.channels {
             for s in ch.iter_mut() {
                 *s *= trim;
             }
         }
     }
-
-    Ok(out)
 }

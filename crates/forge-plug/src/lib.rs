@@ -18,11 +18,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use forge_dsp::{
-    AnalogHardwareModel, AutoGainCompensator, GenreTonalTarget, RealtimeDensityAndClipper,
-    RealtimeDrumTrigger, RealtimeFdnReverb, RealtimeMasterLimiter, RealtimeMasteringEq18,
-    RealtimeNeuralPreamp, RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner,
-    RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus, RealtimeTransientTonalSplit,
-    RealtimeVocalSurgical, publish_shared_spectrum, read_shared_spectrum,
+    AnalogHardwareModel, AutoGainCompensator, DrumTriggerNotes, GenreTonalTarget, NoteMsg,
+    RealtimeDensityAndClipper, RealtimeDrumTrigger, RealtimeFdnReverb, RealtimeMasterLimiter,
+    RealtimeMasteringEq18, RealtimeNeuralPreamp, RealtimeOpenSoothe, RealtimeOpenSpacer,
+    RealtimePhaseAligner, RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus,
+    RealtimeTransientTonalSplit, RealtimeVocalSurgical, SpectrumBusOwner, clear_shared_spectrum,
+    publish_shared_spectrum, read_shared_spectrum, shared_spectrum_slot_index,
 };
 use nih_plug::prelude::*;
 use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
@@ -243,6 +244,13 @@ pub struct ForgeOpenSoothePlug {
     dsp: RealtimeOpenSoothe,
     sub_tape_dsp: RealtimeSubAndTapeBus,
     limiter_dsp: RealtimeMasterLimiter,
+    /// Host sample rate from the last `initialize`, reused by `reset` (which gets none).
+    sample_rate: f64,
+    /// Shared-bus slot this instance last published to, cleared when it changes or on drop.
+    published_slot: Option<usize>,
+    /// This instance's identity on the shared bus, so its clears never empty a slot another
+    /// instance has published to since.
+    bus_owner: SpectrumBusOwner,
 }
 
 #[derive(Params)]
@@ -324,8 +332,10 @@ impl Default for OpenSootheParams {
             shared_bus_slot: IntParam::new(
                 "Shared Spectrum Bus Slot",
                 0,
-                IntRange::Linear { min: 0, max: 7 },
-            ),
+                IntRange::Linear { min: 0, max: 8 },
+            )
+            .with_value_to_string(Arc::new(bus_slot_to_string))
+            .with_string_to_value(Arc::new(bus_slot_from_string)),
         }
     }
 }
@@ -338,7 +348,77 @@ impl Default for ForgeOpenSoothePlug {
             dsp: RealtimeOpenSoothe::new(48_000.0),
             sub_tape_dsp: RealtimeSubAndTapeBus::new(48_000.0, 160.0),
             limiter_dsp: RealtimeMasterLimiter::new(48_000.0),
+            sample_rate: 48_000.0,
+            published_slot: None,
+            bus_owner: SpectrumBusOwner::unique(),
         }
+    }
+}
+
+/// Slot letters for bus-slot parameter values `1..=8`.
+const BUS_SLOT_LETTERS: &str = "ABCDEFGH";
+
+/// Bus-slot parameter display: `0` is `Off`, `1..=8` are `Slot A..H`.
+fn bus_slot_to_string(value: i32) -> String {
+    usize::try_from(value)
+        .ok()
+        .and_then(|v| v.checked_sub(1))
+        .and_then(|i| BUS_SLOT_LETTERS.get(i..=i))
+        .map_or_else(|| String::from("Off"), |letter| format!("Slot {letter}"))
+}
+
+/// Parses bus-slot text back to its parameter value, ignoring case and surrounding spaces:
+/// `Off`, `Slot A..H`, a bare letter `A..H`, or the plain value `0..8`.
+fn bus_slot_from_string(text: &str) -> Option<i32> {
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("off") {
+        return Some(0);
+    }
+    if let Ok(value) = text.parse::<i32>() {
+        return (0..=8).contains(&value).then_some(value);
+    }
+    let letter = match text.get(..4) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("slot") => text[4..].trim(),
+        _ => text,
+    };
+    let mut chars = letter.chars();
+    let (Some(c), None) = (chars.next(), chars.next()) else {
+        return None;
+    };
+    let index = BUS_SLOT_LETTERS.find(c.to_ascii_uppercase())?;
+    i32::try_from(index + 1).ok()
+}
+
+impl Drop for ForgeOpenSoothePlug {
+    /// A removed instance must not leave its last frame on the bus. The clear only empties the
+    /// slot if this instance published to it last, so it never silences another instance.
+    fn drop(&mut self) {
+        if let Some(slot) = self.published_slot.take() {
+            clear_shared_spectrum(self.bus_owner, slot);
+        }
+    }
+}
+
+impl ForgeOpenSoothePlug {
+    /// Publishes `bands` to the bus slot selected by `bus_param` (`0 = Off`). Moving to another
+    /// slot or to `Off` clears the slot this instance published to before, unless another
+    /// instance has published to it since (the last publisher owns a slot).
+    fn publish_to_bus(&mut self, bus_param: usize, bands: &[f32; 32]) {
+        let slot = shared_spectrum_slot_index(bus_param);
+        if let Some(old) = self.published_slot.filter(|&old| Some(old) != slot) {
+            clear_shared_spectrum(self.bus_owner, old);
+        }
+        self.published_slot = slot;
+        if let Some(idx) = slot {
+            publish_shared_spectrum(self.bus_owner, idx, bands);
+        }
+    }
+
+    /// Total input-to-output delay. The limiter's lookahead delay stays in the signal path even
+    /// when the limiter (or delta listen) is off, so this is constant and the host's delay
+    /// compensation never goes stale when those switches change.
+    fn latency_samples(&self) -> u32 {
+        self.dsp.latency_samples() + self.limiter_dsp.latency_samples()
     }
 }
 
@@ -372,13 +452,13 @@ impl Plugin for ForgeOpenSoothePlug {
             |_, _| {},
             move |egui_ctx, setter, _state| {
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
-                    let slot = params.shared_bus_slot.value() as usize;
+                    let slot = shared_spectrum_slot_index(params.shared_bus_slot.value() as usize);
                     draw_forge_studio_header_and_spectrum(
                         ui,
                         "FORGE OPENSOOTHE DE-FIZZ",
                         "2048-pt OLA STFT Dynamic Spectral Resonance & AI Metallic Whistle Suppressor",
                         &telemetry,
-                        Some(slot),
+                        slot,
                     );
                     egui::Grid::new("opensoothe_grid")
                         .num_columns(2)
@@ -427,23 +507,18 @@ impl Plugin for ForgeOpenSoothePlug {
         buffer_config: &BufferConfig,
         context: &mut impl InitContext<Self>,
     ) -> bool {
-        let sr = f64::from(buffer_config.sample_rate);
-        self.dsp.reset(sr);
-        self.sub_tape_dsp = RealtimeSubAndTapeBus::new(sr, 160.0);
-        self.limiter_dsp.reset(sr);
-        let total_latency = self.dsp.latency_samples()
-            + if self.params.enable_limiter.value() {
-                self.limiter_dsp.latency_samples()
-            } else {
-                0
-            };
-        context.set_latency_samples(total_latency);
+        self.sample_rate = f64::from(buffer_config.sample_rate);
+        self.reset();
+        context.set_latency_samples(self.latency_samples());
         true
     }
 
+    /// Clears DSP state at the sample rate from `initialize`. May run on the audio thread, and
+    /// none of these resets allocate.
     fn reset(&mut self) {
-        self.dsp.reset(48_000.0);
-        self.limiter_dsp.reset(48_000.0);
+        self.dsp.reset(self.sample_rate);
+        self.sub_tape_dsp.reset(self.sample_rate);
+        self.limiter_dsp.reset(self.sample_rate);
     }
 
     fn process(
@@ -477,11 +552,12 @@ impl Plugin for ForgeOpenSoothePlug {
                     .process_stereo_sample(out_l, out_r, 0.20, 1.06, tape_drive);
             }
 
-            if use_limiter && !delta {
-                (out_l, out_r) = self
-                    .limiter_dsp
-                    .process_stereo_sample(out_l, out_r, 0.0, ceil, 85.0);
-            }
+            (out_l, out_r) = if use_limiter && !delta {
+                self.limiter_dsp
+                    .process_stereo_sample(out_l, out_r, 0.0, ceil, 85.0)
+            } else {
+                self.limiter_dsp.process_delay_only(out_l, out_r)
+            };
 
             let gr_est = 20.0
                 * (out_l.abs().max(out_r.abs()) / in_l.abs().max(in_r.abs()).max(1e-5))
@@ -502,7 +578,7 @@ impl Plugin for ForgeOpenSoothePlug {
         let bands = self.dsp.last_spectrum_32_db();
         let gr_curve = self.dsp.last_band_gr_32_db();
         self.telemetry.update_spectrum_and_gr(&bands, &gr_curve);
-        publish_shared_spectrum(bus_slot, &bands);
+        self.publish_to_bus(bus_slot, &bands);
 
         ProcessStatus::Normal
     }
@@ -803,6 +879,10 @@ pub struct VocalSurgicalParams {
     pub breath_gate_db: FloatParam,
 }
 
+/// Ramp time for every Vocal Surgical control, in milliseconds. All four controls are linear
+/// amounts or dB thresholds, so a linear ramp is the right curve for each of them.
+const VOCAL_SURGICAL_SMOOTHING_MS: f32 = 20.0;
+
 impl Default for VocalSurgicalParams {
     fn default() -> Self {
         Self {
@@ -812,13 +892,15 @@ impl Default for VocalSurgicalParams {
                 0.65,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
-            .with_value_to_string(formatters::v2s_f32_rounded(3)),
+            .with_value_to_string(formatters::v2s_f32_rounded(3))
+            .with_smoother(SmoothingStyle::Linear(VOCAL_SURGICAL_SMOOTHING_MS)),
             deplosive_strength: FloatParam::new(
                 "Plosive Duck (<115Hz)",
                 0.75,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
-            .with_value_to_string(formatters::v2s_f32_rounded(3)),
+            .with_value_to_string(formatters::v2s_f32_rounded(3))
+            .with_smoother(SmoothingStyle::Linear(VOCAL_SURGICAL_SMOOTHING_MS)),
             deess_threshold_db: FloatParam::new(
                 "Split-Band De-Esser",
                 -22.0,
@@ -828,7 +910,8 @@ impl Default for VocalSurgicalParams {
                 },
             )
             .with_value_to_string(formatters::v2s_f32_rounded(2))
-            .with_unit(" dB"),
+            .with_unit(" dB")
+            .with_smoother(SmoothingStyle::Linear(VOCAL_SURGICAL_SMOOTHING_MS)),
             breath_gate_db: FloatParam::new(
                 "Breath Gate Threshold",
                 -48.0,
@@ -838,8 +921,28 @@ impl Default for VocalSurgicalParams {
                 },
             )
             .with_value_to_string(formatters::v2s_f32_rounded(2))
-            .with_unit(" dB"),
+            .with_unit(" dB")
+            .with_smoother(SmoothingStyle::Linear(VOCAL_SURGICAL_SMOOTHING_MS)),
         }
+    }
+}
+
+/// One sample's worth of Vocal Surgical control values, read from the parameter smoothers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VocalSurgicalControls {
+    declick: f64,
+    deplosive: f64,
+    deess_db: f64,
+    gate_db: f64,
+}
+
+/// Advances every Vocal Surgical smoother by one sample and returns the new values.
+fn next_vocal_surgical_controls(params: &VocalSurgicalParams) -> VocalSurgicalControls {
+    VocalSurgicalControls {
+        declick: f64::from(params.declick_sensitivity.smoothed.next()),
+        deplosive: f64::from(params.deplosive_strength.smoothed.next()),
+        deess_db: f64::from(params.deess_threshold_db.smoothed.next()),
+        gate_db: f64::from(params.breath_gate_db.smoothed.next()),
     }
 }
 
@@ -931,17 +1034,18 @@ impl Plugin for ForgeVocalSurgicalPlug {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        let declick = f64::from(self.params.declick_sensitivity.value());
-        let deplosive = f64::from(self.params.deplosive_strength.value());
-        let deess = f64::from(self.params.deess_threshold_db.value());
-        let gate = f64::from(self.params.breath_gate_db.value());
-
         for mut channel_samples in buffer.iter_samples() {
+            let ctl = next_vocal_surgical_controls(&self.params);
             let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
             let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
-            let (out_l, out_r) = self
-                .dsp
-                .process_stereo_sample(in_l, in_r, declick, deplosive, deess, gate);
+            let (out_l, out_r) = self.dsp.process_stereo_sample(
+                in_l,
+                in_r,
+                ctl.declick,
+                ctl.deplosive,
+                ctl.deess_db,
+                ctl.gate_db,
+            );
             self.analyzer.push_stereo_sample(out_l, out_r);
             let gr_est = 20.0
                 * (out_l.abs().max(out_r.abs()) / in_l.abs().max(in_r.abs()).max(1e-5))
@@ -1030,18 +1134,21 @@ impl Default for SubAndTapeParams {
                 0.25,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
+            .with_smoother(SmoothingStyle::Linear(20.0))
             .with_value_to_string(formatters::v2s_f32_rounded(3)),
             stereo_width: FloatParam::new(
                 "High Stereo Width",
                 1.08,
                 FloatRange::Linear { min: 0.0, max: 2.0 },
             )
+            .with_smoother(SmoothingStyle::Linear(20.0))
             .with_value_to_string(formatters::v2s_f32_rounded(3)),
             tape_drive: FloatParam::new(
                 "Console8 / ChowTape RK4 Drive",
                 0.22,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
+            .with_smoother(SmoothingStyle::Linear(20.0))
             .with_value_to_string(formatters::v2s_f32_rounded(3)),
         }
     }
@@ -1135,13 +1242,14 @@ impl Plugin for ForgeSubAndTapePlug {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        // Only sets the glide target; the DSP retunes its side high-passes in place.
         self.dsp
             .set_mono_cutoff(f64::from(self.params.mono_cutoff_hz.value()));
-        let sub = f64::from(self.params.sub_reinforce.value());
-        let width = f64::from(self.params.stereo_width.value());
-        let drive = f64::from(self.params.tape_drive.value());
 
         for mut channel_samples in buffer.iter_samples() {
+            let sub = f64::from(self.params.sub_reinforce.smoothed.next());
+            let width = f64::from(self.params.stereo_width.smoothed.next());
+            let drive = f64::from(self.params.tape_drive.smoothed.next());
             let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
             let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
             let (out_l, out_r) = self
@@ -1392,6 +1500,11 @@ pub struct ForgeDrumTriggerPlug {
     telemetry: Arc<GuiTelemetry>,
     analyzer: RealtimeSpectrumAnalyzer32,
     dsp: RealtimeDrumTrigger,
+    /// Generated notes still sounding, so each gets its NoteOff.
+    notes: DrumTriggerNotes,
+    /// Set by `reset`; the next block starts by releasing every generated note.
+    release_pending: bool,
+    was_playing: bool,
 }
 
 #[derive(Params)]
@@ -1430,6 +1543,9 @@ impl Default for ForgeDrumTriggerPlug {
             telemetry: Arc::new(GuiTelemetry::default()),
             analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
             dsp: RealtimeDrumTrigger::new(48_000.0),
+            notes: DrumTriggerNotes::new(48_000.0),
+            release_pending: false,
+            was_playing: false,
         }
     }
 }
@@ -1498,7 +1614,13 @@ impl Plugin for ForgeDrumTriggerPlug {
         let sr = f64::from(buffer_config.sample_rate);
         self.dsp.reset(sr);
         self.analyzer.reset(sr);
+        self.notes.set_sample_rate(sr);
         true
+    }
+
+    /// Notes cannot be sent from here, so held notes are released at the start of the next block.
+    fn reset(&mut self) {
+        self.release_pending = true;
     }
 
     fn process(
@@ -1508,7 +1630,9 @@ impl Plugin for ForgeDrumTriggerPlug {
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         let thresh = f64::from(self.params.threshold_db.value());
-        let expand_chords = self.params.expand_midi_chords.value();
+        self.notes
+            .set_chord_expansion(self.params.expand_midi_chords.value());
+        self.release_on_reset_or_stop(context);
 
         // Output events must be in non-decreasing timing order, so incoming MIDI (1) is forwarded
         // in step with the audio-detected drum hits (2) rather than all up front.
@@ -1520,7 +1644,7 @@ impl Plugin for ForgeDrumTriggerPlug {
                 if event.timing() as usize > sample_idx {
                     break;
                 }
-                Self::forward_event(context, event, expand_chords);
+                self.forward_event(context, event);
                 pending = context.next_event();
             }
 
@@ -1528,22 +1652,11 @@ impl Plugin for ForgeDrumTriggerPlug {
             let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
             self.analyzer.push_stereo_sample(in_l, in_r);
             self.telemetry.update_peaks(in_l, in_r, in_l, in_r, 0.0);
-
-            let triggers = self.dsp.process_stereo_sample(in_l, in_r, thresh);
-            for trig in triggers.into_iter().flatten() {
-                let (midi_note, vel) = trig;
-                context.send_event(NoteEvent::NoteOn {
-                    timing: sample_idx as u32,
-                    voice_id: None,
-                    channel: 9, // General MIDI Drum Channel 10 (0-indexed = 9)
-                    note: midi_note,
-                    velocity: vel,
-                });
-            }
+            self.trigger_drums(context, sample_idx as u32, in_l, in_r, thresh);
         }
         // Events timed at or past the end of the block (should not happen, but never drop them).
         while let Some(event) = pending {
-            Self::forward_event(context, event, expand_chords);
+            self.forward_event(context, event);
             pending = context.next_event();
         }
         self.telemetry
@@ -1554,37 +1667,105 @@ impl Plugin for ForgeDrumTriggerPlug {
 }
 
 impl ForgeDrumTriggerPlug {
+    /// Converts a tracked note to a host event. Forwarded roots keep their incoming voice ID and
+    /// generated notes carry none (see [`NoteMsg`]), so a chord tone never shares the ID of the
+    /// root that started it.
+    fn note_event(msg: NoteMsg) -> PluginNoteEvent<Self> {
+        match msg {
+            NoteMsg::On {
+                timing,
+                channel,
+                note,
+                velocity,
+                voice_id,
+            } => NoteEvent::NoteOn {
+                timing,
+                voice_id,
+                channel,
+                note,
+                velocity,
+            },
+            NoteMsg::Off {
+                timing,
+                channel,
+                note,
+                voice_id,
+            } => NoteEvent::NoteOff {
+                timing,
+                voice_id,
+                channel,
+                note,
+                velocity: 0.0,
+            },
+        }
+    }
+
+    /// Releases every tracked note, forwarded roots included, at the start of the block after a
+    /// reset, or when the transport stops.
+    fn release_on_reset_or_stop(&mut self, context: &mut impl ProcessContext<Self>) {
+        let playing = context.transport().playing;
+        let stopped = self.was_playing && !playing;
+        self.was_playing = playing;
+        if std::mem::take(&mut self.release_pending) || stopped {
+            self.notes
+                .release_all(0, &mut |msg| context.send_event(Self::note_event(msg)));
+        }
+    }
+
     /// Step 1: forwards an incoming event and, when enabled, expands 1-finger MIDI notes into
-    /// rootless Neo-Soul 9th voicings (3, 7, 9, 13) at the same timing.
+    /// rootless Neo-Soul 9th voicings (3, 7, 9, 13) at the same timing. NoteOns and NoteOffs go
+    /// through the tracker, which shares each key's occupancy between forwarded roots and
+    /// generated notes and releases only the chord of the voice a NoteOff names. Every other
+    /// event is forwarded unchanged.
     fn forward_event(
+        &mut self,
         context: &mut impl ProcessContext<Self>,
         event: PluginNoteEvent<Self>,
-        expand_chords: bool,
     ) {
-        context.send_event(event);
-        if !expand_chords {
-            return;
+        match event {
+            NoteEvent::NoteOn {
+                timing,
+                voice_id,
+                channel,
+                note,
+                velocity,
+            } => self
+                .notes
+                .root_on(timing, channel, note, velocity, voice_id, &mut |msg| {
+                    context.send_event(Self::note_event(msg))
+                }),
+            NoteEvent::NoteOff {
+                timing,
+                voice_id,
+                channel,
+                note,
+                ..
+            } => self
+                .notes
+                .root_off(timing, channel, note, voice_id, &mut |msg| {
+                    context.send_event(Self::note_event(msg))
+                }),
+            other => context.send_event(other),
         }
-        let root = match event {
-            NoteEvent::NoteOn { note, .. } | NoteEvent::NoteOff { note, .. } => note,
-            _ => return,
-        };
-        for &interval in &[3_u8, 7, 10, 14] {
-            let harm = root.saturating_add(interval);
-            if harm > 120 {
-                continue;
+    }
+
+    /// Step 2: runs the transient detector for one frame and sends gated drum notes on GM
+    /// channel 10, each released a fixed length later.
+    fn trigger_drums(
+        &mut self,
+        context: &mut impl ProcessContext<Self>,
+        timing: u32,
+        in_l: f32,
+        in_r: f32,
+        thresh: f64,
+    ) {
+        let emit = &mut |msg| context.send_event(Self::note_event(msg));
+        self.notes.tick(timing, emit);
+        let triggers = self.dsp.process_stereo_sample(in_l, in_r, thresh);
+        for (slot, trig) in triggers.into_iter().enumerate() {
+            if let Some((midi_note, vel)) = trig {
+                self.notes.drum_hit(timing, slot, midi_note, vel, emit);
             }
-            // Copy of the incoming event re-pitched to the chord tone; note-ons are softened.
-            let mut voiced = event;
-            match &mut voiced {
-                NoteEvent::NoteOn { note, velocity, .. } => {
-                    *note = harm;
-                    *velocity = (*velocity * 0.82).clamp(0.1, 1.0);
-                }
-                NoteEvent::NoteOff { note, .. } => *note = harm,
-                _ => return,
-            }
-            context.send_event(voiced);
         }
     }
 }
@@ -2307,6 +2488,71 @@ pub struct SpaceVerbAndPreampParams {
     pub wet_mix: FloatParam,
 }
 
+/// Bottom of the stored `decay` knob range. The stored range is kept as it was so saved state
+/// and automation stay compatible; [`reverb_decay_knob_to_rt60_secs`] gives it its meaning.
+const REVERB_DECAY_KNOB_MIN: f32 = 0.05;
+/// Top of the stored `decay` knob range.
+const REVERB_DECAY_KNOB_MAX: f32 = 0.98;
+/// RT60 at the bottom of the decay knob. Matches the floor `RealtimeFdnReverb` clamps to.
+pub const REVERB_RT60_MIN_SECS: f64 = 0.2;
+/// RT60 at the top of the decay knob. Matches the ceiling `RealtimeFdnReverb` clamps to.
+pub const REVERB_RT60_MAX_SECS: f64 = 20.0;
+
+/// Position of a stored decay knob value along its range, from 0 at the bottom to 1 at the top.
+fn reverb_decay_knob_position(knob: f32) -> f64 {
+    let span = f64::from(REVERB_DECAY_KNOB_MAX - REVERB_DECAY_KNOB_MIN);
+    let pos = (f64::from(knob) - f64::from(REVERB_DECAY_KNOB_MIN)) / span;
+    if pos.is_finite() {
+        pos.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// Maps the stored SpaceVerb decay knob (0.05 to 0.98) onto an RT60 in seconds.
+///
+/// The curve is logarithmic: equal knob travel multiplies the decay time by the same factor,
+/// running from [`REVERB_RT60_MIN_SECS`] at the bottom to [`REVERB_RT60_MAX_SECS`] at the top.
+pub fn reverb_decay_knob_to_rt60_secs(knob: f32) -> f64 {
+    let ratio = REVERB_RT60_MAX_SECS / REVERB_RT60_MIN_SECS;
+    REVERB_RT60_MIN_SECS * ratio.powf(reverb_decay_knob_position(knob))
+}
+
+/// Inverse of [`reverb_decay_knob_to_rt60_secs`]; RT60 values outside the range are clamped.
+///
+/// Zero, negative and NaN inputs map to the bottom of the knob and positive infinity to the
+/// top, so the logarithm never sees a value it cannot take.
+pub fn rt60_secs_to_reverb_decay_knob(rt60_secs: f64) -> f32 {
+    let pos = if rt60_secs.is_nan() || rt60_secs <= REVERB_RT60_MIN_SECS {
+        0.0
+    } else if rt60_secs >= REVERB_RT60_MAX_SECS {
+        1.0
+    } else {
+        let ratio = REVERB_RT60_MAX_SECS / REVERB_RT60_MIN_SECS;
+        (rt60_secs / REVERB_RT60_MIN_SECS).ln() / ratio.ln()
+    };
+    let span = f64::from(REVERB_DECAY_KNOB_MAX - REVERB_DECAY_KNOB_MIN);
+    (f64::from(REVERB_DECAY_KNOB_MIN) + pos * span) as f32
+}
+
+/// Shows the decay knob as the RT60 it produces, for example `3.90 s`.
+fn reverb_decay_knob_to_string(knob: f32) -> String {
+    format!("{:.2} s", reverb_decay_knob_to_rt60_secs(knob))
+}
+
+/// Parses a decay typed in seconds (`4`, `4 s`, `4.0s`, `4 sec`) back to the stored knob value.
+fn string_to_reverb_decay_knob(text: &str) -> Option<f32> {
+    let trimmed = text.trim();
+    let number = trimmed
+        .strip_suffix("sec")
+        .or_else(|| trimmed.strip_suffix("s"))
+        .unwrap_or(trimmed)
+        .trim();
+    let secs: f64 = number.parse().ok()?;
+    secs.is_finite()
+        .then(|| rt60_secs_to_reverb_decay_knob(secs))
+}
+
 impl Default for SpaceVerbAndPreampParams {
     fn default() -> Self {
         Self {
@@ -2327,11 +2573,12 @@ impl Default for SpaceVerbAndPreampParams {
                 "FDN Reverb Decay",
                 0.65,
                 FloatRange::Linear {
-                    min: 0.05,
-                    max: 0.98,
+                    min: REVERB_DECAY_KNOB_MIN,
+                    max: REVERB_DECAY_KNOB_MAX,
                 },
             )
-            .with_value_to_string(formatters::v2s_f32_rounded(3)),
+            .with_value_to_string(Arc::new(reverb_decay_knob_to_string))
+            .with_string_to_value(Arc::new(string_to_reverb_decay_knob)),
             reverb_damping: FloatParam::new(
                 "High-Frequency Damping",
                 0.40,
@@ -2469,7 +2716,7 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
             _ => AnalogHardwareModel::Neve1073ClassA,
         };
         self.preamp_dsp.set_model(model);
-        let decay = f64::from(self.params.reverb_decay.value());
+        let decay = reverb_decay_knob_to_rt60_secs(self.params.reverb_decay.value());
         let damp = f64::from(self.params.reverb_damping.value());
         let shimmer = f64::from(self.params.shimmer_amount.value());
         let duck = f64::from(self.params.vocal_ducking.value());
@@ -2608,5 +2855,301 @@ mod tests {
         assert!(!p8.params().param_map().is_empty());
         assert!(!p9.params().param_map().is_empty());
         assert!(!p10.params().param_map().is_empty());
+    }
+
+    /// The shared spectrum bus is process-wide and tests run on parallel threads, so every test
+    /// that publishes to or scans the bus holds this lock to keep the others out of its slots.
+    static SHARED_BUS_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_shared_bus() -> std::sync::MutexGuard<'static, ()> {
+        SHARED_BUS_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn open_soothe_bus_slot_zero_is_off_and_a_removed_instance_clears_its_slot() {
+        let _bus = lock_shared_bus();
+        let silent = [forge_dsp::SPECTRUM_FLOOR_DB; 32];
+        let bands = [-20.0_f32; 32];
+        let mut plug = ForgeOpenSoothePlug::default();
+
+        // Off publishes nowhere: every slot keeps its silent default.
+        plug.publish_to_bus(0, &bands);
+        for slot in 0..8 {
+            assert_eq!(
+                read_shared_spectrum(slot),
+                silent,
+                "Off wrote to slot {slot}"
+            );
+        }
+
+        // Slot C is index 2; moving to slot D clears slot C.
+        plug.publish_to_bus(3, &bands);
+        assert_eq!(read_shared_spectrum(2), bands);
+        plug.publish_to_bus(4, &bands);
+        assert_eq!(read_shared_spectrum(2), silent);
+        assert_eq!(read_shared_spectrum(3), bands);
+
+        drop(plug);
+        assert_eq!(
+            read_shared_spectrum(3),
+            silent,
+            "a dropped instance left its frame"
+        );
+    }
+
+    const RT60_TEST_SAMPLE_RATE: f64 = 24_000.0;
+
+    /// RT60 measured from a Schroeder backward-integrated decay curve: the time the curve takes
+    /// to fall from -5 dB to -25 dB (T20), scaled up to 60 dB.
+    fn schroeder_t20_rt60_secs(energy: &[f64], sample_rate: f64) -> f64 {
+        let total: f64 = energy.iter().sum();
+        let mut remaining = total;
+        let mut t5 = None;
+        for (n, e) in energy.iter().enumerate() {
+            let level_db = 10.0 * (remaining / total).log10();
+            if t5.is_none() && level_db <= -5.0 {
+                t5 = Some(n);
+            }
+            if level_db <= -25.0 {
+                let start = t5.unwrap_or(n);
+                return 3.0 * (n - start) as f64 / sample_rate;
+            }
+            remaining -= e;
+        }
+        panic!("the reverb tail never fell 25 dB");
+    }
+
+    /// Fires an impulse through the SpaceVerb FDN at the plug's default damping, 100 % wet, and
+    /// returns the RT60 measured from its tail. The dry impulse itself is left out of the curve.
+    fn measured_spaceverb_rt60_secs(decay_rt60_secs: f64) -> f64 {
+        let defaults = SpaceVerbAndPreampParams::default();
+        let damp = f64::from(defaults.reverb_damping.value());
+        let mut reverb = RealtimeFdnReverb::new(RT60_TEST_SAMPLE_RATE);
+        let len = (RT60_TEST_SAMPLE_RATE * 25.0) as usize;
+        let mut energy = Vec::with_capacity(len);
+        for n in 0..len {
+            let x = if n == 0 { 1.0 } else { 0.0 };
+            let (l, r) = reverb.process_stereo_sample(x, x, decay_rt60_secs, damp, 0.0, 0.0, 1.0);
+            let e = f64::from(l).powi(2) + f64::from(r).powi(2);
+            energy.push(if n == 0 { 0.0 } else { e });
+        }
+        schroeder_t20_rt60_secs(&energy, RT60_TEST_SAMPLE_RATE)
+    }
+
+    #[test]
+    fn spaceverb_decay_knob_sweeps_the_measured_rt60_well_past_one_second() {
+        let params = SpaceVerbAndPreampParams::default();
+        let measured: Vec<f64> = [0.0_f32, 0.33, 0.66, 1.0]
+            .iter()
+            .map(|&normalized| {
+                let knob = params.reverb_decay.preview_plain(normalized);
+                measured_spaceverb_rt60_secs(reverb_decay_knob_to_rt60_secs(knob))
+            })
+            .collect();
+        for pair in measured.windows(2) {
+            assert!(
+                pair[1] > pair[0] * 1.5,
+                "measured RT60 did not rise with the knob: {measured:?}"
+            );
+        }
+        assert!(
+            measured[0] < 0.6,
+            "bottom of the knob is too long: {measured:?}"
+        );
+        assert!(
+            measured[3] > 5.0,
+            "top of the knob never got well past 1 s: {measured:?}"
+        );
+    }
+
+    #[test]
+    fn spaceverb_decay_shows_seconds_and_keeps_its_parameter_ids() {
+        let params = SpaceVerbAndPreampParams::default();
+        let decay = &params.reverb_decay;
+        assert_eq!(decay.normalized_value_to_string(0.0, true), "0.20 s");
+        assert_eq!(decay.normalized_value_to_string(1.0, true), "20.00 s");
+        let normalized = decay
+            .string_to_normalized_value("4 s")
+            .expect("a decay typed in seconds parses");
+        let rt60 = reverb_decay_knob_to_rt60_secs(decay.preview_plain(normalized));
+        assert!((rt60 - 4.0).abs() < 1e-3, "4 s round-tripped to {rt60} s");
+        assert!(decay.string_to_normalized_value("long").is_none());
+
+        let ids: Vec<String> = params.param_map().into_iter().map(|p| p.0).collect();
+        for id in ["model", "pdrive", "decay", "damp", "shimmer", "duck", "mix"] {
+            assert!(ids.iter().any(|i| i == id), "parameter id {id} is missing");
+        }
+    }
+
+    #[test]
+    fn reverb_decay_mapping_round_trips_and_clamps_bad_inputs() {
+        let bottom = REVERB_DECAY_KNOB_MIN;
+        let top = REVERB_DECAY_KNOB_MAX;
+        for bad in [0.0, -1.0, f64::NEG_INFINITY, f64::NAN, 0.1] {
+            let knob = rt60_secs_to_reverb_decay_knob(bad);
+            assert!(
+                knob.is_finite() && knob == bottom,
+                "{bad} s mapped to {knob}"
+            );
+        }
+        for big in [20.0, 1e9, f64::INFINITY] {
+            assert_eq!(rt60_secs_to_reverb_decay_knob(big), top, "{big} s");
+        }
+        assert!((reverb_decay_knob_to_rt60_secs(bottom) - REVERB_RT60_MIN_SECS).abs() < 1e-6);
+        assert!((reverb_decay_knob_to_rt60_secs(top) - REVERB_RT60_MAX_SECS).abs() < 1e-4);
+        for secs in [0.25, 1.0, 2.0, 5.0, 12.5, 19.0] {
+            let back = reverb_decay_knob_to_rt60_secs(rt60_secs_to_reverb_decay_knob(secs));
+            assert!(
+                (back / secs - 1.0).abs() < 1e-4,
+                "{secs} s round-tripped to {back} s"
+            );
+        }
+        assert_eq!(string_to_reverb_decay_knob("0 s"), Some(bottom));
+        assert_eq!(string_to_reverb_decay_knob("inf"), None);
+    }
+
+    /// Reads one Vocal Surgical control out of a [`VocalSurgicalControls`] snapshot.
+    type VocalControlField = fn(&VocalSurgicalControls) -> f64;
+
+    /// Each Vocal Surgical control, its smoother, and a full-range jump to automate it through.
+    fn vocal_surgical_jumps(
+        params: &VocalSurgicalParams,
+    ) -> [(&'static str, &FloatParam, VocalControlField, f32, f32); 4] {
+        [
+            (
+                "declick",
+                &params.declick_sensitivity,
+                |c| c.declick,
+                0.0,
+                1.0,
+            ),
+            (
+                "deplosive",
+                &params.deplosive_strength,
+                |c| c.deplosive,
+                0.0,
+                1.0,
+            ),
+            (
+                "deess",
+                &params.deess_threshold_db,
+                |c| c.deess_db,
+                -45.0,
+                0.0,
+            ),
+            ("gate", &params.breath_gate_db, |c| c.gate_db, -70.0, -20.0),
+        ]
+    }
+
+    #[test]
+    fn vocal_surgical_controls_ramp_across_a_block_instead_of_stepping() {
+        const BLOCK: usize = 64;
+        let params = VocalSurgicalParams::default();
+        let jumps = vocal_surgical_jumps(&params);
+        for (_, param, _, from, to) in jumps {
+            param.smoothed.reset(from);
+            param.smoothed.set_target(48_000.0, to);
+        }
+        let block: Vec<VocalSurgicalControls> = (0..BLOCK)
+            .map(|_| next_vocal_surgical_controls(&params))
+            .collect();
+        for (name, _, field, from, to) in jumps {
+            let span = f64::from(to - from);
+            let values: Vec<f64> = block.iter().map(field).collect();
+            let largest_step = values
+                .windows(2)
+                .map(|w| (w[1] - w[0]).abs())
+                .fold((values[0] - f64::from(from)).abs(), f64::max);
+            assert!(
+                largest_step < span * 0.01,
+                "{name} stepped by {largest_step} of a {span} jump within one block"
+            );
+            let moved = values[BLOCK - 1] - f64::from(from);
+            assert!(
+                moved * span > 0.0 && moved.abs() < span.abs() * 0.5,
+                "{name} moved {moved} of {span} by the end of the block"
+            );
+        }
+    }
+
+    #[test]
+    fn bus_slot_names_match_the_slot_letters() {
+        assert_eq!(bus_slot_to_string(0), "Off");
+        assert_eq!(bus_slot_to_string(1), "Slot A");
+        assert_eq!(bus_slot_to_string(8), "Slot H");
+        assert_eq!(bus_slot_to_string(-1), "Off");
+        assert_eq!(bus_slot_to_string(9), "Off");
+    }
+
+    /// Plugs A and B share Slot F (index 5) and B published last, so B owns it. A switching
+    /// away or being dropped must leave B's frame; B dropping clears it.
+    #[test]
+    fn open_soothe_instances_sharing_a_slot_never_silence_each_other() {
+        let _bus = lock_shared_bus();
+        const PARAM: usize = 6;
+        const SLOT: usize = 5;
+        let silent = [forge_dsp::SPECTRUM_FLOOR_DB; 32];
+        let (a_bands, b_bands, c_bands) = ([-30.0_f32; 32], [-10.0_f32; 32], [-40.0_f32; 32]);
+        let mut a = ForgeOpenSoothePlug::default();
+        let mut b = ForgeOpenSoothePlug::default();
+        a.publish_to_bus(PARAM, &a_bands);
+        b.publish_to_bus(PARAM, &b_bands);
+
+        // A moves to Slot G (index 6): its clear of Slot F must not touch B's frame.
+        a.publish_to_bus(PARAM + 1, &a_bands);
+        assert_eq!(read_shared_spectrum(SLOT), b_bands, "A's switch silenced B");
+        assert_eq!(read_shared_spectrum(SLOT + 1), a_bands);
+
+        // C joins Slot F and is removed after B publishes again: B's frame stays.
+        let mut c = ForgeOpenSoothePlug::default();
+        c.publish_to_bus(PARAM, &c_bands);
+        b.publish_to_bus(PARAM, &b_bands);
+        drop(c);
+        assert_eq!(read_shared_spectrum(SLOT), b_bands, "C's drop silenced B");
+
+        drop(a);
+        assert_eq!(read_shared_spectrum(SLOT + 1), silent, "A owned Slot G");
+        drop(b);
+        assert_eq!(read_shared_spectrum(SLOT), silent, "B owned Slot F");
+    }
+
+    /// clap-validator's `param-conversions` check: every value's text must parse back to the
+    /// same value, through the plugin's own parameter, and re-format to the same text.
+    #[test]
+    fn bus_slot_text_round_trips_for_every_value() {
+        let params = OpenSootheParams::default();
+        let param = &params.shared_bus_slot;
+        for value in 0..=8 {
+            let text = bus_slot_to_string(value);
+            assert_eq!(bus_slot_from_string(&text), Some(value), "{text:?}");
+            let normalized = param.preview_normalized(value);
+            let shown = param.normalized_value_to_string(normalized, false);
+            assert_eq!(shown, text);
+            let parsed = param.string_to_normalized_value(&shown);
+            assert_eq!(parsed, Some(normalized), "{shown:?} did not parse back");
+        }
+    }
+
+    #[test]
+    fn bus_slot_text_accepts_letters_numbers_and_any_case() {
+        for (text, value) in [
+            ("off", 0),
+            (" OFF ", 0),
+            ("slot a", 1),
+            ("SLOT H", 8),
+            ("Slot  c", 3),
+            ("d", 4),
+            ("G", 7),
+            ("0", 0),
+            ("5", 5),
+            ("8", 8),
+        ] {
+            assert_eq!(bus_slot_from_string(text), Some(value), "{text:?}");
+        }
+        for text in ["", "Slot", "Slot I", "I", "9", "-1", "Slot AB", "on"] {
+            assert_eq!(bus_slot_from_string(text), None, "{text:?}");
+        }
     }
 }
