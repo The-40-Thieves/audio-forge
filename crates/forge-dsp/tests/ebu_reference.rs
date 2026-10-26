@@ -347,3 +347,20 @@ fn digital_silence_has_no_fizz_or_band_readings() {
     }
     assert!(r.recommendations.is_empty(), "{:?}", r.recommendations);
 }
+
+#[test]
+fn a_loud_clip_shorter_than_one_gating_block_is_not_treated_as_silence() {
+    // 50 ms of a 4.2 kHz whistle: no 100 ms block, so integrated loudness reads -70 LUFS, but
+    // the clip is loud and long enough for the 2048-point spectral analysis.
+    let frames = (0.05 * f64::from(SR)) as usize;
+    let ch: Vec<f64> = (0..frames)
+        .map(|n| 0.5 * (2.0 * PI * 4200.0 * n as f64 / f64::from(SR)).sin())
+        .collect();
+    let r = audit_audio(&AudioBuffer::from_channels(vec![ch.clone(), ch], SR).expect("buffer"));
+    assert!(
+        r.harshness_2_6khz_db > forge_dsp::SILENT_BAND_DB + 50.0,
+        "{}",
+        r.harshness_2_6khz_db
+    );
+    assert!(r.ai_fizz_index > 0.0, "fizz index {}", r.ai_fizz_index);
+}

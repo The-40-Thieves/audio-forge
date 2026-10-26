@@ -492,8 +492,11 @@ pub fn compute_true_peak(buffer: &AudioBuffer) -> (f64, f64, f64) {
     (sample_peak_dbfs, true_peak_dbtp, timestamp)
 }
 
-/// Band levels reported for audio below the -70 LUFS absolute gate (digital silence).
+/// Band levels reported for audio whose RMS is at or below [`SILENCE_RMS_DBFS`].
 pub const SILENT_BAND_DB: f64 = -120.0;
+
+/// RMS level (dBFS, DC removed) at or below which `audit_audio` treats the input as silence.
+pub const SILENCE_RMS_DBFS: f64 = -100.0;
 
 /// Performs a full ITU-R BS.1770-4 loudness, phase, electrical, and AI-artifact audit.
 pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
@@ -767,9 +770,11 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
         10.0 * sum_e.max(1e-15).log10()
     };
 
-    // Below the BS.1770 absolute gate there is no programme to judge: band energy and RMS
-    // both sit at their numeric floors, and their difference would read as a loud band.
-    let silent = integrated_lufs <= -70.0;
+    // Near digital silence there is no programme to judge: band energy and RMS both sit at
+    // their numeric floors, and their difference would read as a loud band. This is judged on
+    // the signal's own RMS, not integrated loudness, which is -70 for any clip shorter than
+    // one 100 ms gating block however loud it is.
+    let silent = rms_db <= SILENCE_RMS_DBFS;
     let relative_band_db = |f_low: f64, f_high: f64| {
         if silent {
             SILENT_BAND_DB
