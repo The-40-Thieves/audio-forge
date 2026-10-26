@@ -1,6 +1,7 @@
 //! `forge-dsp` — Studio DSP, Restoration, Spectral Suppression, Unmasking, Alignment & Mastering.
 
 pub mod delivery;
+pub mod dtw_align;
 pub mod elite_dsp;
 pub mod loudness_limiter;
 pub mod phase_align;
@@ -13,6 +14,7 @@ pub use delivery::{
     DeliveryCheck, DeliveryOptions, DeliveryReport, DeliveryTarget, ToneMatch, deliver,
     delivery_checks,
 };
+pub use dtw_align::{StretchMarker, align_vocal_double_dtw};
 pub use elite_dsp::{
     AdaaSin, AdaaTanh, AllpassDisperser, AnalogHardwareModel, AutoGainCompensator,
     GenreTonalTarget, JilesAthertonHysteresis, NamWaveNetProfile, Oversampler2x,
@@ -24,9 +26,7 @@ pub use loudness_limiter::{
     Biquad, CytomicSvf, audit_audio, compute_true_peak, flush_denormal_f64, normalize_and_limit,
     sanitize_param_f64, sanitize_sample_f32, sanitize_sample_f64,
 };
-pub use phase_align::{
-    PhaseAlignmentResult, StretchMarker, align_phase_gcc_phat, align_vocal_double_dtw,
-};
+pub use phase_align::{PhaseAlignmentResult, align_phase_gcc_phat};
 pub use realtime::{
     ParamSmoother, RealtimeDrumTrigger, RealtimeMasterLimiter, RealtimeMasteringEq18,
     RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSubAndTapeBus,
