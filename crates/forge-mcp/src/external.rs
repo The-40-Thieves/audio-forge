@@ -108,7 +108,33 @@ mod tests {
         // A regular file where the output's parent directory should be fails `create_dir_all`.
         std::fs::write(root.path().join("blocker"), b"").expect("write");
         let out = root.path().join("blocker").join("master.wav");
-        let meta = ReleaseMetadata {
+
+        assert!(tag_master(&sandbox, &tmp, &out, &meta()).is_err());
+        assert!(!tmp.exists(), "pre-tag render was left behind");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_removes_a_swapped_in_symlink_not_its_target() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sandbox = PathSandbox::new([root.path().to_path_buf()]).expect("sandbox");
+        let victim = root.path().join("victim.wav");
+        std::fs::write(&victim, b"keep me").expect("write");
+        let tmp = root.path().join("master.pre_tag.wav");
+        std::os::unix::fs::symlink(&victim, &tmp).expect("symlink");
+        std::fs::write(root.path().join("blocker"), b"").expect("write");
+        let out = root.path().join("blocker").join("master.wav");
+
+        assert!(tag_master(&sandbox, &tmp, &out, &meta()).is_err());
+        assert!(
+            tmp.symlink_metadata().is_err(),
+            "the swapped-in link was left behind"
+        );
+        assert_eq!(std::fs::read(&victim).expect("victim"), b"keep me");
+    }
+
+    fn meta() -> ReleaseMetadata {
+        ReleaseMetadata {
             title: "T".into(),
             artist: "A".into(),
             album: "Single".into(),
@@ -116,9 +142,6 @@ mod tests {
             bpm: None,
             key: None,
             year: None,
-        };
-
-        assert!(tag_master(&sandbox, &tmp, &out, &meta).is_err());
-        assert!(!tmp.exists(), "pre-tag render was left behind");
+        }
     }
 }
