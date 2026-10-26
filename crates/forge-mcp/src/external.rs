@@ -27,22 +27,33 @@ fn recheck_file(sandbox: &PathSandbox, path: &Path) -> Result<PathBuf, ForgeErro
     Ok(path)
 }
 
-/// Tags `tmp` with ISRC metadata into `out` with FFmpeg, then removes `tmp`.
+/// Tags `tmp` with ISRC metadata into `out` with FFmpeg. `tmp` is removed whether or not
+/// tagging succeeds, including when a check fails before FFmpeg runs.
 pub fn tag_master(
     sandbox: &PathSandbox,
     tmp: &Path,
     out: &Path,
     meta: &ReleaseMetadata,
 ) -> Result<(), ForgeError> {
+    let tagged = tag_into(sandbox, tmp, out, meta);
+    let _ = sandbox.remove_file(tmp);
+    sandbox.verify_file(&tagged?)
+}
+
+/// Runs FFmpeg on the re-checked paths and returns the re-checked output path.
+fn tag_into(
+    sandbox: &PathSandbox,
+    tmp: &Path,
+    out: &Path,
+    meta: &ReleaseMetadata,
+) -> Result<PathBuf, ForgeError> {
     if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
         sandbox.create_dir_all(&sandbox.check(parent)?)?;
     }
     let tmp = recheck_file(sandbox, tmp)?;
     let out = sandbox.check(out)?;
-    let tagged = write_distrokid_metadata(&tmp, &out, meta);
-    let _ = sandbox.remove_file(&tmp);
-    tagged?;
-    sandbox.verify_file(&out)
+    write_distrokid_metadata(&tmp, &out, meta)?;
+    Ok(out)
 }
 
 /// Separates `input` into `stems_dir` on the backend `config` selects, then verifies every
@@ -82,4 +93,66 @@ fn verify_bundle(sandbox: &PathSandbox, bundle: &StemBundle) -> Result<(), Forge
         recheck_file(sandbox, path)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pre_tag_render_is_removed_when_a_check_fails_before_ffmpeg() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sandbox = PathSandbox::new([root.path().to_path_buf()]).expect("sandbox");
+        // Checked before it exists, as the server does, so the path matches the canonical root.
+        let tmp = sandbox
+            .check(&root.path().join("master.pre_tag.wav"))
+            .expect("tmp");
+        std::fs::write(&tmp, b"render").expect("write");
+        // A regular file where the output's parent directory should be fails `create_dir_all`.
+        std::fs::write(root.path().join("blocker"), b"").expect("write");
+        let out = sandbox
+            .check(&root.path().join("blocker"))
+            .expect("out")
+            .join("master.wav");
+
+        assert!(tag_master(&sandbox, &tmp, &out, &meta()).is_err());
+        assert!(!tmp.exists(), "pre-tag render was left behind");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_removes_a_swapped_in_symlink_not_its_target() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sandbox = PathSandbox::new([root.path().to_path_buf()]).expect("sandbox");
+        let victim = root.path().join("victim.wav");
+        std::fs::write(&victim, b"keep me").expect("write");
+        let tmp = sandbox
+            .check(&root.path().join("master.pre_tag.wav"))
+            .expect("tmp");
+        std::os::unix::fs::symlink(&victim, &tmp).expect("symlink");
+        std::fs::write(root.path().join("blocker"), b"").expect("write");
+        let out = sandbox
+            .check(&root.path().join("blocker"))
+            .expect("out")
+            .join("master.wav");
+
+        assert!(tag_master(&sandbox, &tmp, &out, &meta()).is_err());
+        assert!(
+            tmp.symlink_metadata().is_err(),
+            "the swapped-in link was left behind"
+        );
+        assert_eq!(std::fs::read(&victim).expect("victim"), b"keep me");
+    }
+
+    fn meta() -> ReleaseMetadata {
+        ReleaseMetadata {
+            title: "T".into(),
+            artist: "A".into(),
+            album: "Single".into(),
+            isrc: "USS1Z2600001".into(),
+            bpm: None,
+            key: None,
+            year: None,
+        }
+    }
 }
