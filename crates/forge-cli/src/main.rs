@@ -24,7 +24,7 @@ use forge_vocal::{
     track_vocal_pitch,
 };
 use forge_worker::{
-    WorkerBackend, generate_music_lyria, index_drum_sample_library, separate_stems,
+    SeparationConfig, generate_music_lyria, index_drum_sample_library, separate_stems,
 };
 
 #[derive(Parser)]
@@ -610,7 +610,7 @@ async fn main() -> anyhow::Result<()> {
             std::fs::create_dir_all(&midi_dir)?;
 
             // 1. Separate stems
-            let bundle = separate_stems(&input, &stems_dir, &WorkerBackend::Auto)?;
+            let bundle = separate_stems(&input, &stems_dir, &SeparationConfig::from_env())?.bundle;
 
             // 2. Clean & Spectral De-Fizz the Vocal and Instrumental stems
             let mut vocal_pitch_frames = Vec::new();

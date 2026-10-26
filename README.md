@@ -141,7 +141,7 @@ These are independent implementations of well-known techniques. They are not clo
 | Density and clipper | Upward low-level compression and a 3-band, 2x oversampled, first-order ADAA `tanh` clipper. | oeksound Bloom, multiband clippers | [`elite_dsp.rs`](crates/forge-dsp/src/elite_dsp.rs), ADAA proptests |
 | SpaceVerb and preamp | An 8x8 Walsh-Hadamard FDN reverb with ducking and shimmer, plus a small dilated causal WaveNet preamp model. | Valhalla reverbs, NAM-style amp modeling | [`elite_dsp.rs`](crates/forge-dsp/src/elite_dsp.rs), FDN decay and hysteresis proptests |
 | Music theory | A voice-leading solver, Neo-Soul and jazz reharmonization, Dilla/MPC micro-timing, audio-to-MIDI drum triggers, and ABC export. | Scaler, Slate Trigger | [`forge-theory`](crates/forge-theory/src/lib.rs): unit test and proptests |
-| Stem separation | Dispatches to a local or Colab GPU worker that runs Mel-Band-RoFormer. Not pure Rust; it needs the Python worker. | Stem-splitting services | [`forge-worker`](crates/forge-worker/), [`python-worker/`](python-worker/) |
+| Stem separation | Dispatches to a local or Colab GPU worker that runs Mel-Band-RoFormer (`FORGE_WORKER_BACKEND`, `FORGE_COLAB_WORKER_URL`). Without a worker it falls back to a basic Rust DSP band split and reports which backend ran. | Stem-splitting services | [`forge-worker`](crates/forge-worker/), [`python-worker/`](python-worker/) |
 
 ---
 

@@ -102,6 +102,8 @@ jobs:
       - run: pip install ruff==0.17.2 z3-solver==5.3.1.0
       - run: ruff check python-worker scripts
       - run: ruff format --check python-worker scripts
+      # Stem picking and timeouts, with fakes for audio-separator and gradio_client.
+      - run: python -m unittest discover -s python-worker -v
       - run: python scripts/verify_dsp_invariants_z3.py
 
   plugins:
