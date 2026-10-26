@@ -309,3 +309,41 @@ fn true_peak_catches_inter_sample_peak_at_buffer_end() {
         ts * f64::from(SR)
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Short-term max and silence (issues #19 and #16)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn short_term_max_is_not_set_by_a_single_momentary_burst() {
+    // A 400 ms burst 20 dB over a quiet bed: it sets the momentary max, but every 3 s window
+    // averages it with 2.6 s of the bed.
+    let r = audit_audio(&stereo_sine_segments(&[
+        (-40.0, 5.0),
+        (-20.0, 0.4),
+        (-40.0, 5.0),
+    ]));
+    assert!(
+        r.short_term_max_lufs < r.momentary_max_lufs - 5.0,
+        "short-term max {:.2} LUFS follows momentary max {:.2} LUFS",
+        r.short_term_max_lufs,
+        r.momentary_max_lufs
+    );
+}
+
+#[test]
+fn digital_silence_has_no_fizz_or_band_readings() {
+    let silence = AudioBuffer::from_channels(vec![vec![0.0; 10 * SR as usize]; 2], SR)
+        .expect("valid stereo buffer");
+    let r = audit_audio(&silence);
+    assert_eq!(r.ai_fizz_index, 0.0);
+    for (name, db) in [
+        ("hum", r.hum_50_60hz_db),
+        ("mud", r.box_mud_200_500hz_db),
+        ("harshness", r.harshness_2_6khz_db),
+        ("sibilance", r.sibilance_5_14khz_db),
+    ] {
+        assert_eq!(db, forge_dsp::SILENT_BAND_DB, "{name}");
+    }
+    assert!(r.recommendations.is_empty(), "{:?}", r.recommendations);
+}

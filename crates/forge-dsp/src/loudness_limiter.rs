@@ -492,6 +492,9 @@ pub fn compute_true_peak(buffer: &AudioBuffer) -> (f64, f64, f64) {
     (sample_peak_dbfs, true_peak_dbtp, timestamp)
 }
 
+/// Band levels reported for audio below the -70 LUFS absolute gate (digital silence).
+pub const SILENT_BAND_DB: f64 = -120.0;
+
 /// Performs a full ITU-R BS.1770-4 loudness, phase, electrical, and AI-artifact audit.
 pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
     let sr = f64::from(buffer.sample_rate.max(1));
@@ -552,7 +555,13 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
     }
 
     let mut short_term_lufs_vec = Vec::new();
-    let mut short_term_max_lufs = momentary_max_lufs;
+    // The loudest 3 s window. A file shorter than one window has no short-term reading and
+    // falls back to the momentary max; otherwise a single 400 ms burst must not set it.
+    let mut short_term_max_lufs = if sub_energies.len() >= 30 {
+        -70.0
+    } else {
+        momentary_max_lufs
+    };
     if sub_energies.len() >= 30 {
         for w in sub_energies.windows(30) {
             let mean_e = w.iter().sum::<f64>() / 30.0;
@@ -758,17 +767,31 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
         10.0 * sum_e.max(1e-15).log10()
     };
 
-    let hum_50_60hz_db = band_db(45.0, 65.0) - rms_db;
-    let box_mud_200_500hz_db = band_db(200.0, 500.0) - rms_db;
-    let harshness_2_6khz_db = band_db(2000.0, 6000.0) - rms_db;
-    let sibilance_5_14khz_db = band_db(5000.0, 14000.0) - rms_db;
+    // Below the BS.1770 absolute gate there is no programme to judge: band energy and RMS
+    // both sit at their numeric floors, and their difference would read as a loud band.
+    let silent = integrated_lufs <= -70.0;
+    let relative_band_db = |f_low: f64, f_high: f64| {
+        if silent {
+            SILENT_BAND_DB
+        } else {
+            band_db(f_low, f_high) - rms_db
+        }
+    };
+    let hum_50_60hz_db = relative_band_db(45.0, 65.0);
+    let box_mud_200_500hz_db = relative_band_db(200.0, 500.0);
+    let harshness_2_6khz_db = relative_band_db(2000.0, 6000.0);
+    let sibilance_5_14khz_db = relative_band_db(5000.0, 14000.0);
 
     // Composite AI Fizz Index (0..100): measures 2-6 kHz spectral whistle spike + upper-mid energy excess + sub phase smear
     let whistle_db = 20.0 * max_peak_over_median_2_6k.log10();
     let whistle_score = ((whistle_db - 6.0) * 4.5).clamp(0.0, 60.0);
     let harsh_score = ((harshness_2_6khz_db + 8.0) * 3.0).clamp(0.0, 25.0);
     let sub_smear_score = ((0.85 - sub_160hz_correlation) * 30.0).clamp(0.0, 15.0);
-    let ai_fizz_index = (whistle_score + harsh_score + sub_smear_score).clamp(0.0, 100.0);
+    let ai_fizz_index = if silent {
+        0.0
+    } else {
+        (whistle_score + harsh_score + sub_smear_score).clamp(0.0, 100.0)
+    };
 
     let distrokid_ready = (-16.5..=-7.5).contains(&integrated_lufs)
         && true_peak_dbtp <= -0.95
