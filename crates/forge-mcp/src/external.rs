@@ -27,22 +27,33 @@ fn recheck_file(sandbox: &PathSandbox, path: &Path) -> Result<PathBuf, ForgeErro
     Ok(path)
 }
 
-/// Tags `tmp` with ISRC metadata into `out` with FFmpeg, then removes `tmp`.
+/// Tags `tmp` with ISRC metadata into `out` with FFmpeg. `tmp` is removed whether or not
+/// tagging succeeds, including when a check fails before FFmpeg runs.
 pub fn tag_master(
     sandbox: &PathSandbox,
     tmp: &Path,
     out: &Path,
     meta: &ReleaseMetadata,
 ) -> Result<(), ForgeError> {
+    let tagged = tag_into(sandbox, tmp, out, meta);
+    let _ = sandbox.remove_file(tmp);
+    sandbox.verify_file(&tagged?)
+}
+
+/// Runs FFmpeg on the re-checked paths and returns the re-checked output path.
+fn tag_into(
+    sandbox: &PathSandbox,
+    tmp: &Path,
+    out: &Path,
+    meta: &ReleaseMetadata,
+) -> Result<PathBuf, ForgeError> {
     if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
         sandbox.create_dir_all(&sandbox.check(parent)?)?;
     }
     let tmp = recheck_file(sandbox, tmp)?;
     let out = sandbox.check(out)?;
-    let tagged = write_distrokid_metadata(&tmp, &out, meta);
-    let _ = sandbox.remove_file(&tmp);
-    tagged?;
-    sandbox.verify_file(&out)
+    write_distrokid_metadata(&tmp, &out, meta)?;
+    Ok(out)
 }
 
 /// Separates `input` into `stems_dir` on the backend `config` selects, then verifies every
@@ -82,4 +93,32 @@ fn verify_bundle(sandbox: &PathSandbox, bundle: &StemBundle) -> Result<(), Forge
         recheck_file(sandbox, path)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pre_tag_render_is_removed_when_a_check_fails_before_ffmpeg() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sandbox = PathSandbox::new([root.path().to_path_buf()]).expect("sandbox");
+        let tmp = root.path().join("master.pre_tag.wav");
+        std::fs::write(&tmp, b"render").expect("write");
+        // A regular file where the output's parent directory should be fails `create_dir_all`.
+        std::fs::write(root.path().join("blocker"), b"").expect("write");
+        let out = root.path().join("blocker").join("master.wav");
+        let meta = ReleaseMetadata {
+            title: "T".into(),
+            artist: "A".into(),
+            album: "Single".into(),
+            isrc: "USS1Z2600001".into(),
+            bpm: None,
+            key: None,
+            year: None,
+        };
+
+        assert!(tag_master(&sandbox, &tmp, &out, &meta).is_err());
+        assert!(!tmp.exists(), "pre-tag render was left behind");
+    }
 }
