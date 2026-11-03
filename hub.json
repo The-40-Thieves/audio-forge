@@ -1,0 +1,15 @@
+{
+  "$schema": "https://the40thieves.dev/schemas/hub.json",
+  "tagline": "An audio delivery pipeline AI agents can drive: a track and a target in, a spec-compliant master and a measured ship-or-not report out.",
+  "claim": {
+    "text": "BS.1770-4 loudness, loudness range and true peak pass the EBU Tech 3341 and 3342 conformance signals in the test suite, on every CI run.",
+    "source": "https://github.com/The-40-Thieves/audio-forge/blob/main/crates/forge-dsp/tests/ebu_reference.rs",
+    "measured_on": "2026-11-02"
+  },
+  "install": {
+    "shell": "git clone https://github.com/The-40-Thieves/audio-forge && cd audio-forge && cargo build --release -p forge-mcp",
+    "claude-code": "claude mcp add forge -e FORGE_MCP_ROOT=/path/to/your/music -- /path/to/audio-forge/target/release/forge-mcp"
+  },
+  "docs": "docs/",
+  "listed": true
+}
