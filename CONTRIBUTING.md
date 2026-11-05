@@ -75,3 +75,7 @@ benchmarks.
 - Keep a PR to one logical change; it's fine to stack PRs.
 - By contributing you agree your work is licensed under the
   [Apache License 2.0](LICENSE), the same as the project.
+
+## Releases
+
+Tags, GitHub Releases and what the product page at <https://the40thieves.dev/audio-forge/> reads: see [RELEASING.md](RELEASING.md).
