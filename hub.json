@@ -11,5 +11,6 @@
     "claude-code": "claude mcp add forge -e FORGE_MCP_ROOT=/path/to/your/music -- /path/to/audio-forge/target/release/forge-mcp"
   },
   "docs": "docs/",
+  "docs_site": true,
   "listed": true
 }
