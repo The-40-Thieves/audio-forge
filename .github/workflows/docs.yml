@@ -1,0 +1,31 @@
+# Publishes docs/ as a Mintlify site to this repository's `docs-site` branch through the org's
+# reusable workflow (The-40-Thieves/.github, docs-template). The docs hub pulls that branch in
+# under https://docs.the40thieves.dev/audio-forge/. Pinned to a commit of that repository; bump
+# the sha to pick up template changes.
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/**
+      - .github/workflows/docs.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docs:
+    # The reusable workflow's publish job pushes the docs-site branch.
+    permissions:
+      contents: write
+    uses: The-40-Thieves/.github/.github/workflows/docs-mintlify.yml@f6ec28b26a40b5648476ed9a123948fe7004e111 # f6ec28b
+    with:
+      project: audio-forge
+      docs-path: docs
+      title: audio-forge
+      description: An audio delivery pipeline AI agents can drive.
+    secrets:
+      # Optional: starts the docs hub sync at once. Without it the hub syncs hourly.
+      docs-hub-dispatch-token: ${{ secrets.DOCS_HUB_DISPATCH_TOKEN }}

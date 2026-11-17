@@ -997,7 +997,6 @@ pub fn normalize_and_limit(
 
     let mut out = buffer.clone();
     let frames = out.num_frames();
-    let ch_count = out.num_channels();
     if frames == 0 {
         return Ok(out);
     }
@@ -1015,8 +1014,8 @@ pub fn normalize_and_limit(
     let peaks = true_peak_per_frame(&out.channels, frames);
     let gain_env = limiter_gain_envelope(&peaks, ceiling_lin, lookahead, release_coeff);
 
-    for ch in 0..ch_count {
-        for (s, &g) in out.channels[ch].iter_mut().zip(gain_env.iter()) {
+    for ch in &mut out.channels {
+        for (s, &g) in ch.iter_mut().zip(gain_env.iter()) {
             *s *= g;
         }
     }
