@@ -7,3 +7,6 @@ __pycache__/
 *.pyc
 /outputs/
 /tmp/
+
+# graphify knowledge-graph output (regenerate with /graphify)
+graphify-out/
