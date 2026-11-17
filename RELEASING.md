@@ -4,7 +4,7 @@ The org convention (see the organization's CONTRIBUTING): semver tags `vX.Y.Z`, 
 
 ## Steps
 
-1. Bump `version` under `[workspace.package]` in `Cargo.toml` and write the release notes for the version. Land that through a pull request like any other change.
+1. Bump `version` under `[workspace.package]` in `Cargo.toml`, run `cargo update --workspace` so `Cargo.lock` records the new crate versions, and write the release notes for the version. Commit `Cargo.lock` with the bump: `release.yml` builds with `--locked` and fails on a stale lockfile. Land that through a pull request like any other change.
 2. Tag the merge commit on `main` and push the tag:
 
     ```bash
