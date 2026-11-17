@@ -4,7 +4,7 @@
 use std::f64::consts::PI;
 
 use forge_core::{AudioBuffer, AuditReport, ForgeError, Result};
-use rustfft::{num_complex::Complex, FftPlanner};
+use rustfft::{FftPlanner, num_complex::Complex};
 
 /// Sanitizes an arbitrary `f64` audio sample: flushes `NaN`, `±Inf`, and subnormals (`|x| < 1e-30`)
 /// to `0.0`, and bounds extreme finite amplitudes to `[-1e6, 1e6]` (`+120 dBFS`) so squaring (`x * x`)
