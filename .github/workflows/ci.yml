@@ -22,6 +22,13 @@ env:
     libxcb-icccm4-dev libxcursor-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
 jobs:
+  license:
+    name: license coherence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: node scripts/check-license-coherence.mjs
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest

@@ -1,6 +1,6 @@
 desc:ForgeAudio - Surgical Vocal Strip (De-Plosive, De-Breath, De-Ess & Airwindows Console)
 //tags: vocal de-esser de-plosive de-breath saturation
-//author: ForgeAudio (MIT / Apache-2.0)
+//author: ForgeAudio (Apache-2.0)
 
 slider1:1<0,1,1{Off,On}>Dynamic Plosive Suppressor (<110 Hz)
 slider2:-12.0<-24.0,0.0,0.5>De-Breath Attenuation (dB)

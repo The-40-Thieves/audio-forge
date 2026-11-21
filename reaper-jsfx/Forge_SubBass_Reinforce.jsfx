@@ -1,6 +1,6 @@
 desc:ForgeAudio - Sub-Bass Mono-Maker & Phase-Locked Sub-Harmonic Synthesizer
 //tags: bass sub-harmonic mono-maker low-end
-//author: ForgeAudio (MIT / Apache-2.0)
+//author: ForgeAudio (Apache-2.0)
 
 slider1:150<60,250,1>Mono Bass Crossover (Hz)
 slider2:0.20<0.0,1.0,0.01>Sub-Harmonic Reinforce Mix (35-85 Hz)

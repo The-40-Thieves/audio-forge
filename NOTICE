@@ -1,0 +1,23 @@
+ForgeAudio (audio-forge)
+Copyright 2026 The 40 Thieves
+
+This product includes software developed by The 40 Thieves
+(https://the40thieves.dev / https://github.com/The-40-Thieves/audio-forge).
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Third-Party Notices
+===================
+
+1. `nih_plug` (ISC License)
+   Copyright (c) 2022-2024 Robbert van der Helm
+   Used as a vendored, patched plugin framework in the source repository
+   (https://github.com/robbert-vdh/nih-plug).
+
+2. `vst3-sys` (GNU General Public License v3.0 only)
+   Steinberg VST3 C ABI bindings linked into VST3 plugin builds via `nih_plug`
+   (https://github.com/robbert-vdh/vst3-sys).
