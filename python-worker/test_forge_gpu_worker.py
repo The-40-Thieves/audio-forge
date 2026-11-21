@@ -161,5 +161,108 @@ class YueTimeoutTests(TestCase):
                 )
 
 
+class RunDenoiseTests(TestCase):
+    def test_missing_input_fails_fast(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            with self.assertRaises(FileNotFoundError):
+                worker.run_denoise(out / "missing.wav", out, backend="deepfilternet")
+
+    def test_invalid_attenuation_limit_and_backend_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            inp = out / "take.wav"
+            inp.write_bytes(b"RIFF")
+            for bad in (-1.0, 120.0, float("nan"), float("inf")):
+                with self.assertRaises(ValueError):
+                    worker.run_denoise(inp, out, attenuation_limit_db=bad)
+            with self.assertRaises(ValueError):
+                worker.run_denoise(inp, out, backend="unknown")
+
+    def test_deepfilternet_backend_writes_denoised_wav(self) -> None:
+        seen_atten: list[float | None] = []
+
+        class FakeState:
+            def sr(self) -> int:
+                return 48_000
+
+        def init_df() -> tuple[object, FakeState, str]:
+            return (object(), FakeState(), "")
+
+        def load_audio(_path: str, sr: int) -> tuple[bytes, int]:
+            return (b"AUDIO", sr)
+
+        def enhance(
+            _model: object,
+            _state: FakeState,
+            audio: bytes,
+            atten_lim_db: float | None = None,
+        ) -> bytes:
+            seen_atten.append(atten_lim_db)
+            return audio
+
+        def save_audio(path: str, _audio: bytes, _sr: int) -> None:
+            Path(path).write_bytes(b"RIFF")
+
+        modules = {
+            "df": fake_module("df"),
+            "df.enhance": fake_module(
+                "df.enhance",
+                init_df=init_df,
+                load_audio=load_audio,
+                enhance=enhance,
+                save_audio=save_audio,
+            ),
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(sys.modules, modules),
+        ):
+            out = Path(tmp)
+            inp = out / "noisy_vox.wav"
+            inp.write_bytes(b"RIFF")
+            res = worker.run_denoise(
+                inp, out, attenuation_limit_db=18.0, backend="auto"
+            )
+            self.assertEqual(res["backend"], "deepfilternet")
+            self.assertEqual(
+                Path(res["denoised"]).name, "noisy_vox_denoised_deepfilternet.wav"
+            )
+            self.assertTrue(Path(res["denoised"]).is_file())
+            self.assertEqual(seen_atten, [18.0])
+
+    def test_auto_falls_back_to_roformer_when_deepfilternet_absent(self) -> None:
+        class DenoiseSeparator(FakeSeparator):
+            def separate(self, audio_file: str) -> list[str]:
+                base = Path(audio_file).stem
+                names = [
+                    f"{base}_(Noise)_{self.model}.wav",
+                    f"{base}_(Dry)_{self.model}.wav",
+                ]
+                for name in names:
+                    (self.output_dir / name).write_bytes(b"RIFF")
+                return names
+
+        modules = {
+            "df": None,
+            "df.enhance": None,
+            "audio_separator": fake_module("audio_separator"),
+            "audio_separator.separator": fake_module(
+                "audio_separator.separator", Separator=DenoiseSeparator
+            ),
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(sys.modules, modules),
+        ):
+            out = Path(tmp)
+            inp = out / "room_vox.wav"
+            inp.write_bytes(b"RIFF")
+            res = worker.run_denoise(inp, out, backend="auto")
+            self.assertEqual(res["backend"], "mel-band-roformer")
+            self.assertIn("_(Dry)_", Path(res["denoised"]).name)
+            self.assertTrue(Path(res["denoised"]).is_file())
+
+
 if __name__ == "__main__":
     main()

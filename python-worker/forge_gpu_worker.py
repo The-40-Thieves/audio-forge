@@ -9,9 +9,11 @@ Supported tasks:
 - `separate`: Mel-Band-RoFormer (Kim Vocal, MIT), then an optional BS-RoFormer de-reverb of
   the vocal. Returns two stems, `vocals` and `other` (the instrumental); drums, bass, guitar
   and keys are always `None`.
+- `denoise`: Neural audio denoising via DeepFilterNet3 (`df.enhance`) with automatic fallback
+  to Mel-Band-RoFormer denoise (`audio-separator`) for heavy noise/room rescue.
 - `yue2-remote`: Calls mrfakename/yue2-3b or a custom Colab YuE2-3B endpoint.
 
-There is no 6-stem separation, Apollo restoration or audio-to-MIDI transcription task.
+There is no 6-stem separation or audio-to-MIDI transcription task.
 """
 
 from __future__ import annotations
@@ -26,6 +28,8 @@ from pathlib import Path
 VOCAL_TAGS = frozenset({"vocals", "vocal"})
 INSTRUMENTAL_TAGS = frozenset({"instrumental", "instrumentals"})
 DRY_TAGS = frozenset({"noreverb", "dry"})
+DENOISED_TAGS = frozenset({"dry", "nonoise", "denoised", "clean"})
+DENOISE_ROFORMER_MODEL = "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt"
 
 
 def stem_tag(filename: str) -> str | None:
@@ -96,6 +100,93 @@ def run_separate(
     }
 
 
+def _safe_stem(path: Path) -> str:
+    cleaned = "".join(
+        ch if (ch.isalnum() or ch in {"-", "_"}) else "_" for ch in path.stem
+    )
+    return cleaned.strip("._") or "audio"
+
+
+def _denoise_with_deepfilternet(
+    input_path: Path, output_dir: Path, attenuation_limit_db: float | None
+) -> Path:
+    from df.enhance import enhance, init_df, load_audio, save_audio
+
+    model, df_state, _ = init_df()
+    audio, _ = load_audio(str(input_path), sr=df_state.sr())
+    enhanced = enhance(model, df_state, audio, atten_lim_db=attenuation_limit_db)
+    out_path = (
+        output_dir / f"{_safe_stem(input_path)}_denoised_deepfilternet.wav"
+    ).resolve()
+    if not out_path.is_relative_to(output_dir):
+        raise ValueError(f"Refusing to write outside output directory: {out_path}")
+    save_audio(str(out_path), enhanced, df_state.sr())
+    return out_path
+
+
+def _denoise_with_roformer(input_path: Path, output_dir: Path) -> Path:
+    from audio_separator.separator import Separator
+
+    sep = Separator(output_dir=str(output_dir), output_format="WAV")
+    sep.load_model(model_filename=DENOISE_ROFORMER_MODEL)
+    outputs = sep.separate(str(input_path))
+    cleaned = pick_stem(outputs, DENOISED_TAGS, output_dir)
+    if cleaned is None:
+        raise RuntimeError(
+            f"RoFormer denoise produced no clean stem in outputs: {outputs!r}"
+        )
+    resolved_cleaned = cleaned.resolve()
+    if not resolved_cleaned.is_relative_to(output_dir):
+        raise ValueError(
+            f"Refusing to return path outside output directory: {resolved_cleaned}"
+        )
+    return resolved_cleaned
+
+
+def run_denoise(
+    input_path: Path,
+    output_dir: Path,
+    attenuation_limit_db: float | None = None,
+    backend: str = "auto",
+) -> dict[str, str]:
+    """Run neural audio denoising via DeepFilterNet3 or Mel-Band-RoFormer denoise."""
+    if backend not in {"auto", "deepfilternet", "mel-band-roformer"}:
+        raise ValueError(
+            f"Unsupported denoise backend {backend!r}; "
+            "expected auto, deepfilternet, or mel-band-roformer"
+        )
+    if attenuation_limit_db is not None and not (0.0 <= attenuation_limit_db <= 100.0):
+        raise ValueError(
+            f"attenuation_limit_db must be finite and in [0, 100], got {attenuation_limit_db!r}"
+        )
+    resolved_input = input_path.resolve()
+    if not resolved_input.is_file():
+        raise FileNotFoundError(f"Input audio file not found: {resolved_input}")
+    resolved_output = output_dir.resolve()
+    resolved_output.mkdir(parents=True, exist_ok=True)
+
+    if backend in {"auto", "deepfilternet"}:
+        try:
+            out_path = _denoise_with_deepfilternet(
+                resolved_input, resolved_output, attenuation_limit_db
+            )
+            return {"denoised": str(out_path), "backend": "deepfilternet"}
+        except (ImportError, RuntimeError, OSError) as exc:
+            if backend == "deepfilternet":
+                raise RuntimeError(
+                    "deepfilternet failed or is not installed in the worker venv. "
+                    "Run: uv pip install deepfilternet"
+                ) from exc
+
+    try:
+        out_path = _denoise_with_roformer(resolved_input, resolved_output)
+        return {"denoised": str(out_path), "backend": "mel-band-roformer"}
+    except ImportError as exc:
+        raise RuntimeError(
+            "Neither deepfilternet nor audio-separator is installed in the worker venv."
+        ) from exc
+
+
 def run_yue2_remote(
     style: str,
     lyrics: str,
@@ -144,6 +235,23 @@ def main() -> int:
     sep_p.add_argument("--output-dir", type=Path, required=True)
     sep_p.add_argument("--no-dereverb", action="store_true")
 
+    den_p = sub.add_parser(
+        "denoise", help="Run neural denoising (DeepFilterNet3 / Mel-Band-RoFormer)"
+    )
+    den_p.add_argument("--input", type=Path, required=True)
+    den_p.add_argument("--output-dir", type=Path, required=True)
+    den_p.add_argument(
+        "--attenuation-limit-db",
+        type=float,
+        default=None,
+        help="Optional max attenuation limit in dB (0..100, DeepFilterNet3 only)",
+    )
+    den_p.add_argument(
+        "--backend",
+        default="auto",
+        choices=["auto", "deepfilternet", "mel-band-roformer"],
+    )
+
     yue_p = sub.add_parser(
         "yue2-remote", help="Generate song + ABC score via YuE2-3B endpoint"
     )
@@ -164,6 +272,14 @@ def main() -> int:
         if args.command == "separate":
             res = run_separate(
                 args.input, args.output_dir, dereverb=not args.no_dereverb
+            )
+            print(json.dumps(res))
+        elif args.command == "denoise":
+            res = run_denoise(
+                args.input,
+                args.output_dir,
+                attenuation_limit_db=args.attenuation_limit_db,
+                backend=args.backend,
             )
             print(json.dumps(res))
         elif args.command == "yue2-remote":
