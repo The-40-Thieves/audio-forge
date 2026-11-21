@@ -61,6 +61,8 @@ def pick_stem(
 def run_separate(
     input_path: Path, output_dir: Path, dereverb: bool = True
 ) -> dict[str, str | None]:
+    if not input_path.is_file():
+        raise FileNotFoundError(f"Input audio file not found: {input_path}")
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
         from audio_separator.separator import Separator
@@ -103,6 +105,8 @@ def run_yue2_remote(
     space_id: str,
     timeout_s: float = 600.0,
 ) -> dict[str, str]:
+    if not (timeout_s > 0.0 and timeout_s < float("inf")):
+        raise ValueError(f"timeout_s must be positive and finite, got {timeout_s!r}")
     from gradio_client import Client
 
     client = Client(space_id)

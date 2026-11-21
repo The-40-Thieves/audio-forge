@@ -85,8 +85,16 @@ class RunSeparateTests(TestCase):
             mock.patch.dict(sys.modules, modules),
         ):
             out = Path(tmp)
-            result = worker.run_separate(out / input_name, out, dereverb=dereverb)
+            inp = out / input_name
+            inp.write_bytes(b"RIFF")
+            result = worker.run_separate(inp, out, dereverb=dereverb)
             return {k: (Path(v).name if v else None) for k, v in result.items()}
+
+    def test_missing_input_fails_fast_before_loading_models(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            with self.assertRaises(FileNotFoundError):
+                worker.run_separate(out / "does_not_exist.wav", out, dereverb=False)
 
     def test_vocal_named_input_returns_the_vocal_stem(self) -> None:
         result = self.run_separate("Lead_Vocal_mix.wav", dereverb=False)
@@ -126,6 +134,11 @@ class YueTimeoutTests(TestCase):
         self.assertLess(time.monotonic() - started, 2.0)
         self.assertIn("did not answer within 0.2 s", str(ctx.exception))
         self.assertTrue(never_done.cancelled())
+
+    def test_non_positive_timeout_is_rejected(self) -> None:
+        for bad in (0.0, -5.0, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                worker.run_yue2_remote("soul", "la", "full", 32, 1, "x/y", timeout_s=bad)
 
 
 if __name__ == "__main__":
