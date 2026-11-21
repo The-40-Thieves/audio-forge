@@ -74,7 +74,9 @@ fn remove_dc_and_or_declip(buffer: &mut AudioBuffer, remove_dc: bool, declip: bo
     }
 }
 
-/// Reconstructs runs of up to 64 clipped samples (`|x| >= 0.985`) via cubic Hermite interpolation.
+/// Reconstructs runs of up to 64 clipped samples (`|x| >= 0.985`) via cubic Hermite arch
+/// reconstruction with properly scaled boundary tangents (allowing reconstructed peaks to
+/// recover above `1.0` instead of re-clipping them at the plateau).
 fn declip_plateaus(ch: &mut [f64]) {
     let n = ch.len();
     let clip_thresh = 0.985_f64;
@@ -90,9 +92,23 @@ fn declip_plateaus(ch: &mut [f64]) {
             if (1..=64).contains(&span) && start >= 2 && end + 2 < n {
                 let y0 = ch[start - 1];
                 let y1 = ch[end];
-                let m0 = y0 - ch[start - 2];
-                let m1 = ch[end + 1] - y1;
+                // Estimate per-sample boundary slopes using 2nd-order backward/forward differences
+                // when 3 unclipped neighbors are available, falling back to 1st-order otherwise.
+                let slope0 = if start >= 3 {
+                    1.5 * y0 - 2.0 * ch[start - 2] + 0.5 * ch[start - 3]
+                } else {
+                    y0 - ch[start - 2]
+                };
+                let slope1 = if end + 3 <= n {
+                    -1.5 * y1 + 2.0 * ch[end + 1] - 0.5 * ch[end + 2]
+                } else {
+                    ch[end + 1] - y1
+                };
                 let steps = (span + 1) as f64;
+                // Scale derivatives by `steps` (dt = 1/steps) so the Hermite curve matches the
+                // physical sample-rate slope at both clip boundaries, clamped for stability.
+                let m0 = (slope0 * steps).clamp(-4.0, 4.0);
+                let m1 = (slope1 * steps).clamp(-4.0, 4.0);
                 for k in 0..span {
                     let t = ((k + 1) as f64) / steps;
                     let t2 = t * t;
@@ -101,8 +117,8 @@ fn declip_plateaus(ch: &mut [f64]) {
                     let h10 = t3 - 2.0 * t2 + t;
                     let h01 = -2.0 * t3 + 3.0 * t2;
                     let h11 = t3 - t2;
-                    let interp = h00 * y0 + h10 * m0 * 0.5 + h01 * y1 + h11 * m1 * 0.5;
-                    ch[start + k] = interp.clamp(-0.995, 0.995);
+                    let interp = h00 * y0 + h10 * m0 + h01 * y1 + h11 * m1;
+                    ch[start + k] = interp.clamp(-2.0, 2.0);
                 }
             }
         }
@@ -167,6 +183,9 @@ pub fn apply_analog_console_and_tape(buffer: &mut AudioBuffer, drive: f64) {
         return;
     }
     let sr = f64::from(buffer.sample_rate.max(1));
+    // Sample-rate-independent hysteresis slew smoothing (~160 us time constant ≈ 0.88/0.12 at 48 kHz)
+    let hyst_alpha = (-1.0 / (sr * 0.000_16)).exp();
+    let hyst_prev_w = 1.0 - hyst_alpha;
     for ch in &mut buffer.channels {
         let mut prev = 0.0_f64;
         // Head-bump +60 Hz subtle warmth (+0.6 dB scaled by drive)
@@ -177,7 +196,7 @@ pub fn apply_analog_console_and_tape(buffer: &mut AudioBuffer, drive: f64) {
             let driven = (x * (1.0 + 0.45 * amt)).clamp(-1.55, 1.55);
             let sat = (driven * (PI * 0.5 / 1.55)).sin();
             // Subtle hysteresis slew smoothing on harsh ultrasonic transients
-            let hyst = 0.88 * sat + 0.12 * prev;
+            let hyst = hyst_alpha * sat + hyst_prev_w * prev;
             prev = hyst;
             *s = (1.0 - amt * 0.55) * x + (amt * 0.55) * hyst;
         }
@@ -330,26 +349,42 @@ pub fn clean_vocal_surgical(
     Ok(out)
 }
 
-/// Mouth De-Click: detect 1-2ms high-slew spikes and replace via local median interpolation.
+/// Mouth De-Click: detect 1-2ms high-slew spikes in O(n) using a sliding-window slew baseline
+/// and replace them with smooth cubic Hermite interpolation.
 fn remove_mouth_clicks(ch: &mut [f64], sr: f64) {
     let n = ch.len();
     let win = ((sr * 0.0015).round() as usize).clamp(4, 96);
+    if n <= 2 * win + 4 {
+        return;
+    }
+
+    // Precompute |x[k] - x[k-1]| and its prefix sum for O(1) local-neighborhood baseline queries.
+    let mut prefix = vec![0.0_f64; n + 1];
+    for k in 1..n {
+        prefix[k + 1] = prefix[k] + (ch[k] - ch[k - 1]).abs();
+    }
+
+    let inv_count = 1.0 / ((2 * win - 1) as f64);
     let mut i = win + 1;
     while i + win < n {
         let diff = (ch[i] - ch[i - 1]).abs();
-        let mut local_diff_sum = 0.0;
-        for k in (i - win)..(i + win) {
-            if k != i && k > 0 {
-                local_diff_sum += (ch[k] - ch[k - 1]).abs();
-            }
-        }
-        let avg_diff = (local_diff_sum / ((2 * win - 1) as f64)).max(1e-7);
-        if diff > avg_diff * 8.5 && diff > 0.02 {
+        let window_sum = prefix[i + win] - prefix[i - win] - diff;
+        let avg_diff = (window_sum * inv_count).max(1e-7);
+        if diff > avg_diff * 8.5 && diff > 0.02 && i >= 3 && i + 3 < n {
             let y0 = ch[i - 2];
             let y1 = ch[i + 2];
-            ch[i - 1] = 0.75 * y0 + 0.25 * y1;
-            ch[i] = 0.50 * y0 + 0.50 * y1;
-            ch[i + 1] = 0.25 * y0 + 0.75 * y1;
+            let m0 = (y0 - ch[i - 3]) * 4.0;
+            let m1 = (ch[i + 3] - y1) * 4.0;
+            for (k, slot) in ch[i - 1..=i + 1].iter_mut().enumerate() {
+                let t = ((k + 1) as f64) * 0.25;
+                let t2 = t * t;
+                let t3 = t2 * t;
+                let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+                let h10 = t3 - 2.0 * t2 + t;
+                let h01 = -2.0 * t3 + 3.0 * t2;
+                let h11 = t3 - t2;
+                *slot = (h00 * y0 + h10 * m0 + h01 * y1 + h11 * m1).clamp(-2.0, 2.0);
+            }
             i += 3;
             continue;
         }
@@ -363,13 +398,16 @@ fn duck_plosives(ch: &mut [f64], sr: f64) {
     let mut split = LowBandSplit::new(sr, 110.0);
     let mut low_env = 0.0_f64;
     let mut mid_env = 0.0_f64;
+    // Sample-rate-independent ~2.6 ms envelope follower (matches 0.992 / 0.008 at 48 kHz)
+    let env_alpha = (-1.0 / (sr * 0.0026)).exp();
+    let env_beta = 1.0 - env_alpha;
 
     for s in ch.iter_mut() {
         let bands = split.process(*s);
-        low_env = 0.992 * low_env + 0.008 * bands.low.abs();
-        mid_env = 0.992 * mid_env + 0.008 * bands.detect_high.abs();
+        low_env = env_alpha * low_env + env_beta * bands.low.abs();
+        mid_env = env_alpha * mid_env + env_beta * bands.detect_high.abs();
 
-        // If low energy dominates mid energy by >3x, dynamically attenuate the low band
+        // If low energy dominates mid energy by >2.8x, dynamically attenuate the low band
         let plosive_gain = if low_env > mid_env * 2.8 && low_env > 0.015 {
             ((mid_env * 2.8) / low_env).clamp(0.15, 1.0)
         } else {
@@ -379,11 +417,15 @@ fn duck_plosives(ch: &mut [f64], sr: f64) {
     }
 }
 
-/// Smart De-Breath: attenuate low-level high-ZCR unvoiced breath segments between phrases.
+/// Smart De-Breath: attenuate low-level high-ZCR unvoiced breath segments between phrases,
+/// using sample-rate-independent zero-crossing frequency (Hz) and gain smoothing.
 fn attenuate_breaths(ch: &mut [f64], sr: f64, debreath_db: f64) {
     let n = ch.len();
     let breath_gain = 10.0_f64.powf(debreath_db.clamp(-24.0, 0.0) / 20.0);
     let block = ((sr * 0.020).round() as usize).max(64);
+    // Sample-rate-independent ~4.2 ms gain smoothing (matches 0.995 / 0.005 at 48 kHz)
+    let smooth_alpha = (-1.0 / (sr * 0.0042)).exp();
+    let smooth_beta = 1.0 - smooth_alpha;
     let mut smoothed_g = 1.0_f64;
     for b_start in (0..n).step_by(block) {
         let b_end = (b_start + block).min(n);
@@ -395,11 +437,12 @@ fn attenuate_breaths(ch: &mut [f64], sr: f64, debreath_db: f64) {
                 zcr += 1;
             }
         }
-        let zcr_rate = (zcr as f64) / (slice.len() as f64);
-        let is_breath = (0.003..0.045).contains(&rms) && zcr_rate > 0.14;
+        // Physical zero-crossing frequency in Hz (0.14 crossings/sample at 48 kHz ≈ 3360 Hz)
+        let zcr_hz = 0.5 * (zcr as f64) * sr / (slice.len() as f64);
+        let is_breath = (0.003..0.045).contains(&rms) && zcr_hz > 3360.0;
         let target_g = if is_breath { breath_gain } else { 1.0 };
         for s in &mut ch[b_start..b_end] {
-            smoothed_g = 0.995 * smoothed_g + 0.005 * target_g;
+            smoothed_g = smooth_alpha * smoothed_g + smooth_beta * target_g;
             *s *= smoothed_g;
         }
     }

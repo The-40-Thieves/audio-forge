@@ -63,17 +63,17 @@ pub fn align_phase_gcc_phat(
     let tgt_w = &tgt_mono[start..start + slice_len];
 
     let max_lag = max_lag_samples(sr, max_search_ms, fft_len);
-    let (best_lag, best_val) = gcc_phat_peak(ref_w, tgt_w, fft_len, max_lag);
+    let (best_lag, frac_lag, best_val) = gcc_phat_peak(ref_w, tgt_w, fft_len, max_lag);
     let invert_polarity = best_val < 0.0;
     let sign = if invert_polarity { -1.0 } else { 1.0 };
 
     let result = PhaseAlignmentResult {
         delay_samples: best_lag,
-        delay_ms: (best_lag as f64) * 1000.0 / sr,
+        delay_ms: frac_lag * 1000.0 / sr,
         invert_polarity,
         correlation_peak: normalized_correlation(ref_w, tgt_w, best_lag),
     };
-    Ok((shift_target(target, best_lag, sign), result))
+    Ok((shift_target_fractional(target, frac_lag, sign), result))
 }
 
 /// Largest searched lag in samples for a `max_search_ms` window.
@@ -102,17 +102,28 @@ fn highest_energy_window(reference: &[f64], target: &[f64], len: usize) -> usize
     best_start
 }
 
-/// Lag (within `±max_lag`) and signed value of the mildly PHAT-weighted cross-correlation peak.
-fn gcc_phat_peak(ref_w: &[f64], tgt_w: &[f64], fft_len: usize, max_lag: usize) -> (isize, f64) {
+/// Integer lag, parabolic sub-sample lag, and signed value of the mildly PHAT-weighted
+/// cross-correlation peak within `±max_lag`.
+fn gcc_phat_peak(
+    ref_w: &[f64],
+    tgt_w: &[f64],
+    fft_len: usize,
+    max_lag: usize,
+) -> (isize, f64, f64) {
     let mut planner = FftPlanner::<f64>::new();
     let fft_fwd = planner.plan_fft_forward(fft_len);
     let fft_inv = planner.plan_fft_inverse(fft_len);
-    let spectrum = |window: &[f64]| {
+    let scratch_len = fft_fwd
+        .get_inplace_scratch_len()
+        .max(fft_inv.get_inplace_scratch_len());
+    let mut scratch = vec![Complex::new(0.0, 0.0); scratch_len];
+
+    let mut spectrum = |window: &[f64]| {
         let mut spec = vec![Complex::new(0.0, 0.0); fft_len];
         for (bin, &x) in spec.iter_mut().zip(window) {
             *bin = Complex::new(x, 0.0);
         }
-        fft_fwd.process(&mut spec);
+        fft_fwd.process_with_scratch(&mut spec, &mut scratch);
         spec
     };
     let r_spec = spectrum(ref_w);
@@ -127,21 +138,39 @@ fn gcc_phat_peak(ref_w: &[f64], tgt_w: &[f64], fft_len: usize, max_lag: usize) -
             prod / prod.norm().max(1e-12).powf(0.5)
         })
         .collect();
-    fft_inv.process(&mut cross);
+    fft_inv.process_with_scratch(&mut cross, &mut scratch);
 
-    let mut best = (0_isize, 0.0_f64);
-    for lag in -(max_lag as isize)..=(max_lag as isize) {
+    let lag_val = |lag: isize| -> f64 {
         let idx = if lag >= 0 {
             lag as usize
         } else {
             (fft_len as isize + lag) as usize
         };
-        let val = cross[idx].re / (fft_len as f64);
+        cross[idx].re / (fft_len as f64)
+    };
+
+    let mut best = (0_isize, 0.0_f64);
+    for lag in -(max_lag as isize)..=(max_lag as isize) {
+        let val = lag_val(lag);
         if val.abs() > best.1.abs() {
             best = (lag, val);
         }
     }
-    best
+
+    // Parabolic sub-sample refinement around the integer peak when not at the search boundary.
+    let mut frac_lag = best.0 as f64;
+    if best.0.unsigned_abs() < max_lag && best.1.abs() > 1e-12 {
+        let y_m1 = lag_val(best.0 - 1).abs();
+        let y_0 = best.1.abs();
+        let y_p1 = lag_val(best.0 + 1).abs();
+        let denom = y_m1 - 2.0 * y_0 + y_p1;
+        if denom < -1e-12 {
+            let delta = (0.5 * (y_m1 - y_p1) / denom).clamp(-0.5, 0.5);
+            frac_lag += delta;
+        }
+    }
+
+    (best.0, frac_lag, best.1)
 }
 
 /// `|Σ ref[i]·tgt[i + lag]| / √(E_ref·E_tgt)` over the analysis window. Cauchy-Schwarz keeps it
@@ -162,18 +191,58 @@ fn normalized_correlation(ref_w: &[f64], tgt_w: &[f64], lag: isize) -> f64 {
     (dot.abs() / denom).clamp(0.0, 1.0)
 }
 
-/// Shifts every channel of `target` earlier by `lag` samples and applies `sign`.
-fn shift_target(target: &AudioBuffer, lag: isize, sign: f64) -> AudioBuffer {
+/// 4-point Catmull-Rom cubic interpolation at `pos` inside `ch` (zero outside bounds).
+#[inline]
+fn catmull_rom_sample(ch: &[f64], pos: f64) -> f64 {
+    let frames = ch.len() as isize;
+    let i0 = pos.floor() as isize;
+    let t = pos - (i0 as f64);
+    let get = |idx: isize| -> f64 {
+        if idx >= 0 && idx < frames {
+            ch[idx as usize]
+        } else {
+            0.0
+        }
+    };
+    let p0 = get(i0 - 1);
+    let p1 = get(i0);
+    let p2 = get(i0 + 1);
+    let p3 = get(i0 + 2);
+    let t2 = t * t;
+    let t3 = t2 * t;
+    0.5 * ((2.0 * p1)
+        + (-p0 + p2) * t
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
+}
+
+/// Shifts every channel of `target` earlier by `frac_lag` samples (using exact integer copy
+/// when `frac_lag` is within `1e-4` of an integer, and 4-point Catmull-Rom cubic interpolation
+/// for sub-sample offsets) and applies `sign`.
+fn shift_target_fractional(target: &AudioBuffer, frac_lag: f64, sign: f64) -> AudioBuffer {
     let frames = target.num_frames();
+    let nearest = frac_lag.round();
+    let is_integer = (frac_lag - nearest).abs() <= 1e-4;
+    let int_lag = nearest as isize;
+
     let channels = target
         .channels
         .iter()
         .map(|ch| {
             let mut out_ch = vec![0.0_f64; frames];
-            for (i, sample_out) in out_ch.iter_mut().enumerate() {
-                let src_idx = (i as isize) + lag;
-                if src_idx >= 0 && (src_idx as usize) < frames {
-                    *sample_out = ch[src_idx as usize] * sign;
+            if is_integer {
+                for (i, sample_out) in out_ch.iter_mut().enumerate() {
+                    let src_idx = (i as isize) + int_lag;
+                    if src_idx >= 0 && (src_idx as usize) < frames {
+                        *sample_out = ch[src_idx as usize] * sign;
+                    }
+                }
+            } else {
+                for (i, sample_out) in out_ch.iter_mut().enumerate() {
+                    let src_pos = (i as f64) + frac_lag;
+                    if src_pos >= 0.0 && src_pos <= (frames.saturating_sub(1) as f64) {
+                        *sample_out = catmull_rom_sample(ch, src_pos) * sign;
+                    }
                 }
             }
             out_ch
