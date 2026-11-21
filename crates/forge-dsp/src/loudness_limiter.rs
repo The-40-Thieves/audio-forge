@@ -809,9 +809,12 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
     };
 
     // Near digital silence there is no programme to judge: band energy and RMS both sit at
-    // their numeric floors, and their difference would read as a loud band. Check the loudest
-    // individual channel's RMS (not just the mono sum) so a 180-degree out-of-phase stereo
-    // signal whose mono sum cancels to zero is never misclassified as silence.
+    // their numeric floors, and their difference would read as a loud band.
+    // - `mono_silent` gates the mono-FFT band levels & fizz index (so a 180-degree out-of-phase
+    //   stereo signal whose mono sum cancels to zero does not report bogus relative band levels).
+    // - `channel_silent` checks the loudest individual channel's RMS so electrical/phase warnings
+    //   (DC offset, negative stereo correlation, low crest factor) still fire on out-of-phase audio.
+    let mono_silent = rms_db <= SILENCE_RMS_DBFS;
     let max_ch_rms = buffer
         .channels
         .iter()
@@ -831,9 +834,9 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
         })
         .fold(1e-12_f64, f64::max);
     let max_ch_rms_db = 20.0 * max_ch_rms.log10();
-    let silent = max_ch_rms_db <= SILENCE_RMS_DBFS;
+    let channel_silent = max_ch_rms_db <= SILENCE_RMS_DBFS;
     let relative_band_db = |f_low: f64, f_high: f64| {
-        if silent {
+        if mono_silent {
             SILENT_BAND_DB
         } else {
             band_db(f_low, f_high) - rms_db
@@ -849,7 +852,7 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
     let whistle_score = ((whistle_db - 6.0) * 4.5).clamp(0.0, 60.0);
     let harsh_score = ((harshness_2_6khz_db + 8.0) * 3.0).clamp(0.0, 25.0);
     let sub_smear_score = ((0.85 - sub_160hz_correlation) * 30.0).clamp(0.0, 15.0);
-    let ai_fizz_index = if silent {
+    let ai_fizz_index = if mono_silent {
         0.0
     } else {
         (whistle_score + harsh_score + sub_smear_score).clamp(0.0, 100.0)
@@ -889,19 +892,19 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
             "{clipped_samples} clipped sample runs detected. Run cubic-spline de-clipper before mastering."
         ));
     }
-    if !silent && dc_offset.abs() > 0.01 {
+    if !channel_silent && dc_offset.abs() > 0.01 {
         recommendations.push(format!(
             "DC offset is {:+.4} (reduces headroom and causes clicky edits). Enable DC removal in `forge restore`.",
             dc_offset
         ));
     }
-    if !silent && ch_count >= 2 && stereo_correlation < 0.0 {
+    if !channel_silent && ch_count >= 2 && stereo_correlation < 0.0 {
         recommendations.push(format!(
             "Negative broadband stereo correlation ({:.2}) risks phase cancellation in mono playback. Check stem polarity with `forge phase-align`.",
             stereo_correlation
         ));
     }
-    if !silent && frames >= (sr * 0.5) as usize && crest_factor_db < 4.5 {
+    if !mono_silent && frames >= (sr * 0.5) as usize && crest_factor_db < 4.5 {
         recommendations.push(format!(
             "Low crest factor ({:.1} dB) indicates heavy dynamic squashing. Consider backing off limiter drive or lowering target loudness.",
             crest_factor_db
@@ -1146,8 +1149,6 @@ pub fn normalize_and_limit(
             }
         }
 
-        apply_true_peak_trim(&mut out, clean_ceiling_dbtp);
-
         if iter + 1 >= max_iters {
             break;
         }
@@ -1171,6 +1172,8 @@ pub fn normalize_and_limit(
         makeup_db = next_makeup_db;
     }
 
+    // Single final 4x true-peak safety trim after loudness convergence.
+    apply_true_peak_trim(&mut out, clean_ceiling_dbtp);
     Ok(out)
 }
 
