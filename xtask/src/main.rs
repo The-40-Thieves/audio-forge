@@ -215,6 +215,18 @@ const CHECK_STEPS: &[CheckStep] = &[
     },
 ];
 
+/// Failure reported by `cargo xtask check` when a verification step exits nonzero.
+#[derive(Debug, PartialEq, Eq)]
+struct CheckError(String);
+
+impl fmt::Display for CheckError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CheckError {}
+
 fn run_check() -> nih_plug_xtask::Result<()> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     for step in CHECK_STEPS {
@@ -226,7 +238,7 @@ fn run_check() -> nih_plug_xtask::Result<()> {
         }
         let status = cmd.status()?;
         if !status.success() {
-            return Err(UsageError(format!(
+            return Err(CheckError(format!(
                 "check step `{}` failed with status {status}",
                 step.label
             ))

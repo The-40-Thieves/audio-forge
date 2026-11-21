@@ -29,7 +29,7 @@ cargo xtask bundle-all --release                # all 10 plugins
 
 ## Before you open a pull request
 
-Run the local pre-PR gate (runs the same Rust checks as CI in sequence):
+Run the local pre-PR gate (runs the 4 core Rust checks — `fmt`, `clippy`, `test`, `doc` — in sequence):
 
 ```bash
 cargo xtask check
