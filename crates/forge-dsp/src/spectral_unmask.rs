@@ -8,6 +8,7 @@ use std::f64::consts::PI;
 use std::sync::Arc;
 
 use forge_core::{AudioBuffer, ForgeError, Result};
+use rayon::prelude::*;
 use rustfft::{Fft, FftPlanner, num_complex::Complex};
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +20,12 @@ const FFT_SIZE: usize = 2048;
 const HOP: usize = 512;
 /// Number of non-redundant bins of a real `FFT_SIZE` transform.
 const HALF_BINS: usize = FFT_SIZE / 2 + 1;
+/// Attack time constant in seconds for sidechain unmasking.
+const ATTACK_TAU_SECS: f64 = 0.009;
+/// Release time constant in seconds for sidechain unmasking.
+const RELEASE_TAU_SECS: f64 = 0.065;
+/// Raised-cosine skirt width in octaves at `low_cut_hz` and `high_cut_hz`.
+const BAND_SKIRT_OCTAVES: f64 = 1.0 / 3.0;
 
 /// Configuration for OpenSpacer Sidechain Spectral Unmasking.
 ///
@@ -59,47 +66,129 @@ impl UnmaskConfig {
 }
 
 /// Sanitized analysis parameters resolved from an [`UnmaskConfig`] at one sample rate.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct UnmaskBands {
-    b_low: usize,
-    b_high: usize,
+    b_start: usize,
+    b_end: usize,
+    band_weights: Vec<f64>,
     min_gain: f64,
     sensitivity: f64,
+    attack_alpha: f64,
+    release_alpha: f64,
+}
+
+/// Smooth raised-cosine bandpass weight for a bin at `freq_hz` over `[low_hz, high_hz]`.
+fn smooth_unmask_weight(freq_hz: f64, low_hz: f64, high_hz: f64, nyquist: f64) -> f64 {
+    if freq_hz <= 0.0 || low_hz >= high_hz {
+        return 0.0;
+    }
+    let log_f = freq_hz.log2();
+    let lo_mask = if low_hz <= 1e-6 {
+        1.0
+    } else {
+        let log_lo = low_hz.log2();
+        if log_f <= log_lo - BAND_SKIRT_OCTAVES {
+            0.0
+        } else if log_f < log_lo {
+            let t = (log_f - (log_lo - BAND_SKIRT_OCTAVES)) / BAND_SKIRT_OCTAVES;
+            0.5 * (1.0 - (PI * t).cos())
+        } else {
+            1.0
+        }
+    };
+
+    let hi_mask = if high_hz >= nyquist * (1.0 - 1e-6) {
+        1.0
+    } else {
+        let log_hi = high_hz.log2();
+        if log_f >= log_hi + BAND_SKIRT_OCTAVES {
+            0.0
+        } else if log_f > log_hi {
+            let t = (log_f - log_hi) / BAND_SKIRT_OCTAVES;
+            0.5 * (1.0 + (PI * t).cos())
+        } else {
+            1.0
+        }
+    };
+
+    lo_mask * hi_mask
 }
 
 impl UnmaskBands {
     /// Routes every config value through [`sanitize_param_f64`] so `NaN` / `±Inf` cannot reach the
-    /// gain curve, then maps the cutoffs onto bins.
+    /// gain curve, then builds smooth raised-cosine frequency weights and sample-rate-independent
+    /// attack/release coefficients.
     fn resolve(config: &UnmaskConfig, sample_rate: f64) -> Self {
         let defaults = UnmaskConfig::vocal_over_instruments();
         let nyquist = sample_rate / 2.0;
         let bin_hz = sample_rate / (FFT_SIZE as f64);
-        let low_hz = sanitize_param_f64(config.low_cut_hz, defaults.low_cut_hz, 0.0, nyquist);
-        let high_hz = sanitize_param_f64(config.high_cut_hz, defaults.high_cut_hz, 0.0, nyquist);
+        let low_hz = sanitize_param_f64(config.low_cut_hz, defaults.low_cut_hz, 0.0, nyquist)
+            .min((nyquist - bin_hz).max(0.0));
+        let high_hz = sanitize_param_f64(config.high_cut_hz, defaults.high_cut_hz, 0.0, nyquist)
+            .max((low_hz + bin_hz).min(nyquist));
         let max_reduction_db = sanitize_param_f64(
             config.max_reduction_db,
             defaults.max_reduction_db,
             0.5,
             20.0,
         );
-        let b_low = ((low_hz / bin_hz).floor() as usize).clamp(1, HALF_BINS - 3);
-        let b_high = ((high_hz / bin_hz).ceil() as usize).clamp(b_low + 1, HALF_BINS - 2);
+
+        let mut band_weights = vec![0.0_f64; HALF_BINS];
+        let mut b_start = HALF_BINS - 2;
+        let mut b_end = 1_usize;
+        for (b, weight_slot) in band_weights
+            .iter_mut()
+            .enumerate()
+            .take(HALF_BINS - 1)
+            .skip(1)
+        {
+            let w = smooth_unmask_weight((b as f64) * bin_hz, low_hz, high_hz, nyquist);
+            *weight_slot = w;
+            if w > 1e-4 {
+                b_start = b_start.min(b);
+                b_end = b_end.max(b);
+            }
+        }
+        if b_start > b_end {
+            b_start = 1;
+            b_end = 0;
+        }
+
+        let hop_secs = (HOP as f64) / sample_rate;
+        let attack_alpha = (-hop_secs / ATTACK_TAU_SECS).exp();
+        let release_alpha = (-hop_secs / RELEASE_TAU_SECS).exp();
+
         Self {
-            b_low,
-            b_high,
+            b_start,
+            b_end,
+            band_weights,
             min_gain: 10.0_f64.powf(-max_reduction_db / 20.0),
             sensitivity: sanitize_param_f64(config.sensitivity, defaults.sensitivity, 0.1, 2.0),
+            attack_alpha,
+            release_alpha,
         }
     }
 
-    /// Instantaneous ducking gain for one sidechain bin at `db` dBFS (active above `-48 dBFS`).
-    fn raw_gain(&self, db: f64) -> f64 {
-        if db > -48.0 {
+    /// Instantaneous ducking gain for one sidechain bin at `db` dBFS (active above `-48 dBFS`),
+    /// weighted by the smooth band skirt `weight`.
+    fn raw_gain(&self, db: f64, weight: f64) -> f64 {
+        if db > -48.0 && weight > 1e-4 {
             let norm = ((db + 48.0) / 36.0 * self.sensitivity).clamp(0.0, 1.0);
-            1.0 - norm * (1.0 - self.min_gain)
+            1.0 - weight * norm * (1.0 - self.min_gain)
         } else {
             1.0
         }
+    }
+
+    /// Sample-rate-independent asymmetric gain envelope: fast attack toward deeper ducking,
+    /// slow release back to unity.
+    fn smooth_gain(&self, env: f64, raw: f64) -> f64 {
+        let alpha = if raw < env {
+            self.attack_alpha
+        } else {
+            self.release_alpha
+        };
+        alpha * env + (1.0 - alpha) * raw
     }
 }
 
@@ -133,15 +222,6 @@ fn load_windowed(spec: &mut [Complex<f64>], src: &[f64], window: &[f64]) {
     }
 }
 
-/// Asymmetric gain envelope: fast attack toward deeper ducking, slow release back to unity.
-fn smooth_gain(env: f64, raw: f64) -> f64 {
-    if raw < env {
-        0.30 * env + 0.70 * raw
-    } else {
-        0.85 * env + 0.15 * raw
-    }
-}
-
 /// Per-frame, per-bin smoothed ducking gains measured from the padded sidechain.
 fn sidechain_gain_frames(
     sc_padded: &[f64],
@@ -152,18 +232,21 @@ fn sidechain_gain_frames(
     let num_stft_frames = sc_padded.len().saturating_sub(FFT_SIZE) / HOP + 1;
     let mut gain_frames = Vec::with_capacity(num_stft_frames);
     let mut spec = vec![Complex::new(0.0, 0.0); FFT_SIZE];
+    let mut scratch = vec![Complex::new(0.0, 0.0); fft_fwd.get_inplace_scratch_len()];
     let mut env_gains = vec![1.0_f64; HALF_BINS];
 
     for f_idx in 0..num_stft_frames {
         load_windowed(&mut spec, &sc_padded[f_idx * HOP..], window);
-        fft_fwd.process(&mut spec);
+        fft_fwd.process_with_scratch(&mut spec, &mut scratch);
 
         let mut frame_gains = vec![1.0_f64; HALF_BINS];
-        for b in bands.b_low..=bands.b_high {
-            let mag = spec[b].norm() / (FFT_SIZE as f64);
-            let raw_g = bands.raw_gain(20.0 * mag.max(1e-9).log10());
-            env_gains[b] = smooth_gain(env_gains[b], raw_g);
-            frame_gains[b] = env_gains[b];
+        if bands.b_start <= bands.b_end {
+            for b in bands.b_start..=bands.b_end {
+                let mag = spec[b].norm() / (FFT_SIZE as f64);
+                let raw_g = bands.raw_gain(20.0 * mag.max(1e-9).log10(), bands.band_weights[b]);
+                env_gains[b] = bands.smooth_gain(env_gains[b], raw_g);
+                frame_gains[b] = env_gains[b];
+            }
         }
         gain_frames.push(frame_gains);
     }
@@ -190,14 +273,19 @@ fn unmask_channel(
     let mut out_accum = vec![0.0_f64; padded.len()];
     let mut norm_accum = vec![0.0_f64; padded.len()];
     let mut spec = vec![Complex::new(0.0, 0.0); FFT_SIZE];
+    let scratch_len = plans
+        .fwd
+        .get_inplace_scratch_len()
+        .max(plans.inv.get_inplace_scratch_len());
+    let mut scratch = vec![Complex::new(0.0, 0.0); scratch_len];
     let inv_n = 1.0 / (FFT_SIZE as f64);
 
     for (f_idx, frame_gains) in gain_frames.iter().enumerate() {
         let pos = f_idx * HOP;
         load_windowed(&mut spec, &padded[pos..], window);
-        plans.fwd.process(&mut spec);
+        plans.fwd.process_with_scratch(&mut spec, &mut scratch);
         apply_smoothed_gains(&mut spec, frame_gains);
-        plans.inv.process(&mut spec);
+        plans.inv.process_with_scratch(&mut spec, &mut scratch);
 
         let out = &mut out_accum[pos..pos + FFT_SIZE];
         let norm = &mut norm_accum[pos..pos + FFT_SIZE];
@@ -257,7 +345,7 @@ pub fn apply_spectral_unmask(
     let gain_frames = sidechain_gain_frames(&sc_padded, &window, plans.fwd.as_ref(), &bands);
     let channels = target
         .channels
-        .iter()
+        .par_iter()
         .map(|ch| {
             unmask_channel(
                 &padded_sanitized(ch, frames),
