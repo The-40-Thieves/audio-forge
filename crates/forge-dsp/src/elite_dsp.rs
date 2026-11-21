@@ -566,11 +566,11 @@ impl RealtimeFdnReverb {
         let mut outs = [0.0_f64; 8];
         for (i, out_val) in outs.iter_mut().enumerate() {
             let len = self.delay_lens[i];
+            let nominal_delay = Self::BASE_DELAYS_MS[i] * 0.001 * self.sample_rate;
             let mod_offset =
                 (2.0 * PI * (self.lfo_phase + (i as f64) * 0.125)).sin() * mod_depth_samples;
             let max_delay = (len - 3) as f64;
-            let base_delay =
-                ((len as f64) - 16.0 - mod_depth_samples + mod_offset).clamp(1.0, max_delay);
+            let base_delay = (nominal_delay + mod_offset).clamp(1.0, max_delay);
             let d0 = base_delay.floor() as usize;
             let frac = base_delay - (d0 as f64);
             let r0 = (self.write_pos[i] + len - d0) % len;
