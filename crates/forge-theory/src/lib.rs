@@ -261,7 +261,6 @@ pub fn solve_voice_leading(
     let mut chord_events = Vec::new();
     let mut bass_events = Vec::new();
     let mut prev_voicing: Vec<u8> = Vec::new();
-    let mut prev_bass: Option<u8> = None;
     let scale_ticks = |ticks_at_480: u32| -> u32 {
         ((f64::from(ticks_at_480) * f64::from(safe_tpb) / 480.0).round() as u32)
             .min(chord_dur.saturating_sub(1))
@@ -274,17 +273,8 @@ pub fn solve_voice_leading(
         let bass_pc = parsed.bass_pc.unwrap_or(root_pc);
         let base_start_tick = (idx as u32).saturating_mul(chord_dur);
 
-        // 1. Dedicated phase-pure Sub-Bass note honouring slash bass, walking smoothly in A1..C3
-        let bass_note = if let Some(prev) = prev_bass {
-            [24 + bass_pc, 36 + bass_pc, 48 + bass_pc]
-                .into_iter()
-                .filter(|&n| (33..=48).contains(&n))
-                .min_by_key(|&n| (i16::from(n) - i16::from(prev)).abs())
-                .unwrap_or(36 + bass_pc)
-        } else {
-            36 + bass_pc
-        };
-        prev_bass = Some(bass_note);
+        // 1. Dedicated phase-pure Sub-Bass note in C2..B2 (MIDI 36..47), honouring slash bass
+        let bass_note = 36 + bass_pc;
         let bass_offset = match groove {
             GrooveStyle::NeoSoulDilla => scale_ticks(10), // Laid back behind the kick transient
             _ => 0,
@@ -400,26 +390,19 @@ fn best_voice_leading_inversion(pcs: &[u8], prev_voicing: &[u8]) -> Vec<u8> {
             if cand[0] < 50 || *cand.last().unwrap_or(&0) > 81 {
                 continue;
             }
-            // Symmetric nearest-voice L1 distance + mild gravity toward register center
-            let fwd_dist: f64 = cand
-                .iter()
-                .map(|&n| {
-                    prev_voicing
-                        .iter()
-                        .map(|&p| (f64::from(n) - f64::from(p)).abs())
-                        .fold(f64::INFINITY, f64::min)
-                })
-                .sum();
-            let bwd_dist: f64 = prev_voicing
-                .iter()
-                .map(|&p| {
-                    cand.iter()
-                        .map(|&n| (f64::from(n) - f64::from(p)).abs())
-                        .fold(f64::INFINITY, f64::min)
+            // Exact 1D one-to-one L1 voice-leading distance (optimal by rearrangement inequality
+            // on sorted voicings when lengths match; proportional quantile pairing otherwise)
+            // plus mild gravity toward the previous register center.
+            let n_max = cand.len().max(prev_voicing.len());
+            let l1_dist: f64 = (0..n_max)
+                .map(|k| {
+                    let ci = (k * (cand.len() - 1)) / (n_max - 1).max(1);
+                    let pi = (k * (prev_voicing.len() - 1)) / (n_max - 1).max(1);
+                    (f64::from(cand[ci]) - f64::from(prev_voicing[pi])).abs()
                 })
                 .sum();
             let cand_center = cand.iter().map(|&n| f64::from(n)).sum::<f64>() / (cand.len() as f64);
-            let cost = 0.5 * (fwd_dist + bwd_dist) + 0.25 * (cand_center - prev_center).abs();
+            let cost = l1_dist + 0.15 * (cand_center - prev_center).abs();
             if cost < best_cost {
                 best_cost = cost;
                 best_voicing = cand;
