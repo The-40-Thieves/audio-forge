@@ -2,6 +2,7 @@
 name = "forge-mcp"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "JSON-RPC 2.0 Model Context Protocol (MCP) Server for ForgeAudio"
 
@@ -24,3 +25,6 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true

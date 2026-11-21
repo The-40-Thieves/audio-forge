@@ -28,10 +28,25 @@ exclude = ["vendor"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.87"
 license = "Apache-2.0"
 authors = ["The 40 Thieves"]
 repository = "https://github.com/The-40-Thieves/audio-forge"
 description = "Open-source studio DSP, stem/vocal/MIDI surgery, music theory, and REAPER 7.82 production engine"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+inefficient_to_string = "warn"
+explicit_iter_loop = "warn"
+manual_let_else = "warn"
+semicolon_if_nothing_returned = "warn"
 
 [workspace.dependencies]
 anyhow = "1.0"

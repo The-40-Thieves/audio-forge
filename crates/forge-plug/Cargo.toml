@@ -2,6 +2,7 @@
 name = "forge-plug"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Native Real-Time VST3 & CLAP Plugin Suite for ForgeAudio (OpenSoothe, OpenSpacer, Vocal Surgical, SubMono/Tape, Master Limiter, Drum Trigger & Theory)"
 
@@ -23,3 +24,5 @@ nih_plug_egui.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 
+[lints]
+workspace = true

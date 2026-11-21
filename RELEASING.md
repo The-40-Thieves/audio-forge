@@ -12,8 +12,8 @@ The org convention (see the organization's CONTRIBUTING): semver tags `vX.Y.Z`, 
     git push origin vX.Y.Z
     ```
 
-3. `release.yml` runs on the tag, builds the release artifacts and creates the GitHub Release. It can also be re-run by hand for an existing tag (workflow dispatch).
-4. Edit the Release body so it is the release notes for this version, nothing else. The hub shows the first paragraph of it. Until the CI hardening work lands, note in the body that the artifacts are unsigned.
+3. `release.yml` runs on the tag, builds the release artifacts, generates `SHA256SUMS.txt`, signs SLSA build provenance attestations via `actions/attest-build-provenance`, and creates the GitHub Release. It can also be re-run by hand for an existing tag (workflow dispatch).
+4. Edit the Release body so it is the release notes for this version, nothing else. The hub shows the first paragraph of it. Users can verify release archives with `sha256sum -c SHA256SUMS.txt` (Linux/Windows) or `shasum -a 256 -c SHA256SUMS.txt` (macOS), and verify SLSA provenance with `gh attestation verify <archive>.zip --repo The-40-Thieves/audio-forge`.
 
 ## What the hub reads
 

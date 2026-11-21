@@ -22,6 +22,7 @@ jobs:
   build:
     name: build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: true
       matrix:
@@ -38,6 +39,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.TAG }}
+          persist-credentials: false
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y $LINUX_DEPS
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
@@ -80,8 +82,11 @@ jobs:
     name: publish GitHub release
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
     steps:
@@ -90,14 +95,25 @@ jobs:
           pattern: release-*
           merge-multiple: true
           path: dist
+      - name: Generate SHA-256 checksums
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum *.zip > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
+      - name: Attest build provenance (SLSA)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release upload "$TAG" dist/*.zip --clobber --repo "$GITHUB_REPOSITORY"
+            gh release upload "$TAG" dist/*.zip dist/SHA256SUMS.txt --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$TAG" dist/*.zip --repo "$GITHUB_REPOSITORY" \
+            gh release create "$TAG" dist/*.zip dist/SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" \
               --title "$TAG" --generate-notes --verify-tag
           fi

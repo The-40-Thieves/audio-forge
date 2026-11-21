@@ -1538,7 +1538,7 @@ impl ForgeDrumTriggerPlug {
             } => self
                 .notes
                 .root_on(timing, channel, note, velocity, voice_id, &mut |msg| {
-                    context.send_event(Self::note_event(msg))
+                    context.send_event(Self::note_event(msg));
                 }),
             NoteEvent::NoteOff {
                 timing,
@@ -1549,7 +1549,7 @@ impl ForgeDrumTriggerPlug {
             } => self
                 .notes
                 .root_off(timing, channel, note, voice_id, &mut |msg| {
-                    context.send_event(Self::note_event(msg))
+                    context.send_event(Self::note_event(msg));
                 }),
             other => context.send_event(other),
         }

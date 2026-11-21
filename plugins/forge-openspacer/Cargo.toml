@@ -2,6 +2,7 @@
 name = "forge-openspacer"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Standalone VST3 & CLAP Plugin: Forge OpenSpacer Unmask (4-Channel Sidechain Dynamic Spectral Unmasker)"
 
@@ -11,3 +12,6 @@ crate-type = ["cdylib"]
 [dependencies]
 forge-plug = { path = "../../crates/forge-plug" }
 nih_plug.workspace = true
+
+[lints]
+workspace = true
