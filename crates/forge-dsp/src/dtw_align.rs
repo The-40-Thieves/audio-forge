@@ -56,7 +56,8 @@ pub(crate) fn align_vocal_double_dtw_traced(
     let band = (((clean_warp_ms / 10.0).round() as usize).max(2)).min(num_steps / 2);
     let mut dtw = BandedDtw::new(num_steps, band);
     dtw.fill(&g_feats, &d_feats);
-    let step_map = dtw.step_map();
+    let raw_step_map = dtw.step_map();
+    let step_map = smooth_step_map(&raw_step_map);
 
     let markers = stretch_markers(&step_map, hop, sr);
     let out_frames = guide.num_frames();
@@ -208,8 +209,29 @@ fn stretch_markers(step_map: &[f64], hop: usize, sr: f64) -> Vec<StretchMarker> 
         .collect()
 }
 
-/// Resamples one dub channel smoothly along the warped contour. Frames that map past the last
-/// dub sample are silent.
+/// Applies a gentle 3-tap `[0.25, 0.5, 0.25]` smoothing pass to the quantized integer DTW
+/// contour (preserving endpoints and monotonicity) so rendered playback speed changes smoothly
+/// across 10 ms hops instead of stepping abruptly between 0x, 1x, and 2x.
+fn smooth_step_map(raw: &[f64]) -> Vec<f64> {
+    if raw.len() < 3 {
+        return raw.to_vec();
+    }
+    let mut out = raw.to_vec();
+    for i in 1..(raw.len() - 1) {
+        out[i] = 0.25 * raw[i - 1] + 0.50 * raw[i] + 0.25 * raw[i + 1];
+    }
+    // Enforce non-decreasing monotonicity in case of floating-point rounding.
+    for i in 1..out.len() {
+        if out[i] < out[i - 1] {
+            out[i] = out[i - 1];
+        }
+    }
+    out
+}
+
+/// Resamples one dub channel smoothly along the warped contour using 4-point Catmull-Rom cubic
+/// interpolation (preserving high-frequency air and sibilants compared to linear interpolation).
+/// Frames that map past the last dub sample are silent.
 fn warp_channel(ch: &[f64], step_map: &[f64], hop: usize, out_frames: usize) -> Vec<f64> {
     let last = ch.len().saturating_sub(1);
     (0..out_frames)
@@ -219,8 +241,26 @@ fn warp_channel(ch: &[f64], step_map: &[f64], hop: usize, out_frames: usize) -> 
                 return 0.0;
             }
             let idx0 = src_f.floor() as usize;
-            let idx_frac = src_f - (idx0 as f64);
-            ch[idx0] * (1.0 - idx_frac) + ch[(idx0 + 1).min(last)] * idx_frac
+            let t = src_f - (idx0 as f64);
+            let p0 = ch[idx0.saturating_sub(1)];
+            let p1 = ch[idx0];
+            let p2 = ch[(idx0 + 1).min(last)];
+            let p3 = ch[(idx0 + 2).min(last)];
+            let t2 = t * t;
+            let t3 = t2 * t;
+            // Evaluate Catmull-Rom in difference form to avoid intermediate overflow, and clamp
+            // to local sample extrema so cubic ringing cannot create peaks outside the input range.
+            let lo = p0.min(p1).min(p2).min(p3);
+            let hi = p0.max(p1).max(p2).max(p3);
+            let interp = p1
+                + 0.5 * (p2 - p0) * t
+                + (p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3) * t2
+                + (-0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3) * t3;
+            if interp.is_finite() {
+                interp.clamp(lo, hi)
+            } else {
+                p1
+            }
         })
         .collect()
 }
