@@ -116,6 +116,72 @@ fn compute_erb_bounds(bin_hz: f64, sharpness_bins: usize) -> Vec<(usize, usize)>
         .collect()
 }
 
+/// Shared parameters for per-bin ERB dynamic resonance gain estimation.
+struct ErbGainParams<'a> {
+    band_weights: &'a [f64],
+    erb_bounds: &'a [(usize, usize)],
+    thresh_ratio: f64,
+    min_gain: f64,
+    attack_alpha: f64,
+    release_alpha: f64,
+}
+
+/// Updates `smoothed_gains` in place from `log_mags` + `prefix_log` using O(1) ERB baselines.
+fn update_erb_gains(
+    log_mags: &[f64],
+    prefix_log: &[f64],
+    smoothed_gains: &mut [f64],
+    focus: f64,
+    params: &ErbGainParams<'_>,
+) {
+    for b in 1..(HALF_BINS - 1) {
+        let weight = params.band_weights[b] * focus;
+        if weight <= 1e-4 {
+            smoothed_gains[b] = 1.0;
+            continue;
+        }
+        let (b_start, b_end) = params.erb_bounds[b];
+        let total_sum = prefix_log[b_end + 1] - prefix_log[b_start];
+        let total_count = b_end + 1 - b_start;
+
+        // Exclude the 3-bin Hann window main lobe (b-1, b, b+1)
+        let excl_lo = b.saturating_sub(1).max(b_start);
+        let excl_hi = (b + 1).min(b_end);
+        let excl_sum = prefix_log[excl_hi + 1] - prefix_log[excl_lo];
+        let excl_count = excl_hi + 1 - excl_lo;
+
+        let count = total_count.saturating_sub(excl_count);
+        let local_log_env = if count > 0 {
+            (total_sum - excl_sum) / (count as f64)
+        } else {
+            log_mags[b]
+        };
+
+        let ratio = (log_mags[b] - local_log_env).exp();
+        let excess = ratio / params.thresh_ratio;
+        let target_gain = if excess > 1.0 {
+            (1.0 / excess.powf(0.65 * weight)).clamp(params.min_gain, 1.0)
+        } else {
+            1.0
+        };
+
+        let alpha = if target_gain < smoothed_gains[b] {
+            params.attack_alpha
+        } else {
+            params.release_alpha
+        };
+        smoothed_gains[b] = alpha * smoothed_gains[b] + (1.0 - alpha) * target_gain;
+    }
+}
+
+/// Smooths a bin's gain across its 3-bin Hann main lobe to suppress musical noise.
+#[inline]
+fn smooth_lobe_gain(gains: &[f64], b: usize) -> f64 {
+    let min_lobe = gains[b - 1].min(gains[b]).min(gains[b + 1]);
+    let avg_lobe = 0.25 * gains[b - 1] + 0.50 * gains[b] + 0.25 * gains[b + 1];
+    0.65 * min_lobe + 0.35 * avg_lobe
+}
+
 /// Applies stereo-linked Overlap-Add (OLA) STFT dynamic resonance suppression across all channels.
 ///
 /// Uses ERB-scaled log-magnitude (geometric mean) local baseline estimation, smooth raised-cosine
@@ -259,48 +325,23 @@ pub fn apply_spectral_defizz(buffer: &AudioBuffer, config: &DeFizzConfig) -> Res
             prefix_log[b + 1] = prefix_log[b] + lm;
         }
 
-        // Compute per-bin linked dynamic resonance gain against ERB geometric-mean neighborhood
-        for b in 1..(HALF_BINS - 1) {
-            let weight = band_weights[b];
-            if weight <= 1e-4 {
-                smoothed_gains[b] = 1.0;
-                continue;
-            }
-            let (b_start, b_end) = erb_bounds[b];
-            let total_sum = prefix_log[b_end + 1] - prefix_log[b_start];
-            let total_count = b_end + 1 - b_start;
-
-            // Exclude the 3-bin Hann window main lobe (b-1, b, b+1)
-            let excl_lo = b.saturating_sub(1).max(b_start);
-            let excl_hi = (b + 1).min(b_end);
-            let excl_sum = prefix_log[excl_hi + 1] - prefix_log[excl_lo];
-            let excl_count = excl_hi + 1 - excl_lo;
-
-            let count = total_count.saturating_sub(excl_count);
-            let local_log_env = if count > 0 {
-                (total_sum - excl_sum) / (count as f64)
-            } else {
-                log_mags[b]
-            };
-
-            let ratio = (log_mags[b] - local_log_env).exp();
-            let excess = ratio / thresh_ratio;
-            let target_gain = if excess > 1.0 {
-                (1.0 / excess.powf(0.65 * weight)).clamp(min_gain, 1.0)
-            } else {
-                1.0
-            };
-
-            let alpha = if target_gain < smoothed_gains[b] {
-                attack_alpha
-            } else {
-                release_alpha
-            };
-            smoothed_gains[b] = alpha * smoothed_gains[b] + (1.0 - alpha) * target_gain;
-        }
+        let erb_params = ErbGainParams {
+            band_weights: &band_weights,
+            erb_bounds: &erb_bounds,
+            thresh_ratio,
+            min_gain,
+            attack_alpha,
+            release_alpha,
+        };
+        update_erb_gains(
+            &log_mags,
+            &prefix_log,
+            &mut smoothed_gains,
+            1.0,
+            &erb_params,
+        );
 
         if use_per_channel {
-            // Compute per-channel ERB gains and blend with linked gains via `clean_link` + M/S focus.
             for (ch_idx, spec) in specs.iter_mut().enumerate() {
                 let focus = if use_ms {
                     ms_channel_scale[ch_idx]
@@ -314,56 +355,11 @@ pub fn apply_spectral_defizz(buffer: &AudioBuffer, config: &DeFizzConfig) -> Res
                     prefix_log[b + 1] = prefix_log[b] + lm;
                 }
                 let ch_gains = &mut ch_smoothed_gains[ch_idx];
-                for b in 1..(HALF_BINS - 1) {
-                    let weight = band_weights[b] * focus;
-                    if weight <= 1e-4 {
-                        ch_gains[b] = 1.0;
-                        continue;
-                    }
-                    let (b_start, b_end) = erb_bounds[b];
-                    let total_sum = prefix_log[b_end + 1] - prefix_log[b_start];
-                    let total_count = b_end + 1 - b_start;
-                    let excl_lo = b.saturating_sub(1).max(b_start);
-                    let excl_hi = (b + 1).min(b_end);
-                    let excl_sum = prefix_log[excl_hi + 1] - prefix_log[excl_lo];
-                    let excl_count = excl_hi + 1 - excl_lo;
-                    let count = total_count.saturating_sub(excl_count);
-                    let local_log_env = if count > 0 {
-                        (total_sum - excl_sum) / (count as f64)
-                    } else {
-                        log_mags[b]
-                    };
-                    let ratio = (log_mags[b] - local_log_env).exp();
-                    let excess = ratio / thresh_ratio;
-                    let target_gain = if excess > 1.0 {
-                        (1.0 / excess.powf(0.65 * weight)).clamp(min_gain, 1.0)
-                    } else {
-                        1.0
-                    };
-                    let alpha = if target_gain < ch_gains[b] {
-                        attack_alpha
-                    } else {
-                        release_alpha
-                    };
-                    ch_gains[b] = alpha * ch_gains[b] + (1.0 - alpha) * target_gain;
-                }
+                update_erb_gains(&log_mags, &prefix_log, ch_gains, focus, &erb_params);
 
                 for b in 1..(HALF_BINS - 1) {
-                    let g_ch = 0.65 * ch_gains[b - 1].min(ch_gains[b]).min(ch_gains[b + 1])
-                        + 0.35
-                            * (0.25 * ch_gains[b - 1]
-                                + 0.50 * ch_gains[b]
-                                + 0.25 * ch_gains[b + 1]);
-                    let g_link_raw = 0.65
-                        * smoothed_gains[b - 1]
-                            .min(smoothed_gains[b])
-                            .min(smoothed_gains[b + 1])
-                        + 0.35
-                            * (0.25 * smoothed_gains[b - 1]
-                                + 0.50 * smoothed_gains[b]
-                                + 0.25 * smoothed_gains[b + 1]);
-                    // Apply M/S focus to linked gain as well so Mid-only never ducks Side.
-                    let g_link = 1.0 - focus * (1.0 - g_link_raw);
+                    let g_ch = smooth_lobe_gain(ch_gains, b);
+                    let g_link = 1.0 - focus * (1.0 - smooth_lobe_gain(&smoothed_gains, b));
                     let g = (clean_link * g_link + (1.0 - clean_link) * g_ch).clamp(min_gain, 1.0);
                     let eg = if config.delta_listen { 1.0 - g } else { g };
                     spec[b] *= eg;
@@ -392,15 +388,8 @@ pub fn apply_spectral_defizz(buffer: &AudioBuffer, config: &DeFizzConfig) -> Res
                 }
             }
         } else {
-            // Smooth gains across the 3-bin Hann main lobe to prevent musical noise
             for b in 1..(HALF_BINS - 1) {
-                let min_lobe = smoothed_gains[b - 1]
-                    .min(smoothed_gains[b])
-                    .min(smoothed_gains[b + 1]);
-                let avg_lobe = 0.25 * smoothed_gains[b - 1]
-                    + 0.50 * smoothed_gains[b]
-                    + 0.25 * smoothed_gains[b + 1];
-                let g = 0.65 * min_lobe + 0.35 * avg_lobe;
+                let g = smooth_lobe_gain(&smoothed_gains, b);
                 effective_gains[b] = if config.delta_listen { 1.0 - g } else { g };
             }
 

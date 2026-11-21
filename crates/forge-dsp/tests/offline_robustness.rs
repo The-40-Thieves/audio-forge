@@ -50,6 +50,8 @@ proptest! {
         high_cut_hz in wild_f64(),
         max_reduction_db in wild_f64(),
         sensitivity in wild_f64(),
+        mid_side_balance in wild_f64(),
+        delta_listen in any::<bool>(),
     ) {
         let buf = AudioBuffer::from_channels(stereo_tone(frames, 0.5), SR).unwrap();
         let cfg = UnmaskConfig {
@@ -57,7 +59,8 @@ proptest! {
             high_cut_hz,
             max_reduction_db,
             sensitivity,
-            ..UnmaskConfig::default()
+            delta_listen,
+            mid_side_balance,
         };
         let out = apply_spectral_unmask(&buf, &buf, &cfg).expect("unmask succeeded");
         prop_assert_eq!(out.num_frames(), frames);
