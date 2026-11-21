@@ -130,18 +130,29 @@ pub struct RealtimeTransientTonalSplit {
     low_lp_r: Biquad,
     high_hp_l: Biquad,
     high_hp_r: Biquad,
+    fast_alphas: [f64; 3],
+    slow_alphas: [f64; 3],
     fast_env: [f64; 3],
     slow_env: [f64; 3],
 }
 
 impl RealtimeTransientTonalSplit {
+    /// Physical per-band fast/slow envelope time constants (seconds) matching the 48 kHz tuning
+    /// across all sample rates.
+    const FAST_TAUS_SECS: [f64; 3] = [0.000_25, 0.000_13, 0.000_072];
+    const SLOW_TAUS_SECS: [f64; 3] = [0.006_94, 0.003_47, 0.002_07];
+
     pub fn new(sample_rate: f64) -> Self {
         let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
+        let fast_alphas = Self::FAST_TAUS_SECS.map(|tau| (-1.0 / (sr * tau)).exp());
+        let slow_alphas = Self::SLOW_TAUS_SECS.map(|tau| (-1.0 / (sr * tau)).exp());
         Self {
             low_lp_l: Biquad::lowpass(sr, 180.0, FRAC_1_SQRT_2),
             low_lp_r: Biquad::lowpass(sr, 180.0, FRAC_1_SQRT_2),
             high_hp_l: Biquad::highpass(sr, 3200.0, FRAC_1_SQRT_2),
             high_hp_r: Biquad::highpass(sr, 3200.0, FRAC_1_SQRT_2),
+            fast_alphas,
+            slow_alphas,
             fast_env: [0.0; 3],
             slow_env: [1e-6; 3],
         }
@@ -176,9 +187,6 @@ impl RealtimeTransientTonalSplit {
         let bands_l = [lo_l, mid_l, hi_l];
         let bands_r = [lo_r, mid_r, hi_r];
 
-        // Wavelength-scaled fast/slow envelope followers per band
-        let fast_alphas = [0.92, 0.85, 0.75];
-        let slow_alphas = [0.997, 0.994, 0.990];
         let sharp = sanitize_param_f64(separation_sharpness, 1.5, 0.5, 4.0);
 
         let mut out_l = 0.0_f64;
@@ -186,12 +194,10 @@ impl RealtimeTransientTonalSplit {
 
         for b in 0..3 {
             let mag = 0.5 * (bands_l[b].abs() + bands_r[b].abs());
-            self.fast_env[b] = flush_denormal_f64(
-                fast_alphas[b] * self.fast_env[b] + (1.0 - fast_alphas[b]) * mag,
-            );
-            self.slow_env[b] = flush_denormal_f64(
-                slow_alphas[b] * self.slow_env[b] + (1.0 - slow_alphas[b]) * mag,
-            ) + 1e-7;
+            let fa = self.fast_alphas[b];
+            let sa = self.slow_alphas[b];
+            self.fast_env[b] = flush_denormal_f64(fa * self.fast_env[b] + (1.0 - fa) * mag);
+            self.slow_env[b] = flush_denormal_f64(sa * self.slow_env[b] + (1.0 - sa) * mag) + 1e-7;
 
             let ratio = (self.fast_env[b] / self.slow_env[b] - 1.05).max(0.0);
             let trans_mask = (1.0 - (-ratio * 2.2 * sharp).exp()).clamp(0.0, 1.0);
@@ -230,6 +236,7 @@ pub struct RealtimeDensityAndClipper {
     low_lp_r: Biquad,
     high_hp_l: Biquad,
     high_hp_r: Biquad,
+    rms_alpha: f64,
     rms_env: [f64; 3],
     adaa_l: [AdaaTanh; 3],
     adaa_r: [AdaaTanh; 3],
@@ -240,11 +247,14 @@ pub struct RealtimeDensityAndClipper {
 impl RealtimeDensityAndClipper {
     pub fn new(sample_rate: f64) -> Self {
         let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
+        // Sample-rate-independent ~2.6 ms RMS envelope (matches 0.992/0.008 at 48 kHz)
+        let rms_alpha = (-1.0 / (sr * 0.0026)).exp();
         Self {
             low_lp_l: Biquad::lowpass(sr, 160.0, FRAC_1_SQRT_2),
             low_lp_r: Biquad::lowpass(sr, 160.0, FRAC_1_SQRT_2),
             high_hp_l: Biquad::highpass(sr, 2800.0, FRAC_1_SQRT_2),
             high_hp_r: Biquad::highpass(sr, 2800.0, FRAC_1_SQRT_2),
+            rms_alpha,
             rms_env: [1e-4; 3],
             adaa_l: [AdaaTanh::default(); 3],
             adaa_r: [AdaaTanh::default(); 3],
@@ -287,15 +297,26 @@ impl RealtimeDensityAndClipper {
         let drive_lin = 10.0_f64.powf(clean_drive_db / 20.0);
         let ceiling_lin = 10.0_f64.powf(clean_ceil_db / 20.0);
 
+        let ra = self.rms_alpha;
+        let rb = 1.0 - ra;
         for b in 0..3 {
             let pwr = 0.5 * (bands_l[b] * bands_l[b] + bands_r[b] * bands_r[b]);
             self.rms_env[b] =
-                flush_denormal_f64(0.992 * self.rms_env[b] + 0.008 * pwr.max(1e-10)).max(1e-10);
+                flush_denormal_f64(ra * self.rms_env[b] + rb * pwr.max(1e-10)).max(1e-10);
             let lvl_db = 10.0 * self.rms_env[b].log10();
 
-            // Upward compression ("Density"): lift quiet signals between -48 dB and -16 dB up to +9 dB
-            let upward_db = if (-48.0..-16.0).contains(&lvl_db) {
-                ((-16.0 - lvl_db) * 0.32 * dens).min(9.0 * dens)
+            // Upward compression ("Density"): lift quiet signals below -16 dB up to +9 dB,
+            // with a smooth raised-cosine noise-floor fade between -60 dB and -48 dB so tails
+            // never chatter across a hard gate threshold.
+            let upward_db = if lvl_db > -60.0 && lvl_db < -16.0 {
+                let raw_boost = ((-16.0 - lvl_db) * 0.32 * dens).min(9.0 * dens);
+                let floor_fade = if lvl_db < -48.0 {
+                    let t = (lvl_db - (-60.0)) / 12.0;
+                    0.5 * (1.0 - (PI * t).cos())
+                } else {
+                    1.0
+                };
+                raw_boost * floor_fade
             } else {
                 0.0
             };
@@ -351,6 +372,8 @@ pub struct RealtimeFdnReverb {
     low_cut_r: Biquad,
     lfo_phase: f64,
     duck_env: f64,
+    duck_attack_alpha: f64,
+    duck_release_alpha: f64,
     shimmer_buf: Vec<f64>,
     shimmer_write: usize,
     shimmer_phase: f64,
@@ -370,11 +393,15 @@ impl RealtimeFdnReverb {
         let diff_lens: [usize; 4] =
             std::array::from_fn(|i| ((Self::DIFFUSER_MS[i] * 0.001 * sr).round() as usize).max(16));
         let diff_bufs: [Vec<f64>; 4] = std::array::from_fn(|i| vec![0.0; diff_lens[i]]);
+        let mod_margin = ((sr * 0.0005).ceil() as usize).max(32);
         let delay_lens: [usize; 8] = std::array::from_fn(|i| {
-            ((Self::BASE_DELAYS_MS[i] * 0.001 * sr).round() as usize + 64).max(128)
+            ((Self::BASE_DELAYS_MS[i] * 0.001 * sr).round() as usize + mod_margin * 2).max(128)
         });
         let delay_lines: [Vec<f64>; 8] = std::array::from_fn(|i| vec![0.0; delay_lens[i]]);
         let shimmer_len = ((sr * 0.040).round() as usize).max(512);
+        // Sample-rate-independent vocal ducking time constants (~2.1 ms attack, ~42 ms release)
+        let duck_attack_alpha = (-1.0 / (sr * 0.0021)).exp();
+        let duck_release_alpha = (-1.0 / (sr * 0.042)).exp();
 
         Self {
             sample_rate: sr,
@@ -392,14 +419,40 @@ impl RealtimeFdnReverb {
             low_cut_r: Biquad::highpass(sr, 180.0, FRAC_1_SQRT_2),
             lfo_phase: 0.0,
             duck_env: 0.0,
+            duck_attack_alpha,
+            duck_release_alpha,
             shimmer_buf: vec![0.0; shimmer_len],
             shimmer_write: 0,
             shimmer_phase: 0.0,
         }
     }
 
+    /// Resets all reverb state. Clears buffers in place (zero audio-thread allocations) when
+    /// `sample_rate` matches the already-configured rate.
     pub fn reset(&mut self, sample_rate: f64) {
-        *self = Self::new(sample_rate);
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
+        if (sr - self.sample_rate).abs() < 1e-6 {
+            self.pre_delay_buf.fill(0.0);
+            self.pre_delay_write = 0;
+            for b in &mut self.diff_bufs {
+                b.fill(0.0);
+            }
+            self.diff_pos = [0; 4];
+            for line in &mut self.delay_lines {
+                line.fill(0.0);
+            }
+            self.write_pos = [0; 8];
+            self.damp_state = [0.0; 8];
+            self.low_cut_l.reset();
+            self.low_cut_r.reset();
+            self.lfo_phase = 0.0;
+            self.duck_env = 0.0;
+            self.shimmer_buf.fill(0.0);
+            self.shimmer_write = 0;
+            self.shimmer_phase = 0.0;
+        } else {
+            *self = Self::new(sr);
+        }
     }
 
     /// Orthogonal $O(N \log N)$ 8x8 Fast Walsh-Hadamard unitary transform (normalized by $1/\sqrt{8}$).
@@ -487,34 +540,43 @@ impl RealtimeFdnReverb {
             self.diff_pos[d] = (d_pos + 1) % d_len;
         }
 
-        // 2. Octave (+12 st) dual-grain Shimmer generator
+        // 2. Octave (+12 st) dual-grain Shimmer generator with linear fractional interpolation
         let shim_len = self.shimmer_buf.len();
         let shim_f = shim_len as f64;
         self.shimmer_buf[self.shimmer_write] = diff_sig;
         self.shimmer_phase = (self.shimmer_phase - 1.0).rem_euclid(shim_f);
         let phase_b = (self.shimmer_phase + shim_f * 0.5).rem_euclid(shim_f);
         let w_a = 0.5 * (1.0 - (2.0 * PI * self.shimmer_phase / shim_f).cos());
-        let idx_a = (self.shimmer_write + shim_len
-            - (self.shimmer_phase as usize).min(shim_len - 1))
-            % shim_len;
-        let idx_b =
-            (self.shimmer_write + shim_len - (phase_b as usize).min(shim_len - 1)) % shim_len;
-        let shimmer_sig =
-            (w_a * self.shimmer_buf[idx_a] + (1.0 - w_a) * self.shimmer_buf[idx_b]) * clean_shimmer;
+        let read_shimmer = |phase: f64| -> f64 {
+            let d0 = phase.floor() as usize;
+            let frac = phase - (d0 as f64);
+            let i0 = (self.shimmer_write + shim_len - (d0 % shim_len)) % shim_len;
+            let i1 = (self.shimmer_write + shim_len - ((d0 + 1) % shim_len)) % shim_len;
+            self.shimmer_buf[i0] * (1.0 - frac) + self.shimmer_buf[i1] * frac
+        };
+        let shimmer_sig = (w_a * read_shimmer(self.shimmer_phase)
+            + (1.0 - w_a) * read_shimmer(phase_b))
+            * clean_shimmer;
         self.shimmer_write = (self.shimmer_write + 1) % shim_len;
 
-        // 3. Read from 8 modulated FDN delay lines
+        // 3. Read from 8 LFO-modulated FDN delay lines with fractional linear interpolation
+        // (eliminates integer-index zipper clicks and keeps chorus depth constant in ms across SRs)
         self.lfo_phase = (self.lfo_phase + 0.65 / self.sample_rate).fract();
+        let mod_depth_samples = 0.000_125 * self.sample_rate; // 0.125 ms (~6 samples at 48 kHz)
         let mut outs = [0.0_f64; 8];
         for (i, out_val) in outs.iter_mut().enumerate() {
             let len = self.delay_lens[i];
             let mod_offset =
-                ((2.0 * PI * (self.lfo_phase + (i as f64) * 0.125)).sin() * 6.0).round() as isize;
-            let base_delay = (len - 16) as isize + mod_offset;
-            let read_idx = (self.write_pos[i] + len
-                - (base_delay.clamp(1, (len - 2) as isize) as usize))
-                % len;
-            *out_val = flush_denormal_f64(self.delay_lines[i][read_idx]);
+                (2.0 * PI * (self.lfo_phase + (i as f64) * 0.125)).sin() * mod_depth_samples;
+            let max_delay = (len - 3) as f64;
+            let base_delay =
+                ((len as f64) - 16.0 - mod_depth_samples + mod_offset).clamp(1.0, max_delay);
+            let d0 = base_delay.floor() as usize;
+            let frac = base_delay - (d0 as f64);
+            let r0 = (self.write_pos[i] + len - d0) % len;
+            let r1 = (self.write_pos[i] + len - (d0 + 1)) % len;
+            let interp = self.delay_lines[i][r0] * (1.0 - frac) + self.delay_lines[i][r1] * frac;
+            *out_val = flush_denormal_f64(interp);
         }
 
         let mut wet_l = (outs[0] + outs[2] + outs[4] + outs[6]) * 0.5 + er_l * 0.35;
@@ -542,12 +604,14 @@ impl RealtimeFdnReverb {
             self.write_pos[i] = (w_pos + 1) % self.delay_lens[i];
         }
 
-        // 5. Automatic Vocal Sidechain Ducking (ducks wet reverb tail when dry input is present)
+        // 5. Automatic Vocal Sidechain Ducking (sample-rate-independent envelope)
         let in_lvl = 0.5 * (dry_l.abs() + dry_r.abs());
         if in_lvl > self.duck_env {
-            self.duck_env = flush_denormal_f64(0.990 * self.duck_env + 0.010 * in_lvl);
+            let a = self.duck_attack_alpha;
+            self.duck_env = flush_denormal_f64(a * self.duck_env + (1.0 - a) * in_lvl);
         } else {
-            self.duck_env = flush_denormal_f64(0.9995 * self.duck_env + 0.0005 * in_lvl);
+            let a = self.duck_release_alpha;
+            self.duck_env = flush_denormal_f64(a * self.duck_env + (1.0 - a) * in_lvl);
         }
         let duck_gain = (1.0 - (self.duck_env * 4.5 * clean_duck)).clamp(0.15, 1.0);
         wet_l *= duck_gain;
