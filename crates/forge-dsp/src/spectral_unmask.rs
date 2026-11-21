@@ -41,6 +41,19 @@ pub struct UnmaskConfig {
     pub max_reduction_db: f64,
     /// Sensitivity, clamped to `0.1..=2.0` (default `1.0`).
     pub sensitivity: f64,
+    /// When `true`, outputs *only* the carved frequencies removed by the sidechain (Delta audition).
+    #[serde(default)]
+    pub delta_listen: bool,
+    /// Mid/Side carving focus for stereo targets (`-1.0` = carve Mid only, preserving stereo sides;
+    /// `0.0` = balanced L/R; `+1.0` = carve Side only). Ignored for non-stereo channel counts.
+    #[serde(default)]
+    pub mid_side_balance: f64,
+}
+
+impl Default for UnmaskConfig {
+    fn default() -> Self {
+        Self::vocal_over_instruments()
+    }
 }
 
 impl UnmaskConfig {
@@ -51,6 +64,8 @@ impl UnmaskConfig {
             high_cut_hz: 7500.0,
             max_reduction_db: 4.5,
             sensitivity: 1.0,
+            delta_listen: false,
+            mid_side_balance: 0.0,
         }
     }
 
@@ -61,6 +76,8 @@ impl UnmaskConfig {
             high_cut_hz: 130.0,
             max_reduction_db: 7.5,
             sensitivity: 1.25,
+            delta_listen: false,
+            mid_side_balance: 0.0,
         }
     }
 }
@@ -254,11 +271,25 @@ fn sidechain_gain_frames(
 }
 
 /// Applies the 3-tap smoothed gain curve to the positive bins and mirrors the negative ones.
-fn apply_smoothed_gains(spec: &mut [Complex<f64>], gains: &[f64]) {
+///
+/// `depth_scale` scales the carve depth (`0.0` = bypass, `1.0` = full carve); when `delta_listen`
+/// is `true`, outputs only the carved energy (`1.0 - g`) and zeroes DC/Nyquist.
+fn apply_smoothed_gains(
+    spec: &mut [Complex<f64>],
+    gains: &[f64],
+    depth_scale: f64,
+    delta_listen: bool,
+) {
     for b in 1..(HALF_BINS - 1) {
-        let g = 0.25 * gains[b - 1] + 0.50 * gains[b] + 0.25 * gains[b + 1];
-        spec[b] *= g;
+        let g_raw = 0.25 * gains[b - 1] + 0.50 * gains[b] + 0.25 * gains[b + 1];
+        let g = (1.0 - depth_scale * (1.0 - g_raw)).clamp(0.0, 1.0);
+        let eg = if delta_listen { 1.0 - g } else { g };
+        spec[b] *= eg;
         spec[FFT_SIZE - b] = spec[b].conj();
+    }
+    if delta_listen {
+        spec[0] = Complex::new(0.0, 0.0);
+        spec[HALF_BINS - 1] = Complex::new(0.0, 0.0);
     }
 }
 
@@ -269,6 +300,8 @@ fn unmask_channel(
     window: &[f64],
     plans: &StftPlans,
     frames: usize,
+    depth_scale: f64,
+    delta_listen: bool,
 ) -> Vec<f64> {
     let mut out_accum = vec![0.0_f64; padded.len()];
     let mut norm_accum = vec![0.0_f64; padded.len()];
@@ -284,7 +317,7 @@ fn unmask_channel(
         let pos = f_idx * HOP;
         load_windowed(&mut spec, &padded[pos..], window);
         plans.fwd.process_with_scratch(&mut spec, &mut scratch);
-        apply_smoothed_gains(&mut spec, frame_gains);
+        apply_smoothed_gains(&mut spec, frame_gains, depth_scale, delta_listen);
         plans.inv.process_with_scratch(&mut spec, &mut scratch);
 
         let out = &mut out_accum[pos..pos + FFT_SIZE];
@@ -343,19 +376,68 @@ pub fn apply_spectral_unmask(
 
     let sc_padded = padded_sanitized(&sidechain.to_mono(), frames);
     let gain_frames = sidechain_gain_frames(&sc_padded, &window, plans.fwd.as_ref(), &bands);
-    let channels = target
-        .channels
-        .par_iter()
-        .map(|ch| {
-            unmask_channel(
-                &padded_sanitized(ch, frames),
-                &gain_frames,
-                &window,
-                &plans,
-                frames,
-            )
-        })
-        .collect();
+    let clean_ms = sanitize_param_f64(config.mid_side_balance, 0.0, -1.0, 1.0);
+    let use_ms = target.channels.len() == 2 && clean_ms.abs() > 1e-4;
+
+    let channels = if use_ms {
+        let mid_scale = (1.0 - clean_ms.max(0.0)).clamp(0.0, 1.0);
+        let side_scale = (1.0 + clean_ms.min(0.0)).clamp(0.0, 1.0);
+        let mut mid = vec![0.0_f64; frames];
+        let mut side = vec![0.0_f64; frames];
+        for i in 0..frames {
+            let l = sanitize_sample_f64(target.channels[0][i]);
+            let r = sanitize_sample_f64(target.channels[1][i]);
+            mid[i] = 0.5 * (l + r);
+            side[i] = 0.5 * (l - r);
+        }
+        let (mid_out, side_out) = rayon::join(
+            || {
+                unmask_channel(
+                    &padded_sanitized(&mid, frames),
+                    &gain_frames,
+                    &window,
+                    &plans,
+                    frames,
+                    mid_scale,
+                    config.delta_listen,
+                )
+            },
+            || {
+                unmask_channel(
+                    &padded_sanitized(&side, frames),
+                    &gain_frames,
+                    &window,
+                    &plans,
+                    frames,
+                    side_scale,
+                    config.delta_listen,
+                )
+            },
+        );
+        let mut left = vec![0.0_f64; frames];
+        let mut right = vec![0.0_f64; frames];
+        for i in 0..frames {
+            left[i] = mid_out[i] + side_out[i];
+            right[i] = mid_out[i] - side_out[i];
+        }
+        vec![left, right]
+    } else {
+        target
+            .channels
+            .par_iter()
+            .map(|ch| {
+                unmask_channel(
+                    &padded_sanitized(ch, frames),
+                    &gain_frames,
+                    &window,
+                    &plans,
+                    frames,
+                    1.0,
+                    config.delta_listen,
+                )
+            })
+            .collect()
+    };
 
     Ok(AudioBuffer {
         channels,
