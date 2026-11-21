@@ -25,9 +25,10 @@ pub use elite_dsp::{
     RealtimeTransientTonalSplit, compute_genre_tonal_balance_eq,
 };
 pub use loudness_limiter::{
-    Biquad, CytomicSvf, LIMITER_LOOKAHEAD_MS, LIMITER_RELEASE_MS, SILENCE_RMS_DBFS, SILENT_BAND_DB,
-    audit_audio, compute_true_peak, flush_denormal_f64, normalize_and_limit, sanitize_param_f64,
-    sanitize_sample_f32, sanitize_sample_f64,
+    Biquad, CytomicSvf, DitherMode, LIMITER_LOOKAHEAD_MS, LIMITER_RELEASE_MS, LimiterStyle,
+    MasteringLimiterConfig, SILENCE_RMS_DBFS, SILENT_BAND_DB, apply_dither, audit_audio,
+    compute_true_peak, flush_denormal_f64, normalize_and_limit, normalize_and_limit_with_config,
+    sanitize_param_f64, sanitize_sample_f32, sanitize_sample_f64,
 };
 pub use phase_align::{PhaseAlignmentResult, align_phase_gcc_phat};
 pub use realtime::{
