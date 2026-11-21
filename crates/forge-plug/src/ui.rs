@@ -312,15 +312,18 @@ pub(crate) fn draw_forge_studio_header_and_spectrum(
         ));
     }
 
-    // Frequency axis labels aligned to log-spaced 32-band analyzer (25 Hz .. 18.5 kHz)
+    // Frequency axis labels placed at exact log-frequency fractions matching the 32-band analyzer
+    // (25 Hz .. 18.5 kHz).
     let axis_color = egui::Color32::from_rgb(120, 134, 155);
-    for &(frac, label) in &[
-        (0.08_f32, "50Hz"),
-        (0.28, "200Hz"),
-        (0.52, "1kHz"),
-        (0.76, "5kHz"),
-        (0.94, "16kHz"),
+    let log_span = (18_500.0_f32 / 25.0_f32).ln();
+    for &(freq_hz, label) in &[
+        (50.0_f32, "50Hz"),
+        (200.0, "200Hz"),
+        (1_000.0, "1kHz"),
+        (5_000.0, "5kHz"),
+        (16_000.0, "16kHz"),
     ] {
+        let frac = ((freq_hz / 25.0_f32).ln() / log_span).clamp(0.0, 1.0);
         let x = rect.left() + 8.0 + frac * (rect.width() - 16.0);
         painter.text(
             egui::pos2(x, rect.bottom() - 8.0),

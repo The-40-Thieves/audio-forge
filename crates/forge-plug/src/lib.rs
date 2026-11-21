@@ -4,7 +4,8 @@
 //! Built on `nih-plug` and `forge-dsp::realtime` with **zero audio-thread heap allocations**
 //! (`assert_process_allocs` enabled).
 //!
-//! Exports 10 standalone VST3/CLAP studio processors:
+//! Implements 10 VST3/CLAP studio processors (exported individually from `plugins/forge-*`,
+//! or together as one bundle when `all-in-one-export` is enabled):
 //! 1. **Forge OpenSoothe De-Fizz** (2048-pt OLA STFT Dynamic Spectral Resonance & AI Fizz Suppressor)
 //! 2. **Forge OpenSpacer Unmask** (4-Channel Sidechain Dynamic Spectral Unmasker)
 //! 3. **Forge Vocal Surgical Strip** (Zero-Latency Mouth De-Click, Plosive Suppressor, De-Esser & Breath Gate)
