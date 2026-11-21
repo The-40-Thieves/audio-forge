@@ -222,7 +222,7 @@ class RunDenoiseTests(TestCase):
             inp = out / "noisy_vox.wav"
             inp.write_bytes(b"RIFF")
             res = worker.run_denoise(
-                inp, out, attenuation_limit_db=18.0, backend="deepfilternet"
+                inp, out, attenuation_limit_db=18.0, backend="auto"
             )
             self.assertEqual(res["backend"], "deepfilternet")
             self.assertEqual(
@@ -259,7 +259,7 @@ class RunDenoiseTests(TestCase):
             inp = out / "room_vox.wav"
             inp.write_bytes(b"RIFF")
             res = worker.run_denoise(inp, out, backend="auto")
-            self.assertEqual(res["backend"], "bs-roformer")
+            self.assertEqual(res["backend"], "mel-band-roformer")
             self.assertIn("_(Dry)_", Path(res["denoised"]).name)
             self.assertTrue(Path(res["denoised"]).is_file())
 

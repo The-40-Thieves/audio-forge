@@ -100,6 +100,13 @@ def run_separate(
     }
 
 
+def _safe_stem(path: Path) -> str:
+    cleaned = "".join(
+        ch if (ch.isalnum() or ch in {"-", "_"}) else "_" for ch in path.stem
+    )
+    return cleaned.strip("._") or "audio"
+
+
 def _denoise_with_deepfilternet(
     input_path: Path, output_dir: Path, attenuation_limit_db: float | None
 ) -> Path:
@@ -108,7 +115,11 @@ def _denoise_with_deepfilternet(
     model, df_state, _ = init_df()
     audio, _ = load_audio(str(input_path), sr=df_state.sr())
     enhanced = enhance(model, df_state, audio, atten_lim_db=attenuation_limit_db)
-    out_path = output_dir / f"{input_path.stem}_denoised_deepfilternet.wav"
+    out_path = (
+        output_dir / f"{_safe_stem(input_path)}_denoised_deepfilternet.wav"
+    ).resolve()
+    if not out_path.is_relative_to(output_dir):
+        raise ValueError(f"Refusing to write outside output directory: {out_path}")
     save_audio(str(out_path), enhanced, df_state.sr())
     return out_path
 
@@ -124,7 +135,12 @@ def _denoise_with_roformer(input_path: Path, output_dir: Path) -> Path:
         raise RuntimeError(
             f"RoFormer denoise produced no clean stem in outputs: {outputs!r}"
         )
-    return cleaned
+    resolved_cleaned = cleaned.resolve()
+    if not resolved_cleaned.is_relative_to(output_dir):
+        raise ValueError(
+            f"Refusing to return path outside output directory: {resolved_cleaned}"
+        )
+    return resolved_cleaned
 
 
 def run_denoise(
@@ -134,34 +150,37 @@ def run_denoise(
     backend: str = "auto",
 ) -> dict[str, str]:
     """Run neural audio denoising via DeepFilterNet3 or Mel-Band-RoFormer denoise."""
-    if backend not in {"auto", "deepfilternet", "bs-roformer"}:
+    if backend not in {"auto", "deepfilternet", "mel-band-roformer"}:
         raise ValueError(
-            f"Unsupported denoise backend {backend!r}; expected auto, deepfilternet, or bs-roformer"
+            f"Unsupported denoise backend {backend!r}; "
+            "expected auto, deepfilternet, or mel-band-roformer"
         )
     if attenuation_limit_db is not None and not (0.0 <= attenuation_limit_db <= 100.0):
         raise ValueError(
             f"attenuation_limit_db must be finite and in [0, 100], got {attenuation_limit_db!r}"
         )
-    if not input_path.is_file():
-        raise FileNotFoundError(f"Input audio file not found: {input_path}")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_input = input_path.resolve()
+    if not resolved_input.is_file():
+        raise FileNotFoundError(f"Input audio file not found: {resolved_input}")
+    resolved_output = output_dir.resolve()
+    resolved_output.mkdir(parents=True, exist_ok=True)
 
     if backend in {"auto", "deepfilternet"}:
         try:
             out_path = _denoise_with_deepfilternet(
-                input_path, output_dir, attenuation_limit_db
+                resolved_input, resolved_output, attenuation_limit_db
             )
             return {"denoised": str(out_path), "backend": "deepfilternet"}
-        except ImportError as exc:
+        except (ImportError, RuntimeError, OSError) as exc:
             if backend == "deepfilternet":
                 raise RuntimeError(
-                    "deepfilternet is not installed in the worker venv. "
+                    "deepfilternet failed or is not installed in the worker venv. "
                     "Run: uv pip install deepfilternet"
                 ) from exc
 
     try:
-        out_path = _denoise_with_roformer(input_path, output_dir)
-        return {"denoised": str(out_path), "backend": "bs-roformer"}
+        out_path = _denoise_with_roformer(resolved_input, resolved_output)
+        return {"denoised": str(out_path), "backend": "mel-band-roformer"}
     except ImportError as exc:
         raise RuntimeError(
             "Neither deepfilternet nor audio-separator is installed in the worker venv."
@@ -230,7 +249,7 @@ def main() -> int:
     den_p.add_argument(
         "--backend",
         default="auto",
-        choices=["auto", "deepfilternet", "bs-roformer"],
+        choices=["auto", "deepfilternet", "mel-band-roformer"],
     )
 
     yue_p = sub.add_parser(
