@@ -65,7 +65,7 @@ impl VocalScale {
         let mut best_note = rounded;
         let mut best_dist = 999.0_f64;
 
-        for candidate in (rounded - 6).max(0)..=(rounded + 6).min(127) {
+        for candidate in 0_i32..=127 {
             let pc = candidate.rem_euclid(12) as usize;
             if self.allowed_pcs[pc] {
                 let dist = (f64::from(candidate) - clean_pitch).abs();
@@ -331,8 +331,9 @@ pub fn track_vocal_pitch(
     frames
 }
 
-/// Replaces isolated 1-frame F0 spikes that jump >5 semitones away from both voiced neighbors
-/// with the median of the three frames. Monotonic glides are strictly invariant under median-3.
+/// Replaces isolated 1-frame octave-doubling/halving tracking glitches: only fires when both
+/// voiced neighbors agree within 2 semitones and the center frame jumped by ~1 octave
+/// (`10.5..=13.5` semitones), preserving genuine brief melodic notes and monotonic glides.
 fn suppress_isolated_octave_glitches(
     frames: &mut [PitchFrame],
     scale: &VocalScale,
@@ -345,11 +346,15 @@ fn suppress_isolated_octave_glitches(
     for i in 1..(frames.len() - 1) {
         let (a, b, c) = (orig_f0[i - 1], orig_f0[i], orig_f0[i + 1]);
         if a > 0.0 && b > 0.0 && c > 0.0 {
+            let neighbor_spread = (12.0 * (a / c).log2()).abs();
+            if neighbor_spread > 2.0 {
+                continue;
+            }
             let mut triple = [a, b, c];
             triple.sort_by(f64::total_cmp);
             let med = triple[1];
             let jump_semitones = (12.0 * (b / med).log2()).abs();
-            if jump_semitones > 5.0 {
+            if (10.5..=13.5).contains(&jump_semitones) {
                 frames[i] = pitch_frame(frames[i].time_secs, med, scale, retune_strength);
             }
         }
@@ -492,20 +497,26 @@ pub fn shift_vocal_pitch_formant_preserved(
         }
     };
 
-    // Representative average shift across active (non-zero) curve entries so formant
-    // compensation doesn't misfire if the exact track midpoint happens to be a pause.
+    // Duration-weighted average shift across active (non-zero) curve segments so formant
+    // compensation reflects the dominant sung shift rather than an isolated short control point
+    // or a silent midpoint.
     let representative_shift = {
-        let mut sum = 0.0_f64;
-        let mut count = 0_usize;
-        for &(_, s) in semitone_curve {
-            let clean = forge_dsp::sanitize_param_f64(s, 0.0, -24.0, 24.0);
-            if clean.abs() > 1e-4 {
-                sum += clean;
-                count += 1;
+        let mut weighted_sum = 0.0_f64;
+        let mut total_dt = 0.0_f64;
+        if semitone_curve.len() >= 2 {
+            for seg in semitone_curve.windows(2) {
+                let dt = (seg[1].0 - seg[0].0).max(0.0);
+                let s0 = forge_dsp::sanitize_param_f64(seg[0].1, 0.0, -24.0, 24.0);
+                let s1 = forge_dsp::sanitize_param_f64(seg[1].1, 0.0, -24.0, 24.0);
+                let mid = 0.5 * (s0 + s1);
+                if dt > 0.0 && mid.abs() > 1e-4 {
+                    weighted_sum += mid * dt;
+                    total_dt += dt;
+                }
             }
         }
-        if count > 0 {
-            sum / (count as f64)
+        if total_dt > 0.0 {
+            weighted_sum / total_dt
         } else {
             forge_dsp::sanitize_param_f64(
                 interp_shift(buffer.duration_secs() * 0.5),
