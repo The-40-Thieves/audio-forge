@@ -1,0 +1,180 @@
+//! Quality and mastering invariants for Piece #2 (Loudness, Limiter & Delivery).
+
+use std::f64::consts::PI;
+
+use forge_core::AudioBuffer;
+use forge_dsp::{DeliveryOptions, DeliveryTarget, audit_audio, deliver, normalize_and_limit};
+
+const SR: u32 = 48_000;
+
+/// 6-second punchy mix with high crest factor: sustained musical bed plus strong periodic
+/// transient hits every 250 ms so the limiter must actively work when pushing to loud targets.
+fn punchy_high_crest_mix(sr: u32) -> AudioBuffer {
+    let frames = (sr as usize) * 6;
+    let beat_samples = (sr as usize) / 4; // 4 hits/sec
+    let hit_len = (sr as usize) * 18 / 1000; // 18 ms transient burst
+    let mut ch = Vec::with_capacity(frames);
+    for i in 0..frames {
+        let t = (i as f64) / f64::from(sr);
+        let bed = 0.08 * (2.0 * PI * 110.0 * t).sin() + 0.05 * (2.0 * PI * 440.0 * t).sin();
+        let pos_in_beat = i % beat_samples;
+        let hit = if pos_in_beat < hit_len {
+            let env = (-(pos_in_beat as f64) / (f64::from(sr) * 0.006)).exp();
+            0.90 * env * (2.0 * PI * 180.0 * t).sin()
+        } else {
+            0.0
+        };
+        ch.push(bed + hit);
+    }
+    AudioBuffer::from_channels(vec![ch.clone(), ch], sr).unwrap()
+}
+
+#[test]
+fn normalize_and_limit_converges_on_punchy_high_crest_mix() {
+    let mix = punchy_high_crest_mix(SR);
+    let target_lufs = -11.0;
+    let ceiling_dbtp = -1.0;
+
+    let mastered = normalize_and_limit(&mix, target_lufs, ceiling_dbtp).unwrap();
+    let report = audit_audio(&mastered);
+
+    assert!(
+        (report.integrated_lufs - target_lufs).abs() <= 0.35,
+        "expected closed-loop convergence near {target_lufs} LUFS, got {:.2} LUFS",
+        report.integrated_lufs
+    );
+    assert!(
+        report.true_peak_dbtp <= ceiling_dbtp,
+        "true peak {:.2} dBTP exceeded ceiling {ceiling_dbtp} dBTP",
+        report.true_peak_dbtp
+    );
+    assert_eq!(report.clipped_samples, 0);
+}
+
+#[test]
+fn dual_stage_release_recovers_faster_on_transient_than_sustained_overload() {
+    let frames = (SR as usize) * 2;
+    let bed_amp = 0.04;
+    let over_amp = 0.70; // ~+9 dB over -12.0 dBTP ceiling (0.251 lin)
+    let ceiling_dbtp = -12.0;
+    let end_sample = (SR as usize) / 2; // overload ends at t = 0.5 s
+
+    let make_signal = |overload_ms: usize| -> AudioBuffer {
+        let overload_samples = (SR as usize) * overload_ms / 1000;
+        let start_sample = end_sample - overload_samples;
+        let ch: Vec<f64> = (0..frames)
+            .map(|i| {
+                let t = (i as f64) / f64::from(SR);
+                let tone = (2.0 * PI * 1000.0 * t).sin();
+                if i >= start_sample && i < end_sample {
+                    over_amp * tone
+                } else {
+                    bed_amp * tone
+                }
+            })
+            .collect();
+        AudioBuffer::from_channels(vec![ch.clone(), ch], SR).unwrap()
+    };
+
+    let transient_buf = make_signal(3);
+    let sustained_buf = make_signal(250);
+
+    let lufs_t = audit_audio(&transient_buf)
+        .integrated_lufs
+        .clamp(-36.0, -6.0);
+    let lufs_s = audit_audio(&sustained_buf)
+        .integrated_lufs
+        .clamp(-36.0, -6.0);
+
+    let out_t = normalize_and_limit(&transient_buf, lufs_t, ceiling_dbtp).unwrap();
+    let out_s = normalize_and_limit(&sustained_buf, lufs_s, ceiling_dbtp).unwrap();
+
+    let rms = |s: &[f64]| -> f64 { (s.iter().map(|x| x * x).sum::<f64>() / s.len() as f64).sqrt() };
+
+    // Recovery window: 70ms..110ms after overload ends; far bed: 1.5s..1.8s (fully recovered).
+    let rec_start = end_sample + (SR as usize) * 70 / 1000;
+    let rec_end = end_sample + (SR as usize) * 110 / 1000;
+    let far_start = (SR as usize) * 15 / 10;
+    let far_end = (SR as usize) * 18 / 10;
+
+    let recovery_ratio_transient =
+        rms(&out_t.channels[0][rec_start..rec_end]) / rms(&out_t.channels[0][far_start..far_end]);
+    let recovery_ratio_sustained =
+        rms(&out_s.channels[0][rec_start..rec_end]) / rms(&out_s.channels[0][far_start..far_end]);
+
+    assert!(
+        recovery_ratio_transient > recovery_ratio_sustained + 0.05,
+        "expected isolated transient to recover faster than sustained overload: \
+         transient={recovery_ratio_transient:.3}, sustained={recovery_ratio_sustained:.3}"
+    );
+}
+
+#[test]
+fn audit_reports_dc_offset_phase_inversion_and_low_crest_factor() {
+    let frames = SR as usize;
+
+    // 1. DC offset
+    let dc_ch: Vec<f64> = (0..frames)
+        .map(|i| 0.15 + 0.1 * (2.0 * PI * 440.0 * (i as f64) / f64::from(SR)).sin())
+        .collect();
+    let dc_report = audit_audio(&AudioBuffer::from_channels(vec![dc_ch], SR).unwrap());
+    assert!(
+        dc_report
+            .recommendations
+            .iter()
+            .any(|r| r.contains("DC offset")),
+        "expected DC offset recommendation, got {:?}",
+        dc_report.recommendations
+    );
+
+    // 2. Out-of-phase stereo
+    let l: Vec<f64> = (0..frames)
+        .map(|i| 0.25 * (2.0 * PI * 440.0 * (i as f64) / f64::from(SR)).sin())
+        .collect();
+    let r: Vec<f64> = l.iter().map(|&x| -x).collect();
+    let phase_report = audit_audio(&AudioBuffer::from_channels(vec![l, r], SR).unwrap());
+    assert!(
+        phase_report
+            .recommendations
+            .iter()
+            .any(|r| r.contains("Negative broadband stereo correlation")),
+        "expected negative correlation recommendation, got {:?}",
+        phase_report.recommendations
+    );
+
+    // 3. Heavily squashed square-like wave (crest factor ~ 0 dB)
+    let sq: Vec<f64> = (0..frames)
+        .map(|i| {
+            if (2.0 * PI * 220.0 * (i as f64) / f64::from(SR)).sin() >= 0.0 {
+                0.5
+            } else {
+                -0.5
+            }
+        })
+        .collect();
+    let squash_report = audit_audio(&AudioBuffer::from_channels(vec![sq], SR).unwrap());
+    assert!(
+        squash_report
+            .recommendations
+            .iter()
+            .any(|r| r.contains("Low crest factor")),
+        "expected low crest factor recommendation, got {:?}",
+        squash_report.recommendations
+    );
+}
+
+#[test]
+fn deliver_hits_spotify_target_on_punchy_mix() {
+    let mix = punchy_high_crest_mix(SR);
+    let (_, report) = deliver(&mix, &DeliveryOptions::for_target(DeliveryTarget::Spotify)).unwrap();
+    assert!(
+        report.ready,
+        "expected Spotify delivery ready: {:#?}",
+        report.checks
+    );
+    assert!(
+        (report.after.integrated_lufs - (-14.0)).abs() <= 0.4,
+        "expected tight loudness hit near -14.0 LUFS, got {:.2}",
+        report.after.integrated_lufs
+    );
+}
