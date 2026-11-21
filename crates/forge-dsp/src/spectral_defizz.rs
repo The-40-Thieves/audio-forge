@@ -40,6 +40,21 @@ pub struct DeFizzConfig {
     pub sibilance_band_weight: f64,
     /// When `true`, outputs *only* the suppressed harsh resonances (Delta monitor mode).
     pub delta_listen: bool,
+    /// Spectral sensitivity tilt in dB/octave pivoted at 1 kHz (`-6.0..=+6.0`, default `0.0`).
+    /// Positive tilt focuses suppression toward higher frequencies; negative toward lows/mids.
+    #[serde(default)]
+    pub tilt_db_per_oct: f64,
+    /// Stereo gain-linking amount (`0.0` = independent dual-mono, `1.0` = fully linked stereo).
+    #[serde(default = "default_stereo_link")]
+    pub stereo_link: f64,
+    /// Mid/Side suppression focus for stereo buffers (`-1.0` = Mid only, `0.0` = balanced,
+    /// `+1.0` = Side only). Ignored for non-stereo channel counts.
+    #[serde(default)]
+    pub mid_side_balance: f64,
+}
+
+const fn default_stereo_link() -> f64 {
+    1.0
 }
 
 impl Default for DeFizzConfig {
@@ -51,6 +66,9 @@ impl Default for DeFizzConfig {
             fizz_band_weight: 1.25,
             sibilance_band_weight: 1.0,
             delta_listen: false,
+            tilt_db_per_oct: 0.0,
+            stereo_link: 1.0,
+            mid_side_balance: 0.0,
         }
     }
 }
@@ -121,7 +139,12 @@ pub fn apply_spectral_defizz(buffer: &AudioBuffer, config: &DeFizzConfig) -> Res
     let clean_depth_db = sanitize_param_f64(config.max_depth_db, 9.0, 0.5, 24.0);
     let clean_fizz_w = sanitize_param_f64(config.fizz_band_weight, 1.25, 0.0, 2.0);
     let clean_sib_w = sanitize_param_f64(config.sibilance_band_weight, 1.0, 0.0, 2.0);
+    let clean_tilt = sanitize_param_f64(config.tilt_db_per_oct, 0.0, -6.0, 6.0);
+    let clean_link = sanitize_param_f64(config.stereo_link, 1.0, 0.0, 1.0);
+    let clean_ms = sanitize_param_f64(config.mid_side_balance, 0.0, -1.0, 1.0);
     let sharpness = config.sharpness_bins.clamp(2, 24);
+    let use_ms = num_channels == 2 && clean_ms.abs() > 1e-4;
+    let use_per_channel = num_channels == 2 && (clean_link < 0.999 || use_ms);
 
     let band_weights: Vec<f64> = (0..HALF_BINS)
         .map(|b| {
@@ -131,7 +154,16 @@ pub fn apply_spectral_defizz(buffer: &AudioBuffer, config: &DeFizzConfig) -> Res
                 clean_fizz_w * raised_cosine_band_mask(f, 1800.0, 6800.0, BAND_SKIRT_OCTAVES);
             let w_sib =
                 clean_sib_w * raised_cosine_band_mask(f, 5500.0, 14500.0, BAND_SKIRT_OCTAVES);
-            w_mud.max(w_fizz).max(w_sib)
+            let base = w_mud.max(w_fizz).max(w_sib);
+            if clean_tilt.abs() > 1e-6 && f > 20.0 {
+                let octaves_from_1k = (f / 1000.0).log2();
+                let tilt_mul = 10.0_f64
+                    .powf((clean_tilt * octaves_from_1k) / 20.0)
+                    .clamp(0.15, 3.0);
+                (base * tilt_mul).clamp(0.0, 3.0)
+            } else {
+                base
+            }
         })
         .collect();
 
@@ -177,20 +209,41 @@ pub fn apply_spectral_defizz(buffer: &AudioBuffer, config: &DeFizzConfig) -> Res
     let mut log_mags = vec![0.0_f64; HALF_BINS];
     let mut prefix_log = vec![0.0_f64; HALF_BINS + 1];
     let mut smoothed_gains = vec![1.0_f64; HALF_BINS];
+    let mut ch_smoothed_gains: Vec<Vec<f64>> = vec![vec![1.0_f64; HALF_BINS]; num_channels];
     let mut effective_gains = vec![1.0_f64; HALF_BINS];
+
+    // Mid/Side focus scale per channel when `use_ms` is active:
+    // channel 0 = Mid (`1.0` when `clean_ms <= 0`, fades to `0.0` at `+1.0`),
+    // channel 1 = Side (`1.0` when `clean_ms >= 0`, fades to `0.0` at `-1.0`).
+    let ms_channel_scale = [
+        (1.0 - clean_ms.max(0.0)).clamp(0.0, 1.0),
+        (1.0 + clean_ms.min(0.0)).clamp(0.0, 1.0),
+    ];
 
     let inv_n = 1.0 / (FFT_SIZE as f64);
     let inv_channels = 1.0 / (num_channels as f64);
 
     let mut pos = 0_usize;
     while pos + FFT_SIZE <= padded_len {
-        // Forward STFT for each channel
-        for (ch_idx, padded) in padded_channels.iter().enumerate() {
-            let spec = &mut specs[ch_idx];
+        // Forward STFT for each channel (or Mid/Side matrix when M/S balance is active)
+        if use_ms {
             for i in 0..FFT_SIZE {
-                spec[i] = Complex::new(padded[pos + i] * window[i], 0.0);
+                let l = padded_channels[0][pos + i] * window[i];
+                let r = padded_channels[1][pos + i] * window[i];
+                specs[0][i] = Complex::new(0.5 * (l + r), 0.0);
+                specs[1][i] = Complex::new(0.5 * (l - r), 0.0);
             }
-            fft_fwd.process_with_scratch(spec, &mut scratch);
+            for spec in &mut specs {
+                fft_fwd.process_with_scratch(spec, &mut scratch);
+            }
+        } else {
+            for (ch_idx, padded) in padded_channels.iter().enumerate() {
+                let spec = &mut specs[ch_idx];
+                for i in 0..FFT_SIZE {
+                    spec[i] = Complex::new(padded[pos + i] * window[i], 0.0);
+                }
+                fft_fwd.process_with_scratch(spec, &mut scratch);
+            }
         }
 
         // Stereo-linked RMS magnitude per bin in log domain + prefix sum for O(1) ERB baseline
@@ -206,7 +259,7 @@ pub fn apply_spectral_defizz(buffer: &AudioBuffer, config: &DeFizzConfig) -> Res
             prefix_log[b + 1] = prefix_log[b] + lm;
         }
 
-        // Compute per-bin dynamic resonance gain against ERB geometric-mean neighborhood
+        // Compute per-bin linked dynamic resonance gain against ERB geometric-mean neighborhood
         for b in 1..(HALF_BINS - 1) {
             let weight = band_weights[b];
             if weight <= 1e-4 {
@@ -246,38 +299,132 @@ pub fn apply_spectral_defizz(buffer: &AudioBuffer, config: &DeFizzConfig) -> Res
             smoothed_gains[b] = alpha * smoothed_gains[b] + (1.0 - alpha) * target_gain;
         }
 
-        // Smooth gains across the 3-bin Hann main lobe to prevent musical noise
-        for b in 1..(HALF_BINS - 1) {
-            let min_lobe = smoothed_gains[b - 1]
-                .min(smoothed_gains[b])
-                .min(smoothed_gains[b + 1]);
-            let avg_lobe = 0.25 * smoothed_gains[b - 1]
-                + 0.50 * smoothed_gains[b]
-                + 0.25 * smoothed_gains[b + 1];
-            let g = 0.65 * min_lobe + 0.35 * avg_lobe;
-            effective_gains[b] = if config.delta_listen { 1.0 - g } else { g };
-        }
+        if use_per_channel {
+            // Compute per-channel ERB gains and blend with linked gains via `clean_link` + M/S focus.
+            for (ch_idx, spec) in specs.iter_mut().enumerate() {
+                let focus = if use_ms {
+                    ms_channel_scale[ch_idx]
+                } else {
+                    1.0
+                };
+                prefix_log[0] = 0.0;
+                for b in 0..HALF_BINS {
+                    let lm = spec[b].norm().max(1e-12).ln();
+                    log_mags[b] = lm;
+                    prefix_log[b + 1] = prefix_log[b] + lm;
+                }
+                let ch_gains = &mut ch_smoothed_gains[ch_idx];
+                for b in 1..(HALF_BINS - 1) {
+                    let weight = band_weights[b] * focus;
+                    if weight <= 1e-4 {
+                        ch_gains[b] = 1.0;
+                        continue;
+                    }
+                    let (b_start, b_end) = erb_bounds[b];
+                    let total_sum = prefix_log[b_end + 1] - prefix_log[b_start];
+                    let total_count = b_end + 1 - b_start;
+                    let excl_lo = b.saturating_sub(1).max(b_start);
+                    let excl_hi = (b + 1).min(b_end);
+                    let excl_sum = prefix_log[excl_hi + 1] - prefix_log[excl_lo];
+                    let excl_count = excl_hi + 1 - excl_lo;
+                    let count = total_count.saturating_sub(excl_count);
+                    let local_log_env = if count > 0 {
+                        (total_sum - excl_sum) / (count as f64)
+                    } else {
+                        log_mags[b]
+                    };
+                    let ratio = (log_mags[b] - local_log_env).exp();
+                    let excess = ratio / thresh_ratio;
+                    let target_gain = if excess > 1.0 {
+                        (1.0 / excess.powf(0.65 * weight)).clamp(min_gain, 1.0)
+                    } else {
+                        1.0
+                    };
+                    let alpha = if target_gain < ch_gains[b] {
+                        attack_alpha
+                    } else {
+                        release_alpha
+                    };
+                    ch_gains[b] = alpha * ch_gains[b] + (1.0 - alpha) * target_gain;
+                }
 
-        // Apply identical linked gains to every channel and overlap-add resynthesize
-        for (ch_idx, spec) in specs.iter_mut().enumerate() {
-            for (b, &eg) in effective_gains
-                .iter()
-                .enumerate()
-                .take(HALF_BINS - 1)
-                .skip(1)
-            {
-                spec[b] *= eg;
-                spec[FFT_SIZE - b] = spec[b].conj();
-            }
-            if config.delta_listen {
-                spec[0] = Complex::new(0.0, 0.0);
-                spec[HALF_BINS - 1] = Complex::new(0.0, 0.0);
+                for b in 1..(HALF_BINS - 1) {
+                    let g_ch = 0.65 * ch_gains[b - 1].min(ch_gains[b]).min(ch_gains[b + 1])
+                        + 0.35
+                            * (0.25 * ch_gains[b - 1]
+                                + 0.50 * ch_gains[b]
+                                + 0.25 * ch_gains[b + 1]);
+                    let g_link_raw = 0.65
+                        * smoothed_gains[b - 1]
+                            .min(smoothed_gains[b])
+                            .min(smoothed_gains[b + 1])
+                        + 0.35
+                            * (0.25 * smoothed_gains[b - 1]
+                                + 0.50 * smoothed_gains[b]
+                                + 0.25 * smoothed_gains[b + 1]);
+                    // Apply M/S focus to linked gain as well so Mid-only never ducks Side.
+                    let g_link = 1.0 - focus * (1.0 - g_link_raw);
+                    let g = (clean_link * g_link + (1.0 - clean_link) * g_ch).clamp(min_gain, 1.0);
+                    let eg = if config.delta_listen { 1.0 - g } else { g };
+                    spec[b] *= eg;
+                    spec[FFT_SIZE - b] = spec[b].conj();
+                }
+                if config.delta_listen {
+                    spec[0] = Complex::new(0.0, 0.0);
+                    spec[HALF_BINS - 1] = Complex::new(0.0, 0.0);
+                }
+                fft_inv.process_with_scratch(spec, &mut scratch);
             }
 
-            fft_inv.process_with_scratch(spec, &mut scratch);
-            let out_accum = &mut out_accums[ch_idx];
-            for i in 0..FFT_SIZE {
-                out_accum[pos + i] += spec[i].re * inv_n * window[i];
+            if use_ms {
+                for i in 0..FFT_SIZE {
+                    let m = specs[0][i].re * inv_n * window[i];
+                    let s = specs[1][i].re * inv_n * window[i];
+                    out_accums[0][pos + i] += m + s;
+                    out_accums[1][pos + i] += m - s;
+                }
+            } else {
+                for (ch_idx, spec) in specs.iter().enumerate() {
+                    let out_accum = &mut out_accums[ch_idx];
+                    for i in 0..FFT_SIZE {
+                        out_accum[pos + i] += spec[i].re * inv_n * window[i];
+                    }
+                }
+            }
+        } else {
+            // Smooth gains across the 3-bin Hann main lobe to prevent musical noise
+            for b in 1..(HALF_BINS - 1) {
+                let min_lobe = smoothed_gains[b - 1]
+                    .min(smoothed_gains[b])
+                    .min(smoothed_gains[b + 1]);
+                let avg_lobe = 0.25 * smoothed_gains[b - 1]
+                    + 0.50 * smoothed_gains[b]
+                    + 0.25 * smoothed_gains[b + 1];
+                let g = 0.65 * min_lobe + 0.35 * avg_lobe;
+                effective_gains[b] = if config.delta_listen { 1.0 - g } else { g };
+            }
+
+            // Apply identical linked gains to every channel and overlap-add resynthesize
+            for (ch_idx, spec) in specs.iter_mut().enumerate() {
+                for (b, &eg) in effective_gains
+                    .iter()
+                    .enumerate()
+                    .take(HALF_BINS - 1)
+                    .skip(1)
+                {
+                    spec[b] *= eg;
+                    spec[FFT_SIZE - b] = spec[b].conj();
+                }
+                if config.delta_listen {
+                    spec[0] = Complex::new(0.0, 0.0);
+                    spec[HALF_BINS - 1] = Complex::new(0.0, 0.0);
+                }
+
+                fft_inv.process_with_scratch(spec, &mut scratch);
+                let out_accum = &mut out_accums[ch_idx];
+                for i in 0..FFT_SIZE {
+                    out_accum[pos + i] += spec[i].re * inv_n * window[i];
+                }
             }
         }
         for i in 0..FFT_SIZE {

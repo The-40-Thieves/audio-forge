@@ -308,6 +308,7 @@ proptest! {
             high_cut_hz: high_cut,
             max_reduction_db: 6.0,
             sensitivity: 1.0,
+            ..UnmaskConfig::default()
         };
         let unmasked = apply_spectral_unmask(&buf, &buf, &cfg).expect("unmask succeeded");
         prop_assert_eq!(unmasked.num_frames(), frames);

@@ -129,6 +129,7 @@ fn unmask_has_smooth_skirt_at_band_edge() {
         high_cut_hz: 4000.0,
         max_reduction_db: 12.0,
         sensitivity: 1.5,
+        ..UnmaskConfig::default()
     };
 
     let measure_gain = |freq_hz: f64| -> f64 {
@@ -165,6 +166,7 @@ fn unmask_envelope_timing_is_consistent_across_sample_rates() {
         high_cut_hz: 6000.0,
         max_reduction_db: 12.0,
         sensitivity: 1.5,
+        ..UnmaskConfig::default()
     };
 
     let measure_burst_gain = |sr: u32| -> f64 {
@@ -226,4 +228,214 @@ fn defizz_handles_non_finite_band_weights() {
             "non-finite output for weights ({fw}, {sw})"
         );
     }
+}
+
+#[test]
+fn defizz_tilt_shifts_suppression_toward_highs() {
+    let sr = 48_000_u32;
+    let frames = 24_000_usize;
+    let mut ch = pseudo_white(frames, 0xCAFE_1234, 0.08);
+    for (i, s) in ch.iter_mut().enumerate() {
+        let t = (i as f64) / f64::from(sr);
+        *s += 0.35 * (2.0 * PI * 8500.0 * t).sin();
+    }
+    let buf = AudioBuffer::from_channels(vec![ch], sr).unwrap();
+
+    let dark = apply_spectral_defizz(
+        &buf,
+        &DeFizzConfig {
+            tilt_db_per_oct: -6.0,
+            ..DeFizzConfig::default()
+        },
+    )
+    .unwrap();
+    let bright = apply_spectral_defizz(
+        &buf,
+        &DeFizzConfig {
+            tilt_db_per_oct: 6.0,
+            ..DeFizzConfig::default()
+        },
+    )
+    .unwrap();
+
+    let slice = frames / 4..3 * frames / 4;
+    let rms_dark = goertzel_rms(&dark.channels[0][slice.clone()], 8500.0, sr);
+    let rms_bright = goertzel_rms(&bright.channels[0][slice], 8500.0, sr);
+    assert!(
+        rms_bright < rms_dark * 0.90,
+        "positive tilt (+6 dB/oct) should suppress 8.5 kHz more strongly than negative tilt (-6 dB/oct): bright={rms_bright:.5}, dark={rms_dark:.5}"
+    );
+}
+
+#[test]
+fn defizz_mid_side_balance_isolates_mid_and_preserves_side() {
+    let sr = 48_000_u32;
+    let frames = 24_000_usize;
+    let noise_l = pseudo_white(frames, 0x1111_2222, 0.05);
+    let noise_r = pseudo_white(frames, 0x3333_4444, 0.05);
+    let mut left = vec![0.0; frames];
+    let mut right = vec![0.0; frames];
+    for i in 0..frames {
+        let t = (i as f64) / f64::from(sr);
+        // 3.5 kHz resonance purely in Mid (L == R), 4.5 kHz resonance purely in Side (L == -R)
+        let mid_tone = 0.30 * (2.0 * PI * 3500.0 * t).sin();
+        let side_tone = 0.30 * (2.0 * PI * 4500.0 * t).sin();
+        left[i] = noise_l[i] + mid_tone + side_tone;
+        right[i] = noise_r[i] + mid_tone - side_tone;
+    }
+    let buf = AudioBuffer::from_channels(vec![left, right], sr).unwrap();
+
+    let mid_only = apply_spectral_defizz(
+        &buf,
+        &DeFizzConfig {
+            mid_side_balance: -1.0,
+            max_depth_db: 12.0,
+            ..DeFizzConfig::default()
+        },
+    )
+    .unwrap();
+
+    let slice = frames / 4..3 * frames / 4;
+    let mid_in: Vec<f64> = slice
+        .clone()
+        .map(|i| 0.5 * (buf.channels[0][i] + buf.channels[1][i]))
+        .collect();
+    let mid_out: Vec<f64> = slice
+        .clone()
+        .map(|i| 0.5 * (mid_only.channels[0][i] + mid_only.channels[1][i]))
+        .collect();
+    let side_in: Vec<f64> = slice
+        .clone()
+        .map(|i| 0.5 * (buf.channels[0][i] - buf.channels[1][i]))
+        .collect();
+    let side_out: Vec<f64> = slice
+        .map(|i| 0.5 * (mid_only.channels[0][i] - mid_only.channels[1][i]))
+        .collect();
+
+    let mid_ratio = goertzel_rms(&mid_out, 3500.0, sr) / goertzel_rms(&mid_in, 3500.0, sr);
+    let side_ratio = goertzel_rms(&side_out, 4500.0, sr) / goertzel_rms(&side_in, 4500.0, sr);
+
+    assert!(
+        mid_ratio < 0.70,
+        "Mid-only mode should strongly attenuate Mid 3.5 kHz resonance: ratio={mid_ratio:.4}"
+    );
+    assert!(
+        (side_ratio - 1.0).abs() < 0.05,
+        "Mid-only mode should preserve Side 4.5 kHz resonance: ratio={side_ratio:.4}"
+    );
+}
+
+#[test]
+fn defizz_unlinked_stereo_preserves_clean_channel() {
+    let sr = 48_000_u32;
+    let frames = 24_000_usize;
+    let mut left = pseudo_white(frames, 0xAAAA_BBBB, 0.05);
+    let right = pseudo_white(frames, 0xCCCC_DDDD, 0.05);
+    for (i, s) in left.iter_mut().enumerate() {
+        let t = (i as f64) / f64::from(sr);
+        *s += 0.35 * (2.0 * PI * 3500.0 * t).sin();
+    }
+    let buf = AudioBuffer::from_channels(vec![left, right], sr).unwrap();
+
+    let unlinked = apply_spectral_defizz(
+        &buf,
+        &DeFizzConfig {
+            stereo_link: 0.0,
+            max_depth_db: 12.0,
+            ..DeFizzConfig::default()
+        },
+    )
+    .unwrap();
+    let linked = apply_spectral_defizz(
+        &buf,
+        &DeFizzConfig {
+            stereo_link: 1.0,
+            max_depth_db: 12.0,
+            ..DeFizzConfig::default()
+        },
+    )
+    .unwrap();
+
+    let slice = frames / 4..3 * frames / 4;
+    let r_in = goertzel_rms(&buf.channels[1][slice.clone()], 3500.0, sr);
+    let r_unlinked = goertzel_rms(&unlinked.channels[1][slice.clone()], 3500.0, sr) / r_in;
+    let r_linked = goertzel_rms(&linked.channels[1][slice], 3500.0, sr) / r_in;
+
+    assert!(
+        r_unlinked > r_linked + 0.10,
+        "unlinked stereo should avoid ducking the clean right channel compared to linked: unlinked={r_unlinked:.4}, linked={r_linked:.4}"
+    );
+}
+
+#[test]
+fn unmask_delta_listen_isolates_carved_pocket_and_ms_preserves_sides() {
+    let sr = 48_000_u32;
+    let frames = 24_000_usize;
+    let mut left = vec![0.0; frames];
+    let mut right = vec![0.0; frames];
+    let mut sc = vec![0.0; frames];
+    for i in 0..frames {
+        let t = (i as f64) / f64::from(sr);
+        let mid_1k = 0.4 * (2.0 * PI * 1000.0 * t).sin();
+        let side_1k = 0.4 * (2.0 * PI * 1000.0 * t).sin();
+        left[i] = mid_1k + side_1k;
+        right[i] = mid_1k - side_1k;
+        sc[i] = 0.7 * (2.0 * PI * 1000.0 * t).sin();
+    }
+    let target = AudioBuffer::from_channels(vec![left, right], sr).unwrap();
+    let sidechain = AudioBuffer::from_channels(vec![sc], sr).unwrap();
+
+    let cfg_wet = UnmaskConfig {
+        low_cut_hz: 200.0,
+        high_cut_hz: 4000.0,
+        max_reduction_db: 12.0,
+        sensitivity: 1.5,
+        delta_listen: false,
+        mid_side_balance: -1.0, // Carve Mid only, preserve stereo Sides!
+    };
+    let cfg_delta = UnmaskConfig {
+        delta_listen: true,
+        ..cfg_wet
+    };
+
+    let wet = apply_spectral_unmask(&target, &sidechain, &cfg_wet).unwrap();
+    let delta = apply_spectral_unmask(&target, &sidechain, &cfg_delta).unwrap();
+
+    let slice = frames / 4..3 * frames / 4;
+    let side_in: Vec<f64> = slice
+        .clone()
+        .map(|i| 0.5 * (target.channels[0][i] - target.channels[1][i]))
+        .collect();
+    let side_wet: Vec<f64> = slice
+        .clone()
+        .map(|i| 0.5 * (wet.channels[0][i] - wet.channels[1][i]))
+        .collect();
+    let mid_in: Vec<f64> = slice
+        .clone()
+        .map(|i| 0.5 * (target.channels[0][i] + target.channels[1][i]))
+        .collect();
+    let mid_wet: Vec<f64> = slice
+        .clone()
+        .map(|i| 0.5 * (wet.channels[0][i] + wet.channels[1][i]))
+        .collect();
+    let mid_delta: Vec<f64> = slice
+        .map(|i| 0.5 * (delta.channels[0][i] + delta.channels[1][i]))
+        .collect();
+
+    let side_ratio = goertzel_rms(&side_wet, 1000.0, sr) / goertzel_rms(&side_in, 1000.0, sr);
+    let mid_wet_ratio = goertzel_rms(&mid_wet, 1000.0, sr) / goertzel_rms(&mid_in, 1000.0, sr);
+    let mid_delta_ratio = goertzel_rms(&mid_delta, 1000.0, sr) / goertzel_rms(&mid_in, 1000.0, sr);
+
+    assert!(
+        (side_ratio - 1.0).abs() < 0.03,
+        "Mid-only unmask must preserve stereo Side width: side_ratio={side_ratio:.4}"
+    );
+    assert!(
+        mid_wet_ratio < 0.55,
+        "Mid-only unmask must carve Mid 1 kHz pocket: mid_wet_ratio={mid_wet_ratio:.4}"
+    );
+    assert!(
+        (mid_wet_ratio + mid_delta_ratio - 1.0).abs() < 0.05,
+        "Delta + Wet must reconstruct dry magnitude: wet={mid_wet_ratio:.4}, delta={mid_delta_ratio:.4}"
+    );
 }
