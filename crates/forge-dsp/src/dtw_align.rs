@@ -248,10 +248,19 @@ fn warp_channel(ch: &[f64], step_map: &[f64], hop: usize, out_frames: usize) -> 
             let p3 = ch[(idx0 + 2).min(last)];
             let t2 = t * t;
             let t3 = t2 * t;
-            0.5 * ((2.0 * p1)
-                + (-p0 + p2) * t
-                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
-                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
+            // Evaluate Catmull-Rom in difference form to avoid intermediate overflow, and clamp
+            // to local sample extrema so cubic ringing cannot create peaks outside the input range.
+            let lo = p0.min(p1).min(p2).min(p3);
+            let hi = p0.max(p1).max(p2).max(p3);
+            let interp = p1
+                + 0.5 * (p2 - p0) * t
+                + (p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3) * t2
+                + (-0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3) * t3;
+            if interp.is_finite() {
+                interp.clamp(lo, hi)
+            } else {
+                p1
+            }
         })
         .collect()
 }

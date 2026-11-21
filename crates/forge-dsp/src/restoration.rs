@@ -99,11 +99,7 @@ fn declip_plateaus(ch: &mut [f64]) {
                 } else {
                     y0 - ch[start - 2]
                 };
-                let slope1 = if end + 3 <= n {
-                    -1.5 * y1 + 2.0 * ch[end + 1] - 0.5 * ch[end + 2]
-                } else {
-                    ch[end + 1] - y1
-                };
+                let slope1 = -1.5 * y1 + 2.0 * ch[end + 1] - 0.5 * ch[end + 2];
                 let steps = (span + 1) as f64;
                 // Scale derivatives by `steps` (dt = 1/steps) so the Hermite curve matches the
                 // physical sample-rate slope at both clip boundaries, clamped for stability.
@@ -183,9 +179,9 @@ pub fn apply_analog_console_and_tape(buffer: &mut AudioBuffer, drive: f64) {
         return;
     }
     let sr = f64::from(buffer.sample_rate.max(1));
-    // Sample-rate-independent hysteresis slew smoothing (~160 us time constant ≈ 0.88/0.12 at 48 kHz)
-    let hyst_alpha = (-1.0 / (sr * 0.000_16)).exp();
-    let hyst_prev_w = 1.0 - hyst_alpha;
+    // Sample-rate-independent hysteresis slew smoothing (~9.8 us time constant ≈ 0.88 sat / 0.12 prev at 48 kHz)
+    let hyst_prev_w = (-1.0 / (sr * 0.000_009_8)).exp();
+    let hyst_sat_w = 1.0 - hyst_prev_w;
     for ch in &mut buffer.channels {
         let mut prev = 0.0_f64;
         // Head-bump +60 Hz subtle warmth (+0.6 dB scaled by drive)
@@ -196,7 +192,7 @@ pub fn apply_analog_console_and_tape(buffer: &mut AudioBuffer, drive: f64) {
             let driven = (x * (1.0 + 0.45 * amt)).clamp(-1.55, 1.55);
             let sat = (driven * (PI * 0.5 / 1.55)).sin();
             // Subtle hysteresis slew smoothing on harsh ultrasonic transients
-            let hyst = hyst_alpha * sat + hyst_prev_w * prev;
+            let hyst = hyst_sat_w * sat + hyst_prev_w * prev;
             prev = hyst;
             *s = (1.0 - amt * 0.55) * x + (amt * 0.55) * hyst;
         }
@@ -354,7 +350,7 @@ pub fn clean_vocal_surgical(
 fn remove_mouth_clicks(ch: &mut [f64], sr: f64) {
     let n = ch.len();
     let win = ((sr * 0.0015).round() as usize).clamp(4, 96);
-    if n <= 2 * win + 4 {
+    if n <= 2 * win + 1 {
         return;
     }
 
