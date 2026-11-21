@@ -498,42 +498,83 @@ pub const SILENT_BAND_DB: f64 = -120.0;
 /// RMS level (dBFS, DC removed) at or below which `audit_audio` treats the input as silence.
 pub const SILENCE_RMS_DBFS: f64 = -100.0;
 
+/// Computes 100 ms K-weighted sub-block energies in a single streaming pass per channel
+/// (O(num_subs) memory instead of O(frames)), matching ITU-R BS.1770-4 channel summation.
+fn compute_k_weighted_sub_energies(channels: &[Vec<f64>], sample_rate: u32) -> Vec<f64> {
+    let sr = f64::from(sample_rate.max(1));
+    let frames = channels.first().map_or(0, Vec::len);
+    let sub_len = (sr * 0.1).round().max(1.0) as usize;
+    let num_subs = frames / sub_len;
+    if num_subs == 0 {
+        return Vec::new();
+    }
+
+    let inv_sub_len = 1.0 / (sub_len as f64);
+    let mut sub_energies = vec![0.0_f64; num_subs];
+    for ch in channels {
+        let mut shelf = Biquad::k_weight_pre_shelf(sr);
+        let mut rlb = Biquad::k_weight_rlb_highpass(sr);
+        let usable = ch.len().min(num_subs * sub_len);
+        for (s, slot) in sub_energies.iter_mut().enumerate() {
+            let start = s * sub_len;
+            let end = (start + sub_len).min(usable);
+            if start >= end {
+                break;
+            }
+            let mut ch_sq = 0.0;
+            for &x in &ch[start..end] {
+                let v = rlb.process_sample(shelf.process_sample(x));
+                ch_sq += v * v;
+            }
+            *slot += ch_sq * inv_sub_len;
+        }
+    }
+    sub_energies
+}
+
+/// Computes ITU-R BS.1770-4 two-stage gated integrated loudness (LUFS) directly from channels.
+fn compute_integrated_lufs(channels: &[Vec<f64>], sample_rate: u32) -> f64 {
+    let sub_energies = compute_k_weighted_sub_energies(channels, sample_rate);
+    let mut momentary_energies = Vec::new();
+    if sub_energies.len() >= 4 {
+        momentary_energies.reserve(sub_energies.len() - 3);
+        for w in sub_energies.windows(4) {
+            momentary_energies.push(w.iter().sum::<f64>() * 0.25);
+        }
+    } else if !sub_energies.is_empty() {
+        momentary_energies.push(sub_energies.iter().sum::<f64>() / (sub_energies.len() as f64));
+    }
+
+    let abs_gate_e = 10.0_f64.powf((-70.0 + 0.691) / 10.0);
+    let gated_abs: Vec<f64> = momentary_energies
+        .into_iter()
+        .filter(|&e| e > abs_gate_e)
+        .collect();
+
+    if gated_abs.is_empty() {
+        return -70.0;
+    }
+    let mean_abs = gated_abs.iter().sum::<f64>() / (gated_abs.len() as f64);
+    let rel_gate_lufs = -0.691 + 10.0 * mean_abs.log10() - 10.0;
+    let rel_gate_e = 10.0_f64.powf((rel_gate_lufs + 0.691) / 10.0);
+    let gated_rel: Vec<f64> = gated_abs.into_iter().filter(|&e| e > rel_gate_e).collect();
+    if gated_rel.is_empty() {
+        -70.0
+    } else {
+        let mean_rel = gated_rel.iter().sum::<f64>() / (gated_rel.len() as f64);
+        -0.691 + 10.0 * mean_rel.log10()
+    }
+}
+
 /// Performs a full ITU-R BS.1770-4 loudness, phase, electrical, and AI-artifact audit.
 pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
     let sr = f64::from(buffer.sample_rate.max(1));
     let frames = buffer.num_frames();
     let ch_count = buffer.num_channels();
 
-    // 1. K-weight all channels
-    let mut k_channels = Vec::with_capacity(ch_count);
-    for ch in &buffer.channels {
-        let mut shelf = Biquad::k_weight_pre_shelf(sr);
-        let mut rlb = Biquad::k_weight_rlb_highpass(sr);
-        let mut k_ch = Vec::with_capacity(frames);
-        for &x in ch {
-            k_ch.push(rlb.process_sample(shelf.process_sample(x)));
-        }
-        k_channels.push(k_ch);
-    }
-
-    // 2. 100ms sub-blocks for BS.1770-4 gating (400ms Momentary = 4 sub-blocks, 3s Short-Term = 30 sub-blocks)
-    let sub_len = (sr * 0.1).round().max(1.0) as usize;
-    let num_subs = frames / sub_len;
-    let mut sub_energies = Vec::with_capacity(num_subs);
-
-    for s in 0..num_subs {
-        let start = s * sub_len;
-        let end = start + sub_len;
-        let mut sum_sq = 0.0;
-        for k_ch in &k_channels {
-            let mut ch_sq = 0.0;
-            for &v in &k_ch[start..end] {
-                ch_sq += v * v;
-            }
-            sum_sq += ch_sq / (sub_len as f64);
-        }
-        sub_energies.push(sum_sq);
-    }
+    // 1 & 2. Streaming K-weighted 100ms sub-blocks for BS.1770-4 gating
+    // (400ms Momentary = 4 sub-blocks, 3s Short-Term = 30 sub-blocks)
+    let sub_energies = compute_k_weighted_sub_energies(&buffer.channels, buffer.sample_rate);
 
     // Momentary (400ms = 4 blocks) and Short-Term (3000ms = 30 blocks)
     let mut momentary_energies = Vec::new();
@@ -713,20 +754,17 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
             .map(|i| 0.5 * (1.0 - (2.0 * PI * (i as f64) / (fft_size as f64)).cos()))
             .collect();
         let mut buf = vec![Complex::new(0.0, 0.0); fft_size];
+        let mut scratch = vec![Complex::new(0.0, 0.0); fft.get_inplace_scratch_len()];
+        let inv_n_sq = 1.0 / ((fft_size * fft_size) as f64);
 
         let mut pos = 0;
         while pos + fft_size <= mono.len() {
             for i in 0..fft_size {
                 buf[i] = Complex::new((mono[pos + i] - dc_offset) * window[i], 0.0);
             }
-            fft.process(&mut buf);
-            let mags: Vec<f64> = buf[..=fft_size / 2]
-                .iter()
-                .map(|c| (c.re * c.re + c.im * c.im) / ((fft_size * fft_size) as f64))
-                .collect();
-
-            for (dst, &m) in avg_mag_sq.iter_mut().zip(mags.iter()) {
-                *dst += m;
+            fft.process_with_scratch(&mut buf, &mut scratch);
+            for (dst, c) in avg_mag_sq.iter_mut().zip(&buf[..=fft_size / 2]) {
+                *dst += (c.re * c.re + c.im * c.im) * inv_n_sq;
             }
 
             frame_count += 1;
@@ -771,10 +809,29 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
     };
 
     // Near digital silence there is no programme to judge: band energy and RMS both sit at
-    // their numeric floors, and their difference would read as a loud band. This is judged on
-    // the signal's own RMS, not integrated loudness, which is -70 for any clip shorter than
-    // one 100 ms gating block however loud it is.
-    let silent = rms_db <= SILENCE_RMS_DBFS;
+    // their numeric floors, and their difference would read as a loud band. Check the loudest
+    // individual channel's RMS (not just the mono sum) so a 180-degree out-of-phase stereo
+    // signal whose mono sum cancels to zero is never misclassified as silence.
+    let max_ch_rms = buffer
+        .channels
+        .iter()
+        .map(|ch| {
+            if ch.is_empty() {
+                1e-12
+            } else {
+                let mean =
+                    ch.iter().map(|&x| sanitize_sample_f64(x)).sum::<f64>() / (ch.len() as f64);
+                (ch.iter()
+                    .map(|&x| (sanitize_sample_f64(x) - mean).powi(2))
+                    .sum::<f64>()
+                    / (ch.len() as f64))
+                    .sqrt()
+                    .max(1e-12)
+            }
+        })
+        .fold(1e-12_f64, f64::max);
+    let max_ch_rms_db = 20.0 * max_ch_rms.log10();
+    let silent = max_ch_rms_db <= SILENCE_RMS_DBFS;
     let relative_band_db = |f_low: f64, f_high: f64| {
         if silent {
             SILENT_BAND_DB
@@ -830,6 +887,24 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
     if clipped_samples > 0 {
         recommendations.push(format!(
             "{clipped_samples} clipped sample runs detected. Run cubic-spline de-clipper before mastering."
+        ));
+    }
+    if !silent && dc_offset.abs() > 0.01 {
+        recommendations.push(format!(
+            "DC offset is {:+.4} (reduces headroom and causes clicky edits). Enable DC removal in `forge restore`.",
+            dc_offset
+        ));
+    }
+    if !silent && ch_count >= 2 && stereo_correlation < 0.0 {
+        recommendations.push(format!(
+            "Negative broadband stereo correlation ({:.2}) risks phase cancellation in mono playback. Check stem polarity with `forge phase-align`.",
+            stereo_correlation
+        ));
+    }
+    if !silent && frames >= (sr * 0.5) as usize && crest_factor_db < 4.5 {
+        recommendations.push(format!(
+            "Low crest factor ({:.1} dB) indicates heavy dynamic squashing. Consider backing off limiter drive or lowering target loudness.",
+            crest_factor_db
         ));
     }
 
@@ -924,15 +999,29 @@ fn forward_window_min(values: &[f64], window: usize) -> Vec<f64> {
     out
 }
 
+/// Slow program-dependent release engagement attack time constant (seconds).
+/// Long enough that isolated transients (<10 ms) recover via the fast 50 ms stage,
+/// while sustained loud passages smoothly engage the slower release.
+const LIMITER_SLOW_ATTACK_SECS: f64 = 0.080;
+
+/// Slow program-dependent release time constant (seconds) for sustained limiting.
+const LIMITER_SLOW_RELEASE_SECS: f64 = 0.250;
+
+/// Maximum closed-loop LUFS convergence passes in `normalize_and_limit`.
+const LIMITER_MAX_LUFS_ITERS: usize = 4;
+
+/// Stop iterating once measured post-limiter loudness is within this margin of `target_lufs`.
+const LIMITER_LUFS_CONVERGENCE_LU: f64 = 0.15;
+
 /// Gain envelope for `peaks`: the minimum required gain over a window that reaches
-/// `lookahead + LIMITER_HOLD_FRAMES` frames ahead and `LIMITER_HOLD_FRAMES` behind, a release
-/// one-pole that only acts upward, then a `lookahead`-frame moving average. The average turns
-/// each gain drop into a linear ramp that completes `LIMITER_HOLD_FRAMES` frames before the peak.
+/// `lookahead + LIMITER_HOLD_FRAMES` frames ahead and `LIMITER_HOLD_FRAMES` behind, a
+/// program-dependent dual-stage release (fast `LIMITER_RELEASE_MS` for isolated transients,
+/// slow 250 ms for sustained limiting), then a drift-free `lookahead`-frame moving average.
 fn limiter_gain_envelope(
     peaks: &[f64],
     ceiling_lin: f64,
     lookahead: usize,
-    release_coeff: f64,
+    sample_rate: f64,
 ) -> Vec<f64> {
     let required: Vec<f64> = peaks
         .iter()
@@ -946,30 +1035,50 @@ fn limiter_gain_envelope(
         .collect();
     let ahead_min = forward_window_min(&required, lookahead + 2 * LIMITER_HOLD_FRAMES + 1);
 
-    // Prime the release and the moving average as if the first window's gain had been held for
-    // a full lookahead before the file starts, so an over in the first frames is fully reduced
-    // where it occurs instead of leaving the whole-file trim to catch it.
+    let fast_release_coeff = (-1.0 / (sample_rate * LIMITER_RELEASE_MS / 1000.0)).exp();
+    let slow_attack_coeff = (-1.0 / (sample_rate * LIMITER_SLOW_ATTACK_SECS)).exp();
+    let slow_release_coeff = (-1.0 / (sample_rate * LIMITER_SLOW_RELEASE_SECS)).exp();
+
+    // Prime the fast release and the moving average as if the first window's gain had been
+    // held for a full lookahead before the file starts, so an over in the first frames is fully
+    // reduced where it occurs instead of leaving the whole-file trim to catch it. Keep the slow
+    // program-dependent stage at unity so a single-sample start spike does not engage 250 ms release.
     let start = ahead_min.first().copied().unwrap_or(1.0);
-    let mut released = start;
+    let mut fast_released = start;
+    let mut slow_env = 1.0_f64;
     let mut ring = vec![start; lookahead];
     let mut sum = start * lookahead as f64;
     let mut gain_env = vec![1.0_f64; peaks.len()];
     for (i, g) in gain_env.iter_mut().enumerate() {
         let held = ahead_min[i.saturating_sub(LIMITER_HOLD_FRAMES)];
-        released = if held < released {
+        fast_released = if held < fast_released {
             held
         } else {
-            (release_coeff * released + (1.0 - release_coeff) * held).min(held)
+            (fast_release_coeff * fast_released + (1.0 - fast_release_coeff) * held).min(held)
         };
+        slow_env = if held < slow_env {
+            slow_attack_coeff * slow_env + (1.0 - slow_attack_coeff) * held
+        } else {
+            (slow_release_coeff * slow_env + (1.0 - slow_release_coeff) * held).min(held)
+        };
+        let released = fast_released.min(slow_env);
         let slot = i % lookahead;
         sum += released - ring[slot];
         ring[slot] = released;
+        // Periodically resync the running sum to prevent floating-point drift on long tracks.
+        if i & 4095 == 4095 {
+            sum = ring.iter().sum();
+        }
         *g = (sum / lookahead as f64).min(1.0);
     }
     gain_env
 }
 
 /// Masters an `AudioBuffer` to a target Integrated LUFS and strict True-Peak ceiling (`-1.0 dBTP`).
+///
+/// Uses a closed-loop iterative loudness solver around the lookahead true-peak limiter so
+/// dynamic or transient-heavy mixes converge onto `target_lufs` instead of falling short after
+/// peak limiting, while computing the 4x polyphase true-peak scan only once.
 pub fn normalize_and_limit(
     buffer: &AudioBuffer,
     target_lufs: f64,
@@ -986,41 +1095,82 @@ pub fn normalize_and_limit(
         )));
     }
     let clean_ceiling_dbtp = ceiling_dbtp;
-    let initial = audit_audio(buffer);
-    let makeup_db = if initial.integrated_lufs <= -65.0 {
+    let frames = buffer.num_frames();
+    if frames == 0 {
+        return Ok(buffer.clone());
+    }
+
+    // Sanitize once so all iterations share clean inputs and one 4x polyphase true-peak pass.
+    let sanitized_channels: Vec<Vec<f64>> = buffer
+        .channels
+        .iter()
+        .map(|ch| ch.iter().map(|&s| sanitize_sample_f64(s)).collect())
+        .collect();
+
+    let initial_lufs = compute_integrated_lufs(&sanitized_channels, buffer.sample_rate);
+    let silent_input = initial_lufs <= -65.0;
+    let mut makeup_db = if silent_input {
         0.0
     } else {
-        (target_lufs - initial.integrated_lufs).clamp(-24.0, 24.0)
+        (target_lufs - initial_lufs).clamp(-24.0, 24.0)
     };
-    let makeup_gain = 10.0_f64.powf(makeup_db / 20.0);
+
     let ceiling_lin = 10.0_f64.powf((clean_ceiling_dbtp - 0.04) / 20.0);
-
-    let mut out = buffer.clone();
-    let frames = out.num_frames();
-    if frames == 0 {
-        return Ok(out);
-    }
-
-    // Apply initial makeup gain (sanitizing any non-finite samples)
-    for ch in &mut out.channels {
-        for s in ch.iter_mut() {
-            *s = sanitize_sample_f64(*s) * makeup_gain;
-        }
-    }
-
-    let sr = f64::from(out.sample_rate.max(1));
+    let sr = f64::from(buffer.sample_rate.max(1));
     let lookahead = ((sr * LIMITER_LOOKAHEAD_MS / 1000.0).round() as usize).max(4);
-    let release_coeff = (-1.0 / (sr * LIMITER_RELEASE_MS / 1000.0)).exp();
-    let peaks = true_peak_per_frame(&out.channels, frames);
-    let gain_env = limiter_gain_envelope(&peaks, ceiling_lin, lookahead, release_coeff);
+    let base_peaks = true_peak_per_frame(&sanitized_channels, frames);
 
-    for ch in &mut out.channels {
-        for (s, &g) in ch.iter_mut().zip(gain_env.iter()) {
-            *s *= g;
+    let mut out = AudioBuffer {
+        channels: vec![vec![0.0_f64; frames]; sanitized_channels.len()],
+        sample_rate: buffer.sample_rate,
+    };
+
+    let unity_makeup_only = (target_lufs - initial_lufs).abs() < 0.05;
+    let max_iters = if silent_input || unity_makeup_only {
+        1
+    } else {
+        LIMITER_MAX_LUFS_ITERS
+    };
+    let mut prev_abs_err = f64::INFINITY;
+
+    for iter in 0..max_iters {
+        let makeup_gain = 10.0_f64.powf(makeup_db / 20.0);
+        // True-peak FIR is linear, so scaling the signal by `makeup_gain` is equivalent to
+        // comparing `base_peaks` against `ceiling_lin / makeup_gain`.
+        let scaled_ceiling = ceiling_lin / makeup_gain;
+        let gain_env = limiter_gain_envelope(&base_peaks, scaled_ceiling, lookahead, sr);
+
+        for (dst_ch, src_ch) in out.channels.iter_mut().zip(&sanitized_channels) {
+            for ((dst, &src), &g) in dst_ch.iter_mut().zip(src_ch.iter()).zip(gain_env.iter()) {
+                *dst = src * makeup_gain * g;
+            }
         }
+
+        apply_true_peak_trim(&mut out, clean_ceiling_dbtp);
+
+        if iter + 1 >= max_iters {
+            break;
+        }
+        let post_lufs = compute_integrated_lufs(&out.channels, out.sample_rate);
+        if post_lufs <= -65.0 {
+            break;
+        }
+        let err = target_lufs - post_lufs;
+        if err.abs() <= LIMITER_LUFS_CONVERGENCE_LU {
+            break;
+        }
+        // Stop if heavy limiting has saturated loudness recovery.
+        if iter > 0 && err.abs() >= prev_abs_err - 0.05 {
+            break;
+        }
+        prev_abs_err = err.abs();
+        let next_makeup_db = (makeup_db + err).clamp(-24.0, 24.0);
+        if (next_makeup_db - makeup_db).abs() < 1e-3 {
+            break;
+        }
+        makeup_db = next_makeup_db;
     }
 
-    apply_true_peak_trim(&mut out, clean_ceiling_dbtp);
     Ok(out)
 }
 
