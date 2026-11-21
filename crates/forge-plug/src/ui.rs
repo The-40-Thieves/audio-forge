@@ -58,17 +58,15 @@ impl GuiTelemetry {
     #[inline]
     pub fn toggle_spectrum_freeze(&self, shared_slot: Option<usize>) -> bool {
         let next = !self.spectrum_frozen.load(Ordering::Relaxed);
-        if next {
-            if let Some(slot) = shared_slot {
-                let snap = read_shared_spectrum(slot);
-                for (dst, &v) in self.frozen_shared_db.iter().zip(&snap) {
-                    let clean = if v.is_finite() {
-                        v.clamp(-90.0, 6.0)
-                    } else {
-                        -90.0
-                    };
-                    dst.store(clean.to_bits(), Ordering::Relaxed);
-                }
+        if next && let Some(slot) = shared_slot {
+            let snap = read_shared_spectrum(slot);
+            for (dst, &v) in self.frozen_shared_db.iter().zip(&snap) {
+                let clean = if v.is_finite() {
+                    v.clamp(-90.0, 6.0)
+                } else {
+                    -90.0
+                };
+                dst.store(clean.to_bits(), Ordering::Relaxed);
             }
         }
         self.spectrum_frozen.store(next, Ordering::Release);
