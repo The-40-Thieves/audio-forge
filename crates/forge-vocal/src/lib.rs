@@ -65,7 +65,7 @@ impl VocalScale {
         let mut best_note = rounded;
         let mut best_dist = 999.0_f64;
 
-        for candidate in (rounded - 2).max(0)..=(rounded + 2).min(127) {
+        for candidate in 0_i32..=127 {
             let pc = candidate.rem_euclid(12) as usize;
             if self.allowed_pcs[pc] {
                 let dist = (f64::from(candidate) - clean_pitch).abs();
@@ -324,7 +324,41 @@ pub fn track_vocal_pitch(
         frames.push(pitch_frame(time_secs, f0_hz, scale, retune_strength));
         pos += yin.hop;
     }
+
+    // Suppress isolated single-frame octave/fifth tracking spikes (>5 semitones from both
+    // voiced neighbors) without altering monotonic glides or vibrato.
+    suppress_isolated_octave_glitches(&mut frames, scale, retune_strength);
     frames
+}
+
+/// Replaces isolated 1-frame octave-doubling/halving tracking glitches: only fires when both
+/// voiced neighbors agree within 2 semitones and the center frame jumped by ~1 octave
+/// (`10.5..=13.5` semitones), preserving genuine brief melodic notes and monotonic glides.
+fn suppress_isolated_octave_glitches(
+    frames: &mut [PitchFrame],
+    scale: &VocalScale,
+    retune_strength: f64,
+) {
+    if frames.len() < 3 {
+        return;
+    }
+    let orig_f0: Vec<f64> = frames.iter().map(|f| f.f0_hz).collect();
+    for i in 1..(frames.len() - 1) {
+        let (a, b, c) = (orig_f0[i - 1], orig_f0[i], orig_f0[i + 1]);
+        if a > 0.0 && b > 0.0 && c > 0.0 {
+            let neighbor_spread = (12.0 * (a / c).log2()).abs();
+            if neighbor_spread > 2.0 {
+                continue;
+            }
+            let mut triple = [a, b, c];
+            triple.sort_by(f64::total_cmp);
+            let med = triple[1];
+            let jump_semitones = (12.0 * (b / med).log2()).abs();
+            if (10.5..=13.5).contains(&jump_semitones) {
+                frames[i] = pitch_frame(frames[i].time_secs, med, scale, retune_strength);
+            }
+        }
+    }
 }
 
 /// Computes a 10th-order Linear Predictive Coding (LPC) spectral tilt/formant balance ratio
@@ -430,6 +464,8 @@ pub fn shift_vocal_pitch_formant_preserved(
 
     let grain_len = ((sr * 0.032).round() as usize).max(256); // 32ms grain for vocal fundamental
     let sibilant_half_win = ((sr * 0.006).round() as usize).max(64);
+    let sib_stride = ((sr * 0.000_67).round() as usize).max(16); // ~32 samples at 48 kHz
+    let sib_alpha = (-((sib_stride as f64) / sr) / 0.001_55).exp(); // ~1.55 ms smoothing across all SRs
     let grain_f = grain_len as f64;
     let mut out_channels = Vec::with_capacity(buffer.num_channels());
 
@@ -461,6 +497,36 @@ pub fn shift_vocal_pitch_formant_preserved(
         }
     };
 
+    // Duration-weighted average shift across active (non-zero) curve segments so formant
+    // compensation reflects the dominant sung shift rather than an isolated short control point
+    // or a silent midpoint.
+    let representative_shift = {
+        let mut weighted_sum = 0.0_f64;
+        let mut total_dt = 0.0_f64;
+        if semitone_curve.len() >= 2 {
+            for seg in semitone_curve.windows(2) {
+                let dt = (seg[1].0 - seg[0].0).max(0.0);
+                let s0 = forge_dsp::sanitize_param_f64(seg[0].1, 0.0, -24.0, 24.0);
+                let s1 = forge_dsp::sanitize_param_f64(seg[1].1, 0.0, -24.0, 24.0);
+                let mid = 0.5 * (s0 + s1);
+                if dt > 0.0 && mid.abs() > 1e-4 {
+                    weighted_sum += mid * dt;
+                    total_dt += dt;
+                }
+            }
+        }
+        if total_dt > 0.0 {
+            weighted_sum / total_dt
+        } else {
+            forge_dsp::sanitize_param_f64(
+                interp_shift(buffer.duration_secs() * 0.5),
+                0.0,
+                -24.0,
+                24.0,
+            )
+        }
+    };
+
     for ch in &buffer.channels {
         let mut out_ch = vec![0.0_f64; frames];
         let mut phase_a = 0.0_f64;
@@ -469,9 +535,9 @@ pub fn shift_vocal_pitch_formant_preserved(
 
         for (i, sample_out) in out_ch.iter_mut().enumerate() {
             let t = (i as f64) / sr;
-            if i % 32 == 0 {
+            if i % sib_stride == 0 {
                 let target_sib = is_unvoiced_sibilant_frame(ch, i, sibilant_half_win, sr);
-                sibilant_env = sibilant_env * 0.65 + target_sib * 0.35;
+                sibilant_env = sibilant_env * sib_alpha + target_sib * (1.0 - sib_alpha);
             }
 
             let raw_semi = forge_dsp::sanitize_param_f64(interp_shift(t), 0.0, -24.0, 24.0);
@@ -487,13 +553,22 @@ pub fn shift_vocal_pitch_formant_preserved(
             let w_a = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * phase_a / grain_f).cos());
             let w_b = 1.0 - w_a;
 
+            // 4-point Catmull-Rom cubic interpolation preserves vocal presence and air
             let sample_at = |delay: f64| -> f64 {
-                let pos = (i as f64 - delay).clamp(0.0, (frames - 1) as f64);
+                let last = frames - 1;
+                let pos = (i as f64 - delay).clamp(0.0, last as f64);
                 let idx0 = pos.floor() as usize;
                 let frac = pos - (idx0 as f64);
-                let s0 = forge_dsp::sanitize_sample_f64(ch[idx0]);
-                let s1 = forge_dsp::sanitize_sample_f64(ch[(idx0 + 1).min(frames - 1)]);
-                s0 * (1.0 - frac) + s1 * frac
+                let p0 = forge_dsp::sanitize_sample_f64(ch[idx0.saturating_sub(1)]);
+                let p1 = forge_dsp::sanitize_sample_f64(ch[idx0]);
+                let p2 = forge_dsp::sanitize_sample_f64(ch[(idx0 + 1).min(last)]);
+                let p3 = forge_dsp::sanitize_sample_f64(ch[(idx0 + 2).min(last)]);
+                let f2 = frac * frac;
+                let f3 = f2 * frac;
+                0.5 * ((2.0 * p1)
+                    + (-p0 + p2) * frac
+                    + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * f2
+                    + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * f3)
             };
 
             let pitched = w_a * sample_at(phase_a) + w_b * sample_at(phase_b);
@@ -507,13 +582,7 @@ pub fn shift_vocal_pitch_formant_preserved(
         let lpc_tilt_delta = (orig_lpc_tilt - shifted_lpc_tilt).clamp(-4.5, 4.5);
         let clean_formant_semi =
             forge_dsp::sanitize_param_f64(formant_shift_semitones, 0.0, -12.0, 12.0);
-        let mid_shift = forge_dsp::sanitize_param_f64(
-            interp_shift(buffer.duration_secs() * 0.5),
-            0.0,
-            -24.0,
-            24.0,
-        );
-        let net_formant_semi = clean_formant_semi - mid_shift * 0.65;
+        let net_formant_semi = clean_formant_semi - representative_shift * 0.65;
         if net_formant_semi.abs() > 0.05 || lpc_tilt_delta.abs() > 0.05 {
             let mut f1_eq = forge_dsp::Biquad::peaking_eq(
                 sr,
@@ -555,22 +624,29 @@ pub fn generate_vocal_harmony_stack(
     let mut third_down_curve = Vec::with_capacity(contour.len());
     let mut double_curve = Vec::with_capacity(contour.len());
 
-    for (idx, frame) in contour.iter().enumerate() {
+    // Hold the last voiced note across unvoiced gaps so diatonic harmony intervals do not
+    // jump abruptly to the tonic at syllable endings.
+    let mut last_voiced_note = 60 + i32::from(scale.root_pc);
+
+    for frame in &contour {
         let base_note = if frame.midi_pitch > 20.0 {
-            frame.target_midi_pitch.round() as i32
+            last_voiced_note = frame.target_midi_pitch.round() as i32;
+            last_voiced_note
         } else {
-            60 + i32::from(scale.root_pc)
+            last_voiced_note
         };
-        // Subtle 5.5 Hz human vibrato modulation (±0.08 semitones) out of phase per voice
+        // Subtle human vibrato modulation (±0.08 semitones) out of phase per voice, plus slow
+        // organic detune drift on the double instead of frame-alternating jitter.
         let vib_a = 0.08 * (frame.time_secs * 2.0 * std::f64::consts::PI * 5.2).sin();
         let vib_b = 0.08 * (frame.time_secs * 2.0 * std::f64::consts::PI * 5.6 + 1.3).sin();
-        let vib_c = 0.05 * (frame.time_secs * 2.0 * std::f64::consts::PI * 4.8 + 2.5).sin();
+        let vib_c = 0.05 * (frame.time_secs * 2.0 * std::f64::consts::PI * 4.8 + 2.5).sin()
+            + 0.05 * (frame.time_secs * 2.0 * std::f64::consts::PI * 0.7).sin();
 
         let up_semi =
             scale.diatonic_shift_semitones(base_note, 2) + frame.correction_semitones + vib_a;
         let down_semi =
             scale.diatonic_shift_semitones(base_note, -2) + frame.correction_semitones + vib_b;
-        let dbl_semi = frame.correction_semitones + vib_c + if idx % 2 == 0 { 0.04 } else { -0.04 };
+        let dbl_semi = frame.correction_semitones + vib_c;
 
         third_up_curve.push((frame.time_secs, up_semi));
         third_down_curve.push((frame.time_secs, down_semi));
@@ -899,6 +975,81 @@ mod tests {
         for (text, needle) in cases {
             let err = VocalScale::parse(text).expect_err(text).to_string();
             assert!(err.contains(needle), "{text}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_snap_midi_handles_sparse_custom_scales_with_wide_gaps() {
+        // C major triad: [C=0, E=4, G=7] has a 5-semitone gap between G and C.
+        let mut allowed_pcs = [false; 12];
+        allowed_pcs[0] = true;
+        allowed_pcs[4] = true;
+        allowed_pcs[7] = true;
+        let triad = VocalScale {
+            root_pc: 0,
+            is_minor: false,
+            allowed_pcs,
+        };
+        for note in 48..=72 {
+            let snapped = triad.snap_midi(f64::from(note), 1.0).round() as i32;
+            let pc = snapped.rem_euclid(12) as usize;
+            assert!(
+                allowed_pcs[pc],
+                "note {note} snapped to {snapped} (pc {pc}), which is not in triad"
+            );
+        }
+    }
+
+    #[test]
+    fn test_octave_glitch_suppression_fixes_spike_and_preserves_glide() {
+        let scale = VocalScale::parse("C chromatic").expect("scale");
+        // Isolated +1 octave spike at frame 1
+        let mut spiked = vec![
+            pitch_frame(0.02, 220.0, &scale, 0.0),
+            pitch_frame(0.04, 440.0, &scale, 0.0),
+            pitch_frame(0.06, 221.0, &scale, 0.0),
+        ];
+        suppress_isolated_octave_glitches(&mut spiked, &scale, 0.0);
+        assert!(
+            (spiked[1].f0_hz - 221.0).abs() < 1e-9,
+            "expected isolated octave glitch to snap to median 221 Hz, got {}",
+            spiked[1].f0_hz
+        );
+
+        // Monotonic glide stays strictly unchanged
+        let mut glide = vec![
+            pitch_frame(0.02, 200.0, &scale, 0.0),
+            pitch_frame(0.04, 240.0, &scale, 0.0),
+            pitch_frame(0.06, 288.0, &scale, 0.0),
+        ];
+        suppress_isolated_octave_glitches(&mut glide, &scale, 0.0);
+        assert!((glide[1].f0_hz - 240.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_harmony_stack_produces_three_clean_finite_voices() {
+        let sr = 48_000_u32;
+        let frames = sr as usize; // 1.0 s
+        let mut ch = vec![0.0_f64; frames];
+        // Two sung syllables separated by an unvoiced gap to exercise last_voiced_note hold
+        for (i, s) in ch.iter_mut().enumerate() {
+            let t = (i as f64) / f64::from(sr);
+            if !(0.40..0.55).contains(&t) {
+                *s = 0.35 * (2.0 * PI * 220.0 * t).sin() + 0.15 * (2.0 * PI * 440.0 * t).sin();
+            }
+        }
+        let lead = AudioBuffer::from_channels(vec![ch], sr).unwrap();
+        let scale = VocalScale::parse("A minor").unwrap();
+        let (high, low, dbl) = generate_vocal_harmony_stack(&lead, &scale).unwrap();
+        for (label, voice) in [("high", &high), ("low", &low), ("double", &dbl)] {
+            assert_eq!(voice.num_frames(), frames, "{label}");
+            let rms =
+                (voice.channels[0].iter().map(|x| x * x).sum::<f64>() / (frames as f64)).sqrt();
+            assert!(rms > 0.05, "{label} unexpectedly quiet: rms={rms:.4}");
+            assert!(
+                voice.channels[0].iter().all(|x| x.is_finite()),
+                "{label} has non-finite samples"
+            );
         }
     }
 
