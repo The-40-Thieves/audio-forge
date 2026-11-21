@@ -12,6 +12,10 @@ slider3:1.0<0.1,2.0,0.05>Sidechain Sensitivity (Ch 3/4)
 srate_safe = max(srate, 44100);
 sc_env = 0.0;
 duck_gain = 1.0;
+sr_env = max(srate, 1);
+env_a = exp(-1.0 / (sr_env * 0.0021));
+att_a = exp(-1.0 / (sr_env * 0.00013));
+rel_a = exp(-1.0 / (sr_env * 0.0052));
 ic1_m0 = 0; ic2_m0 = 0;
 ic1_m1 = 0; ic2_m1 = 0;
 ic1_sc = 0; ic2_sc = 0;
@@ -39,10 +43,10 @@ ic1_sc = 2.0 * v1_sc - ic1_sc;
 ic2_sc = 2.0 * v2_sc - ic2_sc;
 sc_band = k * v1_sc;
 
-sc_env = 0.990 * sc_env + 0.010 * abs(sc_band);
+sc_env = env_a * sc_env + (1.0 - env_a) * abs(sc_band);
 trig = min(1.0, sc_env * 8.0 * sens);
 target_g = 1.0 - trig * (1.0 - min_gain);
-duck_gain = target_g < duck_gain ? (0.85 * duck_gain + 0.15 * target_g) : (0.996 * duck_gain + 0.004 * target_g);
+duck_gain = target_g < duck_gain ? (att_a * duck_gain + (1.0 - att_a) * target_g) : (rel_a * duck_gain + (1.0 - rel_a) * target_g);
 
 // Extract target band on Left (spl0) and Right (spl1) and carve dynamic mirror pocket
 v3_0 = spl0 - ic2_m0;

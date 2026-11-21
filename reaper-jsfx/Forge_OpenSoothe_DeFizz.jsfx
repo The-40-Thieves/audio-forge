@@ -19,6 +19,15 @@ env_ref = 0.0001;
 gain_fizz = 1.0;
 gain_sib = 1.0;
 
+// Sample-rate-independent envelope & attack/release coefficients (using actual positive srate)
+sr_env = max(srate, 1);
+ref_a = exp(-1.0 / (sr_env * 0.026));
+band_a = exp(-1.0 / (sr_env * 0.0026));
+att_f_a = exp(-1.0 / (sr_env * 0.00013));
+rel_f_a = exp(-1.0 / (sr_env * 0.0052));
+att_s_a = exp(-1.0 / (sr_env * 0.000095));
+rel_s_a = exp(-1.0 / (sr_env * 0.0042));
+
 // State variables for 2-pole SVF bandpass detectors
 ic1_f = 0; ic2_f = 0;
 ic1_s = 0; ic2_s = 0;
@@ -79,17 +88,17 @@ ic1_s = 2.0 * v1_s - ic1_s;
 ic2_s = 2.0 * v2_s - ic2_s;
 bp_sib = k_s * v1_s;
 
-env_ref = 0.9992 * env_ref + 0.0008 * abs(mid) + 0.000001;
-env_fizz = 0.992 * env_fizz + 0.008 * abs(bp_fizz);
-env_sib = 0.992 * env_sib + 0.008 * abs(bp_sib);
+env_ref = ref_a * env_ref + (1.0 - ref_a) * abs(mid) + 0.000001;
+env_fizz = band_a * env_fizz + (1.0 - band_a) * abs(bp_fizz);
+env_sib = band_a * env_sib + (1.0 - band_a) * abs(bp_sib);
 
 ratio_f = (env_fizz * w_fizz) / (env_ref * thresh_lin * 0.45);
 target_gf = ratio_f > 1.0 ? max(min_gain, 1.0 / ratio_f) : 1.0;
-gain_fizz = target_gf < gain_fizz ? (0.85 * gain_fizz + 0.15 * target_gf) : (0.996 * gain_fizz + 0.004 * target_gf);
+gain_fizz = target_gf < gain_fizz ? (att_f_a * gain_fizz + (1.0 - att_f_a) * target_gf) : (rel_f_a * gain_fizz + (1.0 - rel_f_a) * target_gf);
 
 ratio_s = (env_sib * w_sib) / (env_ref * thresh_lin * 0.35);
 target_gs = ratio_s > 1.0 ? max(min_gain, 1.0 / ratio_s) : 1.0;
-gain_sib = target_gs < gain_sib ? (0.80 * gain_sib + 0.20 * target_gs) : (0.995 * gain_sib + 0.005 * target_gs);
+gain_sib = target_gs < gain_sib ? (att_s_a * gain_sib + (1.0 - att_s_a) * target_gs) : (rel_s_a * gain_sib + (1.0 - rel_s_a) * target_gs);
 
 removed_fizz = bp_fizz * (1.0 - gain_fizz) + bp_sib * (1.0 - gain_sib);
 gmem[0] = 20.0 * log10(max(0.001, min(gain_fizz, gain_sib)));

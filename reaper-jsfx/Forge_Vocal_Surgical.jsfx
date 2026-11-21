@@ -12,10 +12,16 @@ srate_safe = max(srate, 44100);
 lo_l = 0; lo_r = 0;
 hi_l = 0; hi_r = 0;
 env_lo = 0; env_mid = 0; env_sib = 0;
+breath_g = 1.0;
+sr_env = max(srate, 1);
+env_a = exp(-1.0 / (sr_env * 0.0026));
+sib_env_a = exp(-1.0 / (sr_env * 0.0014));
+breath_a = exp(-1.0 / (sr_env * 0.0080));
 
 @slider
 alpha_plosive = 1.0 - exp(-2.0 * $pi * 110.0 / srate_safe);
 alpha_sib = 1.0 - exp(-2.0 * $pi * 6200.0 / srate_safe);
+debreath_min_g = 10 ^ (min(0.0, max(-24.0, slider2)) / 20);
 deess_min_g = 10 ^ (-slider3 / 20);
 drive = slider4;
 
@@ -26,8 +32,8 @@ lo_r += alpha_plosive * (spl1 - lo_r);
 mid_l = spl0 - lo_l;
 mid_r = spl1 - lo_r;
 
-env_lo = 0.992 * env_lo + 0.008 * max(abs(lo_l), abs(lo_r));
-env_mid = 0.992 * env_mid + 0.008 * max(abs(mid_l), abs(mid_r));
+env_lo = env_a * env_lo + (1.0 - env_a) * max(abs(lo_l), abs(lo_r));
+env_mid = env_a * env_mid + (1.0 - env_a) * max(abs(mid_l), abs(mid_r));
 
 plosive_g = (slider1 > 0.5 && env_lo > env_mid * 2.6 && env_lo > 0.015) ? max(0.18, (env_mid * 2.6) / env_lo) : 1.0;
 
@@ -40,11 +46,19 @@ hi_r += alpha_sib * (v_r - hi_r);
 sib_l = v_l - hi_l;
 sib_r = v_r - hi_r;
 
-env_sib = 0.985 * env_sib + 0.015 * max(abs(sib_l), abs(sib_r));
+env_sib = sib_env_a * env_sib + (1.0 - sib_env_a) * max(abs(sib_l), abs(sib_r));
 sib_g = (env_sib > env_mid * 0.55 && env_sib > 0.01) ? max(deess_min_g, (env_mid * 0.55) / env_sib) : 1.0;
 
 clean_l = hi_l + sib_l * sib_g;
 clean_r = hi_r + sib_r * sib_g;
+
+// 2B. Smart De-Breath gate wired to slider2 (quiet high-HF unvoiced breath segments)
+env_total = env_lo + env_mid;
+is_breath = (slider2 < -0.5) && (env_total > 0.002) && (env_total < 0.045) && (env_sib > env_mid * 0.45);
+target_breath_g = is_breath ? debreath_min_g : 1.0;
+breath_g = breath_a * breath_g + (1.0 - breath_a) * target_breath_g;
+clean_l *= breath_g;
+clean_r *= breath_g;
 
 // 3. Airwindows Console8 pure sine warmth
 drive > 0.001 ? (

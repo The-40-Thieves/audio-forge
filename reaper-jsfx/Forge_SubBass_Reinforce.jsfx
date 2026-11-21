@@ -12,14 +12,21 @@ lp_l = 0; lp_r = 0;
 sub_osc = 1.0;
 prev_lo = 0.0;
 sub_lp = 0.0;
+sr_env = max(srate, 1);
+smooth_a = exp(-1.0 / (sr_env * 0.010));
+cur_sub_mix = slider2;
+cur_drive = slider3;
 
 @slider
 alpha = 1.0 - exp(-2.0 * $pi * slider1 / srate_safe);
 alpha_sub = 1.0 - exp(-2.0 * $pi * 75.0 / srate_safe);
-sub_mix = slider2;
-drive = slider3;
+target_sub_mix = slider2;
+target_drive = slider3;
 
 @sample
+cur_sub_mix = smooth_a * cur_sub_mix + (1.0 - smooth_a) * target_sub_mix;
+cur_drive = smooth_a * cur_drive + (1.0 - smooth_a) * target_drive;
+
 lp_l += alpha * (spl0 - lp_l);
 lp_r += alpha * (spl1 - lp_r);
 hp_l = spl0 - lp_l;
@@ -36,9 +43,9 @@ prev_lo = mono_lo;
 raw_sub = sub_osc * abs(mono_lo);
 sub_lp += alpha_sub * (raw_sub - sub_lp);
 
-combined_lo = mono_lo + sub_lp * sub_mix;
-driven_lo = sin(min(1.5, max(-1.5, combined_lo * (1.0 + drive * 0.5))));
-final_lo = (1.0 - drive * 0.5) * combined_lo + (drive * 0.5) * driven_lo;
+combined_lo = mono_lo + sub_lp * cur_sub_mix;
+driven_lo = sin(min(1.5, max(-1.5, combined_lo * (1.0 + cur_drive * 0.5))));
+final_lo = (1.0 - cur_drive * 0.5) * combined_lo + (cur_drive * 0.5) * driven_lo;
 
 spl0 = final_lo + hp_l;
 spl1 = final_lo + hp_r;
