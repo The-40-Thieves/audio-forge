@@ -2,6 +2,7 @@
 name = "forge-cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Command-line interface (`forge`) for ForgeAudio studio DSP, stem/vocal/MIDI surgery, music theory, and REAPER 7.82 automation"
 
@@ -21,3 +22,6 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+
+[lints]
+workspace = true

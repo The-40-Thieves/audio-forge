@@ -100,8 +100,7 @@ Fixed here, pending upstream:
 
 ## Security practices in this repository
 
-- Every push and pull request runs `cargo audit`, `clippy -D warnings`, tests on Linux,
-  Windows and macOS, and pluginval/clap-validator against the built plugins.
-- GitHub Actions are pinned to full commit SHAs, and Dependabot keeps Rust crates, Actions
-  and Python dependencies up to date.
+- Every push, pull request, and weekly schedule runs `cargo audit`, `cargo deny`, `clippy -D warnings` (with workspace-wide `unsafe_code = "deny"`), tests on Linux, Windows and macOS, and pluginval/clap-validator against the built plugins.
+- Release archives ship with `SHA256SUMS.txt` and SLSA build provenance attestations (`actions/attest-build-provenance`), verifiable via `gh attestation verify`.
+- GitHub Actions are pinned to full commit SHAs with `persist-credentials: false` and least-privilege `permissions`, and Dependabot keeps Rust crates, Actions and Python dependencies up to date.
 - CodeQL code scanning and secret scanning are enabled.

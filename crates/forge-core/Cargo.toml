@@ -2,6 +2,7 @@
 name = "forge-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Core 64-bit planar AudioBuffer, WAV/FFmpeg I/O, telemetry models, and error contracts for ForgeAudio"
 
@@ -14,3 +15,6 @@ tempfile.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+
+[lints]
+workspace = true

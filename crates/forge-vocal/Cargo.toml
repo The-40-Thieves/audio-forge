@@ -2,6 +2,7 @@
 name = "forge-vocal"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Vocal F0 pitch tracker, formant-preserving scale pitch correction, chord-aware multi-part harmony generator, and REAPER Take Pitch Envelope compiler"
 
@@ -18,3 +19,6 @@ proptest.workspace = true
 [[bench]]
 name = "vocal"
 harness = false
+
+[lints]
+workspace = true

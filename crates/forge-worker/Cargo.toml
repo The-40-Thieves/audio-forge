@@ -2,6 +2,7 @@
 name = "forge-worker"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Hybrid AI model router (Local RTX 3080 uv worker, Remote Colab A100, Google Lyria 3.5 API, XO/Atlas Drum Matcher, and Pure-Rust DSP fallback)"
 
@@ -18,3 +19,5 @@ tokio.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 
+[lints]
+workspace = true

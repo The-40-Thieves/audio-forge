@@ -2,6 +2,7 @@
 name = "forge-theory"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Music theory, minimal-motion Tonnetz voice-leading solver, reharmonizer, groove humanizer, drum transient MIDI trigger, and ABC/MIDI compiler"
 
@@ -18,3 +19,6 @@ tempfile.workspace = true
 [[bench]]
 name = "theory"
 harness = false
+
+[lints]
+workspace = true

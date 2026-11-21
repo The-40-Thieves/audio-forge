@@ -2,6 +2,7 @@
 name = "forge-reaper"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "REAPER 7.82 multitrack .RPP AST builder, JSFX installer, live UDP OSC / HTTP controller, and ISO 3901 ISRC DistroKid tagger"
 
@@ -15,3 +16,6 @@ serde.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+
+[lints]
+workspace = true

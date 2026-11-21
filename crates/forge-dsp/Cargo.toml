@@ -2,6 +2,7 @@
 name = "forge-dsp"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "SIMD-accelerated studio DSP, ITU-R BS.1770-4 loudness/limiter, OpenSoothe spectral de-fizz, OpenSpacer sidechain unmasker, GCC-PHAT phase align, and FastDTW vocalign"
 
@@ -23,3 +24,6 @@ assert_no_alloc = { git = "https://github.com/robbert-vdh/rust-assert-no-alloc.g
 [[bench]]
 name = "dsp"
 harness = false
+
+[lints]
+workspace = true

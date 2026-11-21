@@ -29,13 +29,20 @@ cargo xtask bundle-all --release                # all 10 plugins
 
 ## Before you open a pull request
 
-Run the same checks as CI:
+Run the local pre-PR gate (runs the same Rust checks as CI in sequence):
+
+```bash
+cargo xtask check
+```
+
+Or run each step individually:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+cargo deny -L error check   # optional locally; enforced in CI
 ```
 
 If you touched Python:

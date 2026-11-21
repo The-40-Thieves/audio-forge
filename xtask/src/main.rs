@@ -9,9 +9,12 @@
 //!   Bundles and installs an individual plugin (or `--all` 10 standalone plugins) into the DAW VST3 & CLAP directories.
 //! - `cargo run --package xtask -- list`
 //!   Lists all 10 standalone VST3/CLAP plugins and their descriptions.
+//! - `cargo run --package xtask -- check`
+//!   Runs the local pre-PR quality gate (`fmt`, `clippy`, `test`, `doc`).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 pub const STANDALONE_PLUGINS: [(&str, &str); 10] = [
     (
@@ -83,6 +86,7 @@ fn main() -> nih_plug_xtask::Result<()> {
             Ok(())
         }
         "install" => run_install(&args[1..]),
+        "check" => run_check(),
         _ => nih_plug_xtask::main_with_args("cargo xtask", args),
     }
 }
@@ -172,6 +176,65 @@ fn resolve_targets(install_all: bool, plugin: Option<&str>) -> Result<Vec<String
         ))),
         (false, None) => Err(UsageError("missing plugin name or `--all`".to_string())),
     }
+}
+
+struct CheckStep {
+    label: &'static str,
+    args: &'static [&'static str],
+    env: &'static [(&'static str, &'static str)],
+}
+
+const CHECK_STEPS: &[CheckStep] = &[
+    CheckStep {
+        label: "rustfmt",
+        args: &["fmt", "--all", "--", "--check"],
+        env: &[],
+    },
+    CheckStep {
+        label: "clippy",
+        args: &[
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--locked",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        env: &[],
+    },
+    CheckStep {
+        label: "test",
+        args: &["test", "--workspace", "--locked"],
+        env: &[],
+    },
+    CheckStep {
+        label: "rustdoc",
+        args: &["doc", "--workspace", "--no-deps", "--locked"],
+        env: &[("RUSTDOCFLAGS", "-D warnings")],
+    },
+];
+
+fn run_check() -> nih_plug_xtask::Result<()> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    for step in CHECK_STEPS {
+        println!("==> [xtask check] {} ...", step.label);
+        let mut cmd = Command::new(&cargo);
+        cmd.args(step.args);
+        for &(k, v) in step.env {
+            cmd.env(k, v);
+        }
+        let status = cmd.status()?;
+        if !status.success() {
+            return Err(UsageError(format!(
+                "check step `{}` failed with status {status}",
+                step.label
+            ))
+            .into());
+        }
+    }
+    println!("==> [xtask check] all checks passed.");
+    Ok(())
 }
 
 fn run_install(args: &[String]) -> nih_plug_xtask::Result<()> {
@@ -406,5 +469,12 @@ mod tests {
         let dst = tmp.path().join("copy.clap");
         copy_bundle(&src, &dst).unwrap();
         assert_eq!(std::fs::read_to_string(dst).unwrap(), "clap");
+    }
+
+    #[test]
+    fn check_plan_covers_fmt_clippy_test_and_doc() {
+        let labels: Vec<&str> = CHECK_STEPS.iter().map(|s| s.label).collect();
+        assert_eq!(labels, vec!["rustfmt", "clippy", "test", "rustdoc"]);
+        assert!(CHECK_STEPS.iter().all(|s| !s.args.is_empty()));
     }
 }

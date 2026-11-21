@@ -234,7 +234,7 @@ fn full_root_table_releases_its_oldest_instance() {
     for voice in 0..=MAX_ROOT_INSTANCES {
         let (channel, root) = key(voice);
         notes.root_on(0, channel, root, 0.9, Some(voice as i32), &mut |m| {
-            host.receive(m)
+            host.receive(m);
         });
     }
     // Voice 0 was released to make room; its own NoteOff then matches nothing and is dropped.
@@ -244,7 +244,7 @@ fn full_root_table_releases_its_oldest_instance() {
     for voice in 0..=MAX_ROOT_INSTANCES {
         let (channel, root) = key(voice);
         notes.root_off(1, channel, root, Some(voice as i32), &mut |m| {
-            host.receive(m)
+            host.receive(m);
         });
     }
     host.assert_all_released();

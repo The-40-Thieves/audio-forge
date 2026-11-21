@@ -2,6 +2,7 @@
 name = "forge-submono-tape"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Standalone VST3 & CLAP Plugin: Forge SubMono & Console Tape (<160 Hz Mono-Maker, Harmonic Sub Reinforcer & Console8/ChowTape Saturation)"
 
@@ -11,3 +12,6 @@ crate-type = ["cdylib"]
 [dependencies]
 forge-plug = { path = "../../crates/forge-plug" }
 nih_plug.workspace = true
+
+[lints]
+workspace = true
