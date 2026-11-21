@@ -4,235 +4,40 @@
 //! Built on `nih-plug` and `forge-dsp::realtime` with **zero audio-thread heap allocations**
 //! (`assert_process_allocs` enabled).
 //!
-//! Exports 6 dedicated studio processors in the CLAP multi-plugin bundle (`forge-plug.clap`)
-//! plus the flagship all-in-one modular Mastering & De-Fizz Rack for VST3 (`forge-plug.vst3`):
+//! Exports 10 standalone VST3/CLAP studio processors:
 //! 1. **Forge OpenSoothe De-Fizz** (2048-pt OLA STFT Dynamic Spectral Resonance & AI Fizz Suppressor)
 //! 2. **Forge OpenSpacer Unmask** (4-Channel Sidechain Dynamic Spectral Unmasker)
 //! 3. **Forge Vocal Surgical Strip** (Zero-Latency Mouth De-Click, Plosive Suppressor, De-Esser & Breath Gate)
 //! 4. **Forge SubMono & Console Tape** (Linkwitz-Riley `<160 Hz` Mono-Maker, Sub Reinforce & Console8/ChowTape Warmth)
 //! 5. **Forge Master True-Peak Limiter** (4x Inter-Sample True-Peak `-1.0 dBTP` Lookahead Brickwall Limiter)
 //! 6. **Forge Drum Trigger & Theory MIDI** (Real-Time Audio-to-MIDI Drum Replacer `C1/D1/F#1` + Neo-Soul Chord Voicer)
+//! 7. **Forge Phase & Match EQ** (Phase/Polarity Aligner + 18-Band Mastering EQ & Genre Tonal Balance)
+//! 8. **Forge SplitEQ** (3-Band Structural Transient/Tonal Equalizer & Shaper)
+//! 9. **Forge Density & Clipper** (3-Band Upward Density Compressor & 2x ADAA Soft Clipper)
+//! 10. **Forge SpaceVerb & Preamp** (8x8 Hadamard FDN Reverb with Ducking/Shimmer + Neural WaveNet Preamp)
+
+mod ui;
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 
+#[cfg(test)]
+use forge_dsp::read_shared_spectrum;
 use forge_dsp::{
     AnalogHardwareModel, AutoGainCompensator, DrumTriggerNotes, GenreTonalTarget, NoteMsg,
     RealtimeDensityAndClipper, RealtimeDrumTrigger, RealtimeFdnReverb, RealtimeMasterLimiter,
     RealtimeMasteringEq18, RealtimeNeuralPreamp, RealtimeOpenSoothe, RealtimeOpenSpacer,
     RealtimePhaseAligner, RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus,
     RealtimeTransientTonalSplit, RealtimeVocalSurgical, SpectrumBusOwner, clear_shared_spectrum,
-    publish_shared_spectrum, read_shared_spectrum, shared_spectrum_slot_index,
+    publish_shared_spectrum, shared_spectrum_slot_index,
 };
 use nih_plug::prelude::*;
 use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
 
-/// Lock-free 32-band telemetry, dynamic Gain-Reduction / Bode curve, and A/B snapshot indicator
-/// shared between the real-time audio thread and the 60 FPS `nih_plug_egui` OpenGL studio GUI.
-pub struct GuiTelemetry {
-    pub spectrum_db: [AtomicU32; 32],
-    pub band_gr_db: [AtomicU32; 32],
-    pub peak_in_db: AtomicU32,
-    pub peak_out_db: AtomicU32,
-    pub gr_db: AtomicU32,
-    pub ab_slot: AtomicU32,
-}
-
-impl Default for GuiTelemetry {
-    fn default() -> Self {
-        Self {
-            spectrum_db: std::array::from_fn(|_| AtomicU32::new((-90.0_f32).to_bits())),
-            band_gr_db: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
-            peak_in_db: AtomicU32::new((-90.0_f32).to_bits()),
-            peak_out_db: AtomicU32::new((-90.0_f32).to_bits()),
-            gr_db: AtomicU32::new(0.0_f32.to_bits()),
-            ab_slot: AtomicU32::new(0),
-        }
-    }
-}
-
-impl GuiTelemetry {
-    #[inline]
-    pub fn update_peaks(&self, in_l: f32, in_r: f32, out_l: f32, out_r: f32, gr_db: f32) {
-        let il = if in_l.is_finite() {
-            in_l.abs().min(100.0)
-        } else {
-            0.0
-        };
-        let ir = if in_r.is_finite() {
-            in_r.abs().min(100.0)
-        } else {
-            0.0
-        };
-        let ol = if out_l.is_finite() {
-            out_l.abs().min(100.0)
-        } else {
-            0.0
-        };
-        let or_ = if out_r.is_finite() {
-            out_r.abs().min(100.0)
-        } else {
-            0.0
-        };
-        let gr = if gr_db.is_finite() {
-            gr_db.clamp(-90.0, 24.0)
-        } else {
-            0.0
-        };
-
-        let pk_in = 20.0 * il.max(ir).max(1e-5).log10();
-        let pk_out = 20.0 * ol.max(or_).max(1e-5).log10();
-        let raw_prev_in = f32::from_bits(self.peak_in_db.load(Ordering::Relaxed));
-        let raw_prev_out = f32::from_bits(self.peak_out_db.load(Ordering::Relaxed));
-        let prev_in = if raw_prev_in.is_finite() {
-            raw_prev_in.clamp(-100.0, 40.0)
-        } else {
-            -90.0
-        };
-        let prev_out = if raw_prev_out.is_finite() {
-            raw_prev_out.clamp(-100.0, 40.0)
-        } else {
-            -90.0
-        };
-        let sm_in = if pk_in > prev_in {
-            pk_in
-        } else {
-            prev_in * 0.9995 + pk_in * 0.0005
-        };
-        let sm_out = if pk_out > prev_out {
-            pk_out
-        } else {
-            prev_out * 0.9995 + pk_out * 0.0005
-        };
-        self.peak_in_db.store(sm_in.to_bits(), Ordering::Relaxed);
-        self.peak_out_db.store(sm_out.to_bits(), Ordering::Relaxed);
-        self.gr_db.store(gr.to_bits(), Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub fn update_spectrum_and_gr(&self, spec_32: &[f32; 32], gr_32: &[f32; 32]) {
-        for i in 0..32 {
-            let s = if spec_32[i].is_finite() {
-                spec_32[i].clamp(-90.0, 6.0)
-            } else {
-                -90.0
-            };
-            let g = if gr_32[i].is_finite() {
-                gr_32[i].clamp(-24.0, 24.0)
-            } else {
-                0.0
-            };
-            self.spectrum_db[i].store(s.to_bits(), Ordering::Relaxed);
-            self.band_gr_db[i].store(g.to_bits(), Ordering::Relaxed);
-        }
-    }
-}
-
-/// Renders the shared ForgeAudio dark-mode studio header, A/B State toggle, I/O + Gain Reduction meters,
-/// 32-band Real-Time Spectrum analyzer, and Dynamic Gain-Reduction / Bode Curve polyline inside any `nih_plug_egui` window.
-fn draw_forge_studio_header_and_spectrum(
-    ui: &mut egui::Ui,
-    title: &str,
-    subtitle: &str,
-    telemetry: &GuiTelemetry,
-    shared_slot: Option<usize>,
-) {
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.heading(
-                egui::RichText::new(title)
-                    .color(egui::Color32::from_rgb(90, 210, 255))
-                    .strong(),
-            );
-            ui.label(
-                egui::RichText::new(subtitle)
-                    .color(egui::Color32::from_rgb(165, 175, 195))
-                    .small(),
-            );
-        });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let cur_ab = telemetry.ab_slot.load(Ordering::Relaxed);
-            let ab_label = if cur_ab == 0 {
-                "A/B: [STATE A]"
-            } else {
-                "A/B: [STATE B]"
-            };
-            if ui
-                .button(
-                    egui::RichText::new(ab_label)
-                        .monospace()
-                        .color(egui::Color32::from_rgb(250, 204, 21)),
-                )
-                .clicked()
-            {
-                telemetry.ab_slot.store(1 - (cur_ab & 1), Ordering::Relaxed);
-            }
-            ui.add_space(8.0);
-            let pk_in = f32::from_bits(telemetry.peak_in_db.load(Ordering::Relaxed));
-            let pk_out = f32::from_bits(telemetry.peak_out_db.load(Ordering::Relaxed));
-            let gr = f32::from_bits(telemetry.gr_db.load(Ordering::Relaxed));
-            ui.label(
-                egui::RichText::new(format!(
-                    "IN {:+5.1} dB  |  OUT {:+5.1} dB  |  GR {:5.1} dB",
-                    pk_in, pk_out, gr
-                ))
-                .monospace()
-                .color(egui::Color32::from_rgb(120, 240, 170)),
-            );
-        });
-    });
-    ui.add_space(4.0);
-
-    // 32-Band Real-Time Spectral + Dynamic GR / Bode Curve Overlay Canvas
-    let (rect, _resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 92.0), egui::Sense::hover());
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(16, 20, 28));
-    painter.rect_stroke(
-        rect,
-        6.0,
-        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(42, 54, 72)),
-        egui::StrokeKind::Inside,
-    );
-
-    let shared_vals = shared_slot.map(read_shared_spectrum);
-    let n_bars = 32_usize;
-    let bar_w = (rect.width() - 16.0) / (n_bars as f32);
-    let mut curve_pts = Vec::with_capacity(n_bars);
-    let mid_y = rect.center().y;
-
-    for b in 0..n_bars {
-        let db = if let Some(ref sv) = shared_vals {
-            let local_db = f32::from_bits(telemetry.spectrum_db[b].load(Ordering::Relaxed));
-            local_db.max(sv[b])
-        } else {
-            f32::from_bits(telemetry.spectrum_db[b].load(Ordering::Relaxed))
-        };
-        let norm = ((db + 72.0) / 72.0).clamp(0.04, 1.0);
-        let h = norm * (rect.height() - 14.0);
-        let x0 = rect.left() + 8.0 + (b as f32) * bar_w;
-        let bar_rect = egui::Rect::from_min_max(
-            egui::pos2(x0 + 1.0, rect.bottom() - 6.0 - h),
-            egui::pos2(x0 + bar_w - 2.0, rect.bottom() - 6.0),
-        );
-        painter.rect_filled(bar_rect, 2.0, egui::Color32::from_rgb(56, 189, 248));
-
-        // Plot 32-band Dynamic Gain Reduction / EQ Bode response curve point (-18 dB .. +18 dB)
-        let gr_b =
-            f32::from_bits(telemetry.band_gr_db[b].load(Ordering::Relaxed)).clamp(-18.0, 18.0);
-        let y_pt = (mid_y - (gr_b / 18.0) * (rect.height() * 0.40))
-            .clamp(rect.top() + 4.0, rect.bottom() - 4.0);
-        curve_pts.push(egui::pos2(x0 + bar_w * 0.5, y_pt));
-    }
-    if curve_pts.len() >= 2 {
-        painter.add(egui::Shape::line(
-            curve_pts,
-            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(251, 146, 60)),
-        ));
-    }
-    ui.add_space(6.0);
-}
+pub use ui::GuiTelemetry;
+use ui::draw_forge_studio_header_and_spectrum;
 
 // ============================================================================
 // 1. FORGE OPENSOOTHE DE-FIZZ (CLAP + VST3 Flagship)
