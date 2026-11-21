@@ -57,7 +57,8 @@ jobs:
           mkdir -p "dist/$out/plugins" "dist/$out/bin" "dist/$out/jsfx"
           cp -R target/bundled/*.vst3 target/bundled/*.clap "dist/$out/plugins/"
           cp reaper-jsfx/*.jsfx "dist/$out/jsfx/"
-          cp LICENSE NOTICE README.md "dist/$out/"
+          cp LICENSE README.md "dist/$out/"
+          if [ -f NOTICE ]; then cp NOTICE "dist/$out/"; fi
           for bin in forge forge-mcp; do
             for f in "target/release/$bin" "target/release/$bin.exe"; do
               if [ -f "$f" ]; then cp "$f" "dist/$out/bin/"; fi

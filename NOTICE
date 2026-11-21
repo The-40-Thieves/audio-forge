@@ -13,9 +13,11 @@ You may obtain a copy of the License at
 Third-Party Notices
 ===================
 
-This repository includes a vendored, patched copy of `nih_plug` (under
-`vendor/nih-plug/`), originally developed by Robbert van der Helm and
-licensed under the ISC License:
+1. `nih_plug` (ISC License)
+   Copyright (c) 2022-2024 Robbert van der Helm
+   Used as a vendored, patched plugin framework in the source repository
+   (https://github.com/robbert-vdh/nih-plug).
 
-  Copyright (c) 2022-2024 Robbert van der Helm
-  See `vendor/nih-plug/LICENSE` and `vendor/nih-plug/PATCHES.md`.
+2. `vst3-sys` (GNU General Public License v3.0 only)
+   Steinberg VST3 C ABI bindings linked into VST3 plugin builds via `nih_plug`
+   (https://github.com/robbert-vdh/vst3-sys).
