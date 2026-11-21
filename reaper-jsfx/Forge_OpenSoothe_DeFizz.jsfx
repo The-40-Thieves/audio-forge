@@ -1,6 +1,6 @@
 desc:ForgeAudio - OpenSoothe Dynamic Spectral Resonance Suppressor (AI De-Fizz)
 //tags: equalizer spectral resonance suppressor de-esser ai-cleanup
-//author: ForgeAudio (MIT / Apache-2.0)
+//author: ForgeAudio (Apache-2.0)
 
 options:gmem=ForgeAudioStudio
 
