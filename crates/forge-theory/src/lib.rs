@@ -261,22 +261,31 @@ pub fn solve_voice_leading(
     let mut chord_events = Vec::new();
     let mut bass_events = Vec::new();
     let mut prev_voicing: Vec<u8> = Vec::new();
+    let scale_ticks = |ticks_at_480: u32| -> u32 {
+        ((f64::from(ticks_at_480) * f64::from(safe_tpb) / 480.0).round() as u32)
+            .min(chord_dur.saturating_sub(1))
+    };
 
     for (idx, sym) in chord_symbols.iter().enumerate() {
-        let (root_pc, intervals) = parse_chord_symbol(sym)?;
+        let parsed = parse_chord(sym)?;
+        let root_pc = parsed.root_pc;
+        let intervals = parsed.intervals;
+        let bass_pc = parsed.bass_pc.unwrap_or(root_pc);
         let base_start_tick = (idx as u32).saturating_mul(chord_dur);
 
-        // 1. Dedicated phase-pure Sub-Bass root note in C2..B2 (MIDI 36..47)
-        let bass_note = 36 + root_pc;
+        // 1. Dedicated phase-pure Sub-Bass note in C2..B2 (MIDI 36..47), honouring slash bass
+        let bass_note = 36 + bass_pc;
         let bass_offset = match groove {
-            GrooveStyle::NeoSoulDilla => 10, // Laid back behind the kick transient
+            GrooveStyle::NeoSoulDilla => scale_ticks(10), // Laid back behind the kick transient
             _ => 0,
         };
         bass_events.push(NoteEvent {
             midi_note: bass_note,
             velocity: 102,
             start_tick: base_start_tick + bass_offset,
-            duration_ticks: chord_dur.saturating_sub(bass_offset + 15).max(1),
+            duration_ticks: chord_dur
+                .saturating_sub(bass_offset + scale_ticks(15))
+                .max(1),
             channel: 1,
         });
 
@@ -289,32 +298,22 @@ pub fn solve_voice_leading(
             _ => intervals.clone(),
         };
 
-        let mut current_voicing: Vec<u8> = active_intervals
+        let mut pcs: Vec<u8> = active_intervals
             .iter()
-            .map(|&iv| 60 + ((root_pc + iv) % 12))
+            .map(|&iv| (root_pc + iv) % 12)
             .collect();
-        current_voicing.sort_unstable();
+        pcs.sort_unstable();
+        pcs.dedup();
 
-        // Optimize inversion / octave placement to minimize L1 pitch distance from `prev_voicing`
-        if !prev_voicing.is_empty() {
-            let prev_center: f64 = prev_voicing.iter().map(|&n| f64::from(n)).sum::<f64>()
-                / (prev_voicing.len() as f64);
-
-            for note in &mut current_voicing {
-                let mut best_n = *note;
-                let mut best_dist = (f64::from(*note) - prev_center).abs();
-                for shift in [-12_i16, 12_i16] {
-                    let cand = (i16::from(*note) + shift).clamp(50, 81) as u8;
-                    let dist = (f64::from(cand) - prev_center).abs();
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best_n = cand;
-                    }
-                }
-                *note = best_n;
-            }
-            current_voicing.sort_unstable();
-        }
+        // Search cyclic inversions + octave placements in C3..G5 to minimize total L1 voice
+        // movement from `prev_voicing` while keeping pitch classes distinct and compact.
+        let mut current_voicing = if prev_voicing.is_empty() {
+            let mut v: Vec<u8> = pcs.iter().map(|&pc| 60 + pc).collect();
+            v.sort_unstable();
+            v
+        } else {
+            best_voice_leading_inversion(&pcs, &prev_voicing)
+        };
 
         // Apply Drop-2 or Cinematic spread transformation
         match style {
@@ -335,13 +334,13 @@ pub fn solve_voice_leading(
 
         prev_voicing = current_voicing.clone();
 
-        // 3. Apply Groove / Strum micro-timing and finger velocity curve
+        // 3. Apply Groove / Strum micro-timing (scaled by PPQ) and finger velocity curve
         for (v_idx, &midi_note) in current_voicing.iter().enumerate() {
             let strum_ticks = match groove {
                 GrooveStyle::Straight => 0,
-                GrooveStyle::NeoSoulDilla => (v_idx as u32) * 8 + 12,
-                GrooveStyle::MpcSwing58 => (v_idx as u32) * 4,
-                GrooveStyle::AcousticStrum => (v_idx as u32) * 12,
+                GrooveStyle::NeoSoulDilla => scale_ticks((v_idx as u32) * 8 + 12),
+                GrooveStyle::MpcSwing58 => scale_ticks((v_idx as u32) * 4),
+                GrooveStyle::AcousticStrum => scale_ticks((v_idx as u32) * 12),
             };
             // Emphasize top melody voice and bottom anchor voice
             let is_outer = v_idx == 0 || v_idx + 1 == current_voicing.len();
@@ -351,13 +350,67 @@ pub fn solve_voice_leading(
                 midi_note,
                 velocity,
                 start_tick: base_start_tick + strum_ticks,
-                duration_ticks: chord_dur.saturating_sub(strum_ticks + 20).max(1),
+                duration_ticks: chord_dur
+                    .saturating_sub(strum_ticks + scale_ticks(20))
+                    .max(1),
                 channel: 0,
             });
         }
     }
 
     Ok((chord_events, bass_events))
+}
+
+/// Evaluates all cyclic close-position inversions of `pcs` across octave anchor registers in
+/// `52..=79` and returns the voicing with minimum total L1 semitone distance to `prev_voicing`.
+fn best_voice_leading_inversion(pcs: &[u8], prev_voicing: &[u8]) -> Vec<u8> {
+    if pcs.is_empty() {
+        return Vec::new();
+    }
+    let prev_center: f64 =
+        prev_voicing.iter().map(|&n| f64::from(n)).sum::<f64>() / (prev_voicing.len() as f64);
+
+    let mut best_voicing: Vec<u8> = pcs.iter().map(|&pc| 60 + pc).collect();
+    let mut best_cost = f64::INFINITY;
+
+    for rot in 0..pcs.len() {
+        for base_oct in [48_u8, 60_u8] {
+            let mut cand = Vec::with_capacity(pcs.len());
+            let mut cursor = base_oct + pcs[rot];
+            cand.push(cursor);
+            for step in 1..pcs.len() {
+                let pc = pcs[(rot + step) % pcs.len()];
+                let mut note = (cursor / 12) * 12 + pc;
+                while note <= cursor {
+                    note += 12;
+                }
+                cand.push(note);
+                cursor = note;
+            }
+            if cand[0] < 50 || *cand.last().unwrap_or(&0) > 81 {
+                continue;
+            }
+            // Exact 1D one-to-one L1 voice-leading distance (optimal by rearrangement inequality
+            // on sorted voicings when lengths match; proportional quantile pairing otherwise)
+            // plus mild gravity toward the previous register center.
+            let n_max = cand.len().max(prev_voicing.len());
+            let l1_dist: f64 = (0..n_max)
+                .map(|k| {
+                    let ci = (k * (cand.len() - 1)) / (n_max - 1).max(1);
+                    let pi = (k * (prev_voicing.len() - 1)) / (n_max - 1).max(1);
+                    (f64::from(cand[ci]) - f64::from(prev_voicing[pi])).abs()
+                })
+                .sum();
+            let cand_center = cand.iter().map(|&n| f64::from(n)).sum::<f64>() / (cand.len() as f64);
+            let cost = l1_dist + 0.15 * (cand_center - prev_center).abs();
+            if cost < best_cost {
+                best_cost = cost;
+                best_voicing = cand;
+            }
+        }
+    }
+    best_voicing.sort_unstable();
+    best_voicing
 }
 
 /// Detects drum transients in a drum stem or mix and emits velocity-mapped MIDI trigger tracks
@@ -380,26 +433,54 @@ pub fn extract_drum_midi_triggers(
     let win = ((sr * 0.012).round() as usize).max(32); // 12ms transient analysis window
     let min_retrigger_samples = ((sr * 0.075).round() as usize).max(128); // 75ms debounce
 
-    // Simple 1-pole band split for Kick (<130 Hz), Snare (160–2500 Hz), and Hats (>4500 Hz)
-    let alpha_low = (2.0 * std::f64::consts::PI * 130.0 / sr).clamp(0.005, 0.5);
-    let alpha_high = (2.0 * std::f64::consts::PI * 4500.0 / sr).clamp(0.01, 0.8);
+    // True 2-pole band isolation: Kick (<140 Hz LPF), Snare (220–4500 Hz true BPF via 2-pole HPF
+    // on the 4500 Hz LPF, avoiding phase-cancellation bleed from subtracting a lagged LPF), and
+    // Hats (>4500 Hz 2-pole HPF).
+    let alpha_low = (1.0 - (-2.0 * std::f64::consts::PI * 140.0 / sr).exp()).clamp(0.002, 0.5);
+    let alpha_mid_hp = (1.0 - (-2.0 * std::f64::consts::PI * 220.0 / sr).exp()).clamp(0.002, 0.5);
+    let alpha_high = (1.0 - (-2.0 * std::f64::consts::PI * 4500.0 / sr).exp()).clamp(0.01, 0.85);
 
     let mut low_sig = vec![0.0_f64; n];
     let mut mid_sig = vec![0.0_f64; n];
     let mut high_sig = vec![0.0_f64; n];
 
-    let mut lp_state = 0.0_f64;
-    let mut hp_state = 0.0_f64;
+    let mut lp1 = 0.0_f64;
+    let mut lp2 = 0.0_f64;
+    let mut hp_lp1 = 0.0_f64;
+    let mut hp_lp2 = 0.0_f64;
+    let mut mid_lp1 = 0.0_f64;
+    let mut mid_lp2 = 0.0_f64;
+    let mut hat_lp1 = 0.0_f64;
+    let mut hat_lp2 = 0.0_f64;
     for i in 0..n {
-        let x = mono[i];
-        lp_state += alpha_low * (x - lp_state);
-        hp_state += alpha_high * (x - hp_state);
-        low_sig[i] = lp_state;
-        high_sig[i] = x - hp_state;
-        mid_sig[i] = x - low_sig[i] - high_sig[i];
+        let x = if mono[i].is_finite() { mono[i] } else { 0.0 };
+        lp1 += alpha_low * (x - lp1);
+        lp2 += alpha_low * (lp1 - lp2);
+        low_sig[i] = lp2;
+
+        // 4500 Hz 2-pole LPF, then 220 Hz 2-pole HPF for clean snare bandpass
+        hp_lp1 += alpha_high * (x - hp_lp1);
+        hp_lp2 += alpha_high * (hp_lp1 - hp_lp2);
+        mid_lp1 += alpha_mid_hp * (hp_lp2 - mid_lp1);
+        let mid_hp1 = hp_lp2 - mid_lp1;
+        mid_lp2 += alpha_mid_hp * (mid_hp1 - mid_lp2);
+        mid_sig[i] = mid_hp1 - mid_lp2;
+
+        // 4500 Hz 2-pole HPF for clean hi-hat isolation
+        hat_lp1 += alpha_high * (x - hat_lp1);
+        let hat_hp1 = x - hat_lp1;
+        hat_lp2 += alpha_high * (hat_hp1 - hat_lp2);
+        high_sig[i] = hat_hp1 - hat_lp2;
     }
 
-    let detect_band_hits = |sig: &[f64], midi_note: u8, thresh_mult: f64| -> Vec<NoteEvent> {
+    let note_dur = (safe_tpb / 4).max(1);
+    let detect_band_hits = |sig: &[f64],
+                            other_a: &[f64],
+                            other_b: &[f64],
+                            midi_note: u8,
+                            thresh_mult: f64,
+                            min_dominance: f64|
+     -> Vec<NoteEvent> {
         let mut events = Vec::new();
         let global_rms = (sig.iter().map(|&v| v * v).sum::<f64>() / (sig.len() as f64))
             .sqrt()
@@ -410,11 +491,23 @@ pub fn extract_drum_midi_triggers(
         let mut prev_rms = global_rms;
         for start in (0..n.saturating_sub(win)).step_by(win / 2) {
             let slice = &sig[start..start + win];
-            let rms = (slice.iter().map(|&v| v * v).sum::<f64>() / (win as f64)).sqrt();
+            let rms_sq = slice.iter().map(|&v| v * v).sum::<f64>() / (win as f64);
+            let rms = rms_sq.sqrt();
             let peak = slice.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+
+            // Cross-band dominance ratio rejects bleed from louder hits in neighboring bands.
+            // Evaluate competing bands over an extended window (`2 * win`) so a low-frequency
+            // kick body (140 Hz LPF group delay + ~15 ms period) is seen alongside its attack click.
+            let cmp_end = (start + 2 * win).min(n);
+            let cmp_len = (cmp_end - start) as f64;
+            let other_sq = (other_a[start..cmp_end].iter().map(|&v| v * v).sum::<f64>()
+                + other_b[start..cmp_end].iter().map(|&v| v * v).sum::<f64>())
+                / cmp_len;
+            let band_share = rms_sq / (rms_sq + other_sq + 1e-12);
 
             if peak > min_peak
                 && rms > prev_rms * 1.65
+                && band_share >= min_dominance
                 && (events.is_empty() || start.saturating_sub(last_hit) >= min_retrigger_samples)
             {
                 let norm_vel =
@@ -424,7 +517,7 @@ pub fn extract_drum_midi_triggers(
                     midi_note,
                     velocity: norm_vel,
                     start_tick: tick,
-                    duration_ticks: ticks_per_beat / 4,
+                    duration_ticks: note_dur,
                     channel: 9, // GM Drum Channel 10 (0-indexed = 9)
                 });
                 last_hit = start;
@@ -434,9 +527,9 @@ pub fn extract_drum_midi_triggers(
         events
     };
 
-    let kick_events = detect_band_hits(&low_sig, 36, 1.8);
-    let snare_events = detect_band_hits(&mid_sig, 38, 2.0);
-    let hat_events = detect_band_hits(&high_sig, 42, 1.9);
+    let kick_events = detect_band_hits(&low_sig, &mid_sig, &high_sig, 36, 1.8, 0.30);
+    let snare_events = detect_band_hits(&mid_sig, &low_sig, &high_sig, 38, 2.0, 0.45);
+    let hat_events = detect_band_hits(&high_sig, &low_sig, &mid_sig, 42, 1.9, 0.35);
 
     (kick_events, snare_events, hat_events)
 }
@@ -445,8 +538,17 @@ pub fn extract_drum_midi_triggers(
 pub fn export_abc_score(title: &str, key: &str, bpm: u32, chords: &[String]) -> String {
     let mut out = format!("X:1\nT:{title}\nM:4/4\nL:1/8\nQ:1/4={bpm}\nK:{key}\n");
     for (idx, chord) in chords.iter().enumerate() {
-        let root_char = chord.chars().next().unwrap_or('C').to_ascii_uppercase();
-        out.push_str(&format!("\"{chord}\"{root_char}4 {root_char}4 | "));
+        let trimmed = chord.trim();
+        let mut chars = trimmed.chars();
+        let root_letter = chars.next().unwrap_or('C').to_ascii_uppercase();
+        let abc_accidental = match chars.next() {
+            Some('#') => "^",
+            Some('b') => "_",
+            _ => "",
+        };
+        out.push_str(&format!(
+            "\"{trimmed}\"{abc_accidental}{root_letter}4 {abc_accidental}{root_letter}4 | "
+        ));
         if (idx + 1) % 4 == 0 {
             out.push('\n');
         }
@@ -487,7 +589,11 @@ pub fn write_midi_to_writer<W: Write>(
     let midi_err =
         |e: std::io::Error| ForgeError::TheoryError(format!("Failed to write MIDI file: {e}"));
     let mut smf_tracks = vec![tempo_track(bpm)];
-    smf_tracks.extend(tracks_notes.iter().map(|&(_name, notes)| note_track(notes)));
+    smf_tracks.extend(
+        tracks_notes
+            .iter()
+            .map(|&(name, notes)| note_track(name, notes)),
+    );
     let smf = Smf {
         header: Header {
             format: Format::Parallel,
@@ -536,10 +642,16 @@ fn note_events(notes: &[NoteEvent]) -> Vec<(u32, bool, u8, u8, u8)> {
     raw_events
 }
 
-/// One note track: delta-timed note on/off messages, then end of track.
-fn note_track(notes: &[NoteEvent]) -> Vec<TrackEvent<'static>> {
+/// One note track: optional track name metadata, delta-timed note on/off messages, then end of track.
+fn note_track<'a>(name: &'a str, notes: &[NoteEvent]) -> Vec<TrackEvent<'a>> {
     let raw_events = note_events(notes);
-    let mut track = Vec::with_capacity(raw_events.len() + 1);
+    let mut track = Vec::with_capacity(raw_events.len() + 2);
+    if !name.is_empty() {
+        track.push(TrackEvent {
+            delta: u28::new(0),
+            kind: TrackEventKind::Meta(MetaMessage::TrackName(name.as_bytes())),
+        });
+    }
     let mut last_tick = 0_u32;
     for (tick, is_on, ch, note, vel) in raw_events {
         let delta = tick.saturating_sub(last_tick);
@@ -821,5 +933,95 @@ mod tests {
         let path = dir.path().join("nested").join("chords.mid");
         write_midi_file(&path, 92.0, 480, &tracks).expect("write");
         assert_eq!(std::fs::read(&path).expect("read"), bytes);
+
+        // Verify track name metadata is preserved in the SMF track
+        let has_track_name = smf.tracks[1].iter().any(|e| {
+            matches!(
+                e.kind,
+                TrackEventKind::Meta(MetaMessage::TrackName(b"Chords"))
+            )
+        });
+        assert!(has_track_name, "expected TrackName 'Chords' meta event");
+    }
+
+    #[test]
+    fn test_slash_chords_drive_bass_and_smooth_voice_leading() {
+        let prog: Vec<String> = ["C/E", "Fmaj7", "Am7/G", "G13"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let (chords, bass) =
+            solve_voice_leading(&prog, VoicingStyle::Close, GrooveStyle::Straight, 480, 4)
+                .expect("solved");
+
+        // Bass pitch classes must honor the written slash bass: E(4), F(5), G(7), G(7)
+        let bass_pcs: Vec<u8> = bass.iter().map(|n| n.midi_note % 12).collect();
+        assert_eq!(bass_pcs, vec![4, 5, 7, 7], "bass_notes={bass:?}");
+        // Bass walks smoothly (adjacent steps <= 5 semitones)
+        for w in bass.windows(2) {
+            assert!(
+                (i16::from(w[1].midi_note) - i16::from(w[0].midi_note)).abs() <= 5,
+                "large bass leap: {} -> {}",
+                w[0].midi_note,
+                w[1].midi_note
+            );
+        }
+        // Every chord voicing keeps distinct MIDI notes (no collapsed octave duplicates)
+        for tick in [0_u32, 1920, 3840, 5760] {
+            let mut notes: Vec<u8> = chords
+                .iter()
+                .filter(|n| n.start_tick == tick)
+                .map(|n| n.midi_note)
+                .collect();
+            let len = notes.len();
+            notes.sort_unstable();
+            notes.dedup();
+            assert_eq!(notes.len(), len, "duplicate voice at tick {tick}");
+        }
+    }
+
+    #[test]
+    fn test_export_abc_score_preserves_sharps_and_flats() {
+        let chords: Vec<String> = ["F#m9", "Bb13", "Cmaj9"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let abc = export_abc_score("Test", "C", 96, &chords);
+        assert!(abc.contains("\"F#m9\"^F4 ^F4"), "abc={abc}");
+        assert!(abc.contains("\"Bb13\"_B4 _B4"), "abc={abc}");
+        assert!(abc.contains("\"Cmaj9\"C4 C4"), "abc={abc}");
+    }
+
+    #[test]
+    fn test_drum_midi_trigger_rejects_cross_band_bleed() {
+        let sr = 48_000_u32;
+        let frames = sr as usize; // 1.0 s
+        let mut ch = vec![0.0_f64; frames];
+        // Pure 65 Hz kick drum hits at 0.25 s and 0.75 s (no snare or hi-hat content)
+        for &onset_s in &[0.25_f64, 0.75_f64] {
+            let onset = (onset_s * f64::from(sr)) as usize;
+            for k in 0..4800 {
+                if onset + k < frames {
+                    let t = (k as f64) / f64::from(sr);
+                    let env = (-t / 0.035).exp();
+                    ch[onset + k] += 0.85 * env * (2.0 * std::f64::consts::PI * 65.0 * t).sin();
+                }
+            }
+        }
+        let buf = AudioBuffer::from_channels(vec![ch], sr).unwrap();
+        let (kicks, snares, hats) = extract_drum_midi_triggers(&buf, 120.0, 480);
+        assert!(
+            kicks.len() >= 2,
+            "expected at least 2 kick hits, got {}",
+            kicks.len()
+        );
+        assert!(
+            snares.is_empty(),
+            "kick-only audio should not trigger spurious snares: {snares:?}"
+        );
+        assert!(
+            hats.is_empty(),
+            "kick-only audio should not trigger spurious hats: {hats:?}"
+        );
     }
 }
