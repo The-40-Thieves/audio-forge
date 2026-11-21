@@ -1,21 +1,30 @@
 //! Shared lock-free audio-to-GUI telemetry and dark-mode studio metering/spectrum canvas
 //! rendered across all 10 `forge-plug` VST3/CLAP editors.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use forge_dsp::read_shared_spectrum;
 use nih_plug_egui::egui;
 
-/// Lock-free 32-band telemetry, dynamic Gain-Reduction / Bode curve, and peak-hold state
-/// shared between the real-time audio thread and the 60 FPS `nih_plug_egui` studio GUI.
+/// Number of scrolling Gain-Reduction history points rendered across the studio canvas.
+pub const GR_HISTORY_LEN: usize = 64;
+
+/// Lock-free 32-band telemetry, dynamic Gain-Reduction / Bode curve, scrolling GR history ribbon,
+/// spectrum freeze, and peak-hold state shared between the real-time audio thread and the 60 FPS
+/// `nih_plug_egui` studio GUI.
 pub struct GuiTelemetry {
     pub spectrum_db: [AtomicU32; 32],
     pub band_gr_db: [AtomicU32; 32],
+    pub frozen_shared_db: [AtomicU32; 32],
+    pub gr_history_db: [AtomicU32; GR_HISTORY_LEN],
+    pub gr_history_head: AtomicUsize,
+    gr_history_decim: AtomicU32,
     pub peak_in_db: AtomicU32,
     pub peak_out_db: AtomicU32,
     pub peak_hold_out_db: AtomicU32,
     pub gr_db: AtomicU32,
     pub ab_slot: AtomicU32,
+    pub spectrum_frozen: AtomicBool,
 }
 
 impl Default for GuiTelemetry {
@@ -23,11 +32,16 @@ impl Default for GuiTelemetry {
         Self {
             spectrum_db: std::array::from_fn(|_| AtomicU32::new((-90.0_f32).to_bits())),
             band_gr_db: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
+            frozen_shared_db: std::array::from_fn(|_| AtomicU32::new((-90.0_f32).to_bits())),
+            gr_history_db: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
+            gr_history_head: AtomicUsize::new(0),
+            gr_history_decim: AtomicU32::new(0),
             peak_in_db: AtomicU32::new((-90.0_f32).to_bits()),
             peak_out_db: AtomicU32::new((-90.0_f32).to_bits()),
             peak_hold_out_db: AtomicU32::new((-90.0_f32).to_bits()),
             gr_db: AtomicU32::new(0.0_f32.to_bits()),
             ab_slot: AtomicU32::new(0),
+            spectrum_frozen: AtomicBool::new(false),
         }
     }
 }
@@ -38,6 +52,60 @@ impl GuiTelemetry {
     pub fn reset_peak_hold(&self) {
         self.peak_hold_out_db
             .store((-90.0_f32).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Toggles live spectrum, shared-bus ghost, and GR history freeze and returns the new state.
+    #[inline]
+    pub fn toggle_spectrum_freeze(&self, shared_slot: Option<usize>) -> bool {
+        let next = !self.spectrum_frozen.load(Ordering::Relaxed);
+        if next && let Some(slot) = shared_slot {
+            let snap = read_shared_spectrum(slot);
+            for (dst, &v) in self.frozen_shared_db.iter().zip(&snap) {
+                let clean = if v.is_finite() {
+                    v.clamp(-90.0, 6.0)
+                } else {
+                    -90.0
+                };
+                dst.store(clean.to_bits(), Ordering::Relaxed);
+            }
+        }
+        self.spectrum_frozen.store(next, Ordering::Release);
+        next
+    }
+
+    /// Appends one Gain-Reduction sample (in dB, `<= 0.0`) into the lock-free scrolling history ring.
+    ///
+    /// Writes the slot value *before* publishing the updated head index with `Release` ordering so
+    /// the GUI reader (`Acquire`) never observes an uninitialized/stale newest sample.
+    #[inline]
+    pub fn push_gr_history(&self, gr_db: f32) {
+        let clean = if gr_db.is_finite() {
+            gr_db.clamp(-36.0, 0.0)
+        } else {
+            0.0
+        };
+        let head = self.gr_history_head.load(Ordering::Relaxed);
+        let idx = head % GR_HISTORY_LEN;
+        self.gr_history_db[idx].store(clean.to_bits(), Ordering::Relaxed);
+        self.gr_history_head
+            .store(head.wrapping_add(1), Ordering::Release);
+    }
+
+    /// Reads the scrolling Gain-Reduction history ordered oldest -> newest.
+    #[inline]
+    pub fn read_gr_history_ordered(&self) -> [f32; GR_HISTORY_LEN] {
+        let head = self.gr_history_head.load(Ordering::Acquire) % GR_HISTORY_LEN;
+        let mut out = [0.0_f32; GR_HISTORY_LEN];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let src = (head + i) % GR_HISTORY_LEN;
+            let v = f32::from_bits(self.gr_history_db[src].load(Ordering::Relaxed));
+            *slot = if v.is_finite() {
+                v.clamp(-36.0, 0.0)
+            } else {
+                0.0
+            };
+        }
+        out
     }
 
     #[inline]
@@ -106,10 +174,21 @@ impl GuiTelemetry {
                 .store(pk_out.to_bits(), Ordering::Relaxed);
         }
         self.gr_db.store(gr.to_bits(), Ordering::Relaxed);
+        // Push one scrolling GR-history point roughly every ~20 ms (~46 Hz at 48 kHz),
+        // unless the user has frozen the spectrum & GR display.
+        if !self.spectrum_frozen.load(Ordering::Acquire) {
+            let decim = self.gr_history_decim.fetch_add(1, Ordering::Relaxed);
+            if decim & 1023 == 0 {
+                self.push_gr_history(gr.min(0.0));
+            }
+        }
     }
 
     #[inline]
     pub fn update_spectrum_and_gr(&self, spec_32: &[f32; 32], gr_32: &[f32; 32]) {
+        if self.spectrum_frozen.load(Ordering::Relaxed) {
+            return;
+        }
         for i in 0..32 {
             let s = if spec_32[i].is_finite() {
                 spec_32[i].clamp(-90.0, 6.0)
@@ -217,7 +296,7 @@ pub(crate) fn draw_forge_studio_header_and_spectrum(
         });
     });
 
-    // Visual I/O & Gain Reduction strip
+    // Visual I/O & Gain Reduction strip + Freeze control
     ui.horizontal(|ui| {
         let norm_in = ((pk_in + 60.0) / 60.0).clamp(0.0, 1.0);
         let norm_out = ((pk_out + 60.0) / 60.0).clamp(0.0, 1.0);
@@ -227,6 +306,27 @@ pub(crate) fn draw_forge_studio_header_and_spectrum(
         draw_compact_meter_bar(ui, "OUT", norm_out, meter_color_for_db(pk_out));
         ui.add_space(10.0);
         draw_compact_meter_bar(ui, "GR", norm_gr, egui::Color32::from_rgb(251, 146, 60));
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let frozen = telemetry.spectrum_frozen.load(Ordering::Acquire);
+            let freeze_color = if frozen {
+                egui::Color32::from_rgb(56, 189, 248)
+            } else {
+                egui::Color32::from_rgb(148, 163, 184)
+            };
+            if ui
+                .button(
+                    egui::RichText::new(if frozen { "FROZEN" } else { "FREEZE" })
+                        .monospace()
+                        .small()
+                        .color(freeze_color),
+                )
+                .on_hover_text("Freeze/unfreeze the live spectrum, shared-bus ghost & GR history")
+                .clicked()
+            {
+                telemetry.toggle_spectrum_freeze(shared_slot);
+            }
+        });
     });
     ui.add_space(4.0);
 
@@ -262,7 +362,16 @@ pub(crate) fn draw_forge_studio_header_and_spectrum(
         );
     }
 
-    let shared_vals = shared_slot.map(read_shared_spectrum);
+    let frozen = telemetry.spectrum_frozen.load(Ordering::Acquire);
+    let shared_vals = shared_slot.map(|slot| {
+        if frozen {
+            std::array::from_fn(|i| {
+                f32::from_bits(telemetry.frozen_shared_db[i].load(Ordering::Relaxed))
+            })
+        } else {
+            read_shared_spectrum(slot)
+        }
+    });
     let n_bars = 32_usize;
     let bar_w = (rect.width() - 16.0) / (n_bars as f32);
     let mut curve_pts = Vec::with_capacity(n_bars);
@@ -309,6 +418,25 @@ pub(crate) fn draw_forge_studio_header_and_spectrum(
         painter.add(egui::Shape::line(
             curve_pts,
             egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(251, 146, 60)),
+        ));
+    }
+
+    // Scrolling Gain-Reduction history ribbon (Pro-L 2 / soothe2 style) anchored from plot_top
+    let gr_hist = telemetry.read_gr_history_ordered();
+    if gr_hist.iter().any(|&v| v < -0.1) {
+        let step_x = (rect.width() - 16.0) / ((GR_HISTORY_LEN - 1) as f32);
+        let mut hist_pts = Vec::with_capacity(GR_HISTORY_LEN);
+        for (i, &gr_v) in gr_hist.iter().enumerate() {
+            let x = rect.left() + 8.0 + (i as f32) * step_x;
+            let drop_h = (gr_v.abs() / 18.0).clamp(0.0, 1.0) * (plot_h * 0.45);
+            hist_pts.push(egui::pos2(x, plot_top + drop_h));
+        }
+        painter.add(egui::Shape::line(
+            hist_pts,
+            egui::Stroke::new(
+                1.5_f32,
+                egui::Color32::from_rgba_unmultiplied(248, 113, 113, 195),
+            ),
         ));
     }
 
@@ -390,5 +518,53 @@ mod tests {
                 0.0
             );
         }
+    }
+
+    #[test]
+    fn gr_history_ring_orders_oldest_to_newest_and_sanitizes() {
+        let tel = GuiTelemetry::default();
+        for i in 0..(GR_HISTORY_LEN + 10) {
+            tel.push_gr_history(-(i as f32) * 0.25);
+        }
+        tel.push_gr_history(f32::NAN);
+        let hist = tel.read_gr_history_ordered();
+        assert_eq!(hist.len(), GR_HISTORY_LEN);
+        assert!(hist.iter().all(|v| v.is_finite() && *v <= 0.0));
+        // Most recent sample was NaN -> sanitized to 0.0
+        assert_eq!(hist[GR_HISTORY_LEN - 1], 0.0);
+        // Preceding sample was -(73 * 0.25) = -18.25 dB
+        assert!((hist[GR_HISTORY_LEN - 2] - (-18.25)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn spectrum_freeze_holds_spectrum_and_gr_history() {
+        let tel = GuiTelemetry::default();
+        let initial = [-24.0_f32; 32];
+        let initial_gr = [-3.0_f32; 32];
+        tel.update_spectrum_and_gr(&initial, &initial_gr);
+        tel.push_gr_history(-4.5);
+
+        assert!(tel.toggle_spectrum_freeze(None));
+        tel.update_spectrum_and_gr(&[-6.0_f32; 32], &[-12.0_f32; 32]);
+        for _ in 0..2048 {
+            tel.update_peaks(0.5, 0.5, 0.5, 0.5, -15.0);
+        }
+        // Frozen snapshot must remain untouched
+        assert_eq!(
+            f32::from_bits(tel.spectrum_db[0].load(Ordering::Relaxed)),
+            -24.0
+        );
+        assert_eq!(
+            f32::from_bits(tel.band_gr_db[0].load(Ordering::Relaxed)),
+            -3.0
+        );
+        assert_eq!(tel.read_gr_history_ordered()[GR_HISTORY_LEN - 1], -4.5);
+
+        assert!(!tel.toggle_spectrum_freeze(None));
+        tel.update_spectrum_and_gr(&[-6.0_f32; 32], &[-12.0_f32; 32]);
+        assert_eq!(
+            f32::from_bits(tel.spectrum_db[0].load(Ordering::Relaxed)),
+            -6.0
+        );
     }
 }
