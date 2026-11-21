@@ -1073,7 +1073,7 @@ pub struct MasteringLimiterConfig {
     pub channel_link: f64,
     /// Optional mastering dither / noise shaping applied after final true-peak limiting.
     pub dither: DitherMode,
-    /// Target integer bit depth for dithering (`16` or `24`, clamped to `8..=24`).
+    /// Target integer bit depth for dithering (`8..=24`, typically `16` or `24`).
     pub dither_bits: u16,
 }
 
@@ -1192,7 +1192,29 @@ pub fn normalize_and_limit_with_config(
             "ceiling_dbtp ({ceiling_dbtp}) must be between -24.0 and 0.0 dBTP"
         )));
     }
-    let clean_ceiling_dbtp = ceiling_dbtp;
+    if config.dither != DitherMode::None && !(8..=24).contains(&config.dither_bits) {
+        return Err(ForgeError::InvalidParameter(format!(
+            "dither_bits ({}) must be between 8 and 24",
+            config.dither_bits
+        )));
+    }
+    // Reserve headroom for TPDF / noise-shaped quantization error so dithering cannot push
+    // inter-sample true peaks above the requested `ceiling_dbtp`.
+    let dither_headroom_db = match config.dither {
+        DitherMode::None => 0.0,
+        DitherMode::Tpdf | DitherMode::NoiseShapedHighPass => {
+            let full_scale = (1_u64 << (config.dither_bits - 1)) as f64;
+            let margin_lsb = if config.dither == DitherMode::NoiseShapedHighPass {
+                6.0
+            } else {
+                2.5
+            };
+            let ceil_lin = 10.0_f64.powf(ceiling_dbtp / 20.0);
+            let safe_lin = (ceil_lin - margin_lsb / full_scale).max(ceil_lin * 0.5);
+            (ceiling_dbtp - 20.0 * safe_lin.log10()).max(0.0)
+        }
+    };
+    let clean_ceiling_dbtp = ceiling_dbtp - dither_headroom_db;
     let clean_link = sanitize_param_f64(config.channel_link, 1.0, 0.0, 1.0);
     let frames = buffer.num_frames();
     if frames == 0 {

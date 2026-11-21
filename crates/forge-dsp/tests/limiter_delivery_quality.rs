@@ -200,8 +200,8 @@ fn limiter_styles_all_obey_ceiling_and_differ_in_recovery() {
         let out = normalize_and_limit_with_config(&mix, &cfg).unwrap();
         let report = audit_audio(&out);
         assert!(
-            report.true_peak_dbtp <= -0.95,
-            "style {style:?} exceeded -1.0 dBTP ceiling: {:.3}",
+            report.true_peak_dbtp <= -1.0 + 1e-6,
+            "style {style:?} exceeded -1.0 dBTP ceiling: {:.4}",
             report.true_peak_dbtp
         );
         let rms =
@@ -213,6 +213,25 @@ fn limiter_styles_all_obey_ceiling_and_differ_in_recovery() {
     assert!(
         (aggressive_rms - dynamic_rms).abs() > 1e-4,
         "Aggressive and Dynamic limiter styles should produce distinct envelope dynamics"
+    );
+
+    // Dithered 16-bit mastering must still strictly obey the requested true-peak ceiling.
+    let dithered = normalize_and_limit_with_config(
+        &mix,
+        &MasteringLimiterConfig {
+            target_lufs: -10.0,
+            ceiling_dbtp: -1.0,
+            dither: forge_dsp::DitherMode::NoiseShapedHighPass,
+            dither_bits: 16,
+            ..MasteringLimiterConfig::default()
+        },
+    )
+    .unwrap();
+    let dithered_report = audit_audio(&dithered);
+    assert!(
+        dithered_report.true_peak_dbtp <= -1.0 + 1e-6,
+        "16-bit noise-shaped dithered master exceeded -1.0 dBTP ceiling: {:.4}",
+        dithered_report.true_peak_dbtp
     );
 }
 
