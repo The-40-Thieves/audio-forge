@@ -8,6 +8,10 @@ no-default-features = false
 
 [advisories]
 version = 2
+# Fail on security vulnerabilities across the full dependency graph; only fail on
+# unmaintained direct workspace dependencies (transitive GUI crates like egui -> ttf-parser
+# have no upstream fix yet and are reported by `cargo audit`).
+unmaintained = "workspace"
 ignore = [
     # Tracked in SECURITY.md: pulled in through nih_plug -> nih_log; no patched version exists.
     # Only affects Windows builds with a custom global allocator returning under-aligned memory,
