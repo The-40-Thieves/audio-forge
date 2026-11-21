@@ -178,3 +178,142 @@ fn deliver_hits_spotify_target_on_punchy_mix() {
         report.after.integrated_lufs
     );
 }
+
+#[test]
+fn limiter_styles_all_obey_ceiling_and_differ_in_recovery() {
+    use forge_dsp::{LimiterStyle, MasteringLimiterConfig, normalize_and_limit_with_config};
+
+    let mix = punchy_high_crest_mix(SR);
+    let mut rms_by_style = Vec::new();
+    for style in [
+        LimiterStyle::Transparent,
+        LimiterStyle::Punchy,
+        LimiterStyle::Dynamic,
+        LimiterStyle::Aggressive,
+    ] {
+        let cfg = MasteringLimiterConfig {
+            target_lufs: -10.0,
+            ceiling_dbtp: -1.0,
+            style,
+            ..MasteringLimiterConfig::default()
+        };
+        let out = normalize_and_limit_with_config(&mix, &cfg).unwrap();
+        let report = audit_audio(&out);
+        assert!(
+            report.true_peak_dbtp <= -0.95,
+            "style {style:?} exceeded -1.0 dBTP ceiling: {:.3}",
+            report.true_peak_dbtp
+        );
+        let rms =
+            (out.channels[0].iter().map(|s| s * s).sum::<f64>() / out.num_frames() as f64).sqrt();
+        rms_by_style.push((style, rms));
+    }
+    let dynamic_rms = rms_by_style[2].1;
+    let aggressive_rms = rms_by_style[3].1;
+    assert!(
+        (aggressive_rms - dynamic_rms).abs() > 1e-4,
+        "Aggressive and Dynamic limiter styles should produce distinct envelope dynamics"
+    );
+}
+
+#[test]
+fn unlinked_channel_limiter_preserves_quiet_channel_during_asymmetric_transient() {
+    use forge_dsp::{MasteringLimiterConfig, normalize_and_limit_with_config};
+
+    let frames = (SR as usize) * 2;
+    let mut left = vec![0.0; frames];
+    let mut right = vec![0.0; frames];
+    for i in 0..frames {
+        let t = (i as f64) / f64::from(SR);
+        let base = 0.25 * (2.0 * PI * 440.0 * t).sin();
+        left[i] = base;
+        right[i] = base;
+        // Inject a strong transient spike on Left ONLY at 0.5 s
+        if (24_000..24_120).contains(&i) {
+            left[i] += 1.8 * (2.0 * PI * 1000.0 * t).sin();
+        }
+    }
+    let buf = AudioBuffer::from_channels(vec![left, right], SR).unwrap();
+
+    let linked = normalize_and_limit_with_config(
+        &buf,
+        &MasteringLimiterConfig {
+            target_lufs: -14.0,
+            ceiling_dbtp: -1.0,
+            channel_link: 1.0,
+            ..MasteringLimiterConfig::default()
+        },
+    )
+    .unwrap();
+    let unlinked = normalize_and_limit_with_config(
+        &buf,
+        &MasteringLimiterConfig {
+            target_lufs: -14.0,
+            ceiling_dbtp: -1.0,
+            channel_link: 0.0,
+            ..MasteringLimiterConfig::default()
+        },
+    )
+    .unwrap();
+
+    let slice = 24_000..24_600;
+    let r_linked_rms = (linked.channels[1][slice.clone()]
+        .iter()
+        .map(|s| s * s)
+        .sum::<f64>()
+        / slice.len() as f64)
+        .sqrt();
+    let r_unlinked_rms = (unlinked.channels[1][slice.clone()]
+        .iter()
+        .map(|s| s * s)
+        .sum::<f64>()
+        / slice.len() as f64)
+        .sqrt();
+
+    assert!(
+        r_unlinked_rms > r_linked_rms * 1.15,
+        "unlinked limiter should avoid ducking the unaffected right channel: unlinked={r_unlinked_rms:.5}, linked={r_linked_rms:.5}"
+    );
+}
+
+#[test]
+fn noise_shaped_dither_lowers_midband_quantization_noise_floor_at_16bit() {
+    use forge_dsp::{DitherMode, apply_dither};
+    use rustfft::{FftPlanner, num_complex::Complex};
+
+    let n = 16_384_usize;
+    // Ultra-quiet -84 dBFS 1 kHz sine (around 2 LSB at 16-bit)
+    let amp = 10.0_f64.powf(-84.0 / 20.0);
+    let ch: Vec<f64> = (0..n)
+        .map(|i| amp * (2.0 * PI * 1000.0 * (i as f64) / f64::from(SR)).sin())
+        .collect();
+    let buf = AudioBuffer::from_channels(vec![ch.clone()], SR).unwrap();
+
+    let tpdf = apply_dither(&buf, 16, DitherMode::Tpdf).unwrap();
+    let shaped = apply_dither(&buf, 16, DitherMode::NoiseShapedHighPass).unwrap();
+
+    let midband_noise_power = |processed: &[f64]| -> f64 {
+        let mut planner = FftPlanner::<f64>::new();
+        let fft = planner.plan_fft_forward(n);
+        let mut spec: Vec<Complex<f64>> = processed
+            .iter()
+            .zip(&ch)
+            .map(|(&p, &orig)| Complex::new(p - orig, 0.0))
+            .collect();
+        fft.process(&mut spec);
+        let bin_hz = f64::from(SR) / (n as f64);
+        let b_lo = (500.0 / bin_hz).round() as usize;
+        let b_hi = (5000.0 / bin_hz).round() as usize;
+        spec[b_lo..=b_hi].iter().map(|c| c.norm_sqr()).sum::<f64>()
+    };
+
+    let p_tpdf = midband_noise_power(&tpdf.channels[0]);
+    let p_shaped = midband_noise_power(&shaped.channels[0]);
+    let improvement_db = 10.0 * (p_tpdf / p_shaped.max(1e-30)).log10();
+
+    assert!(
+        improvement_db > 6.0,
+        "2nd-order psychoacoustic noise shaping should reduce 0.5–5 kHz noise floor by > 6 dB over flat TPDF, got {improvement_db:.2} dB"
+    );
+    assert!(shaped.channels[0].iter().all(|s| s.is_finite()));
+}

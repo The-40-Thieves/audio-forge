@@ -1016,16 +1016,92 @@ const LIMITER_MAX_LUFS_ITERS: usize = 4;
 /// Stop iterating once measured post-limiter loudness is within this margin of `target_lufs`.
 const LIMITER_LUFS_CONVERGENCE_LU: f64 = 0.15;
 
+/// Mastering limiter release & lookahead topology (inspired by FabFilter Pro-L 2 / Ozone IRC).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum LimiterStyle {
+    /// Balanced transparent mastering (default; matches `normalize_and_limit`).
+    #[default]
+    Transparent,
+    /// Shorter lookahead and faster transient recovery for drums, hip-hop, and pop punch.
+    Punchy,
+    /// Longer lookahead and slower release preserving macro-dynamics for acoustic/jazz/orchestral.
+    Dynamic,
+    /// Tight lookahead and fast release for club/EDM loudness maximization.
+    Aggressive,
+}
+
+impl LimiterStyle {
+    const fn timing_params(self) -> (f64, f64, f64, f64) {
+        // (lookahead_ms, fast_release_ms, slow_attack_s, slow_release_s)
+        match self {
+            Self::Transparent => (
+                LIMITER_LOOKAHEAD_MS,
+                LIMITER_RELEASE_MS,
+                LIMITER_SLOW_ATTACK_SECS,
+                LIMITER_SLOW_RELEASE_SECS,
+            ),
+            Self::Punchy => (0.8, 22.0, 0.060, 0.140),
+            Self::Dynamic => (2.0, 65.0, 0.110, 0.320),
+            Self::Aggressive => (0.5, 14.0, 0.045, 0.090),
+        }
+    }
+}
+
+/// Mastering-grade output dithering and psychoacoustic noise shaping mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum DitherMode {
+    /// No dithering (keep full 64-bit floating-point precision).
+    #[default]
+    None,
+    /// Flat Triangular Probability Density Function (TPDF) dither at ±1 LSB.
+    Tpdf,
+    /// TPDF dither with 2nd-order psychoacoustic high-pass error-feedback noise shaping,
+    /// pushing quantization noise out of the 1–5 kHz ear-sensitive band toward Nyquist.
+    NoiseShapedHighPass,
+}
+
+/// Full configuration for [`normalize_and_limit_with_config`].
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct MasteringLimiterConfig {
+    /// Target Integrated Loudness in LUFS (`-40.0..=-4.0`).
+    pub target_lufs: f64,
+    /// Strict 4x oversampled True-Peak ceiling in dBTP (`-24.0..=0.0`).
+    pub ceiling_dbtp: f64,
+    /// Limiter lookahead and dual-stage release topology.
+    pub style: LimiterStyle,
+    /// Stereo channel linking (`0.0` = independent dual-mono, `1.0` = fully linked stereo).
+    pub channel_link: f64,
+    /// Optional mastering dither / noise shaping applied after final true-peak limiting.
+    pub dither: DitherMode,
+    /// Target integer bit depth for dithering (`16` or `24`, clamped to `8..=24`).
+    pub dither_bits: u16,
+}
+
+impl Default for MasteringLimiterConfig {
+    fn default() -> Self {
+        Self {
+            target_lufs: -14.0,
+            ceiling_dbtp: -1.0,
+            style: LimiterStyle::Transparent,
+            channel_link: 1.0,
+            dither: DitherMode::None,
+            dither_bits: 24,
+        }
+    }
+}
+
 /// Gain envelope for `peaks`: the minimum required gain over a window that reaches
 /// `lookahead + LIMITER_HOLD_FRAMES` frames ahead and `LIMITER_HOLD_FRAMES` behind, a
-/// program-dependent dual-stage release (fast `LIMITER_RELEASE_MS` for isolated transients,
-/// slow 250 ms for sustained limiting), then a drift-free `lookahead`-frame moving average.
-fn limiter_gain_envelope(
+/// program-dependent dual-stage release parameterized by `style`, then a drift-free
+/// `lookahead`-frame moving average.
+fn limiter_gain_envelope_styled(
     peaks: &[f64],
     ceiling_lin: f64,
     lookahead: usize,
     sample_rate: f64,
+    style: LimiterStyle,
 ) -> Vec<f64> {
+    let (_, fast_release_ms, slow_attack_s, slow_release_s) = style.timing_params();
     let required: Vec<f64> = peaks
         .iter()
         .map(|&p| {
@@ -1038,9 +1114,9 @@ fn limiter_gain_envelope(
         .collect();
     let ahead_min = forward_window_min(&required, lookahead + 2 * LIMITER_HOLD_FRAMES + 1);
 
-    let fast_release_coeff = (-1.0 / (sample_rate * LIMITER_RELEASE_MS / 1000.0)).exp();
-    let slow_attack_coeff = (-1.0 / (sample_rate * LIMITER_SLOW_ATTACK_SECS)).exp();
-    let slow_release_coeff = (-1.0 / (sample_rate * LIMITER_SLOW_RELEASE_SECS)).exp();
+    let fast_release_coeff = (-1.0 / (sample_rate * fast_release_ms / 1000.0)).exp();
+    let slow_attack_coeff = (-1.0 / (sample_rate * slow_attack_s)).exp();
+    let slow_release_coeff = (-1.0 / (sample_rate * slow_release_s)).exp();
 
     // Prime the fast release and the moving average as if the first window's gain had been
     // held for a full lookahead before the file starts, so an over in the first frames is fully
@@ -1087,6 +1163,25 @@ pub fn normalize_and_limit(
     target_lufs: f64,
     ceiling_dbtp: f64,
 ) -> Result<AudioBuffer> {
+    normalize_and_limit_with_config(
+        buffer,
+        &MasteringLimiterConfig {
+            target_lufs,
+            ceiling_dbtp,
+            ..MasteringLimiterConfig::default()
+        },
+    )
+}
+
+/// Masters an `AudioBuffer` with full control over limiter release topology ([`LimiterStyle`]),
+/// stereo channel linking (`0.0..=1.0`), and output dithering / psychoacoustic noise shaping
+/// ([`DitherMode`]).
+pub fn normalize_and_limit_with_config(
+    buffer: &AudioBuffer,
+    config: &MasteringLimiterConfig,
+) -> Result<AudioBuffer> {
+    let target_lufs = config.target_lufs;
+    let ceiling_dbtp = config.ceiling_dbtp;
     if !target_lufs.is_finite() || !(-40.0..=-4.0).contains(&target_lufs) {
         return Err(ForgeError::InvalidParameter(format!(
             "target_lufs ({target_lufs}) must be between -40.0 and -4.0 LUFS"
@@ -1098,6 +1193,7 @@ pub fn normalize_and_limit(
         )));
     }
     let clean_ceiling_dbtp = ceiling_dbtp;
+    let clean_link = sanitize_param_f64(config.channel_link, 1.0, 0.0, 1.0);
     let frames = buffer.num_frames();
     if frames == 0 {
         return Ok(buffer.clone());
@@ -1120,8 +1216,18 @@ pub fn normalize_and_limit(
 
     let ceiling_lin = 10.0_f64.powf((clean_ceiling_dbtp - 0.04) / 20.0);
     let sr = f64::from(buffer.sample_rate.max(1));
-    let lookahead = ((sr * LIMITER_LOOKAHEAD_MS / 1000.0).round() as usize).max(4);
+    let (lookahead_ms, _, _, _) = config.style.timing_params();
+    let lookahead = ((sr * lookahead_ms / 1000.0).round() as usize).max(4);
     let base_peaks = true_peak_per_frame(&sanitized_channels, frames);
+    let use_unlinked = sanitized_channels.len() > 1 && clean_link < 0.999;
+    let per_ch_peaks: Vec<Vec<f64>> = if use_unlinked {
+        sanitized_channels
+            .iter()
+            .map(|ch| true_peak_per_frame(std::slice::from_ref(ch), frames))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let mut out = AudioBuffer {
         channels: vec![vec![0.0_f64; frames]; sanitized_channels.len()],
@@ -1141,11 +1247,36 @@ pub fn normalize_and_limit(
         // True-peak FIR is linear, so scaling the signal by `makeup_gain` is equivalent to
         // comparing `base_peaks` against `ceiling_lin / makeup_gain`.
         let scaled_ceiling = ceiling_lin / makeup_gain;
-        let gain_env = limiter_gain_envelope(&base_peaks, scaled_ceiling, lookahead, sr);
+        let linked_env =
+            limiter_gain_envelope_styled(&base_peaks, scaled_ceiling, lookahead, sr, config.style);
 
-        for (dst_ch, src_ch) in out.channels.iter_mut().zip(&sanitized_channels) {
-            for ((dst, &src), &g) in dst_ch.iter_mut().zip(src_ch.iter()).zip(gain_env.iter()) {
-                *dst = src * makeup_gain * g;
+        if use_unlinked {
+            for (ch_idx, (dst_ch, src_ch)) in
+                out.channels.iter_mut().zip(&sanitized_channels).enumerate()
+            {
+                let ch_env = limiter_gain_envelope_styled(
+                    &per_ch_peaks[ch_idx],
+                    scaled_ceiling,
+                    lookahead,
+                    sr,
+                    config.style,
+                );
+                for (((dst, &src), &g_link), &g_ch) in dst_ch
+                    .iter_mut()
+                    .zip(src_ch.iter())
+                    .zip(linked_env.iter())
+                    .zip(ch_env.iter())
+                {
+                    let g = (clean_link * g_link + (1.0 - clean_link) * g_ch).min(g_ch);
+                    *dst = src * makeup_gain * g;
+                }
+            }
+        } else {
+            for (dst_ch, src_ch) in out.channels.iter_mut().zip(&sanitized_channels) {
+                for ((dst, &src), &g) in dst_ch.iter_mut().zip(src_ch.iter()).zip(linked_env.iter())
+                {
+                    *dst = src * makeup_gain * g;
+                }
             }
         }
 
@@ -1174,7 +1305,76 @@ pub fn normalize_and_limit(
 
     // Single final 4x true-peak safety trim after loudness convergence.
     apply_true_peak_trim(&mut out, clean_ceiling_dbtp);
+
+    if config.dither != DitherMode::None {
+        out = apply_dither(&out, config.dither_bits, config.dither)?;
+    }
+
     Ok(out)
+}
+
+/// Deterministic xorshift64* PRNG producing uniform `[-0.5, +0.5)` floats for audio dithering.
+#[inline]
+fn next_uniform_bipolar(state: &mut u64) -> f64 {
+    let mut x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    let bits = x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11;
+    (bits as f64) * (1.0 / ((1_u64 << 53) as f64)) - 0.5
+}
+
+/// Applies mastering-grade TPDF dithering and optional 2nd-order psychoacoustic high-pass
+/// noise shaping (`H(z) = -1.623 z^-1 + 0.692 z^-2`) quantized to `bit_depth` (`8..=24` bits).
+pub fn apply_dither(buffer: &AudioBuffer, bit_depth: u16, mode: DitherMode) -> Result<AudioBuffer> {
+    if !(8..=24).contains(&bit_depth) {
+        return Err(ForgeError::InvalidParameter(format!(
+            "dither bit_depth ({bit_depth}) must be between 8 and 24"
+        )));
+    }
+    if mode == DitherMode::None || buffer.num_frames() == 0 {
+        return Ok(buffer.clone());
+    }
+
+    let full_scale = (1_u64 << (bit_depth - 1)) as f64;
+    let inv_scale = 1.0 / full_scale;
+    let max_code = full_scale - 1.0;
+    let min_code = -full_scale;
+
+    let mut out_channels = Vec::with_capacity(buffer.channels.len());
+    for (ch_idx, ch) in buffer.channels.iter().enumerate() {
+        // Decorrelated per-channel deterministic seed so stereo dither noise is uncorrelated.
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15_u64
+            ^ ((ch_idx as u64)
+                .wrapping_add(1)
+                .wrapping_mul(0xBF58_476D_1CE4_E5B9));
+        let mut e1 = 0.0_f64;
+        let mut e2 = 0.0_f64;
+        let mut dst = Vec::with_capacity(ch.len());
+
+        for &raw in ch {
+            let x = sanitize_sample_f64(raw).clamp(-1.0, 1.0) * full_scale;
+            // Triangular PDF dither in [-1.0, +1.0) LSB
+            let tpdf = next_uniform_bipolar(&mut rng) + next_uniform_bipolar(&mut rng);
+            let shaped = match mode {
+                DitherMode::None => x,
+                DitherMode::Tpdf => x,
+                DitherMode::NoiseShapedHighPass => x + 1.623 * e1 - 0.692 * e2,
+            };
+            let q = (shaped + tpdf).round().clamp(min_code, max_code);
+            let err = flush_denormal_f64(shaped - q);
+            e2 = e1;
+            e1 = err;
+            dst.push(q * inv_scale);
+        }
+        out_channels.push(dst);
+    }
+
+    Ok(AudioBuffer {
+        channels: out_channels,
+        sample_rate: buffer.sample_rate,
+    })
 }
 
 /// Final safety trim if the 4x true peak still slightly exceeds `ceiling_dbtp`.
