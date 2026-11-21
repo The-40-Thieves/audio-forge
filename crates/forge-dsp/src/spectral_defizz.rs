@@ -388,9 +388,14 @@ pub fn apply_spectral_defizz(buffer: &AudioBuffer, config: &DeFizzConfig) -> Res
                 }
             }
         } else {
-            for b in 1..(HALF_BINS - 1) {
+            for (b, eg) in effective_gains
+                .iter_mut()
+                .enumerate()
+                .take(HALF_BINS - 1)
+                .skip(1)
+            {
                 let g = smooth_lobe_gain(&smoothed_gains, b);
-                effective_gains[b] = if config.delta_listen { 1.0 - g } else { g };
+                *eg = if config.delta_listen { 1.0 - g } else { g };
             }
 
             // Apply identical linked gains to every channel and overlap-add resynthesize
