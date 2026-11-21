@@ -91,10 +91,28 @@ class RunSeparateTests(TestCase):
             return {k: (Path(v).name if v else None) for k, v in result.items()}
 
     def test_missing_input_fails_fast_before_loading_models(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        constructed = False
+
+        class GuardSeparator(FakeSeparator):
+            def __init__(self, output_dir: str, output_format: str) -> None:
+                nonlocal constructed
+                constructed = True
+                super().__init__(output_dir, output_format)
+
+        modules = {
+            "audio_separator": fake_module("audio_separator"),
+            "audio_separator.separator": fake_module(
+                "audio_separator.separator", Separator=GuardSeparator
+            ),
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(sys.modules, modules),
+        ):
             out = Path(tmp)
             with self.assertRaises(FileNotFoundError):
                 worker.run_separate(out / "does_not_exist.wav", out, dereverb=False)
+        self.assertFalse(constructed)
 
     def test_vocal_named_input_returns_the_vocal_stem(self) -> None:
         result = self.run_separate("Lead_Vocal_mix.wav", dereverb=False)
@@ -138,7 +156,9 @@ class YueTimeoutTests(TestCase):
     def test_non_positive_timeout_is_rejected(self) -> None:
         for bad in (0.0, -5.0, float("nan"), float("inf")):
             with self.assertRaises(ValueError):
-                worker.run_yue2_remote("soul", "la", "full", 32, 1, "x/y", timeout_s=bad)
+                worker.run_yue2_remote(
+                    "soul", "la", "full", 32, 1, "x/y", timeout_s=bad
+                )
 
 
 if __name__ == "__main__":

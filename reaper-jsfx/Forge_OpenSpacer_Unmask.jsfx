@@ -12,9 +12,10 @@ slider3:1.0<0.1,2.0,0.05>Sidechain Sensitivity (Ch 3/4)
 srate_safe = max(srate, 44100);
 sc_env = 0.0;
 duck_gain = 1.0;
-env_a = exp(-1.0 / (srate_safe * 0.0021));
-att_a = exp(-1.0 / (srate_safe * 0.00013));
-rel_a = exp(-1.0 / (srate_safe * 0.0052));
+sr_env = max(srate, 1);
+env_a = exp(-1.0 / (sr_env * 0.0021));
+att_a = exp(-1.0 / (sr_env * 0.00013));
+rel_a = exp(-1.0 / (sr_env * 0.0052));
 ic1_m0 = 0; ic2_m0 = 0;
 ic1_m1 = 0; ic2_m1 = 0;
 ic1_sc = 0; ic2_sc = 0;

@@ -13,9 +13,10 @@ lo_l = 0; lo_r = 0;
 hi_l = 0; hi_r = 0;
 env_lo = 0; env_mid = 0; env_sib = 0;
 breath_g = 1.0;
-env_a = exp(-1.0 / (srate_safe * 0.0026));
-sib_env_a = exp(-1.0 / (srate_safe * 0.0014));
-breath_a = exp(-1.0 / (srate_safe * 0.0080));
+sr_env = max(srate, 1);
+env_a = exp(-1.0 / (sr_env * 0.0026));
+sib_env_a = exp(-1.0 / (sr_env * 0.0014));
+breath_a = exp(-1.0 / (sr_env * 0.0080));
 
 @slider
 alpha_plosive = 1.0 - exp(-2.0 * $pi * 110.0 / srate_safe);

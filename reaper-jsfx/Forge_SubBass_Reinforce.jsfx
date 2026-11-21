@@ -12,7 +12,8 @@ lp_l = 0; lp_r = 0;
 sub_osc = 1.0;
 prev_lo = 0.0;
 sub_lp = 0.0;
-smooth_a = exp(-1.0 / (srate_safe * 0.010));
+sr_env = max(srate, 1);
+smooth_a = exp(-1.0 / (sr_env * 0.010));
 cur_sub_mix = slider2;
 cur_drive = slider3;
 

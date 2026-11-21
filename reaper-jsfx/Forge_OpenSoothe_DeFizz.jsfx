@@ -19,13 +19,14 @@ env_ref = 0.0001;
 gain_fizz = 1.0;
 gain_sib = 1.0;
 
-// Sample-rate-independent envelope & attack/release coefficients
-ref_a = exp(-1.0 / (srate_safe * 0.026));
-band_a = exp(-1.0 / (srate_safe * 0.0026));
-att_f_a = exp(-1.0 / (srate_safe * 0.00013));
-rel_f_a = exp(-1.0 / (srate_safe * 0.0052));
-att_s_a = exp(-1.0 / (srate_safe * 0.000095));
-rel_s_a = exp(-1.0 / (srate_safe * 0.0042));
+// Sample-rate-independent envelope & attack/release coefficients (using actual positive srate)
+sr_env = max(srate, 1);
+ref_a = exp(-1.0 / (sr_env * 0.026));
+band_a = exp(-1.0 / (sr_env * 0.0026));
+att_f_a = exp(-1.0 / (sr_env * 0.00013));
+rel_f_a = exp(-1.0 / (sr_env * 0.0052));
+att_s_a = exp(-1.0 / (sr_env * 0.000095));
+rel_s_a = exp(-1.0 / (sr_env * 0.0042));
 
 // State variables for 2-pole SVF bandpass detectors
 ic1_f = 0; ic2_f = 0;
