@@ -170,19 +170,34 @@ impl RealtimeOpenSoothe {
 
     pub fn update_band_weights(&mut self, fizz_weight: f64, sibilance_weight: f64) {
         let bin_hz = self.sample_rate / (self.fft_size as f64);
+        let clean_fizz = sanitize_param_f64(fizz_weight, 1.25, 0.0, 2.0);
+        let clean_sib = sanitize_param_f64(sibilance_weight, 1.0, 0.0, 2.0);
+        let skirt_mask = |f: f64, lo: f64, hi: f64| -> f64 {
+            const SKIRT_OCT: f64 = 1.0 / 3.0;
+            if f <= 0.0 || lo >= hi {
+                return 0.0;
+            }
+            let lf = f.log2();
+            let llo = lo.log2();
+            let lhi = hi.log2();
+            if lf <= llo - SKIRT_OCT || lf >= lhi + SKIRT_OCT {
+                0.0
+            } else if lf < llo {
+                let t = (lf - (llo - SKIRT_OCT)) / SKIRT_OCT;
+                0.5 * (1.0 - (PI * t).cos())
+            } else if lf <= lhi {
+                1.0
+            } else {
+                let t = (lf - lhi) / SKIRT_OCT;
+                0.5 * (1.0 + (PI * t).cos())
+            }
+        };
         for (b, w_out) in self.band_weights.iter_mut().enumerate() {
             let f = (b as f64) * bin_hz;
-            let mut w = 0.0_f64;
-            if (1800.0..=6800.0).contains(&f) {
-                w = w.max(fizz_weight);
-            }
-            if (5500.0..=14500.0).contains(&f) {
-                w = w.max(sibilance_weight);
-            }
-            if (250.0..=500.0).contains(&f) {
-                w = w.max(0.35);
-            }
-            *w_out = w;
+            let w_mud = 0.35 * skirt_mask(f, 250.0, 500.0);
+            let w_fizz = clean_fizz * skirt_mask(f, 1800.0, 6800.0);
+            let w_sib = clean_sib * skirt_mask(f, 5500.0, 14500.0);
+            *w_out = w_mud.max(w_fizz).max(w_sib);
         }
     }
 
@@ -252,6 +267,9 @@ impl RealtimeOpenSoothe {
         let frame_start = self.ring_pos.wrapping_sub(self.fft_size);
         let inv_n = 1.0 / (self.fft_size as f64);
         let bin_hz = self.sample_rate / (self.fft_size as f64);
+        let hop_secs = (self.hop_size as f64) / self.sample_rate.max(1.0);
+        let attack_alpha = (-hop_secs / 0.010).exp();
+        let release_alpha = (-hop_secs / 0.055).exp();
         let mut band_pow = [0.0_f64; SPECTRUM_BANDS];
 
         let mut min_g_seen = 1.0_f64;
@@ -327,11 +345,12 @@ impl RealtimeOpenSoothe {
                     1.0
                 };
 
-                if target_gain < *smoothed_val {
-                    *smoothed_val = 0.35 * (*smoothed_val) + 0.65 * target_gain;
+                let alpha = if target_gain < *smoothed_val {
+                    attack_alpha
                 } else {
-                    *smoothed_val = 0.82 * (*smoothed_val) + 0.18 * target_gain;
-                }
+                    release_alpha
+                };
+                *smoothed_val = alpha * (*smoothed_val) + (1.0 - alpha) * target_gain;
             }
 
             for b in 1..(self.half_bins - 1) {
