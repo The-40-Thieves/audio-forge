@@ -17,8 +17,9 @@ use serde::{Deserialize, Serialize};
 const SCRIPT_REL: &str = "python-worker/forge_gpu_worker.py";
 /// Longest stderr excerpt carried into an error message.
 const STDERR_EXCERPT: usize = 600;
-/// Maximum allowed wall-clock timeout for a local GPU worker subprocess (1 hour).
-pub const MAX_WORKER_TIMEOUT: Duration = Duration::from_secs(3_600);
+/// Maximum allowed wall-clock timeout for a local GPU worker subprocess (24 hours,
+/// accommodating long multi-track separation jobs while preventing `Instant` overflow).
+pub const MAX_WORKER_TIMEOUT: Duration = Duration::from_secs(86_400);
 
 /// The program and leading arguments that launch the local GPU worker. The task arguments
 /// (`separate --input ... --output-dir ...`) are appended to `args`.
@@ -349,38 +350,49 @@ fn kill_tree(child: &mut Child) {
 mod client_tests {
     use super::*;
 
-    fn mock_worker_echo(stdout_lines: &[&str], exit_code: i32) -> LocalWorkerCommand {
+    fn mock_worker_echo(
+        stdout_lines: &[&str],
+        exit_code: i32,
+    ) -> (tempfile::TempDir, LocalWorkerCommand) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out_file = dir.path().join("stdout.txt");
+        let mut content = stdout_lines.join("\n");
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        std::fs::write(&out_file, content).expect("write mock stdout");
         #[cfg(unix)]
-        {
-            let mut script = String::new();
-            for line in stdout_lines {
-                let escaped = line.replace('\'', "'\\''");
-                script.push_str(&format!("printf '%s\\n' '{escaped}'; "));
-            }
-            script.push_str(&format!("exit {exit_code}; #"));
-            LocalWorkerCommand {
-                program: "sh".into(),
-                args: vec!["-c".into(), script.into(), "mock-worker".into()],
-            }
-        }
+        let cmd = LocalWorkerCommand {
+            program: "sh".into(),
+            args: vec![
+                "-c".into(),
+                format!("cat \"$1\"; exit {exit_code}").into(),
+                "mock-worker".into(),
+                out_file.into_os_string(),
+            ],
+        };
         #[cfg(windows)]
-        {
-            let mut script = String::new();
-            for line in stdout_lines {
-                let escaped = line.replace('\'', "''");
-                script.push_str(&format!("Write-Output '{escaped}'; "));
-            }
-            script.push_str(&format!("exit {exit_code}; #"));
+        let cmd = {
+            let bat = dir.path().join("mock.cmd");
+            std::fs::write(
+                &bat,
+                format!(
+                    "@echo off\r\ntype \"{}\"\r\nexit /b {exit_code}\r\n",
+                    out_file.display()
+                ),
+            )
+            .expect("write mock.cmd");
             LocalWorkerCommand {
-                program: "powershell".into(),
-                args: vec!["-NoProfile".into(), "-Command".into(), script.into()],
+                program: "cmd".into(),
+                args: vec!["/C".into(), bat.into_os_string()],
             }
-        }
+        };
+        (dir, cmd)
     }
 
     #[test]
     fn denoise_client_parses_json_after_log_lines() {
-        let worker = mock_worker_echo(
+        let (_dir, worker) = mock_worker_echo(
             &[
                 "Loading DeepFilterNet3...",
                 r#"{"denoised":"/tmp/out/vocals_denoised.wav","backend":"deepfilternet3"}"#,
@@ -402,7 +414,7 @@ mod client_tests {
 
     #[test]
     fn denoise_client_rejects_invalid_attenuation_and_timeout() {
-        let worker = mock_worker_echo(&[], 0);
+        let (_dir, worker) = mock_worker_echo(&[], 0);
         for bad in [-1.0, 101.0, f64::NAN, f64::INFINITY] {
             let err = run_local_neural_denoise(
                 &worker,
@@ -431,7 +443,7 @@ mod client_tests {
 
     #[test]
     fn denoise_client_reports_nonzero_exit_and_malformed_json() {
-        let fail_worker = mock_worker_echo(&["boom"], 2);
+        let (_dir1, fail_worker) = mock_worker_echo(&["boom"], 2);
         assert!(
             run_local_neural_denoise(
                 &fail_worker,
@@ -444,7 +456,7 @@ mod client_tests {
             .is_err()
         );
 
-        let bad_json_worker = mock_worker_echo(&["not-json"], 0);
+        let (_dir2, bad_json_worker) = mock_worker_echo(&["not-json"], 0);
         let err = run_local_neural_denoise(
             &bad_json_worker,
             Path::new("in.wav"),
@@ -459,7 +471,7 @@ mod client_tests {
 
     #[test]
     fn transcribe_client_parses_json_and_handles_failures() {
-        let worker = mock_worker_echo(
+        let (_dir1, worker) = mock_worker_echo(
             &[
                 "Running basic-pitch...",
                 r#"{"midi":"/tmp/out/piano_basic_pitch.mid"}"#,
@@ -475,7 +487,7 @@ mod client_tests {
         .expect("transcribe json");
         assert_eq!(res.midi, PathBuf::from("/tmp/out/piano_basic_pitch.mid"));
 
-        let bad_worker = mock_worker_echo(&["not-json"], 0);
+        let (_dir2, bad_worker) = mock_worker_echo(&["not-json"], 0);
         assert!(
             run_local_transcribe_midi(
                 &bad_worker,

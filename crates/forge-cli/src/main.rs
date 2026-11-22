@@ -274,7 +274,7 @@ enum Commands {
         /// Output directory for denoised audio
         #[arg(short, long)]
         output_dir: PathBuf,
-        /// Backend (`auto`, `deepfilternet3`, or `roformer`)
+        /// Backend (`auto`, `deepfilternet` / `deepfilternet3`, or `mel-band-roformer` / `roformer`)
         #[arg(long, default_value = "auto")]
         backend: String,
         /// Optional attenuation limit in dB (0..=100, DeepFilterNet3)
@@ -899,12 +899,20 @@ async fn main() -> anyhow::Result<()> {
             attenuation_limit_db,
             timeout_secs,
         } => {
+            let worker_backend = match backend.trim().to_ascii_lowercase().as_str() {
+                "auto" => "auto",
+                "deepfilternet" | "deepfilternet3" => "deepfilternet",
+                "mel-band-roformer" | "roformer" => "mel-band-roformer",
+                other => anyhow::bail!(
+                    "unknown --backend '{other}' (expected auto, deepfilternet, or mel-band-roformer)"
+                ),
+            };
             let worker = resolve_default_local_worker()?;
             let res = run_local_neural_denoise(
                 &worker,
                 &input,
                 &output_dir,
-                &backend,
+                worker_backend,
                 attenuation_limit_db,
                 std::time::Duration::from_secs(timeout_secs),
             )?;
