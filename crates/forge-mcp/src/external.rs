@@ -89,15 +89,19 @@ fn tag_into(
     }
     let out = sandbox.check(out)?;
     let stage = tempfile::tempdir()?;
-    let staged_in = stage_in(sandbox, tmp, stage.path())?;
+    let stage_in_dir = stage.path().join("in");
+    let stage_out_dir = stage.path().join("out");
+    std::fs::create_dir_all(&stage_in_dir)?;
+    std::fs::create_dir_all(&stage_out_dir)?;
+    let staged_in = stage_in(sandbox, tmp, &stage_in_dir)?;
     let out_ext = out
         .extension()
         .and_then(|e| e.to_str())
         .filter(|e| !e.is_empty())
         .unwrap_or("wav");
-    let staged_out = stage.path().join(format!("tagged_output.{out_ext}"));
+    let staged_out = stage_out_dir.join(format!("tagged_output.{out_ext}"));
     write_distrokid_metadata(&staged_in, &staged_out, meta)?;
-    commit_staged(sandbox, stage.path(), &staged_out, &out)
+    commit_staged(sandbox, &stage_out_dir, &staged_out, &out)
 }
 
 /// Separates `input` into a private staging directory on the backend `config` selects, then
@@ -114,9 +118,11 @@ pub fn separate_stems_checked(
     sandbox.verify_dir(&stems_dir)?;
 
     let stage = tempfile::tempdir()?;
-    let staged_in = stage_in(sandbox, input, stage.path())?;
-    let staged_out = stage.path().join("stems");
+    let stage_in_dir = stage.path().join("in");
+    let staged_out = stage.path().join("out");
+    std::fs::create_dir_all(&stage_in_dir)?;
     std::fs::create_dir_all(&staged_out)?;
+    let staged_in = stage_in(sandbox, input, &stage_in_dir)?;
 
     let mut report = separate_stems(&staged_in, &staged_out, config)?;
     commit_bundle(sandbox, &staged_out, &stems_dir, &mut report.bundle)?;
