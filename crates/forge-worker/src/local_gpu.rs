@@ -11,11 +11,15 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use forge_core::{ForgeError, Result, StemBundle};
+use serde::{Deserialize, Serialize};
 
 /// Location of the worker script inside the repository.
 const SCRIPT_REL: &str = "python-worker/forge_gpu_worker.py";
 /// Longest stderr excerpt carried into an error message.
 const STDERR_EXCERPT: usize = 600;
+/// Maximum allowed wall-clock timeout for a local GPU worker subprocess (24 hours,
+/// accommodating long multi-track separation jobs while preventing `Instant` overflow).
+pub const MAX_WORKER_TIMEOUT: Duration = Duration::from_secs(86_400);
 
 /// The program and leading arguments that launch the local GPU worker. The task arguments
 /// (`separate --input ... --output-dir ...`) are appended to `args`.
@@ -97,6 +101,115 @@ pub(crate) fn separate(
     })
 }
 
+/// Output of `forge_gpu_worker.py denoise`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NeuralDenoiseResult {
+    pub denoised: PathBuf,
+    pub backend: String,
+}
+
+/// Output of `forge_gpu_worker.py transcribe`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MidiTranscribeResult {
+    pub midi: PathBuf,
+}
+
+/// Resolves the default local GPU worker command from `FORGE_GPU_WORKER_SCRIPT` or
+/// `BUILD_SOURCE_ROOT`.
+pub fn resolve_default_local_worker() -> Result<LocalWorkerCommand> {
+    let override_path = std::env::var_os("FORGE_GPU_WORKER_SCRIPT").map(PathBuf::from);
+    let script = resolve_worker_script(override_path, Some(Path::new(BUILD_SOURCE_ROOT)))
+        .ok_or_else(|| {
+            ForgeError::WorkerError(
+                "Could not locate python-worker/forge_gpu_worker.py; set FORGE_GPU_WORKER_SCRIPT"
+                    .to_string(),
+            )
+        })?;
+    Ok(LocalWorkerCommand::uv(&script))
+}
+
+/// Runs neural denoising (`DeepFilterNet3` / `Mel-Band-RoFormer`) via the local Python GPU worker.
+pub fn run_local_neural_denoise(
+    worker: &LocalWorkerCommand,
+    input_path: &Path,
+    output_dir: &Path,
+    backend: &str,
+    attenuation_limit_db: Option<f64>,
+    timeout: Duration,
+) -> Result<NeuralDenoiseResult> {
+    let mut cmd = Command::new(&worker.program);
+    cmd.args(&worker.args)
+        .arg("denoise")
+        .arg("--input")
+        .arg(input_path)
+        .arg("--output-dir")
+        .arg(output_dir)
+        .arg("--backend")
+        .arg(backend);
+    if let Some(lim) = attenuation_limit_db {
+        if !lim.is_finite() || !(0.0..=100.0).contains(&lim) {
+            return Err(ForgeError::InvalidParameter(format!(
+                "attenuation_limit_db ({lim}) must be finite and in 0..=100"
+            )));
+        }
+        cmd.arg("--attenuation-limit-db").arg(format!("{lim}"));
+    }
+    let out = run_with_timeout(cmd, timeout)?;
+    if !out.status.success() {
+        return Err(ForgeError::WorkerError(format!(
+            "GPU worker denoise exited with {}: {}",
+            out.status,
+            stderr_excerpt(&out.stderr)
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let last_line = stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    serde_json::from_str(last_line).map_err(|e| {
+        ForgeError::WorkerError(format!(
+            "GPU worker printed no denoise JSON ({e}): {last_line}"
+        ))
+    })
+}
+
+/// Runs polyphonic audio-to-MIDI transcription (`basic-pitch`) via the local Python GPU worker.
+pub fn run_local_transcribe_midi(
+    worker: &LocalWorkerCommand,
+    input_path: &Path,
+    output_dir: &Path,
+    timeout: Duration,
+) -> Result<MidiTranscribeResult> {
+    let mut cmd = Command::new(&worker.program);
+    cmd.args(&worker.args)
+        .arg("transcribe")
+        .arg("--input")
+        .arg(input_path)
+        .arg("--output-dir")
+        .arg(output_dir);
+    let out = run_with_timeout(cmd, timeout)?;
+    if !out.status.success() {
+        return Err(ForgeError::WorkerError(format!(
+            "GPU worker transcribe exited with {}: {}",
+            out.status,
+            stderr_excerpt(&out.stderr)
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let last_line = stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    serde_json::from_str(last_line).map_err(|e| {
+        ForgeError::WorkerError(format!(
+            "GPU worker printed no transcribe JSON ({e}): {last_line}"
+        ))
+    })
+}
+
 /// Exit status and captured output of a finished worker process.
 pub(crate) struct WorkerOutput {
     pub status: ExitStatus,
@@ -108,6 +221,16 @@ pub(crate) struct WorkerOutput {
 /// timeout the process tree is killed and the reader threads are abandoned (a surviving
 /// grandchild may hold the pipes open after the worker itself exits).
 pub(crate) fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<WorkerOutput> {
+    if timeout.is_zero() || timeout > MAX_WORKER_TIMEOUT {
+        return Err(ForgeError::InvalidParameter(format!(
+            "worker timeout ({:.3} s) must be > 0 and <= {} s",
+            timeout.as_secs_f64(),
+            MAX_WORKER_TIMEOUT.as_secs()
+        )));
+    }
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        ForgeError::InvalidParameter("worker timeout overflows Instant".to_string())
+    })?;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -118,7 +241,6 @@ pub(crate) fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<Wo
     })?;
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
-    let deadline = Instant::now() + timeout;
     let timed_out = |child: &mut Child| {
         kill_tree(child);
         ForgeError::WorkerError(format!(
@@ -222,6 +344,170 @@ fn kill_tree(child: &mut Child) {
 fn kill_tree(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(test)]
+mod client_tests {
+    use super::*;
+
+    fn mock_worker_echo(
+        stdout_lines: &[&str],
+        exit_code: i32,
+    ) -> (tempfile::TempDir, LocalWorkerCommand) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out_file = dir.path().join("stdout.txt");
+        let mut content = stdout_lines.join("\n");
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        std::fs::write(&out_file, content).expect("write mock stdout");
+        #[cfg(unix)]
+        let cmd = LocalWorkerCommand {
+            program: "sh".into(),
+            args: vec![
+                "-c".into(),
+                format!("cat \"$1\"; exit {exit_code}").into(),
+                "mock-worker".into(),
+                out_file.into_os_string(),
+            ],
+        };
+        #[cfg(windows)]
+        let cmd = {
+            let bat = dir.path().join("mock.cmd");
+            std::fs::write(
+                &bat,
+                format!(
+                    "@echo off\r\ntype \"{}\"\r\nexit /b {exit_code}\r\n",
+                    out_file.display()
+                ),
+            )
+            .expect("write mock.cmd");
+            LocalWorkerCommand {
+                program: "cmd".into(),
+                args: vec!["/C".into(), bat.into_os_string()],
+            }
+        };
+        (dir, cmd)
+    }
+
+    #[test]
+    fn denoise_client_parses_json_after_log_lines() {
+        let (_dir, worker) = mock_worker_echo(
+            &[
+                "Loading DeepFilterNet3...",
+                r#"{"denoised":"/tmp/out/vocals_denoised.wav","backend":"deepfilternet3"}"#,
+            ],
+            0,
+        );
+        let res = run_local_neural_denoise(
+            &worker,
+            Path::new("vocals.wav"),
+            Path::new("/tmp/out"),
+            "auto",
+            Some(18.0),
+            Duration::from_secs(10),
+        )
+        .expect("denoise json");
+        assert_eq!(res.backend, "deepfilternet3");
+        assert_eq!(res.denoised, PathBuf::from("/tmp/out/vocals_denoised.wav"));
+    }
+
+    #[test]
+    fn denoise_client_rejects_invalid_attenuation_and_timeout() {
+        let (_dir, worker) = mock_worker_echo(&[], 0);
+        for bad in [-1.0, 101.0, f64::NAN, f64::INFINITY] {
+            let err = run_local_neural_denoise(
+                &worker,
+                Path::new("in.wav"),
+                Path::new("out"),
+                "auto",
+                Some(bad),
+                Duration::from_secs(10),
+            )
+            .expect_err("invalid attenuation");
+            assert!(err.to_string().contains("attenuation_limit_db"), "{err}");
+        }
+        for bad_timeout in [Duration::ZERO, Duration::MAX] {
+            let err = run_local_neural_denoise(
+                &worker,
+                Path::new("in.wav"),
+                Path::new("out"),
+                "auto",
+                None,
+                bad_timeout,
+            )
+            .expect_err("invalid timeout");
+            assert!(err.to_string().contains("timeout"), "{err}");
+        }
+    }
+
+    #[test]
+    fn denoise_client_reports_nonzero_exit_and_malformed_json() {
+        let (_dir1, fail_worker) = mock_worker_echo(&["boom"], 2);
+        assert!(
+            run_local_neural_denoise(
+                &fail_worker,
+                Path::new("in.wav"),
+                Path::new("out"),
+                "auto",
+                None,
+                Duration::from_secs(10),
+            )
+            .is_err()
+        );
+
+        let (_dir2, bad_json_worker) = mock_worker_echo(&["not-json"], 0);
+        let err = run_local_neural_denoise(
+            &bad_json_worker,
+            Path::new("in.wav"),
+            Path::new("out"),
+            "auto",
+            None,
+            Duration::from_secs(10),
+        )
+        .expect_err("malformed json");
+        assert!(err.to_string().contains("denoise JSON"), "{err}");
+    }
+
+    #[test]
+    fn transcribe_client_parses_json_and_handles_failures() {
+        let (_dir1, worker) = mock_worker_echo(
+            &[
+                "Running basic-pitch...",
+                r#"{"midi":"/tmp/out/piano_basic_pitch.mid"}"#,
+            ],
+            0,
+        );
+        let res = run_local_transcribe_midi(
+            &worker,
+            Path::new("piano.wav"),
+            Path::new("/tmp/out"),
+            Duration::from_secs(10),
+        )
+        .expect("transcribe json");
+        assert_eq!(res.midi, PathBuf::from("/tmp/out/piano_basic_pitch.mid"));
+
+        let (_dir2, bad_worker) = mock_worker_echo(&["not-json"], 0);
+        assert!(
+            run_local_transcribe_midi(
+                &bad_worker,
+                Path::new("piano.wav"),
+                Path::new("/tmp/out"),
+                Duration::from_secs(10),
+            )
+            .is_err()
+        );
+
+        assert!(
+            run_local_transcribe_midi(
+                &worker,
+                Path::new("piano.wav"),
+                Path::new("/tmp/out"),
+                Duration::MAX,
+            )
+            .is_err()
+        );
+    }
 }
 
 #[cfg(all(test, unix))]

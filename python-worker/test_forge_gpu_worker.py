@@ -264,5 +264,69 @@ class RunDenoiseTests(TestCase):
             self.assertTrue(Path(res["denoised"]).is_file())
 
 
+class SixStemAndTranscribeTests(TestCase):
+    def test_six_stem_separation_populates_all_six_slots(self) -> None:
+        class SixStemSeparator(FakeSeparator):
+            def separate(self, audio_file: str) -> list[str]:
+                base = Path(audio_file).stem
+                stems = ("Vocals", "Drums", "Bass", "Guitar", "Piano", "Other")
+                names = [f"{base}_({stem})_{self.model}.wav" for stem in stems]
+                for name in names:
+                    (self.output_dir / name).write_bytes(b"RIFF")
+                return names
+
+        modules = {
+            "audio_separator": fake_module("audio_separator"),
+            "audio_separator.separator": fake_module(
+                "audio_separator.separator", Separator=SixStemSeparator
+            ),
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(sys.modules, modules),
+        ):
+            out = Path(tmp)
+            inp = out / "full_mix.wav"
+            inp.write_bytes(b"RIFF")
+            res = worker.run_separate(inp, out, dereverb=False, stems=6)
+            expected = {
+                "vocals": "full_mix_(Vocals)_htdemucs_6s.wav",
+                "drums": "full_mix_(Drums)_htdemucs_6s.wav",
+                "bass": "full_mix_(Bass)_htdemucs_6s.wav",
+                "guitar": "full_mix_(Guitar)_htdemucs_6s.wav",
+                "keys": "full_mix_(Piano)_htdemucs_6s.wav",
+                "other": "full_mix_(Other)_htdemucs_6s.wav",
+            }
+            for key, filename in expected.items():
+                self.assertIsNotNone(res[key], f"missing 6-stem slot: {key}")
+                self.assertEqual(Path(res[key]).name, filename)
+                self.assertTrue(Path(res[key]).is_file())
+
+    def test_transcribe_writes_midi_file(self) -> None:
+        class FakeMidi:
+            def write(self, path: str) -> None:
+                Path(path).write_bytes(b"MThd")
+
+        def fake_predict(_audio: str) -> tuple[object, FakeMidi, list[object]]:
+            return (None, FakeMidi(), [])
+
+        modules = {
+            "basic_pitch": fake_module("basic_pitch"),
+            "basic_pitch.inference": fake_module(
+                "basic_pitch.inference", predict=fake_predict
+            ),
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(sys.modules, modules),
+        ):
+            out = Path(tmp)
+            inp = out / "piano_solo.wav"
+            inp.write_bytes(b"RIFF")
+            res = worker.run_transcribe(inp, out)
+            self.assertEqual(Path(res["midi"]).name, "piano_solo_basic_pitch.mid")
+            self.assertTrue(Path(res["midi"]).is_file())
+
+
 if __name__ == "__main__":
     main()
