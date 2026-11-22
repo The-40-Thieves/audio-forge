@@ -191,13 +191,24 @@ fn nam_json_size_limit_enforces_exact_boundary_and_preserves_existing_model() {
     assert!(NamWaveNetProfile::parse_nam_taps(&over).is_err());
 
     // A rejected load on RealtimeNeuralPreamp leaves the previously loaded model intact.
+    let valid_nam = r#"{"architecture":"WaveNet","weights":[0.8,0.2,0.1,0.05,0.02]}"#;
     let mut preamp = RealtimeNeuralPreamp::new(AnalogHardwareModel::Neve1073ClassA);
+    let mut reference = RealtimeNeuralPreamp::new(AnalogHardwareModel::Neve1073ClassA);
     preamp
-        .load_nam_json(r#"{"architecture":"WaveNet","weights":[0.8,0.2,0.1,0.05,0.02]}"#)
+        .load_nam_json(valid_nam)
         .expect("initial valid NAM load");
-    let (before_l, before_r) = preamp.process_stereo_sample(0.25, -0.25, 3.0, 0.0);
+    reference
+        .load_nam_json(valid_nam)
+        .expect("reference NAM load");
     assert!(preamp.load_nam_json(&over).is_err());
     let (after_l, after_r) = preamp.process_stereo_sample(0.25, -0.25, 3.0, 0.0);
-    assert!(before_l.is_finite() && before_r.is_finite());
-    assert!(after_l.is_finite() && after_r.is_finite());
+    let (ref_l, ref_r) = reference.process_stereo_sample(0.25, -0.25, 3.0, 0.0);
+    assert_eq!(
+        after_l, ref_l,
+        "rejected load altered loaded NAM model on L"
+    );
+    assert_eq!(
+        after_r, ref_r,
+        "rejected load altered loaded NAM model on R"
+    );
 }

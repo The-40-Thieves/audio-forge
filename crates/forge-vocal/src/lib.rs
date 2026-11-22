@@ -525,30 +525,32 @@ pub fn shift_vocal_pitch_formant_preserved(
         }
     };
 
-    // Pitch-adaptive grain window lengths (in samples):
+    // Choose a single constant pitch-adaptive grain length from the shared curve's dominant
+    // shift so stereo channels stay phase-locked and crossing ±4 st never bends pitch:
     // - 22 ms for large upward shifts (> +4 st) to suppress comb-filtering,
     // - 38 ms for large downward shifts (< -4 st) to preserve low-fundamental smoothness,
     // - 32 ms nominal grain for standard tuning.
-    // Smoothly adapted per sample from the instantaneous pitch shift so opposite shifts
-    // (+12 / -12 st) never cancel, and read with a centered window (`+0.5 * grain_f`) so
-    // all harmony layers share zero-latency time alignment regardless of grain size.
-    let grain_up_f = (sr * 0.022).round().max(256.0);
-    let grain_nom_f = (sr * 0.032).round().max(256.0);
-    let grain_down_f = (sr * 0.038).round().max(256.0);
-    let grain_alpha = (-1.0 / (0.050 * sr)).exp();
+    // Centered reading (`+0.5 * grain_f`) with zero-padded out-of-bounds reads keeps all
+    // harmony layers zero-latency time-aligned without holding the tail sample.
+    let dominant_shift = semitone_curve
+        .iter()
+        .map(|&(_, s)| forge_dsp::sanitize_param_f64(s, 0.0, -24.0, 24.0))
+        .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+        .unwrap_or(0.0);
+    let grain_secs = if dominant_shift > 4.0 {
+        0.022
+    } else if dominant_shift < -4.0 {
+        0.038
+    } else {
+        0.032
+    };
+    let grain_f = (sr * grain_secs).round().max(256.0);
+    let half_grain = 0.5 * grain_f;
 
     for ch in &buffer.channels {
         let mut out_ch = vec![0.0_f64; frames];
         let mut phase_a = 0.0_f64;
         let mut sibilant_env = 0.0_f64;
-        let initial_semi = forge_dsp::sanitize_param_f64(interp_shift(0.0), 0.0, -24.0, 24.0);
-        let mut grain_f = if initial_semi > 4.0 {
-            grain_up_f
-        } else if initial_semi < -4.0 {
-            grain_down_f
-        } else {
-            grain_nom_f
-        };
         let orig_lpc_tilt = estimate_lpc_formant_tilt_db(ch);
 
         for (i, sample_out) in out_ch.iter_mut().enumerate() {
@@ -561,37 +563,36 @@ pub fn shift_vocal_pitch_formant_preserved(
             let raw_semi = forge_dsp::sanitize_param_f64(interp_shift(t), 0.0, -24.0, 24.0);
             // Attenuate pitch shift smoothly toward 0.0 semitones during unvoiced sibilants
             let semi = raw_semi * (1.0 - sibilant_env * 0.85);
-            let target_grain = if semi > 4.0 {
-                grain_up_f
-            } else if semi < -4.0 {
-                grain_down_f
-            } else {
-                grain_nom_f
-            };
-            grain_f = grain_f * grain_alpha + target_grain * (1.0 - grain_alpha);
-
             let pitch_ratio = 2.0_f64.powf(semi / 12.0);
             let rate_delta = 1.0 - pitch_ratio;
 
             phase_a = (phase_a + rate_delta).rem_euclid(grain_f);
-            let phase_b = (phase_a + grain_f * 0.5).rem_euclid(grain_f);
+            let phase_b = (phase_a + half_grain).rem_euclid(grain_f);
 
             // Complementary Hann crossfade weights (`w_a + w_b == 1.0`)
             let w_a = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * phase_a / grain_f).cos());
             let w_b = 1.0 - w_a;
 
-            // 4-point Catmull-Rom cubic interpolation centered at `i` (zero latency across
-            // all grain sizes so multi-voice harmony layers stay phase-aligned in time).
-            let half_grain = 0.5 * grain_f;
+            // 4-point Catmull-Rom cubic interpolation centered at `i` with zero-padded
+            // boundaries so tails never freeze and multi-voice harmony layers stay aligned.
             let sample_at = |delay: f64| -> f64 {
-                let last = frames - 1;
-                let pos = (i as f64 + half_grain - delay).clamp(0.0, last as f64);
+                let pos = (i as f64) + half_grain - delay;
+                if pos < 0.0 || pos > ((frames - 1) as f64) {
+                    return 0.0;
+                }
                 let idx0 = pos.floor() as usize;
                 let frac = pos - (idx0 as f64);
-                let p0 = forge_dsp::sanitize_sample_f64(ch[idx0.saturating_sub(1)]);
-                let p1 = forge_dsp::sanitize_sample_f64(ch[idx0]);
-                let p2 = forge_dsp::sanitize_sample_f64(ch[(idx0 + 1).min(last)]);
-                let p3 = forge_dsp::sanitize_sample_f64(ch[(idx0 + 2).min(last)]);
+                let get = |idx: isize| -> f64 {
+                    if idx < 0 || (idx as usize) >= frames {
+                        0.0
+                    } else {
+                        forge_dsp::sanitize_sample_f64(ch[idx as usize])
+                    }
+                };
+                let p0 = get(idx0 as isize - 1);
+                let p1 = get(idx0 as isize);
+                let p2 = get(idx0 as isize + 1);
+                let p3 = get(idx0 as isize + 2);
                 let f2 = frac * frac;
                 let f3 = f2 * frac;
                 0.5 * ((2.0 * p1)
