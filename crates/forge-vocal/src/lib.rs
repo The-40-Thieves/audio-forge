@@ -525,23 +525,30 @@ pub fn shift_vocal_pitch_formant_preserved(
         }
     };
 
-    // Pitch-adaptive grain window: tighter 22 ms grain for large upward shifts (> +4 st) to
-    // suppress comb-filtering, wider 38 ms grain for large downward shifts (< -4 st) to preserve
-    // low-fundamental smoothness, and 32 ms nominal grain for standard tuning.
-    let grain_secs = if representative_shift > 4.0 {
-        0.022
-    } else if representative_shift < -4.0 {
-        0.038
-    } else {
-        0.032
-    };
-    let grain_len = ((sr * grain_secs).round() as usize).max(256);
-    let grain_f = grain_len as f64;
+    // Pitch-adaptive grain window lengths (in samples):
+    // - 22 ms for large upward shifts (> +4 st) to suppress comb-filtering,
+    // - 38 ms for large downward shifts (< -4 st) to preserve low-fundamental smoothness,
+    // - 32 ms nominal grain for standard tuning.
+    // Smoothly adapted per sample from the instantaneous pitch shift so opposite shifts
+    // (+12 / -12 st) never cancel, and read with a centered window (`+0.5 * grain_f`) so
+    // all harmony layers share zero-latency time alignment regardless of grain size.
+    let grain_up_f = (sr * 0.022).round().max(256.0);
+    let grain_nom_f = (sr * 0.032).round().max(256.0);
+    let grain_down_f = (sr * 0.038).round().max(256.0);
+    let grain_alpha = (-1.0 / (0.050 * sr)).exp();
 
     for ch in &buffer.channels {
         let mut out_ch = vec![0.0_f64; frames];
         let mut phase_a = 0.0_f64;
         let mut sibilant_env = 0.0_f64;
+        let initial_semi = forge_dsp::sanitize_param_f64(interp_shift(0.0), 0.0, -24.0, 24.0);
+        let mut grain_f = if initial_semi > 4.0 {
+            grain_up_f
+        } else if initial_semi < -4.0 {
+            grain_down_f
+        } else {
+            grain_nom_f
+        };
         let orig_lpc_tilt = estimate_lpc_formant_tilt_db(ch);
 
         for (i, sample_out) in out_ch.iter_mut().enumerate() {
@@ -554,6 +561,15 @@ pub fn shift_vocal_pitch_formant_preserved(
             let raw_semi = forge_dsp::sanitize_param_f64(interp_shift(t), 0.0, -24.0, 24.0);
             // Attenuate pitch shift smoothly toward 0.0 semitones during unvoiced sibilants
             let semi = raw_semi * (1.0 - sibilant_env * 0.85);
+            let target_grain = if semi > 4.0 {
+                grain_up_f
+            } else if semi < -4.0 {
+                grain_down_f
+            } else {
+                grain_nom_f
+            };
+            grain_f = grain_f * grain_alpha + target_grain * (1.0 - grain_alpha);
+
             let pitch_ratio = 2.0_f64.powf(semi / 12.0);
             let rate_delta = 1.0 - pitch_ratio;
 
@@ -564,10 +580,12 @@ pub fn shift_vocal_pitch_formant_preserved(
             let w_a = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * phase_a / grain_f).cos());
             let w_b = 1.0 - w_a;
 
-            // 4-point Catmull-Rom cubic interpolation preserves vocal presence and air
+            // 4-point Catmull-Rom cubic interpolation centered at `i` (zero latency across
+            // all grain sizes so multi-voice harmony layers stay phase-aligned in time).
+            let half_grain = 0.5 * grain_f;
             let sample_at = |delay: f64| -> f64 {
                 let last = frames - 1;
-                let pos = (i as f64 - delay).clamp(0.0, last as f64);
+                let pos = (i as f64 + half_grain - delay).clamp(0.0, last as f64);
                 let idx0 = pos.floor() as usize;
                 let frac = pos - (idx0 as f64);
                 let p0 = forge_dsp::sanitize_sample_f64(ch[idx0.saturating_sub(1)]);
@@ -1141,5 +1159,69 @@ mod tests {
                 prop_assert!(y.is_finite() && y.abs() <= 16.0);
             }
         }
+    }
+
+    #[test]
+    fn test_pitch_adaptive_grain_handles_large_upward_downward_and_opposite_shifts() {
+        let sr = 48_000_u32;
+        let frames = sr as usize; // 1.0 s sustained vocal-like tone at 220 Hz (A3)
+        let f0 = 220.0_f64;
+        let ch: Vec<f64> = (0..frames)
+            .map(|i| {
+                let t = (i as f64) / (sr as f64);
+                0.45 * (2.0 * PI * f0 * t).sin() + 0.15 * (2.0 * PI * 2.0 * f0 * t).sin()
+            })
+            .collect();
+        let buf = AudioBuffer::from_channels(vec![ch], sr).unwrap();
+        let scale = VocalScale::parse("A chromatic").unwrap();
+
+        // Large upward shift (+7 st -> ~329.6 Hz, E4)
+        let up = shift_vocal_pitch_formant_preserved(&buf, &[(0.0, 7.0), (1.0, 7.0)], 0.0).unwrap();
+        let up_frames = track_vocal_pitch(&up, &scale, 0.0);
+        let up_voiced: Vec<f64> = up_frames
+            .iter()
+            .filter(|f| f.f0_hz > 0.0 && f.time_secs > 0.15 && f.time_secs < 0.85)
+            .map(|f| f.f0_hz)
+            .collect();
+        assert!(
+            !up_voiced.is_empty(),
+            "upward-shifted tone should be voiced"
+        );
+        let up_med = up_voiced[up_voiced.len() / 2];
+        let expected_up = f0 * 2.0_f64.powf(7.0 / 12.0);
+        assert!(
+            (up_med - expected_up).abs() / expected_up < 0.04,
+            "upward +7 st pitch mismatch: got {up_med:.1} Hz, expected ~{expected_up:.1} Hz"
+        );
+
+        // Large downward shift (-7 st -> ~146.8 Hz, D3)
+        let down =
+            shift_vocal_pitch_formant_preserved(&buf, &[(0.0, -7.0), (1.0, -7.0)], 0.0).unwrap();
+        let down_frames = track_vocal_pitch(&down, &scale, 0.0);
+        let down_voiced: Vec<f64> = down_frames
+            .iter()
+            .filter(|f| f.f0_hz > 0.0 && f.time_secs > 0.15 && f.time_secs < 0.85)
+            .map(|f| f.f0_hz)
+            .collect();
+        assert!(
+            !down_voiced.is_empty(),
+            "downward-shifted tone should be voiced"
+        );
+        let down_med = down_voiced[down_voiced.len() / 2];
+        let expected_down = f0 * 2.0_f64.powf(-7.0 / 12.0);
+        assert!(
+            (down_med - expected_down).abs() / expected_down < 0.04,
+            "downward -7 st pitch mismatch: got {down_med:.1} Hz, expected ~{expected_down:.1} Hz"
+        );
+
+        // Opposite shifts (+7 st then -7 st) must remain clean and finite
+        let mixed = shift_vocal_pitch_formant_preserved(
+            &buf,
+            &[(0.0, 7.0), (0.49, 7.0), (0.51, -7.0), (1.0, -7.0)],
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(mixed.num_frames(), frames);
+        assert!(mixed.channels[0].iter().all(|s| s.is_finite()));
     }
 }

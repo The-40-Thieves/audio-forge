@@ -137,3 +137,67 @@ fn spliteq_transient_detection_is_consistent_across_48k_and_96k() {
         "SplitEQ transient response diverged across sample rates: 48k={p48:.3}, 96k={p96:.3}"
     );
 }
+
+#[test]
+fn spaceverb_room_geometry_updates_er_taps_and_survives_sample_rate_reset() {
+    use forge_dsp::ReverbRoomGeometry;
+
+    let mut rev = RealtimeFdnReverb::new(48_000.0);
+    assert_eq!(rev.room_geometry(), ReverbRoomGeometry::Hall);
+    let hall_taps = rev.er_taps_samples();
+
+    rev.set_room_geometry(ReverbRoomGeometry::Plate);
+    assert_eq!(rev.room_geometry(), ReverbRoomGeometry::Plate);
+    let plate_taps_48k = rev.er_taps_samples();
+    assert_ne!(plate_taps_48k, hall_taps);
+
+    // Changing sample rate must preserve the chosen geometry and rescale taps proportionally.
+    rev.reset(96_000.0);
+    assert_eq!(rev.room_geometry(), ReverbRoomGeometry::Plate);
+    let plate_taps_96k = rev.er_taps_samples();
+    assert!(
+        plate_taps_96k[0] > plate_taps_48k[0],
+        "expected 96 kHz taps ({:?}) to scale above 48 kHz taps ({:?})",
+        plate_taps_96k,
+        plate_taps_48k
+    );
+}
+
+#[test]
+fn nam_json_size_limit_enforces_exact_boundary_and_preserves_existing_model() {
+    use forge_dsp::{
+        AnalogHardwareModel, MAX_NAM_JSON_BYTES, NamWaveNetProfile, RealtimeNeuralPreamp,
+    };
+
+    let prefix = r#"{"architecture":"WaveNet","weights":[0.5,-0.25,0.125,0.06,0.02],"pad":""#;
+    let suffix = r#""}"#;
+    let pad_len = MAX_NAM_JSON_BYTES - prefix.len() - suffix.len();
+    let mut exact = String::with_capacity(MAX_NAM_JSON_BYTES);
+    exact.push_str(prefix);
+    exact.extend(std::iter::repeat_n('a', pad_len));
+    exact.push_str(suffix);
+    assert_eq!(exact.len(), MAX_NAM_JSON_BYTES);
+
+    // Exact boundary is accepted.
+    let taps = NamWaveNetProfile::parse_nam_taps(&exact).expect("exact limit should succeed");
+    assert!(taps.iter().all(|w| w.is_finite()));
+
+    // One byte over the limit is rejected with InvalidParameter.
+    let mut over = String::with_capacity(MAX_NAM_JSON_BYTES + 1);
+    over.push_str(prefix);
+    over.extend(std::iter::repeat_n('a', pad_len + 1));
+    over.push_str(suffix);
+    assert_eq!(over.len(), MAX_NAM_JSON_BYTES + 1);
+    assert!(NamWaveNetProfile::parse_nam_taps(&over).is_err());
+
+    // A rejected load on RealtimeNeuralPreamp leaves the previously loaded model intact.
+    let mut preamp = RealtimeNeuralPreamp::new(AnalogHardwareModel::Neve1073ClassA);
+    preamp
+        .load_nam_json(r#"{"architecture":"WaveNet","weights":[0.8,0.2,0.1,0.05,0.02]}"#)
+        .expect("initial valid NAM load");
+    let (before_l, before_r) = preamp.process_stereo_sample(0.25, -0.25, 3.0, 0.0);
+    assert!(preamp.load_nam_json(&over).is_err());
+    let (after_l, after_r) = preamp.process_stereo_sample(0.25, -0.25, 3.0, 0.0);
+    assert!(before_l.is_finite() && before_r.is_finite());
+    assert!(after_l.is_finite() && after_r.is_finite());
+}

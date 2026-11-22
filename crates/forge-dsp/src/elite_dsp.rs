@@ -389,6 +389,7 @@ impl ReverbRoomGeometry {
 /// - **Vocal Sidechain Ducking** + **+12 Semitone Octave Shimmer** dual-grain pitch-shifted feedback injection
 pub struct RealtimeFdnReverb {
     sample_rate: f64,
+    room_geometry: ReverbRoomGeometry,
     pre_delay_buf: Vec<f64>,
     pre_delay_write: usize,
     er_taps_samples: [usize; 8],
@@ -436,6 +437,7 @@ impl RealtimeFdnReverb {
 
         Self {
             sample_rate: sr,
+            room_geometry: ReverbRoomGeometry::Hall,
             pre_delay_buf: vec![0.0; pre_len],
             pre_delay_write: 0,
             er_taps_samples,
@@ -462,11 +464,24 @@ impl RealtimeFdnReverb {
     /// `Ambient`) by retuning the 8 Moorer ER taps in place with zero heap allocations.
     #[inline]
     pub fn set_room_geometry(&mut self, geometry: ReverbRoomGeometry) {
+        self.room_geometry = geometry;
         let max_tap = self.pre_delay_buf.len().saturating_sub(2).max(1);
         let taps_ms = geometry.er_taps_ms();
         for (dst, &ms) in self.er_taps_samples.iter_mut().zip(&taps_ms) {
             *dst = ((ms * 0.001 * self.sample_rate).round() as usize).clamp(1, max_tap);
         }
+    }
+
+    /// Returns the currently selected early-reflection room geometry.
+    #[inline]
+    pub const fn room_geometry(&self) -> ReverbRoomGeometry {
+        self.room_geometry
+    }
+
+    /// Returns the active 8 Moorer early-reflection tap offsets in samples.
+    #[inline]
+    pub const fn er_taps_samples(&self) -> [usize; 8] {
+        self.er_taps_samples
     }
 
     /// Resets all reverb state. Clears buffers in place (zero audio-thread allocations) when
@@ -493,7 +508,9 @@ impl RealtimeFdnReverb {
             self.shimmer_write = 0;
             self.shimmer_phase = 0.0;
         } else {
+            let saved_geometry = self.room_geometry;
             *self = Self::new(sr);
+            self.set_room_geometry(saved_geometry);
         }
     }
 
