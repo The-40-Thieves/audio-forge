@@ -346,6 +346,37 @@ impl RealtimeDensityAndClipper {
 // 4. 8x8 HADAMARD FDN ALGORITHMIC REVERB WITH VOCAL DUCKING & OCTAVE SHIMMER
 // ============================================================================
 
+/// Physical early-reflection room geometry presets for [`RealtimeFdnReverb`]
+/// (Dragonfly Reverb `Hibiki` / Valhalla VintageVerb / FabFilter Pro-R 2 room modes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReverbRoomGeometry {
+    /// Dense, immediate metallic plate reflections (`2.1 ms` to `18.6 ms`).
+    Plate,
+    /// Large concert hall reflections (`4.3 ms` to `33.4 ms`, default).
+    #[default]
+    Hall,
+    /// Tight studio echo chamber (`3.2 ms` to `24.8 ms`).
+    Chamber,
+    /// Intimate wood/drum room (`1.8 ms` to `14.5 ms`).
+    Room,
+    /// Wide, diffuse ambient bloom (`6.5 ms` to `41.2 ms`).
+    Ambient,
+}
+
+impl ReverbRoomGeometry {
+    /// Returns the 8 Moorer stereo early-reflection tap times in milliseconds.
+    #[inline]
+    pub const fn er_taps_ms(self) -> [f64; 8] {
+        match self {
+            Self::Plate => [2.1, 4.3, 6.8, 9.1, 11.7, 14.2, 16.5, 18.6],
+            Self::Hall => [4.3, 7.9, 11.6, 15.2, 19.8, 24.1, 28.7, 33.4],
+            Self::Chamber => [3.2, 5.9, 8.7, 11.8, 15.1, 18.4, 21.6, 24.8],
+            Self::Room => [1.8, 3.4, 5.1, 6.9, 8.8, 10.7, 12.6, 14.5],
+            Self::Ambient => [6.5, 11.3, 16.4, 21.7, 26.9, 31.8, 36.7, 41.2],
+        }
+    }
+}
+
 /// Real-Time **Moorer Early Reflections + 4-Stage Allpass Diffuser + 8x8 Fast Walsh-Hadamard FDN Reverb**
 /// (**Forge SpaceVerb** — Dragonfly Reverb `Hibiki` / Valhalla VintageVerb / FabFilter Pro-R 2 architecture).
 ///
