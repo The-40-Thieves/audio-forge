@@ -89,6 +89,8 @@ pub struct AbBankState {
     pub preset_json_buf: String,
     #[serde(skip)]
     pub preset_status: String,
+    #[serde(skip)]
+    pub last_synced_json: String,
 }
 
 impl AbBankState {
@@ -124,10 +126,12 @@ impl AbBankState {
     }
 
     /// Saves current A/B state into a `#[persist]` string mutex.
-    pub fn save_to_persisted(&self, persisted: &Mutex<String>) {
+    pub fn save_to_persisted(&mut self, persisted: &Mutex<String>) {
+        let json = self.to_json();
         if let Ok(mut guard) = persisted.lock() {
-            *guard = self.to_json();
+            *guard = json.clone();
         }
+        self.last_synced_json = json;
     }
     /// Captures current normalized values from `params` into both A and B if uninitialized.
     pub fn ensure_initialized(&mut self, params: &[(&'static str, ParamRef<'_>)]) {
@@ -282,6 +286,20 @@ pub(crate) fn draw_ab_and_presets_bar_persisted(
     presets: &[FactoryPreset],
     persisted: Option<&Mutex<String>>,
 ) {
+    // If the DAW restored `#[persist = "ab-state"]` after `editor()` was constructed (common in
+    // VST3), pull the newly restored JSON into `ab` before initializing or overwriting it.
+    if let Some(p) = persisted
+        && let Ok(guard) = p.lock()
+        && !guard.is_empty()
+        && *guard != ab.last_synced_json
+        && let Some(mut restored) = AbBankState::from_json(&guard)
+    {
+        restored.last_synced_json = guard.clone();
+        restored.show_json_drawer = ab.show_json_drawer;
+        restored.preset_json_buf = std::mem::take(&mut ab.preset_json_buf);
+        restored.preset_status = std::mem::take(&mut ab.preset_status);
+        *ab = restored;
+    }
     ab.ensure_initialized(params);
     let mut dirty_ab = false;
     ui.horizontal_wrapped(|ui| {
@@ -1389,7 +1407,7 @@ mod tests {
         let params = [("gain", ParamRef::Float(&p_gain))];
 
         let persisted = Mutex::new(String::new());
-        let ab = AbBankState {
+        let mut ab = AbBankState {
             active_slot: 1,
             slot_a: vec![("gain".to_string(), 0.2)],
             slot_b: vec![("gain".to_string(), 0.8)],

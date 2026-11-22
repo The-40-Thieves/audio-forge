@@ -1575,10 +1575,11 @@ impl RealtimeMasterLimiter {
             peak = peak.max(interp.abs());
         }
         if mode == IspOversampling::X8 {
-            // Evaluate half-phase cubic midpoints between the 4x phases for 8x ISP detection
-            let m01 = 0.5625 * (phases[0] + phases[1]) - 0.0625 * (x + phases[2]);
+            // Evaluate strictly contiguous half-phase midpoints within the 4x polyphase window
+            // (all four `phases` share the exact same group delay).
+            let m01 = 0.5 * (phases[0] + phases[1]);
             let m12 = 0.5625 * (phases[1] + phases[2]) - 0.0625 * (phases[0] + phases[3]);
-            let m23 = 0.5625 * (phases[2] + phases[3]) - 0.0625 * (phases[1] + hist[1]);
+            let m23 = 0.5 * (phases[2] + phases[3]);
             peak = peak.max(m01.abs()).max(m12.abs()).max(m23.abs());
         }
         peak

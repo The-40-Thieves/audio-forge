@@ -701,17 +701,24 @@ impl RealtimeFdnReverb {
             let fb_lo = 10.0_f64.powf(-3.0 * delay_sec / rt60_lo).min(0.985);
             let fb_hi = 10.0_f64.powf(-3.0 * delay_sec / rt60_hi).min(0.985);
 
-            // Split feedback into low (<350 Hz), mid, and damped high bands for independent RT60
+            // Apply HF damping first so default (1.0, 1.0) Decay Rate EQ preserves exact Jot damping,
+            // then split into low (<350 Hz) and mid/high bands for independent Decay Rate EQ scaling.
+            self.damp_state[i] =
+                flush_denormal_f64((1.0 - damp) * out_val + damp * self.damp_state[i]);
+            let damped = self.damp_state[i];
             self.low_shelf_state[i] = flush_denormal_f64(
-                low_alpha * self.low_shelf_state[i] + (1.0 - low_alpha) * out_val,
+                low_alpha * self.low_shelf_state[i] + (1.0 - low_alpha) * damped,
             );
             let lo_part = self.low_shelf_state[i];
-            let hi_mid = out_val - lo_part;
-            self.damp_state[i] =
-                flush_denormal_f64((1.0 - damp) * hi_mid + damp * self.damp_state[i]);
-            let mid_part = self.damp_state[i];
-            let hi_part = hi_mid - mid_part;
-            let fb_sig = lo_part * fb_lo + mid_part * fb_mid + hi_part * fb_hi;
+            let upper_part = damped - lo_part;
+            let hi_blend = (self.decay_high_mult - 1.0).clamp(-0.75, 1.0);
+            let upper_gain = if hi_blend >= 0.0 {
+                fb_mid + (fb_hi - fb_mid) * hi_blend
+            } else {
+                fb_mid + (fb_mid - fb_hi) * hi_blend
+            }
+            .clamp(0.0, 0.985);
+            let fb_sig = lo_part * fb_lo + upper_part * upper_gain;
 
             let base_inj = if i % 2 == 0 {
                 0.65 * diff_sig + 0.35 * send_l

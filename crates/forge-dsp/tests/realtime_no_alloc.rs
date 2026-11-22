@@ -232,7 +232,7 @@ fn limiter_8x_isp_spaceverb_decay_eq_and_4x_clipper_do_not_allocate() {
     let mut rev = RealtimeFdnReverb::new(48_000.0);
     let mut clip = RealtimeDensityAndClipper::new(48_000.0);
 
-    assert_no_alloc(|| {
+    assert_no_allocs("8x ISP + Decay EQ + 4x Clipper", || {
         lim.set_isp_oversampling(IspOversampling::X8);
         rev.set_decay_eq(1.3, 0.6);
         rev.set_mod_depth(1.5);

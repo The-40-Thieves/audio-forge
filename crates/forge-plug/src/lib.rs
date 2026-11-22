@@ -1738,7 +1738,7 @@ impl Plugin for ForgeMasterLimiterPlug {
             let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
             let (mut out_l, mut out_r) =
                 self.dsp.process_stereo_sample(in_l, in_r, drive, ceil, rel);
-            if unity_audition && drive > 0.01 {
+            if unity_audition && drive.abs() > 0.01 {
                 let comp = 10.0_f32.powf((-drive as f32) / 20.0);
                 out_l *= comp;
                 out_r *= comp;
