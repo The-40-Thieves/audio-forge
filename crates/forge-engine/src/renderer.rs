@@ -9,7 +9,7 @@ use forge_core::{AudioBuffer, AuditReport, Result};
 use forge_dsp::{Biquad, RealtimeSpectrumAnalyzer32, audit_audio, flush_denormal_f64};
 
 use crate::fx::FxProcessor;
-use crate::project::{AudioObject, DawProject, ObjectEq3, Track, WaveformPeaks};
+use crate::project::{AudioObject, AuxBus, DawProject, ObjectEq3, Track, WaveformPeaks};
 
 /// Simple pre-allocated stereo delay line for sample-accurate Plugin Delay Compensation (PDC).
 struct PdcDelayLine {
@@ -116,6 +116,15 @@ struct TrackRuntime {
     pdc: PdcDelayLine,
     total_latency: usize,
     peak_db: f32,
+}
+
+struct AuxBusRuntime {
+    config: AuxBus,
+    inserts: Vec<FxProcessor>,
+    pdc: PdcDelayLine,
+    fx_latency: usize,
+    acc_l: f32,
+    acc_r: f32,
 }
 
 /// Live meter snapshot published from the audio engine to the DAW GUI.
@@ -255,6 +264,8 @@ pub struct ObjectOrientedEngine {
     master_insert_cfgs: Vec<crate::project::FxSlotConfig>,
     master_inserts: Vec<FxProcessor>,
     tracks: Vec<TrackRuntime>,
+    aux_buses: Vec<AuxBusRuntime>,
+    main_bus_pdc: PdcDelayLine,
     analyzer: RealtimeSpectrumAnalyzer32,
     total_pdc_samples: usize,
     meters: EngineMeters,
@@ -328,6 +339,36 @@ impl ObjectOrientedEngine {
             tr.pdc = PdcDelayLine::new(pad);
         }
 
+        // Compile Aux / FX Return Buses & align Main Mix vs Aux Bus PDC
+        let mut aux_buses = Vec::with_capacity(project.aux_buses.len());
+        let mut max_aux_latency = 0_usize;
+        for bus in &project.aux_buses {
+            let inserts: Vec<FxProcessor> = bus
+                .inserts
+                .iter()
+                .map(|c| FxProcessor::from_config(c, sr))
+                .collect();
+            let fx_latency: usize = inserts
+                .iter()
+                .zip(&bus.inserts)
+                .map(|(p, c)| p.latency_samples(c))
+                .sum();
+            max_aux_latency = max_aux_latency.max(fx_latency);
+            aux_buses.push(AuxBusRuntime {
+                config: bus.clone(),
+                inserts,
+                pdc: PdcDelayLine::new(0),
+                fx_latency,
+                acc_l: 0.0,
+                acc_r: 0.0,
+            });
+        }
+        for bus in &mut aux_buses {
+            let pad = max_aux_latency.saturating_sub(bus.fx_latency);
+            bus.pdc = PdcDelayLine::new(pad);
+        }
+        let main_bus_pdc = PdcDelayLine::new(max_aux_latency);
+
         let master_inserts: Vec<FxProcessor> = project
             .master_inserts
             .iter()
@@ -338,7 +379,7 @@ impl ObjectOrientedEngine {
             .zip(&project.master_inserts)
             .map(|(p, c)| p.latency_samples(c))
             .sum();
-        let total_pdc_samples = max_track_latency + master_lat;
+        let total_pdc_samples = max_track_latency + max_aux_latency + master_lat;
 
         let track_peaks_db = vec![-90.0; tracks.len()];
         Self {
@@ -351,6 +392,8 @@ impl ObjectOrientedEngine {
             master_insert_cfgs: project.master_inserts.clone(),
             master_inserts,
             tracks,
+            aux_buses,
+            main_bus_pdc,
             analyzer: RealtimeSpectrumAnalyzer32::new(sr),
             total_pdc_samples,
             meters: EngineMeters {
@@ -393,9 +436,22 @@ impl ObjectOrientedEngine {
             return false;
         }
         if self.tracks.len() != project.tracks.len()
+            || self.aux_buses.len() != project.aux_buses.len()
             || self.master_insert_cfgs.len() != project.master_inserts.len()
         {
             return false;
+        }
+        for (bus_rt, bus_cfg) in self.aux_buses.iter().zip(project.aux_buses.iter()) {
+            if bus_rt.config.id != bus_cfg.id || bus_rt.inserts.len() != bus_cfg.inserts.len() {
+                return false;
+            }
+            for (a, b) in bus_rt.config.inserts.iter().zip(bus_cfg.inserts.iter()) {
+                if std::mem::discriminant(a) != std::mem::discriminant(b)
+                    || a.is_bypassed() != b.is_bypassed()
+                {
+                    return false;
+                }
+            }
         }
         for (a, b) in self
             .master_insert_cfgs
@@ -455,6 +511,9 @@ impl ObjectOrientedEngine {
                 obj_rt.config = obj_cfg.clone();
             }
         }
+        for (bus_rt, bus_cfg) in self.aux_buses.iter_mut().zip(project.aux_buses.iter()) {
+            bus_rt.config = bus_cfg.clone();
+        }
         true
     }
 
@@ -473,6 +532,15 @@ impl ObjectOrientedEngine {
                 }
             }
         }
+        for bus in &mut self.aux_buses {
+            bus.pdc.reset();
+            bus.acc_l = 0.0;
+            bus.acc_r = 0.0;
+            for ins in &mut bus.inserts {
+                ins.reset(sr);
+            }
+        }
+        self.main_bus_pdc.reset();
         for ins in &mut self.master_inserts {
             ins.reset(sr);
         }
@@ -505,6 +573,11 @@ impl ObjectOrientedEngine {
             let pos = self.playhead_samples;
             let mut mix_l = 0.0_f32;
             let mut mix_r = 0.0_f32;
+
+            for bus in &mut self.aux_buses {
+                bus.acc_l = 0.0;
+                bus.acc_r = 0.0;
+            }
 
             for tr in &mut self.tracks {
                 let audible = if any_solo {
@@ -604,6 +677,9 @@ impl ObjectOrientedEngine {
                 }
                 (tr_l, tr_r) = tr.pdc.process(tr_l, tr_r);
 
+                let pre_l = tr_l;
+                let pre_r = tr_r;
+
                 let gain_db = tr.config.volume_auto.evaluate(pos, tr.config.gain_db);
                 let pan = tr.config.pan_auto.evaluate(pos, tr.config.pan);
                 let tg = 10.0_f32.powf(gain_db.clamp(-60.0, 12.0) / 20.0)
@@ -611,6 +687,26 @@ impl ObjectOrientedEngine {
                 let (tpl, tpr) = Self::equal_power_pan(pan);
                 tr_l *= tg * tpl;
                 tr_r *= tg * tpr;
+
+                // Route pre-fader and post-fader track sends to Aux Buses (zero alloc)
+                for send in &tr.config.sends {
+                    if send.mute || send.gain_db <= -59.5 {
+                        continue;
+                    }
+                    let sg = 10.0_f32.powf(send.gain_db.clamp(-60.0, 6.0) / 20.0);
+                    let (sl, sr_) = if send.pre_fader {
+                        (pre_l * sg, pre_r * sg)
+                    } else {
+                        (tr_l * sg, tr_r * sg)
+                    };
+                    for bus in &mut self.aux_buses {
+                        if bus.config.id == send.bus_id && !bus.config.mute {
+                            bus.acc_l += sl;
+                            bus.acc_r += sr_;
+                            break;
+                        }
+                    }
+                }
 
                 let pk = tr_l.abs().max(tr_r.abs());
                 let pk_db = 20.0 * pk.max(1e-5).log10();
@@ -620,6 +716,24 @@ impl ObjectOrientedEngine {
 
                 mix_l += tr_l;
                 mix_r += tr_r;
+            }
+
+            // Align Main Mix bus with parallel Aux bus PDC, then sum processed Aux returns
+            (mix_l, mix_r) = self.main_bus_pdc.process(mix_l, mix_r);
+            for bus in &mut self.aux_buses {
+                if bus.config.mute {
+                    continue;
+                }
+                let mut bl = bus.acc_l;
+                let mut br = bus.acc_r;
+                for (proc_fx, cfg) in bus.inserts.iter_mut().zip(&bus.config.inserts) {
+                    (bl, br) = proc_fx.process_stereo(cfg, bl, br);
+                }
+                (bl, br) = bus.pdc.process(bl, br);
+                let bg = 10.0_f32.powf(bus.config.gain_db.clamp(-60.0, 12.0) / 20.0);
+                let (bpl, bpr) = Self::equal_power_pan(bus.config.pan);
+                mix_l += bl * bg * bpl;
+                mix_r += br * bg * bpr;
             }
 
             // Master bus inserts & gain
@@ -723,6 +837,22 @@ impl ObjectOrientedEngine {
             }
             for obj in &tr.objects {
                 for fx in &obj.fx_chain {
+                    inspect_fx(fx, &mut tail_secs);
+                }
+            }
+        }
+        for bus in &project.aux_buses {
+            if bus.mute {
+                continue;
+            }
+            let has_active_send = project.tracks.iter().any(|t| {
+                !t.mute
+                    && t.sends
+                        .iter()
+                        .any(|s| s.bus_id == bus.id && !s.mute && s.gain_db > -59.5)
+            });
+            if has_active_send {
+                for fx in &bus.inserts {
                     inspect_fx(fx, &mut tail_secs);
                 }
             }

@@ -4,7 +4,9 @@
 
 use assert_no_alloc::{AllocDisabler, assert_no_alloc, violation_count};
 use forge_core::AudioBuffer;
-use forge_engine::{AudioObject, ClipCache, DawProject, FxSlotConfig, ObjectOrientedEngine};
+use forge_engine::{
+    AudioObject, ClipCache, DawProject, FxSlotConfig, ObjectOrientedEngine, TrackSend,
+};
 use std::path::PathBuf;
 
 #[global_allocator]
@@ -47,6 +49,13 @@ fn object_oriented_engine_render_block_is_zero_alloc() {
     project.tracks[0]
         .inserts
         .push(FxSlotConfig::default_space_verb());
+    let aux_id = project.aux_buses[0].id;
+    project.tracks[0].sends.push(TrackSend {
+        bus_id: aux_id,
+        gain_db: -6.0,
+        pre_fader: false,
+        mute: false,
+    });
     project
         .master_inserts
         .push(FxSlotConfig::default_density_clipper());

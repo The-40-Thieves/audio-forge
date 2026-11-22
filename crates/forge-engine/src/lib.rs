@@ -18,9 +18,9 @@ pub mod renderer;
 pub use audio_io::{LiveAudioEngine, LiveRecorder};
 pub use fx::FxProcessor;
 pub use project::{
-    AudioObject, AutomationLane, AutomationPoint, DawProject, FadeCurve, FxSlotConfig,
+    AudioObject, AutomationLane, AutomationPoint, AuxBus, DawProject, FadeCurve, FxSlotConfig,
     MAX_PROJECT_JSON_BYTES, MAX_UNDO_DEPTH, ObjectEq3, PROJECT_SCHEMA_VERSION, TimelineMarker,
-    Track, UndoStack, WaveformPeaks,
+    Track, TrackSend, UndoStack, WaveformPeaks,
 };
 pub use renderer::{ClipCache, EngineMeters, ObjectOrientedEngine, resample_buffer_linear};
 
@@ -261,5 +261,55 @@ mod tests {
         assert_eq!(dst.track_peaks_db.as_ptr(), ptr_before);
         assert_eq!(dst.track_peaks_db, vec![-12.0, -6.5, -18.0]);
         assert_eq!(dst.total_pdc_samples, 144);
+    }
+
+    #[test]
+    fn aux_bus_parallel_send_routing_and_pdc_work() {
+        let sr = 48_000_u32;
+        let frames = 4096_usize;
+        let mut cache = ClipCache::default();
+        let clip_path = PathBuf::from("mem://aux_send.wav");
+        cache.insert_memory_clip(clip_path.clone(), sine_clip(sr, frames, 440.0, 0.4));
+
+        let mut proj = DawProject::new("Aux Bus Test", sr, 120.0);
+        proj.master_inserts.clear();
+        proj.tracks[0]
+            .objects
+            .push(AudioObject::new(10, "Vocal", clip_path, frames as u64));
+        // Mute main track fader via -60 dB and send pre-fader at 0 dB to Aux 1 (Hall Verb)
+        proj.tracks[0].gain_db = -60.0;
+        let aux_id = proj.aux_buses[0].id;
+        proj.tracks[0].sends.push(TrackSend {
+            bus_id: aux_id,
+            gain_db: 0.0,
+            pre_fader: true,
+            mute: false,
+        });
+
+        let wet = ObjectOrientedEngine::bounce_offline(&proj, &cache, frames).unwrap();
+        let wet_energy: f64 = wet.channels[0].iter().map(|s| s * s).sum();
+        assert!(
+            wet_energy > 1.0,
+            "pre-fader send to Aux 1 Hall Verb should produce audible wet energy, got {wet_energy}"
+        );
+    }
+
+    #[test]
+    fn track_auto_crossfade_overlaps_applies_equal_power_xfade() {
+        let mut tr = Track::new(1, "Vocal Comp", [56, 189, 248]);
+        let mut a = AudioObject::new(10, "Take 1", PathBuf::from("t1.wav"), 4800);
+        a.timeline_start_samples = 0;
+        let mut b = AudioObject::new(11, "Take 2", PathBuf::from("t2.wav"), 4800);
+        b.timeline_start_samples = 3600; // 1200-sample overlap with Take 1
+        tr.objects.push(a);
+        tr.objects.push(b);
+
+        let pairs = tr.auto_crossfade_overlaps();
+        assert_eq!(pairs, 1);
+        assert_eq!(tr.objects[0].fade_out_samples, 1200);
+        assert_eq!(tr.objects[1].fade_in_samples, 1200);
+        assert_eq!(tr.objects[0].fade_curve, FadeCurve::EqualPower);
+        assert_eq!(tr.objects[1].fade_curve, FadeCurve::EqualPower);
+        assert_eq!(tr.overlap_regions(), vec![(3600, 4800)]);
     }
 }

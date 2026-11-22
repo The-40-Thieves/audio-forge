@@ -448,6 +448,40 @@ impl AutomationLane {
     }
 }
 
+/// Parallel aux send routing tap from a [`Track`] into an [`AuxBus`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrackSend {
+    pub bus_id: u64,
+    /// Send level in dB (`-60.0` = off / muted, `0.0` = unity, up to `+6.0`).
+    pub gain_db: f32,
+    pub pre_fader: bool,
+    pub mute: bool,
+}
+
+/// Parallel Aux / FX Return Bus (e.g. Reverb, Delay, Parallel Drum Smash) with automatic PDC.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuxBus {
+    pub id: u64,
+    pub name: String,
+    pub gain_db: f32,
+    pub pan: f32,
+    pub mute: bool,
+    pub inserts: Vec<FxSlotConfig>,
+}
+
+impl AuxBus {
+    pub fn new(id: u64, name: impl Into<String>) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            gain_db: 0.0,
+            pan: 0.0,
+            mute: false,
+            inserts: Vec::new(),
+        }
+    }
+}
+
 /// A multitrack audio lane containing zero or more [`AudioObject`]s and track-level FX inserts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Track {
@@ -467,6 +501,8 @@ pub struct Track {
     pub volume_auto: AutomationLane,
     #[serde(default)]
     pub pan_auto: AutomationLane,
+    #[serde(default)]
+    pub sends: Vec<TrackSend>,
     pub objects: Vec<AudioObject>,
     pub inserts: Vec<FxSlotConfig>,
 }
@@ -486,9 +522,59 @@ impl Track {
             show_automation: false,
             volume_auto: AutomationLane::default(),
             pan_auto: AutomationLane::default(),
+            sends: Vec::new(),
             objects: Vec::new(),
             inserts: Vec::new(),
         }
+    }
+
+    /// Samplitude-style automatic equal-power crossfades across all overlapping [`AudioObject`]s
+    /// on this track. Returns the number of crossfade pairs applied.
+    pub fn auto_crossfade_overlaps(&mut self) -> usize {
+        if self.objects.len() < 2 {
+            return 0;
+        }
+        let mut order: Vec<usize> = (0..self.objects.len()).collect();
+        order.sort_by_key(|&i| self.objects[i].timeline_start_samples);
+        let mut count = 0_usize;
+        for pair in order.windows(2) {
+            let i_a = pair[0];
+            let i_b = pair[1];
+            let end_a = self.objects[i_a].timeline_end_samples();
+            let start_b = self.objects[i_b].timeline_start_samples;
+            let end_b = self.objects[i_b].timeline_end_samples();
+            if end_a > start_b && end_b > end_a {
+                let overlap = end_a - start_b;
+                self.objects[i_a].fade_out_samples = overlap;
+                self.objects[i_a].fade_out_offset_samples = 0;
+                self.objects[i_a].fade_curve = FadeCurve::EqualPower;
+                self.objects[i_b].fade_in_samples = overlap;
+                self.objects[i_b].fade_in_offset_samples = 0;
+                self.objects[i_b].fade_curve = FadeCurve::EqualPower;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Returns `(start_sample, end_sample)` for all overlapping object intervals on this track.
+    pub fn overlap_regions(&self) -> Vec<(u64, u64)> {
+        if self.objects.len() < 2 {
+            return Vec::new();
+        }
+        let mut order: Vec<usize> = (0..self.objects.len()).collect();
+        order.sort_by_key(|&i| self.objects[i].timeline_start_samples);
+        let mut out = Vec::new();
+        for pair in order.windows(2) {
+            let a = &self.objects[pair[0]];
+            let b = &self.objects[pair[1]];
+            let end_a = a.timeline_end_samples();
+            let start_b = b.timeline_start_samples;
+            if end_a > start_b {
+                out.push((start_b, end_a.min(b.timeline_end_samples())));
+            }
+        }
+        out
     }
 }
 
@@ -514,6 +600,8 @@ pub struct DawProject {
     pub master_gain_db: f32,
     pub master_inserts: Vec<FxSlotConfig>,
     pub tracks: Vec<Track>,
+    #[serde(default)]
+    pub aux_buses: Vec<AuxBus>,
     pub markers: Vec<TimelineMarker>,
     next_id: u64,
 }
@@ -557,6 +645,21 @@ impl DawProject {
                 Track::new(1, "01 Lead Vocal", TRACK_PALETTE[0]),
                 Track::new(2, "02 Instrumental / Beat", TRACK_PALETTE[1]),
             ],
+            aux_buses: vec![AuxBus {
+                id: 5,
+                name: "Aux 1: Hall Verb".to_string(),
+                gain_db: 0.0,
+                pan: 0.0,
+                mute: false,
+                inserts: vec![FxSlotConfig::SpaceVerb {
+                    bypass: false,
+                    decay_rt60_secs: 2.2,
+                    damping: 0.35,
+                    shimmer: 0.1,
+                    ducking: 0.2,
+                    wet_mix: 1.0,
+                }],
+            }],
             markers: vec![TimelineMarker {
                 name: "Start".to_string(),
                 sample_pos: 0,
@@ -575,6 +678,12 @@ impl DawProject {
         let id = self.alloc_id();
         let color = TRACK_PALETTE[self.tracks.len() % TRACK_PALETTE.len()];
         self.tracks.push(Track::new(id, name, color));
+        id
+    }
+
+    pub fn add_aux_bus(&mut self, name: impl Into<String>) -> u64 {
+        let id = self.alloc_id();
+        self.aux_buses.push(AuxBus::new(id, name));
         id
     }
 

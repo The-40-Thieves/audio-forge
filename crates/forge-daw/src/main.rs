@@ -15,7 +15,7 @@ use eframe::egui;
 use forge_core::AudioBuffer;
 use forge_engine::{
     AudioObject, ClipCache, DawProject, FadeCurve, FxSlotConfig, LiveAudioEngine, LiveRecorder,
-    ObjectOrientedEngine, UndoStack,
+    ObjectOrientedEngine, TimelineMarker, TrackSend, UndoStack,
 };
 
 fn main() -> eframe::Result {
@@ -99,6 +99,7 @@ struct ForgeDawApp {
     selected_object_id: Option<u64>,
     active_drag: Option<(usize, u64, DragMode)>,
     snap_grid: SnapGrid,
+    auto_crossfade: bool,
     pixels_per_sec: f32,
     scroll_secs: f32,
     import_path_buf: String,
@@ -136,6 +137,7 @@ impl ForgeDawApp {
             selected_object_id: None,
             active_drag: None,
             snap_grid: SnapGrid::Quarter,
+            auto_crossfade: true,
             pixels_per_sec: 120.0,
             scroll_secs: 0.0,
             import_path_buf: String::new(),
@@ -367,6 +369,19 @@ impl ForgeDawApp {
         }
     }
 
+    fn add_marker_at_playhead(&mut self) {
+        let prev = self.project.clone();
+        let pos = self.playhead_samples();
+        let idx = self.project.markers.len() + 1;
+        self.project.markers.push(TimelineMarker {
+            name: format!("M{idx}"),
+            sample_pos: pos,
+        });
+        self.project.markers.sort_by_key(|m| m.sample_pos);
+        self.commit_project_change(prev);
+        self.status_line = format!("Added marker M{idx} at sample {pos}");
+    }
+
     fn bounce_master(&mut self) {
         let out_path = PathBuf::from(self.bounce_path_buf.trim());
         match ObjectOrientedEngine::bounce_to_wav(&self.project, &self.cache, &out_path) {
@@ -519,6 +534,10 @@ impl ForgeDawApp {
                     self.project.add_track(format!("{n:02} Audio Track"));
                     self.commit_project_change(prev);
                 }
+                if ui.button("+ Marker").clicked() {
+                    self.add_marker_at_playhead();
+                }
+                ui.checkbox(&mut self.auto_crossfade, "XFade");
                 if ui.button("Bounce Master").clicked() {
                     self.bounce_master();
                 }
@@ -823,9 +842,10 @@ impl ForgeDawApp {
                         .max_width((ui.available_width() - 320.0).max(200.0))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
+                                let first_aux_id = self.project.aux_buses.first().map(|b| b.id);
                                 for (ti, tr) in self.project.tracks.iter_mut().enumerate() {
                                     ui.group(|ui| {
-                                        ui.set_width(110.0);
+                                        ui.set_width(120.0);
                                         let col = egui::Color32::from_rgb(
                                             tr.color_rgb[0],
                                             tr.color_rgb[1],
@@ -862,6 +882,67 @@ impl ForgeDawApp {
                                             .add(
                                                 egui::Slider::new(&mut tr.pan, -1.0..=1.0)
                                                     .text("Pan"),
+                                            )
+                                            .changed();
+                                        if let Some(aux_id) = first_aux_id {
+                                            let mut send_db = tr
+                                                .sends
+                                                .iter()
+                                                .find(|s| s.bus_id == aux_id)
+                                                .map_or(-60.0, |s| s.gain_db);
+                                            if ui
+                                                .add(
+                                                    egui::Slider::new(&mut send_db, -60.0..=6.0)
+                                                        .text("Aux1"),
+                                                )
+                                                .changed()
+                                            {
+                                                if let Some(s) =
+                                                    tr.sends.iter_mut().find(|s| s.bus_id == aux_id)
+                                                {
+                                                    s.gain_db = send_db;
+                                                } else {
+                                                    tr.sends.push(TrackSend {
+                                                        bus_id: aux_id,
+                                                        gain_db: send_db,
+                                                        pre_fader: false,
+                                                        mute: false,
+                                                    });
+                                                }
+                                                changed = true;
+                                            }
+                                        }
+                                    });
+                                }
+
+                                // Aux / FX Return Bus Strips
+                                for bus in &mut self.project.aux_buses {
+                                    ui.group(|ui| {
+                                        ui.set_width(114.0);
+                                        ui.label(
+                                            egui::RichText::new(&bus.name)
+                                                .small()
+                                                .strong()
+                                                .color(egui::Color32::from_rgb(192, 132, 252)),
+                                        );
+                                        ui.horizontal(|ui| {
+                                            if ui.selectable_label(bus.mute, "M").clicked() {
+                                                bus.mute = !bus.mute;
+                                                changed = true;
+                                            }
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "FX:{}",
+                                                    bus.inserts.len()
+                                                ))
+                                                .monospace()
+                                                .small(),
+                                            );
+                                        });
+                                        changed |= ui
+                                            .add(
+                                                egui::Slider::new(&mut bus.gain_db, -48.0..=12.0)
+                                                    .text("Ret"),
                                             )
                                             .changed();
                                     });
@@ -968,6 +1049,32 @@ impl ForgeDawApp {
                             egui::FontId::monospace(10.0),
                             egui::Color32::from_rgb(165, 175, 195),
                         );
+                    }
+                }
+
+                // Draw clickable Timeline Marker flags on the ruler
+                for mk in &self.project.markers {
+                    let mk_secs = (mk.sample_pos as f64 / sr) as f32;
+                    let mx = ruler_rect.left() + (mk_secs - self.scroll_secs) * self.pixels_per_sec;
+                    if mx >= ruler_rect.left() && mx <= ruler_rect.right() {
+                        let flag_rect = egui::Rect::from_min_size(
+                            egui::pos2(mx, ruler_rect.top() + 1.0),
+                            egui::vec2(38.0, 14.0),
+                        );
+                        rp.rect_filled(flag_rect, 2.0, egui::Color32::from_rgb(14, 116, 144));
+                        rp.text(
+                            egui::pos2(mx + 3.0, ruler_rect.top() + 8.0),
+                            egui::Align2::LEFT_CENTER,
+                            &mk.name,
+                            egui::FontId::monospace(9.5),
+                            egui::Color32::WHITE,
+                        );
+                        if ruler_resp.clicked()
+                            && let Some(pt) = ruler_resp.interact_pointer_pos()
+                            && flag_rect.contains(pt)
+                        {
+                            self.set_playhead_samples(mk.sample_pos);
+                        }
                     }
                 }
             });
@@ -1297,6 +1404,44 @@ impl ForgeDawApp {
                             self.active_drag = None;
                         }
 
+                        // Highlight automatic Equal-Power Crossfade overlap zones
+                        for (ov_start, ov_end) in self.project.tracks[ti].overlap_regions() {
+                            let ox0 = lane_rect.left()
+                                + (((ov_start as f64 / sr) as f32) - self.scroll_secs)
+                                    * self.pixels_per_sec;
+                            let ox1 = lane_rect.left()
+                                + (((ov_end as f64 / sr) as f32) - self.scroll_secs)
+                                    * self.pixels_per_sec;
+                            if ox1 > lane_rect.left() && ox0 < lane_rect.right() {
+                                let xrect = egui::Rect::from_min_max(
+                                    egui::pos2(ox0.max(lane_rect.left()), lane_rect.top() + 4.0),
+                                    egui::pos2(
+                                        ox1.min(lane_rect.right()),
+                                        lane_rect.bottom() - 4.0,
+                                    ),
+                                );
+                                p.rect_filled(
+                                    xrect,
+                                    2.0,
+                                    egui::Color32::from_rgba_unmultiplied(250, 204, 21, 45),
+                                );
+                                p.line_segment(
+                                    [xrect.left_top(), xrect.right_bottom()],
+                                    egui::Stroke::new(
+                                        1.25_f32,
+                                        egui::Color32::from_rgb(250, 204, 21),
+                                    ),
+                                );
+                                p.line_segment(
+                                    [xrect.left_bottom(), xrect.right_top()],
+                                    egui::Stroke::new(
+                                        1.25_f32,
+                                        egui::Color32::from_rgb(250, 204, 21),
+                                    ),
+                                );
+                            }
+                        }
+
                         // Interactive Volume Automation Lane Overlay
                         if self.project.tracks[ti].show_automation {
                             let db_to_y = |db: f32| -> f32 {
@@ -1372,6 +1517,11 @@ impl ForgeDawApp {
             });
 
             if changed {
+                if self.auto_crossfade {
+                    for tr in &mut self.project.tracks {
+                        tr.auto_crossfade_overlaps();
+                    }
+                }
                 self.commit_project_change(prev_snapshot);
             }
         });
@@ -1499,10 +1649,11 @@ fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) -> bool {
 impl eframe::App for ForgeDawApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !ctx.wants_keyboard_input() {
-            let (space, split, del, undo, redo, dup) = ctx.input(|i| {
+            let (space, split, marker, del, undo, redo, dup) = ctx.input(|i| {
                 (
                     i.key_pressed(egui::Key::Space),
                     i.key_pressed(egui::Key::S) && !i.modifiers.ctrl && !i.modifiers.command,
+                    i.key_pressed(egui::Key::M) && !i.modifiers.ctrl && !i.modifiers.command,
                     i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
                     i.key_pressed(egui::Key::Z) && (i.modifiers.ctrl || i.modifiers.command),
                     i.key_pressed(egui::Key::Y) && (i.modifiers.ctrl || i.modifiers.command),
@@ -1514,6 +1665,9 @@ impl eframe::App for ForgeDawApp {
             }
             if split {
                 self.split_selected_at_playhead();
+            }
+            if marker {
+                self.add_marker_at_playhead();
             }
             if del {
                 self.delete_selected_object();
