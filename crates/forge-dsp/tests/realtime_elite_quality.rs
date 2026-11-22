@@ -247,3 +247,118 @@ fn limiter_8x_isp_spaceverb_decay_eq_and_4x_adaa_clipper_are_stable() {
         assert!(l.abs() < 2.0 && r.abs() < 2.0);
     }
 }
+
+fn synthetic_wavenet_nam_json(
+    channels: usize,
+    kernel_size: usize,
+    dilations: &[usize],
+    gated: bool,
+) -> String {
+    let out_ch = if gated { channels * 2 } else { channels };
+    let rechannel = channels; // input_size = 1
+    let per_layer =
+        out_ch * channels * kernel_size + out_ch + out_ch + channels * channels + channels;
+    let head = channels; // head_size = 1, head_bias = false
+    let total = rechannel + dilations.len() * per_layer + head + 1;
+    let weights: Vec<f64> = (0..total)
+        .map(|i| {
+            let phase = (i as f64) * 0.37;
+            0.25 * phase.sin() + 0.1 * (phase * 0.5).cos()
+        })
+        .collect();
+    serde_json::json!({
+        "version": "0.5.4",
+        "architecture": "WaveNet",
+        "config": {
+            "layers": [{
+                "input_size": 1,
+                "condition_size": 1,
+                "head_size": 1,
+                "channels": channels,
+                "kernel_size": kernel_size,
+                "dilations": dilations,
+                "activation": "Tanh",
+                "gated": gated,
+                "head_bias": false
+            }],
+            "head_scale": 0.5
+        },
+        "weights": weights
+    })
+    .to_string()
+}
+
+#[test]
+fn full_wavenet_nam_inference_produces_finite_nonlinear_output_and_enforces_bounds() {
+    use forge_dsp::{AnalogHardwareModel, RealtimeNeuralPreamp};
+    let mut preamp = RealtimeNeuralPreamp::new(AnalogHardwareModel::Neve1073ClassA);
+    assert!(!preamp.is_full_wavenet_loaded());
+
+    let nam_json = synthetic_wavenet_nam_json(4, 3, &[1, 2, 4, 8], true);
+    preamp
+        .load_nam_json(&nam_json)
+        .expect("full gated WaveNet .nam should load");
+    assert!(preamp.is_full_wavenet_loaded());
+
+    let mut energy = 0.0_f64;
+    for i in 0..2048 {
+        let x = 0.5 * (2.0 * std::f64::consts::PI * 220.0 * (i as f64) / 48_000.0).sin() as f32;
+        let (l, r) = preamp.process_stereo_sample(x, -x, 6.0, 0.0);
+        assert!(l.is_finite() && r.is_finite());
+        assert!(l.abs() < 4.0 && r.abs() < 4.0);
+        energy += f64::from(l) * f64::from(l);
+    }
+    assert!(
+        energy > 1e-4,
+        "WaveNet inference produced near-silent output: {energy}"
+    );
+
+    // Reset clears history cleanly without unloading the model
+    preamp.reset();
+    assert!(preamp.is_full_wavenet_loaded());
+
+    // Bounds checks: channels > MAX_WAVENET_CHANNELS rejected without clobbering active model
+    let bad_channels = synthetic_wavenet_nam_json(32, 3, &[1, 2], false);
+    assert!(preamp.load_nam_json(&bad_channels).is_err());
+    assert!(preamp.is_full_wavenet_loaded());
+
+    // Truncated weights rejected
+    let truncated = r#"{"version":"0.5.4","architecture":"WaveNet","config":{"layers":[{"channels":4,"kernel_size":3,"dilations":[1,2]}]},"weights":[0.1,0.2]}"#;
+    assert!(preamp.load_nam_json(truncated).is_err());
+}
+
+#[test]
+fn open_soothe_low_latency_mode_and_pro_controls_suppress_resonance_under_6ms() {
+    use forge_dsp::RealtimeOpenSoothe;
+
+    let mut soothe = RealtimeOpenSoothe::new(48_000.0);
+    assert_eq!(soothe.latency_samples(), 2048);
+
+    soothe.set_low_latency(true);
+    assert!(soothe.is_low_latency());
+    assert_eq!(soothe.latency_samples(), 256);
+    assert!(
+        (f64::from(soothe.latency_samples()) / 48_000.0) * 1000.0 < 5.5,
+        "tracking mode latency must be under 5.5 ms at 48 kHz"
+    );
+
+    soothe.set_attack_ms(3.0);
+    soothe.set_release_ms(40.0);
+    soothe.set_hard_mode(true);
+    soothe.set_focus_eq(-3.0, 6.0, 2.0);
+
+    let mut max_gr = 0.0_f32;
+    for i in 0..8192 {
+        let t = (i as f64) / 48_000.0;
+        // Broadband bed + harsh 3.5 kHz whistle
+        let s = (0.15 * (2.0 * std::f64::consts::PI * 220.0 * t).sin()
+            + 0.45 * (2.0 * std::f64::consts::PI * 3500.0 * t).sin()) as f32;
+        let (l, r) = soothe.process_stereo_sample(s, s, 2.0, 12.0, 8, false);
+        assert!(l.is_finite() && r.is_finite());
+        max_gr = max_gr.max(soothe.last_gain_reduction_db());
+    }
+    assert!(
+        max_gr > 0.5,
+        "low-latency OpenSoothe should suppress harsh 3.5 kHz resonance, got max_gr={max_gr} dB"
+    );
+}

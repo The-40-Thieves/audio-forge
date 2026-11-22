@@ -245,3 +245,50 @@ fn limiter_8x_isp_spaceverb_decay_eq_and_4x_clipper_do_not_allocate() {
         }
     });
 }
+
+#[test]
+fn full_wavenet_nam_and_opensoothe_low_latency_do_not_allocate() {
+    use forge_dsp::{AnalogHardwareModel, RealtimeNeuralPreamp};
+    let mut preamp = RealtimeNeuralPreamp::new(AnalogHardwareModel::Neve1073ClassA);
+    let weights = vec![0.05_f64; 128];
+    let nam_json = serde_json::json!({
+        "version": "0.5.4",
+        "architecture": "WaveNet",
+        "config": {
+            "layers": [{
+                "input_size": 1,
+                "condition_size": 1,
+                "head_size": 1,
+                "channels": 2,
+                "kernel_size": 3,
+                "dilations": [1, 2],
+                "activation": "Tanh",
+                "gated": true,
+                "head_bias": false
+            }],
+            "head_scale": 0.5
+        },
+        "weights": weights
+    })
+    .to_string();
+    preamp.load_nam_json(&nam_json).expect("valid WaveNet");
+
+    let mut soothe = RealtimeOpenSoothe::new(48_000.0);
+
+    assert_no_allocs("WaveNet NAM + OpenSoothe low-latency", || {
+        soothe.set_low_latency(true);
+        soothe.set_attack_ms(4.0);
+        soothe.set_release_ms(45.0);
+        soothe.set_hard_mode(true);
+        soothe.set_focus_eq(-2.0, 4.0, 1.0);
+        for i in 0..512 {
+            let x = ((i as f32) * 0.05).sin() * 0.4;
+            let (pl, pr) = preamp.process_stereo_sample(x, -x, 6.0, 0.0);
+            let (sl, sr) = soothe.process_stereo_sample(pl, pr, 3.0, 9.0, 8, false);
+            std::hint::black_box((sl, sr));
+        }
+        preamp.reset();
+        soothe.set_low_latency(false);
+        soothe.reset(48_000.0);
+    });
+}
