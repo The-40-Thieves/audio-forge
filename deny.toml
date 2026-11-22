@@ -3,7 +3,7 @@
 # Run locally with: cargo deny check
 
 [graph]
-all-features = false
+all-features = true
 no-default-features = false
 
 [advisories]

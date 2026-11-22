@@ -27,10 +27,10 @@ use std::sync::atomic::Ordering;
 #[cfg(test)]
 use forge_dsp::read_shared_spectrum;
 use forge_dsp::{
-    AnalogHardwareModel, AutoGainCompensator, DrumTriggerNotes, GenreTonalTarget, NoteMsg,
-    RealtimeDensityAndClipper, RealtimeDrumTrigger, RealtimeFdnReverb, RealtimeMasterLimiter,
-    RealtimeMasteringEq18, RealtimeNeuralPreamp, RealtimeOpenSoothe, RealtimeOpenSpacer,
-    RealtimePhaseAligner, RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus,
+    AnalogHardwareModel, AutoGainCompensator, DitherMode, DrumTriggerNotes, GenreTonalTarget,
+    LimiterStyle, NoteMsg, RealtimeDensityAndClipper, RealtimeDrumTrigger, RealtimeFdnReverb,
+    RealtimeMasterLimiter, RealtimeMasteringEq18, RealtimeNeuralPreamp, RealtimeOpenSoothe,
+    RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus,
     RealtimeTransientTonalSplit, RealtimeVocalSurgical, SpectrumBusOwner, clear_shared_spectrum,
     publish_shared_spectrum, shared_spectrum_slot_index,
 };
@@ -298,6 +298,12 @@ pub struct OpenSootheParams {
     pub ceiling_dbtp: FloatParam,
     #[id = "bus_slot"]
     pub shared_bus_slot: IntParam,
+    #[id = "tilt"]
+    pub tilt_db_per_oct: FloatParam,
+    #[id = "slink"]
+    pub stereo_link: FloatParam,
+    #[id = "msbal"]
+    pub mid_side_balance: FloatParam,
 }
 
 impl Default for OpenSootheParams {
@@ -359,6 +365,32 @@ impl Default for OpenSootheParams {
             )
             .with_value_to_string(Arc::new(bus_slot_to_string))
             .with_string_to_value(Arc::new(bus_slot_from_string)),
+            tilt_db_per_oct: FloatParam::new(
+                "Spectral Tilt",
+                0.0,
+                FloatRange::Linear {
+                    min: -6.0,
+                    max: 6.0,
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(2))
+            .with_unit(" dB/oct"),
+            stereo_link: FloatParam::new(
+                "Stereo Link",
+                1.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_value_to_string(formatters::v2s_f32_percentage(0))
+            .with_string_to_value(formatters::s2v_f32_percentage()),
+            mid_side_balance: FloatParam::new(
+                "Mid/Side Focus",
+                0.0,
+                FloatRange::Linear {
+                    min: -1.0,
+                    max: 1.0,
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(2)),
         }
     }
 }
@@ -493,43 +525,62 @@ impl Plugin for ForgeOpenSoothePlug {
                         ("limit", ParamRef::Bool(&params.enable_limiter)),
                         ("ceil", ParamRef::Float(&params.ceiling_dbtp)),
                         ("bus_slot", ParamRef::Int(&params.shared_bus_slot)),
+                        ("tilt", ParamRef::Float(&params.tilt_db_per_oct)),
+                        ("slink", ParamRef::Float(&params.stereo_link)),
+                        ("ms", ParamRef::Float(&params.mid_side_balance)),
                     ];
                     draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, OPENSOOTHE_PRESETS);
-                    egui::Grid::new("opensoothe_grid")
-                        .num_columns(2)
-                        .spacing([16.0, 8.0])
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
                         .show(ui, |ui| {
-                            ui.label("Sensitivity (dB)");
-                            ui.add(widgets::ParamSlider::for_param(&params.sensitivity_db, setter));
-                            ui.end_row();
+                            egui::Grid::new("opensoothe_grid")
+                                .num_columns(2)
+                                .spacing([16.0, 8.0])
+                                .show(ui, |ui| {
+                                    ui.label("Sensitivity (dB)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.sensitivity_db, setter));
+                                    ui.end_row();
 
-                            ui.label("Max Suppression (dB)");
-                            ui.add(widgets::ParamSlider::for_param(&params.max_depth_db, setter));
-                            ui.end_row();
+                                    ui.label("Max Suppression (dB)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.max_depth_db, setter));
+                                    ui.end_row();
 
-                            ui.label("Sharpness Radius");
-                            ui.add(widgets::ParamSlider::for_param(&params.sharpness_bins, setter));
-                            ui.end_row();
+                                    ui.label("Sharpness Radius");
+                                    ui.add(widgets::ParamSlider::for_param(&params.sharpness_bins, setter));
+                                    ui.end_row();
 
-                            ui.label("Delta Listen (Fizz Only)");
-                            ui.add(widgets::ParamSlider::for_param(&params.delta_listen, setter));
-                            ui.end_row();
+                                    ui.label("Delta Listen (Fizz Only)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.delta_listen, setter));
+                                    ui.end_row();
 
-                            ui.label("SubMono (<160 Hz) + Tape Bus");
-                            ui.add(widgets::ParamSlider::for_param(&params.enable_sub_tape, setter));
-                            ui.end_row();
+                                    ui.label("SubMono (<160 Hz) + Tape Bus");
+                                    ui.add(widgets::ParamSlider::for_param(&params.enable_sub_tape, setter));
+                                    ui.end_row();
 
-                            ui.label("Console8 / ChowTape Drive");
-                            ui.add(widgets::ParamSlider::for_param(&params.tape_drive, setter));
-                            ui.end_row();
+                                    ui.label("Console8 / ChowTape Drive");
+                                    ui.add(widgets::ParamSlider::for_param(&params.tape_drive, setter));
+                                    ui.end_row();
 
-                            ui.label("True-Peak -1.0 dBTP Brickwall");
-                            ui.add(widgets::ParamSlider::for_param(&params.enable_limiter, setter));
-                            ui.end_row();
+                                    ui.label("True-Peak -1.0 dBTP Brickwall");
+                                    ui.add(widgets::ParamSlider::for_param(&params.enable_limiter, setter));
+                                    ui.end_row();
 
-                            ui.label("Cross-Instance Spectrum Slot");
-                            ui.add(widgets::ParamSlider::for_param(&params.shared_bus_slot, setter));
-                            ui.end_row();
+                                    ui.label("Cross-Instance Spectrum Slot");
+                                    ui.add(widgets::ParamSlider::for_param(&params.shared_bus_slot, setter));
+                                    ui.end_row();
+
+                                    ui.label("Spectral Tilt (dB/oct)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.tilt_db_per_oct, setter));
+                                    ui.end_row();
+
+                                    ui.label("Stereo Link");
+                                    ui.add(widgets::ParamSlider::for_param(&params.stereo_link, setter));
+                                    ui.end_row();
+
+                                    ui.label("Mid/Side Focus (-1 M .. +1 S)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.mid_side_balance, setter));
+                                    ui.end_row();
+                                });
                         });
                 });
             },
@@ -568,6 +619,12 @@ impl Plugin for ForgeOpenSoothePlug {
         let use_limiter = self.params.enable_limiter.value();
         let ceil = f64::from(self.params.ceiling_dbtp.value());
         let bus_slot = self.params.shared_bus_slot.value() as usize;
+        self.dsp
+            .set_tilt_db_per_oct(f64::from(self.params.tilt_db_per_oct.value()));
+        self.dsp
+            .set_stereo_link(f64::from(self.params.stereo_link.value()));
+        self.dsp
+            .set_mid_side_balance(f64::from(self.params.mid_side_balance.value()));
 
         for mut channel_samples in buffer.iter_samples() {
             let sens = f64::from(self.params.sensitivity_db.smoothed.next());
@@ -668,6 +725,10 @@ pub struct OpenSpacerParams {
     pub high_hz: FloatParam,
     #[id = "kickmode"]
     pub kick_bass_mode: BoolParam,
+    #[id = "delta"]
+    pub delta_listen: BoolParam,
+    #[id = "msbal"]
+    pub mid_side_balance: FloatParam,
 }
 
 impl Default for OpenSpacerParams {
@@ -714,6 +775,16 @@ impl Default for OpenSpacerParams {
             .with_value_to_string(formatters::v2s_f32_rounded(2))
             .with_unit(" Hz"),
             kick_bass_mode: BoolParam::new("Kick -> Sub-Bass Mode (30-130 Hz)", false),
+            delta_listen: BoolParam::new("Delta Listen (Carved Pocket Only)", false),
+            mid_side_balance: FloatParam::new(
+                "Mid/Side Focus",
+                0.0,
+                FloatRange::Linear {
+                    min: -1.0,
+                    max: 1.0,
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(2)),
         }
     }
 }
@@ -794,6 +865,12 @@ impl Plugin for ForgeOpenSpacerPlug {
                             ui.label("Kick -> Sub-Bass Mode");
                             ui.add(widgets::ParamSlider::for_param(&params.kick_bass_mode, setter));
                             ui.end_row();
+                            ui.label("Delta Listen (Carved Only)");
+                            ui.add(widgets::ParamSlider::for_param(&params.delta_listen, setter));
+                            ui.end_row();
+                            ui.label("Mid/Side Focus (-1 M .. +1 S)");
+                            ui.add(widgets::ParamSlider::for_param(&params.mid_side_balance, setter));
+                            ui.end_row();
                         });
                 });
             },
@@ -829,6 +906,9 @@ impl Plugin for ForgeOpenSpacerPlug {
             )
         };
         let max_cut = f64::from(self.params.max_cut_db.value());
+        self.dsp.set_delta_listen(self.params.delta_listen.value());
+        self.dsp
+            .set_mid_side_balance(f64::from(self.params.mid_side_balance.value()));
         let samples_len = buffer.samples();
 
         for i in 0..samples_len {
@@ -1379,6 +1459,12 @@ pub struct MasterLimiterParams {
     pub ceiling_dbtp: FloatParam,
     #[id = "rel"]
     pub release_ms: FloatParam,
+    #[id = "style"]
+    pub limiter_style: IntParam,
+    #[id = "clink"]
+    pub channel_link: FloatParam,
+    #[id = "dither"]
+    pub dither_mode: IntParam,
 }
 
 impl Default for MasterLimiterParams {
@@ -1416,6 +1502,39 @@ impl Default for MasterLimiterParams {
             )
             .with_value_to_string(formatters::v2s_f32_rounded(2))
             .with_unit(" ms"),
+            limiter_style: IntParam::new("Limiter Style", 0, IntRange::Linear { min: 0, max: 3 })
+                .with_value_to_string(Arc::new(|v| match v {
+                    0 => "Transparent".to_string(),
+                    1 => "Punchy".to_string(),
+                    2 => "Dynamic".to_string(),
+                    _ => "Aggressive".to_string(),
+                }))
+                .with_string_to_value(Arc::new(|s| match s.trim().to_ascii_lowercase().as_str() {
+                    "0" | "transparent" => Some(0),
+                    "1" | "punchy" => Some(1),
+                    "2" | "dynamic" => Some(2),
+                    "3" | "aggressive" => Some(3),
+                    _ => None,
+                })),
+            channel_link: FloatParam::new(
+                "Channel Link",
+                1.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_value_to_string(formatters::v2s_f32_percentage(0))
+            .with_string_to_value(formatters::s2v_f32_percentage()),
+            dither_mode: IntParam::new("Output Dither", 0, IntRange::Linear { min: 0, max: 2 })
+                .with_value_to_string(Arc::new(|v| match v {
+                    0 => "Off".to_string(),
+                    1 => "TPDF 24-bit".to_string(),
+                    _ => "Noise-Shaped 16-bit".to_string(),
+                }))
+                .with_string_to_value(Arc::new(|s| match s.trim().to_ascii_lowercase().as_str() {
+                    "0" | "off" | "none" => Some(0),
+                    "1" | "tpdf" | "tpdf 24-bit" => Some(1),
+                    "2" | "noise-shaped" | "noise-shaped 16-bit" | "shaped" => Some(2),
+                    _ => None,
+                })),
         }
     }
 }
@@ -1488,6 +1607,15 @@ impl Plugin for ForgeMasterLimiterPlug {
                             ui.label("Release Time (ms)");
                             ui.add(widgets::ParamSlider::for_param(&params.release_ms, setter));
                             ui.end_row();
+                            ui.label("Limiter Style");
+                            ui.add(widgets::ParamSlider::for_param(&params.limiter_style, setter));
+                            ui.end_row();
+                            ui.label("Channel Link");
+                            ui.add(widgets::ParamSlider::for_param(&params.channel_link, setter));
+                            ui.end_row();
+                            ui.label("Output Dither");
+                            ui.add(widgets::ParamSlider::for_param(&params.dither_mode, setter));
+                            ui.end_row();
                         });
                 });
             },
@@ -1520,6 +1648,21 @@ impl Plugin for ForgeMasterLimiterPlug {
     ) -> ProcessStatus {
         let ceil = f64::from(self.params.ceiling_dbtp.value());
         let rel = f64::from(self.params.release_ms.value());
+        let style = match self.params.limiter_style.value() {
+            1 => LimiterStyle::Punchy,
+            2 => LimiterStyle::Dynamic,
+            3 => LimiterStyle::Aggressive,
+            _ => LimiterStyle::Transparent,
+        };
+        let (dither_mode, dither_bits) = match self.params.dither_mode.value() {
+            1 => (DitherMode::Tpdf, 24),
+            2 => (DitherMode::NoiseShapedHighPass, 16),
+            _ => (DitherMode::None, 24),
+        };
+        self.dsp.set_style(style);
+        self.dsp
+            .set_channel_link(f64::from(self.params.channel_link.value()));
+        self.dsp.set_dither(dither_mode, dither_bits);
 
         for mut channel_samples in buffer.iter_samples() {
             let drive = f64::from(self.params.drive_db.smoothed.next());

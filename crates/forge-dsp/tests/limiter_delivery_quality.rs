@@ -336,3 +336,62 @@ fn noise_shaped_dither_lowers_midband_quantization_noise_floor_at_16bit() {
     );
     assert!(shaped.channels[0].iter().all(|s| s.is_finite()));
 }
+
+#[test]
+fn realtime_limiter_dual_mono_channel_link_and_dither_ceiling() {
+    use forge_dsp::{DitherMode, RealtimeMasterLimiter};
+
+    let mut unlinked = RealtimeMasterLimiter::new(f64::from(SR));
+    unlinked.set_channel_link(0.0);
+    let mut linked = RealtimeMasterLimiter::new(f64::from(SR));
+    linked.set_channel_link(1.0);
+
+    let lat = unlinked.latency_samples() as usize;
+    let total = lat + 4096;
+    let mut r_unlinked_rms = 0.0_f64;
+    let mut r_linked_rms = 0.0_f64;
+    let mut count = 0usize;
+
+    for i in 0..total {
+        let t = (i as f64) / f64::from(SR);
+        let quiet_r = (0.20 * (2.0 * PI * 440.0 * t).sin()) as f32;
+        let loud_l = if (500..2500).contains(&i) {
+            (2.5 * (2.0 * PI * 1000.0 * t).sin()) as f32
+        } else {
+            quiet_r
+        };
+        let (_, ur) = unlinked.process_stereo_sample(loud_l, quiet_r, 0.0, -1.0, 80.0);
+        let (_, lr) = linked.process_stereo_sample(loud_l, quiet_r, 0.0, -1.0, 80.0);
+        if i >= lat + 700 && i < lat + 2200 {
+            r_unlinked_rms += f64::from(ur) * f64::from(ur);
+            r_linked_rms += f64::from(lr) * f64::from(lr);
+            count += 1;
+        }
+    }
+    r_unlinked_rms = (r_unlinked_rms / count as f64).sqrt();
+    r_linked_rms = (r_linked_rms / count as f64).sqrt();
+    assert!(
+        r_unlinked_rms > r_linked_rms * 1.35,
+        "unlinked channel_link=0.0 must preserve quiet R during loud L transient: unlinked={r_unlinked_rms:.4}, linked={r_linked_rms:.4}"
+    );
+
+    // 8-bit TPDF dither must still obey the requested -1.0 dBTP true-peak ceiling.
+    let mut dither_lim = RealtimeMasterLimiter::new(f64::from(SR));
+    dither_lim.set_dither(DitherMode::Tpdf, 8);
+    let mut out_l = Vec::with_capacity(8192);
+    let mut out_r = Vec::with_capacity(8192);
+    for i in 0..8192 {
+        let t = (i as f64) / f64::from(SR);
+        let x = (1.8 * (2.0 * PI * 997.0 * t).sin()) as f32;
+        let (yl, yr) = dither_lim.process_stereo_sample(x, x, 0.0, -1.0, 80.0);
+        out_l.push(f64::from(yl));
+        out_r.push(f64::from(yr));
+    }
+    let buf = AudioBuffer::from_channels(vec![out_l, out_r], SR).unwrap();
+    let rep = audit_audio(&buf);
+    assert!(
+        rep.true_peak_dbtp <= -1.0 + 0.05,
+        "8-bit realtime TPDF dither exceeded -1.0 dBTP ceiling: {:.4}",
+        rep.true_peak_dbtp
+    );
+}
