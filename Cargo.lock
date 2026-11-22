@@ -1185,6 +1185,8 @@ dependencies = [
  "nih_plug",
  "nih_plug_egui",
  "proptest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

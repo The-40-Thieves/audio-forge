@@ -20,25 +20,31 @@
 mod ui;
 
 use std::num::NonZeroU32;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
 use forge_dsp::read_shared_spectrum;
 use forge_dsp::{
     AnalogHardwareModel, AutoGainCompensator, DitherMode, DrumTriggerNotes, GenreTonalTarget,
-    LimiterStyle, NoteMsg, RealtimeDensityAndClipper, RealtimeDrumTrigger, RealtimeFdnReverb,
-    RealtimeMasterLimiter, RealtimeMasteringEq18, RealtimeNeuralPreamp, RealtimeOpenSoothe,
-    RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus,
-    RealtimeTransientTonalSplit, RealtimeVocalSurgical, ReverbRoomGeometry, SpectrumBusOwner,
-    clear_shared_spectrum, publish_shared_spectrum, shared_spectrum_slot_index,
+    IspOversampling, LimiterStyle, NoteMsg, RealtimeDensityAndClipper, RealtimeDrumTrigger,
+    RealtimeFdnReverb, RealtimeMasterLimiter, RealtimeMasteringEq18, RealtimeNeuralPreamp,
+    RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSpectrumAnalyzer32,
+    RealtimeSubAndTapeBus, RealtimeTransientTonalSplit, RealtimeVocalSurgical, ReverbRoomGeometry,
+    SpectrumBusOwner, clear_shared_spectrum, publish_shared_spectrum, shared_spectrum_slot_index,
 };
 use forge_vocal::{RealtimeVocalTune, VocalTuneScaleMode};
 use nih_plug::prelude::*;
 use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
 
-pub use ui::{AbBankState, FactoryPreset, GuiTelemetry, OutputLoudnessMeter, ParamRef};
-use ui::{draw_ab_and_presets_bar, draw_forge_studio_header_and_spectrum};
+pub use ui::{
+    AbBankState, FactoryPreset, GuiTelemetry, OutputLoudnessMeter, ParamRef, UserPreset,
+    export_user_preset_json, import_user_preset_json,
+};
+use ui::{
+    CanvasDragHandle, draw_ab_and_presets_bar, draw_ab_and_presets_bar_persisted,
+    draw_forge_studio_header_and_spectrum, draw_forge_studio_header_and_spectrum_interactive,
+};
 
 const OPENSOOTHE_PRESETS: &[FactoryPreset] = &[
     FactoryPreset {
@@ -305,6 +311,8 @@ pub struct ForgeOpenSoothePlug {
 pub struct OpenSootheParams {
     #[persist = "editor-state"]
     pub editor_state: Arc<EguiState>,
+    #[persist = "ab-state"]
+    pub ab_state: Arc<Mutex<String>>,
     #[id = "sens"]
     pub sensitivity_db: FloatParam,
     #[id = "depth"]
@@ -329,12 +337,27 @@ pub struct OpenSootheParams {
     pub stereo_link: FloatParam,
     #[id = "msbal"]
     pub mid_side_balance: FloatParam,
+    #[id = "lowlat"]
+    pub low_latency_mode: BoolParam,
+    #[id = "atk"]
+    pub attack_ms: FloatParam,
+    #[id = "rel"]
+    pub release_ms: FloatParam,
+    #[id = "hard"]
+    pub hard_mode: BoolParam,
+    #[id = "foc_lo"]
+    pub focus_low_db: FloatParam,
+    #[id = "foc_mid"]
+    pub focus_mid_db: FloatParam,
+    #[id = "foc_hi"]
+    pub focus_high_db: FloatParam,
 }
 
 impl Default for OpenSootheParams {
     fn default() -> Self {
         Self {
-            editor_state: EguiState::from_size(720, 420),
+            editor_state: EguiState::from_size(720, 460),
+            ab_state: Arc::new(Mutex::new(String::new())),
             sensitivity_db: FloatParam::new(
                 "Sensitivity",
                 3.5,
@@ -416,6 +439,60 @@ impl Default for OpenSootheParams {
                 },
             )
             .with_value_to_string(formatters::v2s_f32_rounded(2)),
+            low_latency_mode: BoolParam::new("Low-Latency Tracking", false),
+            attack_ms: FloatParam::new(
+                "Attack",
+                10.0,
+                FloatRange::Skewed {
+                    min: 1.0,
+                    max: 100.0,
+                    factor: FloatRange::skew_factor(-1.5),
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(1))
+            .with_unit(" ms"),
+            release_ms: FloatParam::new(
+                "Release",
+                55.0,
+                FloatRange::Skewed {
+                    min: 10.0,
+                    max: 500.0,
+                    factor: FloatRange::skew_factor(-1.5),
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(1))
+            .with_unit(" ms"),
+            hard_mode: BoolParam::new("Hard Mode (Surgical)", false),
+            focus_low_db: FloatParam::new(
+                "Focus Low (<400 Hz)",
+                0.0,
+                FloatRange::Linear {
+                    min: -12.0,
+                    max: 12.0,
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(1))
+            .with_unit(" dB"),
+            focus_mid_db: FloatParam::new(
+                "Focus Mid (0.4-4 kHz)",
+                0.0,
+                FloatRange::Linear {
+                    min: -12.0,
+                    max: 12.0,
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(1))
+            .with_unit(" dB"),
+            focus_high_db: FloatParam::new(
+                "Focus High (>4 kHz)",
+                0.0,
+                FloatRange::Linear {
+                    min: -12.0,
+                    max: 12.0,
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(1))
+            .with_unit(" dB"),
         }
     }
 }
@@ -526,19 +603,26 @@ impl Plugin for ForgeOpenSoothePlug {
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         let params = self.params.clone();
         let telemetry = self.telemetry.clone();
+        let initial_ab = AbBankState::load_from_persisted(&self.params.ab_state);
         create_egui_editor(
             self.params.editor_state.clone(),
-            AbBankState::default(),
+            initial_ab,
             |_, _| {},
             move |egui_ctx, setter, ab_state| {
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
                     let slot = shared_spectrum_slot_index(params.shared_bus_slot.value() as usize);
-                    draw_forge_studio_header_and_spectrum(
+                    draw_forge_studio_header_and_spectrum_interactive(
                         ui,
                         "FORGE OPENSOOTHE DE-FIZZ",
                         "2048-pt OLA STFT Dynamic Spectral Resonance & AI Metallic Whistle Suppressor",
                         &telemetry,
                         slot,
+                        Some(setter),
+                        Some(CanvasDragHandle {
+                            label: "SENS",
+                            param: &params.sensitivity_db,
+                            color: egui::Color32::from_rgb(250, 204, 21),
+                        }),
                     );
                     let param_refs = [
                         ("sens", ParamRef::Float(&params.sensitivity_db)),
@@ -553,8 +637,22 @@ impl Plugin for ForgeOpenSoothePlug {
                         ("tilt", ParamRef::Float(&params.tilt_db_per_oct)),
                         ("slink", ParamRef::Float(&params.stereo_link)),
                         ("ms", ParamRef::Float(&params.mid_side_balance)),
+                        ("lowlat", ParamRef::Bool(&params.low_latency_mode)),
+                        ("atk", ParamRef::Float(&params.attack_ms)),
+                        ("rel", ParamRef::Float(&params.release_ms)),
+                        ("hard", ParamRef::Bool(&params.hard_mode)),
+                        ("foc_lo", ParamRef::Float(&params.focus_low_db)),
+                        ("foc_mid", ParamRef::Float(&params.focus_mid_db)),
+                        ("foc_hi", ParamRef::Float(&params.focus_high_db)),
                     ];
-                    draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, OPENSOOTHE_PRESETS);
+                    draw_ab_and_presets_bar_persisted(
+                        ui,
+                        setter,
+                        &param_refs,
+                        ab_state,
+                        OPENSOOTHE_PRESETS,
+                        Some(&params.ab_state),
+                    );
                     egui::ScrollArea::vertical()
                         .auto_shrink([false; 2])
                         .show(ui, |ui| {
@@ -605,6 +703,34 @@ impl Plugin for ForgeOpenSoothePlug {
                                     ui.label("Mid/Side Focus (-1 M .. +1 S)");
                                     ui.add(widgets::ParamSlider::for_param(&params.mid_side_balance, setter));
                                     ui.end_row();
+
+                                    ui.label("Low-Latency Tracking (~5.3 ms)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.low_latency_mode, setter));
+                                    ui.end_row();
+
+                                    ui.label("Attack (ms)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.attack_ms, setter));
+                                    ui.end_row();
+
+                                    ui.label("Release (ms)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.release_ms, setter));
+                                    ui.end_row();
+
+                                    ui.label("Hard Mode (Surgical vs Soft)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.hard_mode, setter));
+                                    ui.end_row();
+
+                                    ui.label("Focus Low (<400 Hz)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.focus_low_db, setter));
+                                    ui.end_row();
+
+                                    ui.label("Focus Mid (0.4-4 kHz)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.focus_mid_db, setter));
+                                    ui.end_row();
+
+                                    ui.label("Focus High (>4 kHz)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.focus_high_db, setter));
+                                    ui.end_row();
                                 });
                         });
                 });
@@ -619,6 +745,8 @@ impl Plugin for ForgeOpenSoothePlug {
         context: &mut impl InitContext<Self>,
     ) -> bool {
         self.sample_rate = f64::from(buffer_config.sample_rate);
+        self.dsp
+            .set_low_latency(self.params.low_latency_mode.value());
         self.reset();
         context.set_latency_samples(self.latency_samples());
         true
@@ -638,6 +766,8 @@ impl Plugin for ForgeOpenSoothePlug {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        let low_lat = self.params.low_latency_mode.value();
+        self.dsp.set_low_latency(low_lat);
         let sharp = self.params.sharpness_bins.value() as usize;
         let delta = self.params.delta_listen.value();
         let use_sub_tape = self.params.enable_sub_tape.value();
@@ -650,6 +780,16 @@ impl Plugin for ForgeOpenSoothePlug {
             .set_stereo_link(f64::from(self.params.stereo_link.value()));
         self.dsp
             .set_mid_side_balance(f64::from(self.params.mid_side_balance.value()));
+        self.dsp
+            .set_attack_ms(f64::from(self.params.attack_ms.value()));
+        self.dsp
+            .set_release_ms(f64::from(self.params.release_ms.value()));
+        self.dsp.set_hard_mode(self.params.hard_mode.value());
+        self.dsp.set_focus_eq(
+            f64::from(self.params.focus_low_db.value()),
+            f64::from(self.params.focus_mid_db.value()),
+            f64::from(self.params.focus_high_db.value()),
+        );
 
         for mut channel_samples in buffer.iter_samples() {
             let sens = f64::from(self.params.sensitivity_db.smoothed.next());
@@ -1472,12 +1612,15 @@ pub struct ForgeMasterLimiterPlug {
     analyzer: RealtimeSpectrumAnalyzer32,
     loudness_meter: OutputLoudnessMeter,
     dsp: RealtimeMasterLimiter,
+    sample_rate: f64,
 }
 
 #[derive(Params)]
 pub struct MasterLimiterParams {
     #[persist = "editor-state"]
     pub editor_state: Arc<EguiState>,
+    #[persist = "ab-state"]
+    pub ab_state: Arc<Mutex<String>>,
     #[id = "drive"]
     pub drive_db: FloatParam,
     #[id = "ceil"]
@@ -1490,12 +1633,17 @@ pub struct MasterLimiterParams {
     pub channel_link: FloatParam,
     #[id = "dither"]
     pub dither_mode: IntParam,
+    #[id = "isp8x"]
+    pub isp_8x: BoolParam,
+    #[id = "unity"]
+    pub unity_audition: BoolParam,
 }
 
 impl Default for MasterLimiterParams {
     fn default() -> Self {
         Self {
-            editor_state: EguiState::from_size(680, 360),
+            editor_state: EguiState::from_size(680, 420),
+            ab_state: Arc::new(Mutex::new(String::new())),
             drive_db: FloatParam::new(
                 "Input Gain / Drive",
                 0.0,
@@ -1560,6 +1708,8 @@ impl Default for MasterLimiterParams {
                     "2" | "noise-shaped" | "noise-shaped 16-bit" | "shaped" => Some(2),
                     _ => None,
                 })),
+            isp_8x: BoolParam::new("8x True-Peak Oversampling", false),
+            unity_audition: BoolParam::new("1:1 Unity Gain Audition", false),
         }
     }
 }
@@ -1572,6 +1722,7 @@ impl Default for ForgeMasterLimiterPlug {
             analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
             loudness_meter: OutputLoudnessMeter::new(48_000.0),
             dsp: RealtimeMasterLimiter::new(48_000.0),
+            sample_rate: 48_000.0,
         }
     }
 }
@@ -1600,47 +1751,76 @@ impl Plugin for ForgeMasterLimiterPlug {
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         let params = self.params.clone();
         let telemetry = self.telemetry.clone();
+        let initial_ab = AbBankState::load_from_persisted(&self.params.ab_state);
         create_egui_editor(
             self.params.editor_state.clone(),
-            AbBankState::default(),
+            initial_ab,
             |_, _| {},
             move |egui_ctx, setter, ab_state| {
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
-                    draw_forge_studio_header_and_spectrum(
+                    draw_forge_studio_header_and_spectrum_interactive(
                         ui,
                         "FORGE MASTER TRUE-PEAK BRICKWALL LIMITER",
-                        "Lookahead 4x Inter-Sample True-Peak Brickwall Limiter (-1.0 dBTP) & ITU-R BS.1770-4 Meter",
+                        "Lookahead 4x/8x Inter-Sample True-Peak Brickwall Limiter (-1.0 dBTP) & ITU-R BS.1770-4 Meter",
                         &telemetry,
                         None,
+                        Some(setter),
+                        Some(CanvasDragHandle {
+                            label: "CEIL",
+                            param: &params.ceiling_dbtp,
+                            color: egui::Color32::from_rgb(248, 113, 113),
+                        }),
                     );
                     let param_refs = [
                         ("drive", ParamRef::Float(&params.drive_db)),
                         ("ceil", ParamRef::Float(&params.ceiling_dbtp)),
                         ("rel", ParamRef::Float(&params.release_ms)),
+                        ("style", ParamRef::Int(&params.limiter_style)),
+                        ("clink", ParamRef::Float(&params.channel_link)),
+                        ("dither", ParamRef::Int(&params.dither_mode)),
+                        ("isp8x", ParamRef::Bool(&params.isp_8x)),
+                        ("unity", ParamRef::Bool(&params.unity_audition)),
                     ];
-                    draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, LIMITER_PRESETS);
-                    egui::Grid::new("limiter_grid")
-                        .num_columns(2)
-                        .spacing([16.0, 8.0])
+                    draw_ab_and_presets_bar_persisted(
+                        ui,
+                        setter,
+                        &param_refs,
+                        ab_state,
+                        LIMITER_PRESETS,
+                        Some(&params.ab_state),
+                    );
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
                         .show(ui, |ui| {
-                            ui.label("Input Gain / Drive (dB)");
-                            ui.add(widgets::ParamSlider::for_param(&params.drive_db, setter));
-                            ui.end_row();
-                            ui.label("True-Peak Ceiling (dBTP)");
-                            ui.add(widgets::ParamSlider::for_param(&params.ceiling_dbtp, setter));
-                            ui.end_row();
-                            ui.label("Release Time (ms)");
-                            ui.add(widgets::ParamSlider::for_param(&params.release_ms, setter));
-                            ui.end_row();
-                            ui.label("Limiter Style");
-                            ui.add(widgets::ParamSlider::for_param(&params.limiter_style, setter));
-                            ui.end_row();
-                            ui.label("Channel Link");
-                            ui.add(widgets::ParamSlider::for_param(&params.channel_link, setter));
-                            ui.end_row();
-                            ui.label("Output Dither");
-                            ui.add(widgets::ParamSlider::for_param(&params.dither_mode, setter));
-                            ui.end_row();
+                            egui::Grid::new("limiter_grid")
+                                .num_columns(2)
+                                .spacing([16.0, 8.0])
+                                .show(ui, |ui| {
+                                    ui.label("Input Gain / Drive (dB)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.drive_db, setter));
+                                    ui.end_row();
+                                    ui.label("True-Peak Ceiling (dBTP)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.ceiling_dbtp, setter));
+                                    ui.end_row();
+                                    ui.label("Release Time (ms)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.release_ms, setter));
+                                    ui.end_row();
+                                    ui.label("Limiter Style");
+                                    ui.add(widgets::ParamSlider::for_param(&params.limiter_style, setter));
+                                    ui.end_row();
+                                    ui.label("Channel Link");
+                                    ui.add(widgets::ParamSlider::for_param(&params.channel_link, setter));
+                                    ui.end_row();
+                                    ui.label("Output Dither");
+                                    ui.add(widgets::ParamSlider::for_param(&params.dither_mode, setter));
+                                    ui.end_row();
+                                    ui.label("8x ISP Oversampling");
+                                    ui.add(widgets::ParamSlider::for_param(&params.isp_8x, setter));
+                                    ui.end_row();
+                                    ui.label("1:1 Unity Gain Audition");
+                                    ui.add(widgets::ParamSlider::for_param(&params.unity_audition, setter));
+                                    ui.end_row();
+                                });
                         });
                 });
             },
@@ -1654,6 +1834,7 @@ impl Plugin for ForgeMasterLimiterPlug {
         context: &mut impl InitContext<Self>,
     ) -> bool {
         let sr = f64::from(buffer_config.sample_rate);
+        self.sample_rate = sr;
         self.dsp.reset(sr);
         self.analyzer.reset(sr);
         self.loudness_meter.reset(sr);
@@ -1662,6 +1843,8 @@ impl Plugin for ForgeMasterLimiterPlug {
     }
 
     fn reset(&mut self) {
+        self.dsp.reset(self.sample_rate);
+        self.analyzer.reset(self.sample_rate);
         self.loudness_meter.clear();
     }
 
@@ -1688,12 +1871,25 @@ impl Plugin for ForgeMasterLimiterPlug {
         self.dsp
             .set_channel_link(f64::from(self.params.channel_link.value()));
         self.dsp.set_dither(dither_mode, dither_bits);
+        self.dsp
+            .set_isp_oversampling(if self.params.isp_8x.value() {
+                IspOversampling::X8
+            } else {
+                IspOversampling::X4
+            });
+        let unity_audition = self.params.unity_audition.value();
 
         for mut channel_samples in buffer.iter_samples() {
             let drive = f64::from(self.params.drive_db.smoothed.next());
             let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
             let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
-            let (out_l, out_r) = self.dsp.process_stereo_sample(in_l, in_r, drive, ceil, rel);
+            let (mut out_l, mut out_r) =
+                self.dsp.process_stereo_sample(in_l, in_r, drive, ceil, rel);
+            if unity_audition && drive.abs() > 0.01 {
+                let comp = 10.0_f32.powf((-drive as f32) / 20.0);
+                out_l *= comp;
+                out_r *= comp;
+            }
             self.analyzer.push_stereo_sample(out_l, out_r);
             self.loudness_meter.push_output_sample(out_l, out_r);
             let (_lufs, _dbtp, gr) = self.dsp.telemetry();
@@ -2776,6 +2972,14 @@ pub struct SpaceVerbAndPreampParams {
     pub wet_mix: FloatParam,
     #[id = "room"]
     pub room_geometry: IntParam,
+    #[id = "declo"]
+    pub decay_low_mult: FloatParam,
+    #[id = "dechi"]
+    pub decay_high_mult: FloatParam,
+    #[id = "moddep"]
+    pub mod_depth: FloatParam,
+    #[persist = "ab-state"]
+    pub ab_state: Arc<Mutex<String>>,
 }
 
 /// Bottom of the stored `decay` knob range. The stored range is kept as it was so saved state
@@ -2912,6 +3116,34 @@ impl Default for SpaceVerbAndPreampParams {
                     "4" | "ambient" => Some(4),
                     _ => None,
                 })),
+            decay_low_mult: FloatParam::new(
+                "Low Decay EQ",
+                1.0,
+                FloatRange::Linear {
+                    min: 0.25,
+                    max: 2.0,
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(2))
+            .with_unit("x"),
+            decay_high_mult: FloatParam::new(
+                "High Decay EQ",
+                1.0,
+                FloatRange::Linear {
+                    min: 0.25,
+                    max: 2.0,
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(2))
+            .with_unit("x"),
+            mod_depth: FloatParam::new(
+                "Chorus Mod Depth",
+                1.0,
+                FloatRange::Linear { min: 0.0, max: 2.0 },
+            )
+            .with_value_to_string(formatters::v2s_f32_percentage(0))
+            .with_string_to_value(formatters::s2v_f32_percentage()),
+            ab_state: Arc::new(Mutex::new(String::new())),
         }
     }
 }
@@ -2952,9 +3184,10 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         let params = self.params.clone();
         let telemetry = self.telemetry.clone();
+        let initial_ab = AbBankState::load_from_persisted(&self.params.ab_state);
         create_egui_editor(
             self.params.editor_state.clone(),
-            AbBankState::default(),
+            initial_ab,
             |_, _| {},
             move |egui_ctx, setter, ab_state| {
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
@@ -2973,36 +3206,60 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
                         ("shimmer", ParamRef::Float(&params.shimmer_amount)),
                         ("duck", ParamRef::Float(&params.vocal_ducking)),
                         ("mix", ParamRef::Float(&params.wet_mix)),
+                        ("room", ParamRef::Int(&params.room_geometry)),
+                        ("declo", ParamRef::Float(&params.decay_low_mult)),
+                        ("dechi", ParamRef::Float(&params.decay_high_mult)),
+                        ("moddep", ParamRef::Float(&params.mod_depth)),
                     ];
-                    draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, SPACEVERB_PRESETS);
-                    egui::Grid::new("spaceverb_grid")
-                        .num_columns(2)
-                        .spacing([16.0, 8.0])
+                    draw_ab_and_presets_bar_persisted(
+                        ui,
+                        setter,
+                        &param_refs,
+                        ab_state,
+                        SPACEVERB_PRESETS,
+                        Some(&params.ab_state),
+                    );
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
                         .show(ui, |ui| {
-                            ui.label("Neural Hardware Model (0..3)");
-                            ui.add(widgets::ParamSlider::for_param(&params.neural_model_idx, setter));
-                            ui.end_row();
-                            ui.label("Neural WaveNet Drive");
-                            ui.add(widgets::ParamSlider::for_param(&params.preamp_drive, setter));
-                            ui.end_row();
-                            ui.label("8x8 FDN Reverb Decay");
-                            ui.add(widgets::ParamSlider::for_param(&params.reverb_decay, setter));
-                            ui.end_row();
-                            ui.label("High Damping");
-                            ui.add(widgets::ParamSlider::for_param(&params.reverb_damping, setter));
-                            ui.end_row();
-                            ui.label("+12 st Octave Shimmer");
-                            ui.add(widgets::ParamSlider::for_param(&params.shimmer_amount, setter));
-                            ui.end_row();
-                            ui.label("Vocal Auto-Ducking");
-                            ui.add(widgets::ParamSlider::for_param(&params.vocal_ducking, setter));
-                            ui.end_row();
-                            ui.label("Reverb Wet Mix");
-                            ui.add(widgets::ParamSlider::for_param(&params.wet_mix, setter));
-                            ui.end_row();
-                            ui.label("Room Geometry");
-                            ui.add(widgets::ParamSlider::for_param(&params.room_geometry, setter));
-                            ui.end_row();
+                            egui::Grid::new("spaceverb_grid")
+                                .num_columns(2)
+                                .spacing([16.0, 8.0])
+                                .show(ui, |ui| {
+                                    ui.label("Neural Hardware Model (0..3)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.neural_model_idx, setter));
+                                    ui.end_row();
+                                    ui.label("Neural WaveNet Drive");
+                                    ui.add(widgets::ParamSlider::for_param(&params.preamp_drive, setter));
+                                    ui.end_row();
+                                    ui.label("8x8 FDN Reverb Decay");
+                                    ui.add(widgets::ParamSlider::for_param(&params.reverb_decay, setter));
+                                    ui.end_row();
+                                    ui.label("High Damping");
+                                    ui.add(widgets::ParamSlider::for_param(&params.reverb_damping, setter));
+                                    ui.end_row();
+                                    ui.label("+12 st Octave Shimmer");
+                                    ui.add(widgets::ParamSlider::for_param(&params.shimmer_amount, setter));
+                                    ui.end_row();
+                                    ui.label("Vocal Auto-Ducking");
+                                    ui.add(widgets::ParamSlider::for_param(&params.vocal_ducking, setter));
+                                    ui.end_row();
+                                    ui.label("Reverb Wet Mix");
+                                    ui.add(widgets::ParamSlider::for_param(&params.wet_mix, setter));
+                                    ui.end_row();
+                                    ui.label("Room Geometry");
+                                    ui.add(widgets::ParamSlider::for_param(&params.room_geometry, setter));
+                                    ui.end_row();
+                                    ui.label("Low Decay Rate EQ (<350 Hz)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.decay_low_mult, setter));
+                                    ui.end_row();
+                                    ui.label("High Decay Rate EQ (>4 kHz)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.decay_high_mult, setter));
+                                    ui.end_row();
+                                    ui.label("Chorus Modulation Depth");
+                                    ui.add(widgets::ParamSlider::for_param(&params.mod_depth, setter));
+                                    ui.end_row();
+                                });
                         });
                 });
             },
@@ -3043,6 +3300,12 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
             _ => ReverbRoomGeometry::Hall,
         };
         self.reverb_dsp.set_room_geometry(room_geometry);
+        self.reverb_dsp.set_decay_eq(
+            f64::from(self.params.decay_low_mult.value()),
+            f64::from(self.params.decay_high_mult.value()),
+        );
+        self.reverb_dsp
+            .set_mod_depth(f64::from(self.params.mod_depth.value()));
         let decay = reverb_decay_knob_to_rt60_secs(self.params.reverb_decay.value());
         let damp = f64::from(self.params.reverb_damping.value());
         let shimmer = f64::from(self.params.shimmer_amount.value());

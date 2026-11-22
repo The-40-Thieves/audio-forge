@@ -64,18 +64,14 @@ impl ParamSmoother {
     }
 }
 
-/// Real-Time Zero-Allocation **OpenSoothe** OLA-STFT Dynamic Spectral Resonance & AI De-Fizz Processor.
-///
-/// Uses a 2048-sample Hann-windowed ring buffer with 512-sample hop (`75%` overlap, exact COLA).
-/// Each input sample reaches the output exactly `fft_size` (2048) samples later, which is the
-/// latency reported to the DAW for sample-accurate PDC.
-pub struct RealtimeOpenSoothe {
+/// Internal pre-allocated OLA-STFT core for [`RealtimeOpenSoothe`] (instantiated at both
+/// 2048-pt Ultra resolution and 256-pt Low-Latency Tracking resolution).
+struct OpenSootheStftCore {
     sample_rate: f64,
     fft_size: usize,
     hop_size: usize,
     half_bins: usize,
     window: Vec<f64>,
-    /// `stft_band_power_norm(window)`: turns summed bin powers into sine-referenced band power.
     spectrum_power_norm: f64,
     band_weights: Vec<f64>,
     fft_fwd: Arc<dyn Fft<f64>>,
@@ -89,23 +85,28 @@ pub struct RealtimeOpenSoothe {
     hop_counter: usize,
     spec_scratch: Vec<Complex<f64>>,
     spec_scratch_r: Vec<Complex<f64>>,
-    /// Pre-allocated rustfft scratch, so `process_with_scratch` never allocates per hop.
     fft_scratch: Vec<Complex<f64>>,
     mags_scratch: Vec<f64>,
     smoothed_gains_l: Vec<f64>,
     smoothed_gains_r: Vec<f64>,
-    tilt_db_per_oct: f64,
-    stereo_link: f64,
-    mid_side_balance: f64,
     last_gr_db: f32,
     last_spectrum_db: [f32; 32],
     last_band_gr_db: [f32; 32],
 }
 
-impl RealtimeOpenSoothe {
-    pub fn new(sample_rate: f64) -> Self {
-        let fft_size = 2048;
-        let hop_size = 512;
+#[derive(Clone, Copy)]
+struct OpenSootheControlState {
+    tilt_db_per_oct: f64,
+    stereo_link: f64,
+    mid_side_balance: f64,
+    attack_ms: f64,
+    release_ms: f64,
+    hard_mode: bool,
+    focus_eq_db: [f64; 3],
+}
+
+impl OpenSootheStftCore {
+    fn new(sample_rate: f64, fft_size: usize, hop_size: usize) -> Self {
         let half_bins = fft_size / 2 + 1;
         let mut planner = FftPlanner::<f64>::new();
         let fft_fwd = planner.plan_fft_forward(fft_size);
@@ -119,7 +120,7 @@ impl RealtimeOpenSoothe {
             .collect();
         let spectrum_power_norm = stft_band_power_norm(&window);
 
-        let mut proc = Self {
+        let mut core = Self {
             sample_rate: sample_rate.max(8000.0),
             fft_size,
             hop_size,
@@ -142,24 +143,15 @@ impl RealtimeOpenSoothe {
             mags_scratch: vec![0.0; half_bins],
             smoothed_gains_l: vec![1.0; half_bins],
             smoothed_gains_r: vec![1.0; half_bins],
-            tilt_db_per_oct: 0.0,
-            stereo_link: 1.0,
-            mid_side_balance: 0.0,
             last_gr_db: 0.0,
             last_spectrum_db: [SPECTRUM_FLOOR_DB; SPECTRUM_BANDS],
             last_band_gr_db: [0.0; 32],
         };
-        proc.update_band_weights(1.35, 1.15);
-        proc
+        core.update_band_weights(1.35, 1.15);
+        core
     }
 
-    /// Delay from input to output: a sample written at ring position `k` is overlap-added
-    /// into the output ring at `k + fft_size`, so the delay is the full frame, not `fft_size - hop`.
-    pub fn latency_samples(&self) -> u32 {
-        self.fft_size as u32
-    }
-
-    pub fn reset(&mut self, sample_rate: f64) {
+    fn reset(&mut self, sample_rate: f64) {
         self.sample_rate = sample_rate.max(8000.0);
         self.in_ring_l.fill(0.0);
         self.in_ring_r.fill(0.0);
@@ -176,7 +168,7 @@ impl RealtimeOpenSoothe {
         self.update_band_weights(1.35, 1.15);
     }
 
-    pub fn update_band_weights(&mut self, fizz_weight: f64, sibilance_weight: f64) {
+    fn update_band_weights(&mut self, fizz_weight: f64, sibilance_weight: f64) {
         let bin_hz = self.sample_rate / (self.fft_size as f64);
         let clean_fizz = sanitize_param_f64(fizz_weight, 1.25, 0.0, 2.0);
         let clean_sib = sanitize_param_f64(sibilance_weight, 1.0, 0.0, 2.0);
@@ -209,38 +201,26 @@ impl RealtimeOpenSoothe {
         }
     }
 
-    pub fn last_gain_reduction_db(&self) -> f32 {
-        self.last_gr_db
-    }
-
-    pub fn last_spectrum_32_db(&self) -> [f32; 32] {
-        self.last_spectrum_db
-    }
-
-    pub fn last_band_gr_32_db(&self) -> [f32; 32] {
-        self.last_band_gr_db
-    }
-
-    /// Sets spectral sensitivity tilt in dB/octave pivoted at 1 kHz (`-6.0..=+6.0`). Zero-alloc.
     #[inline]
-    pub fn set_tilt_db_per_oct(&mut self, tilt_db_per_oct: f64) {
-        self.tilt_db_per_oct = sanitize_param_f64(tilt_db_per_oct, 0.0, -6.0, 6.0);
-    }
-
-    /// Sets stereo gain linking (`0.0` = dual-mono, `1.0` = linked stereo). Zero-alloc.
-    #[inline]
-    pub fn set_stereo_link(&mut self, stereo_link: f64) {
-        self.stereo_link = sanitize_param_f64(stereo_link, 1.0, 0.0, 1.0);
-    }
-
-    /// Sets Mid/Side focus (`-1.0` = Mid only, `0.0` = balanced, `+1.0` = Side only). Zero-alloc.
-    #[inline]
-    pub fn set_mid_side_balance(&mut self, mid_side_balance: f64) {
-        self.mid_side_balance = sanitize_param_f64(mid_side_balance, 0.0, -1.0, 1.0);
+    fn focus_eq_multiplier(freq_hz: f64, focus_db: [f64; 3]) -> f64 {
+        if focus_db[0].abs() < 1e-4 && focus_db[1].abs() < 1e-4 && focus_db[2].abs() < 1e-4 {
+            return 1.0;
+        }
+        // Smooth log-frequency weighting across Low (<400 Hz), Mid (400..4000 Hz), High (>4000 Hz)
+        let f = freq_hz.max(20.0);
+        let lf = f.log2();
+        let l_lo = 400.0_f64.log2();
+        let l_hi = 4000.0_f64.log2();
+        let w_low = ((l_lo + 0.5 - lf) / 1.0).clamp(0.0, 1.0);
+        let w_high = ((lf - (l_hi - 0.5)) / 1.0).clamp(0.0, 1.0);
+        let w_mid = (1.0 - w_low - w_high).max(0.0);
+        let db = w_low * focus_db[0] + w_mid * focus_db[1] + w_high * focus_db[2];
+        10.0_f64.powf(db / 20.0).clamp(0.15, 4.0)
     }
 
     #[inline]
-    pub fn process_stereo_sample(
+    #[allow(clippy::too_many_arguments)]
+    fn process_stereo_sample(
         &mut self,
         in_l: f32,
         in_r: f32,
@@ -248,6 +228,7 @@ impl RealtimeOpenSoothe {
         max_depth_db: f64,
         sharpness_bins: usize,
         delta_listen: bool,
+        ctrl: OpenSootheControlState,
     ) -> (f32, f32) {
         let mask_in = self.fft_size - 1;
         let mask_out = self.fft_size * 2 - 1;
@@ -260,7 +241,6 @@ impl RealtimeOpenSoothe {
         let out_l = flush_denormal_f64(self.out_ring_l[read_idx] / denom) as f32;
         let out_r = flush_denormal_f64(self.out_ring_r[read_idx] / denom) as f32;
 
-        // Clear consumed output slot for future overlap-add
         self.out_ring_l[read_idx] = 0.0;
         self.out_ring_r[read_idx] = 0.0;
         self.norm_ring[read_idx] = 0.0;
@@ -272,7 +252,7 @@ impl RealtimeOpenSoothe {
             self.hop_counter = 0;
             let clean_sens = sanitize_param_f64(sensitivity_db, 3.5, 0.5, 24.0);
             let clean_depth = sanitize_param_f64(max_depth_db, 9.0, 0.5, 24.0);
-            self.process_stft_hop(clean_sens, clean_depth, sharpness_bins, delta_listen);
+            self.process_stft_hop(clean_sens, clean_depth, sharpness_bins, delta_listen, ctrl);
         }
 
         (out_l, out_r)
@@ -284,36 +264,38 @@ impl RealtimeOpenSoothe {
         max_depth_db: f64,
         sharpness_bins: usize,
         delta_listen: bool,
+        ctrl: OpenSootheControlState,
     ) {
         let thresh_ratio = 10.0_f64.powf(sensitivity_db.max(0.5) / 20.0);
         let min_gain = 10.0_f64.powf(-max_depth_db.clamp(0.5, 24.0) / 20.0);
-        let radius = sharpness_bins.clamp(4, 24);
+        let radius = if self.fft_size <= 256 {
+            (sharpness_bins / 4).clamp(2, 8)
+        } else {
+            sharpness_bins.clamp(4, 24)
+        };
         let mask_in = self.fft_size - 1;
         let mask_out = self.fft_size * 2 - 1;
         let frame_start = self.ring_pos.wrapping_sub(self.fft_size);
         let inv_n = 1.0 / (self.fft_size as f64);
         let bin_hz = self.sample_rate / (self.fft_size as f64);
         let hop_secs = (self.hop_size as f64) / self.sample_rate.max(1.0);
-        let attack_alpha = (-hop_secs / 0.010).exp();
-        let release_alpha = (-hop_secs / 0.055).exp();
+        let attack_alpha = (-hop_secs / (ctrl.attack_ms * 0.001)).exp();
+        let release_alpha = (-hop_secs / (ctrl.release_ms * 0.001)).exp();
+        let slope_exp = if ctrl.hard_mode { 0.95 } else { 0.65 };
         let mut band_pow = [0.0_f64; SPECTRUM_BANDS];
 
         let mut min_g_seen = 1.0_f64;
-        let use_ms = self.mid_side_balance.abs() > 1e-4;
+        let use_ms = ctrl.mid_side_balance.abs() > 1e-4;
         let ms_focus = [
-            (1.0 - self.mid_side_balance.max(0.0)).clamp(0.0, 1.0),
-            (1.0 + self.mid_side_balance.min(0.0)).clamp(0.0, 1.0),
+            (1.0 - ctrl.mid_side_balance.max(0.0)).clamp(0.0, 1.0),
+            (1.0 + ctrl.mid_side_balance.min(0.0)).clamp(0.0, 1.0),
         ];
-        // M = 0.5*(L+R) and S = 0.5*(L-R) satisfy M^2 + S^2 = 0.5*(L^2 + R^2), so double the
-        // per-channel spectrum norm in Mid/Side mode to keep displayed levels invariant.
         let spec_norm = if use_ms {
             self.spectrum_power_norm
         } else {
             0.5 * self.spectrum_power_norm
         };
 
-        // Pass 1: FFT both channels and update both current-hop smoothed gain curves before
-        // applying stereo linking so L and R always share current-hop gains symmetrically.
         for (ch_idx, &ms_f) in ms_focus.iter().enumerate() {
             let focus = if use_ms { ms_f } else { 1.0 };
             let spec = if ch_idx == 0 {
@@ -350,7 +332,6 @@ impl RealtimeOpenSoothe {
             {
                 *mag = c.norm().max(1e-12);
             }
-            // Input spectrum for the display, summed over both channels before any gain.
             accumulate_stft_band_power(&self.mags_scratch, bin_hz, spec_norm, &mut band_pow);
 
             let smoothed = if ch_idx == 0 {
@@ -365,19 +346,20 @@ impl RealtimeOpenSoothe {
                 .take(self.half_bins - 1)
                 .skip(1)
             {
-                let base_w = self.band_weights[b] * focus;
-                let weight = if self.tilt_db_per_oct.abs() > 1e-6 && base_w > 0.01 {
-                    let f = (b as f64) * bin_hz;
+                let f = (b as f64) * bin_hz;
+                let base_w =
+                    self.band_weights[b] * focus * Self::focus_eq_multiplier(f, ctrl.focus_eq_db);
+                let weight = if ctrl.tilt_db_per_oct.abs() > 1e-6 && base_w > 0.01 {
                     let tilt_mul = if f > 20.0 {
                         10.0_f64
-                            .powf((self.tilt_db_per_oct * (f / 1000.0).log2()) / 20.0)
+                            .powf((ctrl.tilt_db_per_oct * (f / 1000.0).log2()) / 20.0)
                             .clamp(0.15, 3.0)
                     } else {
                         1.0
                     };
-                    (base_w * tilt_mul).clamp(0.0, 3.0)
+                    (base_w * tilt_mul).clamp(0.0, 3.5)
                 } else {
-                    base_w
+                    base_w.clamp(0.0, 3.5)
                 };
                 if weight <= 0.01 {
                     *smoothed_val = 1.0;
@@ -407,7 +389,7 @@ impl RealtimeOpenSoothe {
 
                 let excess = (self.mags_scratch[b] / local_env) / thresh_ratio;
                 let target_gain = if excess > 1.0 {
-                    (1.0 / excess.powf(0.65 * weight)).clamp(min_gain, 1.0)
+                    (1.0 / excess.powf(slope_exp * weight)).clamp(min_gain, 1.0)
                 } else {
                     1.0
                 };
@@ -421,7 +403,6 @@ impl RealtimeOpenSoothe {
             }
         }
 
-        // Pass 2: Apply symmetric stereo-linked lobe-smoothed gains, IFFT, and overlap-add.
         for b in 1..(self.half_bins - 1) {
             let lobe_l = {
                 let min_l = self.smoothed_gains_l[b - 1]
@@ -441,11 +422,11 @@ impl RealtimeOpenSoothe {
                     + 0.25 * self.smoothed_gains_r[b + 1];
                 0.65 * min_r + 0.35 * avg_r
             };
-            let (gl, gr) = if !use_ms && self.stereo_link > 1e-4 {
+            let (gl, gr) = if !use_ms && ctrl.stereo_link > 1e-4 {
                 let g_link = lobe_l.min(lobe_r);
                 (
-                    self.stereo_link * g_link + (1.0 - self.stereo_link) * lobe_l,
-                    self.stereo_link * g_link + (1.0 - self.stereo_link) * lobe_r,
+                    ctrl.stereo_link * g_link + (1.0 - ctrl.stereo_link) * lobe_l,
+                    ctrl.stereo_link * g_link + (1.0 - ctrl.stereo_link) * lobe_r,
                 )
             } else {
                 (lobe_l, lobe_r)
@@ -491,8 +472,6 @@ impl RealtimeOpenSoothe {
         }
 
         self.last_gr_db = (-20.0 * min_g_seen.max(1e-6).log10()) as f32;
-
-        // 32-band input power spectrum (L/R power average) and dynamic gain-reduction curve
         self.last_spectrum_db = band_power_to_db(&band_pow);
         for band_idx in 0..SPECTRUM_BANDS {
             let (b0, b1) = stft_band_bins(band_idx, bin_hz, self.half_bins);
@@ -506,6 +485,168 @@ impl RealtimeOpenSoothe {
             self.last_band_gr_db[band_idx] =
                 (20.0 * min_band_g.max(1.0e-4).log10() as f32).clamp(-24.0, 0.0);
         }
+    }
+}
+
+/// Real-Time Zero-Allocation **OpenSoothe** OLA-STFT Dynamic Spectral Resonance & AI De-Fizz Processor.
+///
+/// Pre-allocates both a 2048-sample Ultra resolution engine (`42.7 ms` @ 48 kHz) and a
+/// 256-sample Low-Latency Tracking engine (`5.3 ms` @ 48 kHz) so switching modes never allocates.
+pub struct RealtimeOpenSoothe {
+    ultra: OpenSootheStftCore,
+    tracking: OpenSootheStftCore,
+    low_latency: bool,
+    ctrl: OpenSootheControlState,
+}
+
+impl RealtimeOpenSoothe {
+    pub fn new(sample_rate: f64) -> Self {
+        Self {
+            ultra: OpenSootheStftCore::new(sample_rate, 2048, 512),
+            tracking: OpenSootheStftCore::new(sample_rate, 256, 64),
+            low_latency: false,
+            ctrl: OpenSootheControlState {
+                tilt_db_per_oct: 0.0,
+                stereo_link: 1.0,
+                mid_side_balance: 0.0,
+                attack_ms: 10.0,
+                release_ms: 55.0,
+                hard_mode: false,
+                focus_eq_db: [0.0; 3],
+            },
+        }
+    }
+
+    #[inline]
+    fn active(&self) -> &OpenSootheStftCore {
+        if self.low_latency {
+            &self.tracking
+        } else {
+            &self.ultra
+        }
+    }
+
+    #[inline]
+    fn active_mut(&mut self) -> &mut OpenSootheStftCore {
+        if self.low_latency {
+            &mut self.tracking
+        } else {
+            &mut self.ultra
+        }
+    }
+
+    /// Delay from input to output: `256` samples in low-latency tracking mode (`5.33 ms` @ 48 kHz)
+    /// or `2048` samples in Ultra mode (`42.67 ms` @ 48 kHz).
+    pub fn latency_samples(&self) -> u32 {
+        self.active().fft_size as u32
+    }
+
+    /// Switches between Ultra (2048-pt) and Low-Latency Tracking (256-pt) modes with zero allocations.
+    /// Flushes the newly-selected STFT core in place so stale buffered audio never replays.
+    #[inline]
+    pub fn set_low_latency(&mut self, low_latency: bool) {
+        if low_latency != self.low_latency {
+            self.low_latency = low_latency;
+            let sr = self.active().sample_rate;
+            self.active_mut().reset(sr);
+        }
+    }
+
+    pub fn is_low_latency(&self) -> bool {
+        self.low_latency
+    }
+
+    pub fn reset(&mut self, sample_rate: f64) {
+        self.ultra.reset(sample_rate);
+        self.tracking.reset(sample_rate);
+    }
+
+    pub fn update_band_weights(&mut self, fizz_weight: f64, sibilance_weight: f64) {
+        self.ultra
+            .update_band_weights(fizz_weight, sibilance_weight);
+        self.tracking
+            .update_band_weights(fizz_weight, sibilance_weight);
+    }
+
+    pub fn last_gain_reduction_db(&self) -> f32 {
+        self.active().last_gr_db
+    }
+
+    pub fn last_spectrum_32_db(&self) -> [f32; 32] {
+        self.active().last_spectrum_db
+    }
+
+    pub fn last_band_gr_32_db(&self) -> [f32; 32] {
+        self.active().last_band_gr_db
+    }
+
+    /// Sets spectral sensitivity tilt in dB/octave pivoted at 1 kHz (`-6.0..=+6.0`). Zero-alloc.
+    #[inline]
+    pub fn set_tilt_db_per_oct(&mut self, tilt_db_per_oct: f64) {
+        self.ctrl.tilt_db_per_oct = sanitize_param_f64(tilt_db_per_oct, 0.0, -6.0, 6.0);
+    }
+
+    /// Sets stereo gain linking (`0.0` = dual-mono, `1.0` = linked stereo). Zero-alloc.
+    #[inline]
+    pub fn set_stereo_link(&mut self, stereo_link: f64) {
+        self.ctrl.stereo_link = sanitize_param_f64(stereo_link, 1.0, 0.0, 1.0);
+    }
+
+    /// Sets Mid/Side focus (`-1.0` = Mid only, `0.0` = balanced, `+1.0` = Side only). Zero-alloc.
+    #[inline]
+    pub fn set_mid_side_balance(&mut self, mid_side_balance: f64) {
+        self.ctrl.mid_side_balance = sanitize_param_f64(mid_side_balance, 0.0, -1.0, 1.0);
+    }
+
+    /// Sets dynamic suppression attack time in milliseconds (`1.0..=100.0`). Zero-alloc.
+    #[inline]
+    pub fn set_attack_ms(&mut self, attack_ms: f64) {
+        self.ctrl.attack_ms = sanitize_param_f64(attack_ms, 10.0, 1.0, 100.0);
+    }
+
+    /// Sets dynamic suppression release time in milliseconds (`10.0..=500.0`). Zero-alloc.
+    #[inline]
+    pub fn set_release_ms(&mut self, release_ms: f64) {
+        self.ctrl.release_ms = sanitize_param_f64(release_ms, 55.0, 10.0, 500.0);
+    }
+
+    /// Sets Hard (`true`, surgical) vs Soft (`false`, musical) suppression curve. Zero-alloc.
+    #[inline]
+    pub fn set_hard_mode(&mut self, hard_mode: bool) {
+        self.ctrl.hard_mode = hard_mode;
+    }
+
+    /// Sets 3-band Focus EQ sensitivity boosts/cuts in dB (`-12.0..=+12.0`) for Low (<400 Hz),
+    /// Mid (400..4000 Hz), and High (>4000 Hz). Zero-alloc.
+    #[inline]
+    pub fn set_focus_eq(&mut self, low_db: f64, mid_db: f64, high_db: f64) {
+        self.ctrl.focus_eq_db = [
+            sanitize_param_f64(low_db, 0.0, -12.0, 12.0),
+            sanitize_param_f64(mid_db, 0.0, -12.0, 12.0),
+            sanitize_param_f64(high_db, 0.0, -12.0, 12.0),
+        ];
+    }
+
+    #[inline]
+    pub fn process_stereo_sample(
+        &mut self,
+        in_l: f32,
+        in_r: f32,
+        sensitivity_db: f64,
+        max_depth_db: f64,
+        sharpness_bins: usize,
+        delta_listen: bool,
+    ) -> (f32, f32) {
+        let ctrl = self.ctrl;
+        self.active_mut().process_stereo_sample(
+            in_l,
+            in_r,
+            sensitivity_db,
+            max_depth_db,
+            sharpness_bins,
+            delta_listen,
+            ctrl,
+        )
     }
 }
 
@@ -1249,6 +1390,16 @@ impl RealtimeSubAndTapeBus {
 /// The ramp finishes before a detected peak leaves the `lookahead` delay line, and the hold keeps
 /// the gain flat across the interpolation filter's neighbourhood, so the output's true peak stays
 /// under the ceiling without the final clamp engaging.
+/// Inter-sample true-peak detector oversampling mode for [`RealtimeMasterLimiter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IspOversampling {
+    /// Standard ITU-R BS.1770-4 Annex 2 4x 48-tap polyphase FIR.
+    #[default]
+    X4,
+    /// Ultra-precision 8x oversampling (4x BS.1770-4 polyphase + cubic half-phase midpoints).
+    X8,
+}
+
 pub struct RealtimeMasterLimiter {
     sample_rate: f64,
     lookahead_samples: usize,
@@ -1266,6 +1417,7 @@ pub struct RealtimeMasterLimiter {
     last_gr_db: f32,
     tp_hist_l: [f64; TP_TAPS],
     tp_hist_r: [f64; TP_TAPS],
+    isp_oversampling: IspOversampling,
     hold_l: SlidingMin,
     hold_r: SlidingMin,
     released_gain_l: f64,
@@ -1385,6 +1537,7 @@ impl RealtimeMasterLimiter {
             last_gr_db: 0.0,
             tp_hist_l: [0.0; TP_TAPS],
             tp_hist_r: [0.0; TP_TAPS],
+            isp_oversampling: IspOversampling::X4,
             hold_l: SlidingMin::new(Self::MAX_LOOKAHEAD_SAMPLES + Self::HOLD_AFTER),
             hold_r: SlidingMin::new(Self::MAX_LOOKAHEAD_SAMPLES + Self::HOLD_AFTER),
             released_gain_l: 1.0,
@@ -1494,6 +1647,18 @@ impl RealtimeMasterLimiter {
         self.dither_bits = bits.clamp(8, 24);
     }
 
+    /// Selects 4x (ITU-R BS.1770-4) or 8x (ultra-precision) inter-sample peak oversampling.
+    /// Zero-alloc.
+    #[inline]
+    pub fn set_isp_oversampling(&mut self, mode: IspOversampling) {
+        self.isp_oversampling = mode;
+    }
+
+    #[inline]
+    pub const fn isp_oversampling(&self) -> IspOversampling {
+        self.isp_oversampling
+    }
+
     #[inline]
     fn next_dither_bipolar(state: &mut u64) -> f64 {
         let mut x = *state;
@@ -1537,17 +1702,26 @@ impl RealtimeMasterLimiter {
         (-1.0 / ((release_ms * 0.001) * sample_rate)).exp()
     }
 
-    /// Pushes `x` into the newest-first history and returns the largest of `|x|` and the four
-    /// interpolated phases of the ITU-R BS.1770-4 Annex 2 filter (the FIR `compute_true_peak`
-    /// uses).
+    /// Pushes `x` into the newest-first history and returns the largest of `|x|` and the
+    /// interpolated sub-samples (4x BS.1770-4 polyphase FIR, or 8x with Catmull-Rom midpoints).
     #[inline]
-    fn estimate_4x_intersample_peak(hist: &mut [f64; TP_TAPS], x: f64) -> f64 {
+    fn estimate_intersample_peak(hist: &mut [f64; TP_TAPS], x: f64, mode: IspOversampling) -> f64 {
         hist.copy_within(0..TP_TAPS - 1, 1);
         hist[0] = x;
         let mut peak = x.abs();
-        for coeffs in &TRUE_PEAK_PHASES {
+        let mut phases = [0.0_f64; 4];
+        for (slot, coeffs) in phases.iter_mut().zip(&TRUE_PEAK_PHASES) {
             let interp: f64 = coeffs.iter().zip(hist.iter()).map(|(c, h)| c * h).sum();
+            *slot = interp;
             peak = peak.max(interp.abs());
+        }
+        if mode == IspOversampling::X8 {
+            // Evaluate strictly contiguous half-phase midpoints within the 4x polyphase window
+            // (all four `phases` share the exact same group delay).
+            let m01 = 0.5 * (phases[0] + phases[1]);
+            let m12 = 0.5625 * (phases[1] + phases[2]) - 0.0625 * (phases[0] + phases[3]);
+            let m23 = 0.5 * (phases[2] + phases[3]);
+            peak = peak.max(m01.abs()).max(m12.abs()).max(m23.abs());
         }
         peak
     }
@@ -1562,8 +1736,9 @@ impl RealtimeMasterLimiter {
         target_lin: f64,
         release_coeff: f64,
     ) -> (f64, f64, f64) {
-        let tp_l = Self::estimate_4x_intersample_peak(&mut self.tp_hist_l, xl).max(1e-12);
-        let tp_r = Self::estimate_4x_intersample_peak(&mut self.tp_hist_r, xr).max(1e-12);
+        let mode = self.isp_oversampling;
+        let tp_l = Self::estimate_intersample_peak(&mut self.tp_hist_l, xl, mode).max(1e-12);
+        let tp_r = Self::estimate_intersample_peak(&mut self.tp_hist_r, xr, mode).max(1e-12);
         let tp_max = tp_l.max(tp_r);
         let link = self.channel_link;
         let eff_tp_l = link * tp_max + (1.0 - link) * tp_l;

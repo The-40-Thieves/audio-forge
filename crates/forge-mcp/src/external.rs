@@ -12,10 +12,15 @@
 use crate::sandbox::PathSandbox;
 use forge_core::{ForgeError, StemBundle};
 use forge_reaper::{ReleaseMetadata, write_distrokid_metadata};
-use forge_worker::{SeparationConfig, SeparationReport, separate_stems};
+use forge_worker::{
+    MidiTranscribeResult, NeuralDenoiseResult, SeparationConfig, SeparationReport,
+    resolve_default_local_worker, run_local_neural_denoise, run_local_transcribe_midi,
+    separate_stems,
+};
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Copies a sandboxed input file (opened through the `cap-std` root handle) into `stage_dir`,
 /// preserving its file name/extension so external tools detect the format normally.
@@ -127,6 +132,80 @@ pub fn separate_stems_checked(
     let mut report = separate_stems(&staged_in, &staged_out, config)?;
     commit_bundle(sandbox, &staged_out, &stems_dir, &mut report.bundle)?;
     Ok(report)
+}
+
+/// Runs neural audio denoising (`DeepFilterNet3` / `Mel-Band-RoFormer`) inside a private
+/// staging directory, then commits the produced denoised WAV into `output_dir` through
+/// `cap-std` root handles.
+pub fn neural_denoise_checked(
+    sandbox: &PathSandbox,
+    input: &Path,
+    output_dir: &Path,
+    backend: &str,
+    attenuation_limit_db: Option<f64>,
+    timeout: Duration,
+) -> Result<NeuralDenoiseResult, ForgeError> {
+    let output_dir = sandbox.check(output_dir)?;
+    sandbox.create_dir_all(&output_dir)?;
+    sandbox.verify_dir(&output_dir)?;
+
+    let worker = resolve_default_local_worker()?;
+    let stage = tempfile::tempdir()?;
+    let stage_in_dir = stage.path().join("in");
+    let staged_out = stage.path().join("out");
+    std::fs::create_dir_all(&stage_in_dir)?;
+    std::fs::create_dir_all(&staged_out)?;
+    let staged_in = stage_in(sandbox, input, &stage_in_dir)?;
+
+    let mut res = run_local_neural_denoise(
+        &worker,
+        &staged_in,
+        &staged_out,
+        backend,
+        attenuation_limit_db,
+        timeout,
+    )?;
+    let file_name = res.denoised.file_name().ok_or_else(|| {
+        ForgeError::InvalidParameter(format!(
+            "Staged denoised file '{}' has no file name",
+            res.denoised.display()
+        ))
+    })?;
+    let dest = output_dir.join(file_name);
+    res.denoised = commit_staged(sandbox, &staged_out, &res.denoised, &dest)?;
+    Ok(res)
+}
+
+/// Runs polyphonic audio-to-MIDI transcription (`basic-pitch`) inside a private staging
+/// directory, then commits the produced MIDI file into `output_dir` through `cap-std` handles.
+pub fn transcribe_midi_checked(
+    sandbox: &PathSandbox,
+    input: &Path,
+    output_dir: &Path,
+    timeout: Duration,
+) -> Result<MidiTranscribeResult, ForgeError> {
+    let output_dir = sandbox.check(output_dir)?;
+    sandbox.create_dir_all(&output_dir)?;
+    sandbox.verify_dir(&output_dir)?;
+
+    let worker = resolve_default_local_worker()?;
+    let stage = tempfile::tempdir()?;
+    let stage_in_dir = stage.path().join("in");
+    let staged_out = stage.path().join("out");
+    std::fs::create_dir_all(&stage_in_dir)?;
+    std::fs::create_dir_all(&staged_out)?;
+    let staged_in = stage_in(sandbox, input, &stage_in_dir)?;
+
+    let mut res = run_local_transcribe_midi(&worker, &staged_in, &staged_out, timeout)?;
+    let file_name = res.midi.file_name().ok_or_else(|| {
+        ForgeError::InvalidParameter(format!(
+            "Staged MIDI file '{}' has no file name",
+            res.midi.display()
+        ))
+    })?;
+    let dest = output_dir.join(file_name);
+    res.midi = commit_staged(sandbox, &staged_out, &res.midi, &dest)?;
+    Ok(res)
 }
 
 fn commit_bundle(

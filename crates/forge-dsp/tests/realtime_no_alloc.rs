@@ -221,3 +221,74 @@ fn drum_trigger_shared_keys_and_voice_ids_do_not_allocate() {
     });
     std::hint::black_box(sent);
 }
+
+#[test]
+fn limiter_8x_isp_spaceverb_decay_eq_and_4x_clipper_do_not_allocate() {
+    use forge_dsp::{
+        IspOversampling, RealtimeDensityAndClipper, RealtimeFdnReverb, RealtimeMasterLimiter,
+    };
+
+    let mut lim = RealtimeMasterLimiter::new(48_000.0);
+    let mut rev = RealtimeFdnReverb::new(48_000.0);
+    let mut clip = RealtimeDensityAndClipper::new(48_000.0);
+
+    assert_no_allocs("8x ISP + Decay EQ + 4x Clipper", || {
+        lim.set_isp_oversampling(IspOversampling::X8);
+        rev.set_decay_eq(1.3, 0.6);
+        rev.set_mod_depth(1.5);
+        for i in 0..256 {
+            let x = ((i as f32) * 0.1).sin() * 0.5;
+            let (cl, cr) = clip.process_stereo_sample(x, -x, 0.3, 6.0, -0.5);
+            let (rl, rr) = rev.process_stereo_sample(cl, cr, 2.0, 0.35, 0.1, 0.2, 0.3);
+            let (ll, lr) = lim.process_stereo_sample(rl, rr, 3.0, -1.0, 80.0);
+            std::hint::black_box((ll, lr));
+        }
+    });
+}
+
+#[test]
+fn full_wavenet_nam_and_opensoothe_low_latency_do_not_allocate() {
+    use forge_dsp::{AnalogHardwareModel, RealtimeNeuralPreamp};
+    let mut preamp = RealtimeNeuralPreamp::new(AnalogHardwareModel::Neve1073ClassA);
+    let weights = vec![0.05_f64; 128];
+    let nam_json = serde_json::json!({
+        "version": "0.5.4",
+        "architecture": "WaveNet",
+        "config": {
+            "layers": [{
+                "input_size": 1,
+                "condition_size": 1,
+                "head_size": 1,
+                "channels": 2,
+                "kernel_size": 3,
+                "dilations": [1, 2],
+                "activation": "Tanh",
+                "gated": true,
+                "head_bias": false
+            }],
+            "head_scale": 0.5
+        },
+        "weights": weights
+    })
+    .to_string();
+    preamp.load_nam_json(&nam_json).expect("valid WaveNet");
+
+    let mut soothe = RealtimeOpenSoothe::new(48_000.0);
+
+    assert_no_allocs("WaveNet NAM + OpenSoothe low-latency", || {
+        soothe.set_low_latency(true);
+        soothe.set_attack_ms(4.0);
+        soothe.set_release_ms(45.0);
+        soothe.set_hard_mode(true);
+        soothe.set_focus_eq(-2.0, 4.0, 1.0);
+        for i in 0..512 {
+            let x = ((i as f32) * 0.05).sin() * 0.4;
+            let (pl, pr) = preamp.process_stereo_sample(x, -x, 6.0, 0.0);
+            let (sl, sr) = soothe.process_stereo_sample(pl, pr, 3.0, 9.0, 8, false);
+            std::hint::black_box((sl, sr));
+        }
+        preamp.reset();
+        soothe.set_low_latency(false);
+        soothe.reset(48_000.0);
+    });
+}
