@@ -1447,6 +1447,7 @@ pub struct ForgeMasterLimiterPlug {
     analyzer: RealtimeSpectrumAnalyzer32,
     loudness_meter: OutputLoudnessMeter,
     dsp: RealtimeMasterLimiter,
+    sample_rate: f64,
 }
 
 #[derive(Params)]
@@ -1547,6 +1548,7 @@ impl Default for ForgeMasterLimiterPlug {
             analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
             loudness_meter: OutputLoudnessMeter::new(48_000.0),
             dsp: RealtimeMasterLimiter::new(48_000.0),
+            sample_rate: 48_000.0,
         }
     }
 }
@@ -1592,6 +1594,9 @@ impl Plugin for ForgeMasterLimiterPlug {
                         ("drive", ParamRef::Float(&params.drive_db)),
                         ("ceil", ParamRef::Float(&params.ceiling_dbtp)),
                         ("rel", ParamRef::Float(&params.release_ms)),
+                        ("style", ParamRef::Int(&params.limiter_style)),
+                        ("clink", ParamRef::Float(&params.channel_link)),
+                        ("dither", ParamRef::Int(&params.dither_mode)),
                     ];
                     draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, LIMITER_PRESETS);
                     egui::Grid::new("limiter_grid")
@@ -1629,6 +1634,7 @@ impl Plugin for ForgeMasterLimiterPlug {
         context: &mut impl InitContext<Self>,
     ) -> bool {
         let sr = f64::from(buffer_config.sample_rate);
+        self.sample_rate = sr;
         self.dsp.reset(sr);
         self.analyzer.reset(sr);
         self.loudness_meter.reset(sr);
@@ -1637,6 +1643,8 @@ impl Plugin for ForgeMasterLimiterPlug {
     }
 
     fn reset(&mut self) {
+        self.dsp.reset(self.sample_rate);
+        self.analyzer.reset(self.sample_rate);
         self.loudness_meter.clear();
     }
 
@@ -2948,6 +2956,7 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
                         ("shimmer", ParamRef::Float(&params.shimmer_amount)),
                         ("duck", ParamRef::Float(&params.vocal_ducking)),
                         ("mix", ParamRef::Float(&params.wet_mix)),
+                        ("room", ParamRef::Int(&params.room_geometry)),
                     ];
                     draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, SPACEVERB_PRESETS);
                     egui::Grid::new("spaceverb_grid")

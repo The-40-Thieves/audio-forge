@@ -573,21 +573,15 @@ pub fn shift_vocal_pitch_formant_preserved(
             let w_a = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * phase_a / grain_f).cos());
             let w_b = 1.0 - w_a;
 
-            // 4-point Catmull-Rom cubic interpolation centered at `i` with zero-padded
-            // boundaries so tails never freeze and multi-voice harmony layers stay aligned.
+            // 4-point Catmull-Rom cubic interpolation centered at `i`; clamps cleanly to
+            // `[0, frames - 1]` at clip boundaries so neither grain leg ever steps or dips.
             let sample_at = |delay: f64| -> f64 {
-                let pos = (i as f64) + half_grain - delay;
-                if pos < 0.0 || pos > ((frames - 1) as f64) {
-                    return 0.0;
-                }
+                let pos = ((i as f64) + half_grain - delay).clamp(0.0, (frames - 1) as f64);
                 let idx0 = pos.floor() as usize;
                 let frac = pos - (idx0 as f64);
                 let get = |idx: isize| -> f64 {
-                    if idx < 0 || (idx as usize) >= frames {
-                        0.0
-                    } else {
-                        forge_dsp::sanitize_sample_f64(ch[idx as usize])
-                    }
+                    let clamped = idx.clamp(0, (frames - 1) as isize) as usize;
+                    forge_dsp::sanitize_sample_f64(ch[clamped])
                 };
                 let p0 = get(idx0 as isize - 1);
                 let p1 = get(idx0 as isize);

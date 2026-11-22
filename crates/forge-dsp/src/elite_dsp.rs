@@ -393,6 +393,9 @@ pub struct RealtimeFdnReverb {
     pre_delay_buf: Vec<f64>,
     pre_delay_write: usize,
     er_taps_samples: [usize; 8],
+    er_taps_prev: [usize; 8],
+    er_xfade_len: usize,
+    er_xfade_rem: usize,
     diff_bufs: [Vec<f64>; 4],
     diff_lens: [usize; 4],
     diff_pos: [usize; 4],
@@ -435,12 +438,17 @@ impl RealtimeFdnReverb {
         let duck_attack_alpha = (-1.0 / (sr * 0.0021)).exp();
         let duck_release_alpha = (-1.0 / (sr * 0.042)).exp();
 
+        let er_xfade_len = ((sr * 0.020).round() as usize).max(64);
+
         Self {
             sample_rate: sr,
             room_geometry: ReverbRoomGeometry::Hall,
             pre_delay_buf: vec![0.0; pre_len],
             pre_delay_write: 0,
             er_taps_samples,
+            er_taps_prev: er_taps_samples,
+            er_xfade_len,
+            er_xfade_rem: 0,
             diff_bufs,
             diff_lens,
             diff_pos: [0; 4],
@@ -461,9 +469,17 @@ impl RealtimeFdnReverb {
     }
 
     /// Selects the physical early-reflection room geometry (`Plate`, `Hall`, `Chamber`, `Room`,
-    /// `Ambient`) by retuning the 8 Moorer ER taps in place with zero heap allocations.
+    /// `Ambient`) by retuning the 8 Moorer ER taps in place with zero heap allocations and a
+    /// click-free 20 ms linear crossfade from the previous geometry.
     #[inline]
     pub fn set_room_geometry(&mut self, geometry: ReverbRoomGeometry) {
+        if geometry == self.room_geometry {
+            return;
+        }
+        if self.er_xfade_rem == 0 {
+            self.er_taps_prev = self.er_taps_samples;
+            self.er_xfade_rem = self.er_xfade_len;
+        }
         self.room_geometry = geometry;
         let max_tap = self.pre_delay_buf.len().saturating_sub(2).max(1);
         let taps_ms = geometry.er_taps_ms();
@@ -507,10 +523,14 @@ impl RealtimeFdnReverb {
             self.shimmer_buf.fill(0.0);
             self.shimmer_write = 0;
             self.shimmer_phase = 0.0;
+            self.er_taps_prev = self.er_taps_samples;
+            self.er_xfade_rem = 0;
         } else {
             let saved_geometry = self.room_geometry;
             *self = Self::new(sr);
             self.set_room_geometry(saved_geometry);
+            self.er_taps_prev = self.er_taps_samples;
+            self.er_xfade_rem = 0;
         }
     }
 
@@ -567,15 +587,29 @@ impl RealtimeFdnReverb {
         let send_r = self.low_cut_r.process_sample(dry_r);
         let send_mono = flush_denormal_f64(0.5 * (send_l + send_r));
 
-        // 1B. Moorer 8-Tap Stereo Early Reflections + Pre-Delay (Dragonfly / Hibiki stage 1)
+        // 1B. Moorer 8-Tap Stereo Early Reflections + Pre-Delay (with click-free geometry crossfade)
         let pre_len = self.pre_delay_buf.len();
         self.pre_delay_buf[self.pre_delay_write] = send_mono;
         let mut er_l = 0.0_f64;
         let mut er_r = 0.0_f64;
         const ER_GAINS: [f64; 8] = [0.34, 0.28, 0.23, 0.19, 0.16, 0.13, 0.11, 0.09];
+        let xfade_new = if self.er_xfade_rem > 0 {
+            let progress = 1.0 - (self.er_xfade_rem as f64) / (self.er_xfade_len.max(1) as f64);
+            self.er_xfade_rem -= 1;
+            progress.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
         for (t, &er_gain) in ER_GAINS.iter().enumerate() {
             let r_idx = (self.pre_delay_write + pre_len - self.er_taps_samples[t]) % pre_len;
-            let tap_val = self.pre_delay_buf[r_idx] * er_gain;
+            let cur_val = self.pre_delay_buf[r_idx];
+            let tap_val = if xfade_new < 1.0 {
+                let p_idx = (self.pre_delay_write + pre_len - self.er_taps_prev[t]) % pre_len;
+                let prev_val = self.pre_delay_buf[p_idx];
+                (prev_val * (1.0 - xfade_new) + cur_val * xfade_new) * er_gain
+            } else {
+                cur_val * er_gain
+            };
             if t % 2 == 0 {
                 er_l += tap_val;
                 er_r += tap_val * 0.35;
