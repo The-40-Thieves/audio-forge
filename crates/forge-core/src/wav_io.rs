@@ -238,15 +238,19 @@ fn clean_unit(x: f64) -> f64 {
 }
 
 /// Writes already-dithered/pre-quantized samples without adding another dither pass.
+/// Uses the `2^(bits-1)` full-scale grid (`fmt.max + 1.0`) so codes quantized by the mastering
+/// limiter round-trip bit-identically, and safely handles ragged channel slices.
 fn write_rounded<W: Write + Seek>(
     buf: &AudioBuffer,
     writer: &mut WavWriter<W>,
     fmt: IntFormat,
     origin: &str,
 ) -> Result<()> {
+    let full_scale = fmt.max + 1.0;
     for f in 0..buf.num_frames() {
-        for ch in 0..buf.num_channels() {
-            let scaled = clean_unit(buf.channels[ch][f]) * fmt.scale;
+        for ch in &buf.channels {
+            let sample = ch.get(f).copied().unwrap_or(0.0);
+            let scaled = clean_unit(sample) * full_scale;
             let q = scaled.round().clamp(fmt.min, fmt.max);
             if fmt.narrow {
                 writer
@@ -350,5 +354,24 @@ mod tests {
         let err = AudioBuffer::load_wav_from_reader(Cursor::new(b"not a wav".to_vec()), "x.wav")
             .expect_err("garbage");
         assert!(err.to_string().contains("x.wav"), "{err}");
+    }
+
+    #[test]
+    fn save_wav_no_dither_preserves_prequantized_16_and_24_bit_codes() {
+        for bits in [16_u16, 24_u16] {
+            let full_scale = (1_u64 << (bits - 1)) as f64;
+            let codes: [i32; 5] = [-1024, -1, 0, 1, 2047];
+            let ch: Vec<f64> = codes.iter().map(|&c| (c as f64) / full_scale).collect();
+            let buf = AudioBuffer::from_channels(vec![ch], 48_000).expect("buf");
+            let mut bytes = Cursor::new(Vec::new());
+            buf.save_wav_no_dither_to_writer(&mut bytes, bits, "mem")
+                .expect("encode");
+            let mut reader = hound::WavReader::new(Cursor::new(bytes.into_inner())).expect("read");
+            let decoded: Vec<i32> = reader
+                .samples::<i32>()
+                .map(|s| s.expect("sample"))
+                .collect();
+            assert_eq!(decoded, codes, "codes changed for {bits}-bit no-dither WAV");
+        }
     }
 }

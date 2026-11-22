@@ -813,15 +813,12 @@ impl RealtimeOpenSpacer {
             } else {
                 SPECTRUM_FLOOR_DB
             };
-            self.last_spectrum_db[band_idx] = db.clamp(SPECTRUM_FLOOR_DB, 0.0);
+            self.last_spectrum_db[band_idx] = db.clamp(SPECTRUM_FLOOR_DB, 6.0);
         }
         for band_idx in 0..SPECTRUM_BANDS {
-            let f_lo = 20.0 * 1000.0_f64.powf((band_idx as f64) / (SPECTRUM_BANDS as f64));
-            let f_hi = 20.0 * 1000.0_f64.powf(((band_idx + 1) as f64) / (SPECTRUM_BANDS as f64));
-            let b_lo = ((f_lo / bin_hz).floor() as usize).clamp(1, self.half_bins - 2);
-            let b_hi = ((f_hi / bin_hz).ceil() as usize).clamp(b_lo + 1, self.half_bins - 1);
+            let (b_lo, b_hi) = stft_band_bins(band_idx, bin_hz, self.half_bins);
             let mut min_band_g = 1.0_f64;
-            for &g in &self.smoothed_gains[b_lo..b_hi] {
+            for &g in &self.smoothed_gains[b_lo..=b_hi] {
                 if g < min_band_g {
                     min_band_g = g;
                 }
@@ -1615,7 +1612,7 @@ impl RealtimeMasterLimiter {
         let inv_ramp = 1.0 / (self.ramp_len as f64);
         let gain_l = (self.ramp_sum_l * inv_ramp).clamp(1e-6, 1.0);
         let gain_r = (self.ramp_sum_r * inv_ramp).clamp(1e-6, 1.0);
-        (tp_max, gain_l, gain_r)
+        ((tp_l * gain_l).max(tp_r * gain_r), gain_l, gain_r)
     }
 
     #[inline]
@@ -1631,7 +1628,7 @@ impl RealtimeMasterLimiter {
     /// ITU-R BS.1770-4 K-weighted momentary loudness tracker (400 ms time constant), plus the
     /// telemetry the editor reads.
     #[inline]
-    fn update_meter(&mut self, out_l: f64, out_r: f64, tp: f64, ceiling_lin: f64) {
+    fn update_meter(&mut self, out_l: f64, out_r: f64, out_tp_est: f64, ceiling_lin: f64) {
         let kw_l = self
             .k_r1b_l
             .process_sample(self.k_shelf_l.process_sample(out_l));
@@ -1645,8 +1642,7 @@ impl RealtimeMasterLimiter {
                 .max(1e-12);
 
         self.last_lufs = (-0.691 + 10.0 * self.momentary_energy.log10()) as f32;
-        self.last_true_peak_dbtp =
-            (20.0 * (tp * self.envelope_gain).min(ceiling_lin).max(1e-9).log10()) as f32;
+        self.last_true_peak_dbtp = (20.0 * out_tp_est.min(ceiling_lin).max(1e-9).log10()) as f32;
         self.last_gr_db = (-20.0 * self.envelope_gain.max(1e-6).log10()) as f32;
     }
 
