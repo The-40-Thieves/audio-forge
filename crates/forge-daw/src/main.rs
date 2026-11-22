@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use eframe::egui;
 use forge_core::AudioBuffer;
 use forge_engine::{
-    AudioObject, ClipCache, DawProject, FadeCurve, FxSlotConfig, LiveAudioEngine,
+    AudioObject, ClipCache, DawProject, FadeCurve, FxSlotConfig, LiveAudioEngine, LiveRecorder,
     ObjectOrientedEngine, UndoStack,
 };
 
@@ -48,13 +48,57 @@ fn configure_studio_theme(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapGrid {
+    Off,
+    Bar,
+    Quarter,
+    Eighth,
+    Sixteenth,
+}
+
+impl SnapGrid {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Bar => "Bar",
+            Self::Quarter => "1/4",
+            Self::Eighth => "1/8",
+            Self::Sixteenth => "1/16",
+        }
+    }
+
+    fn snap_samples(self, raw_samples: u64, sample_rate: u32, bpm: f64, time_sig_num: u8) -> u64 {
+        let beats_per_step = match self {
+            Self::Off => return raw_samples,
+            Self::Bar => f64::from(time_sig_num.max(1)),
+            Self::Quarter => 1.0,
+            Self::Eighth => 0.5,
+            Self::Sixteenth => 0.25,
+        };
+        let step_secs = (60.0 / bpm.max(20.0)) * beats_per_step;
+        let step_smp = (step_secs * f64::from(sample_rate.max(8_000))).max(1.0);
+        (((raw_samples as f64) / step_smp).round() * step_smp).max(0.0) as u64
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DragMode {
+    Move,
+    TrimLeft,
+    TrimRight,
+}
+
 struct ForgeDawApp {
     project: DawProject,
     undo: UndoStack,
     cache: ClipCache,
     audio: Option<LiveAudioEngine>,
+    recorder: Option<LiveRecorder>,
     selected_track_idx: usize,
     selected_object_id: Option<u64>,
+    active_drag: Option<(usize, u64, DragMode)>,
+    snap_grid: SnapGrid,
     pixels_per_sec: f32,
     scroll_secs: f32,
     import_path_buf: String,
@@ -87,8 +131,11 @@ impl ForgeDawApp {
             undo: UndoStack::default(),
             cache,
             audio,
+            recorder: None,
             selected_track_idx: 0,
             selected_object_id: None,
+            active_drag: None,
+            snap_grid: SnapGrid::Quarter,
             pixels_per_sec: 120.0,
             scroll_secs: 0.0,
             import_path_buf: String::new(),
@@ -141,9 +188,15 @@ impl ForgeDawApp {
         }
         if let Ok(buf) = AudioBuffer::from_channels(vec![ch_l, ch_r], sr) {
             let prev = self.project.clone();
-            let path = PathBuf::from(format!("mem://demo_am7_{}.wav", self.project.tracks.len()));
-            self.cache.insert_memory_clip(path.clone(), buf);
             let id = self.project.alloc_id();
+            let media_dir = std::env::temp_dir().join("forgestudio_media");
+            let _ = std::fs::create_dir_all(&media_dir);
+            let path = media_dir.join(format!("demo_am7_{id}.wav"));
+            if buf.save_wav(&path, 24).is_ok() {
+                let _ = self.cache.load_clip_for_rate(&path, sr);
+            } else {
+                self.cache.insert_memory_clip(path.clone(), buf);
+            }
             let mut obj = AudioObject::new(id, "Demo Am7 Groove", path, frames as u64);
             obj.timeline_start_samples = self.playhead_samples();
             obj.fade_in_samples = u64::from(sr) / 20;
@@ -154,7 +207,7 @@ impl ForgeDawApp {
             self.project.tracks[tr_idx].objects.push(obj);
             self.selected_object_id = Some(id);
             self.commit_project_change(prev);
-            self.status_line = "Inserted 4s Demo Am7 Audio Object".to_string();
+            self.status_line = "Inserted 4s Demo Am7 Audio Object (saved to WAV)".to_string();
         }
     }
 
@@ -165,7 +218,10 @@ impl ForgeDawApp {
             return;
         }
         let path = PathBuf::from(&raw);
-        match self.cache.load_clip(&path) {
+        match self
+            .cache
+            .load_clip_for_rate(&path, self.project.sample_rate)
+        {
             Ok(buf) => {
                 let prev = self.project.clone();
                 let id = self.project.alloc_id();
@@ -182,10 +238,131 @@ impl ForgeDawApp {
                 self.project.tracks[tr_idx].objects.push(obj);
                 self.selected_object_id = Some(id);
                 self.commit_project_change(prev);
-                self.status_line = format!("Imported '{}' onto track {}", raw, tr_idx + 1);
+                self.status_line = format!(
+                    "Imported '{}' ({} Hz) onto track {}",
+                    raw,
+                    self.project.sample_rate,
+                    tr_idx + 1
+                );
             }
             Err(e) => {
                 self.status_line = format!("Import failed: {e}");
+            }
+        }
+    }
+
+    fn toggle_record(&mut self) {
+        if let Some(rec) = self.recorder.take() {
+            let tr_idx = rec
+                .track_idx()
+                .min(self.project.tracks.len().saturating_sub(1));
+            let start_pos = rec.start_timeline_samples();
+            let id = self.project.alloc_id();
+            let media_dir = std::env::temp_dir().join("forgestudio_media");
+            let out_wav = media_dir.join(format!("recording_{id}.wav"));
+            match rec.stop_and_save(&out_wav, self.project.sample_rate) {
+                Ok(buf) => {
+                    let prev = self.project.clone();
+                    let len = buf.num_frames() as u64;
+                    self.cache.insert_memory_clip(out_wav.clone(), buf);
+                    let mut obj = AudioObject::new(id, format!("Take {id}"), out_wav, len);
+                    obj.timeline_start_samples = start_pos;
+                    self.project.tracks[tr_idx].objects.push(obj);
+                    self.selected_object_id = Some(id);
+                    self.commit_project_change(prev);
+                    self.status_line = format!(
+                        "Recorded {:.2}s onto track {}",
+                        (len as f64) / f64::from(self.project.sample_rate.max(1)),
+                        tr_idx + 1
+                    );
+                }
+                Err(e) => {
+                    self.status_line = format!("Recording failed: {e}");
+                }
+            }
+            if let Some(ref eng) = self.audio {
+                eng.set_playing(false);
+            }
+        } else {
+            let armed_idx = self
+                .project
+                .tracks
+                .iter()
+                .position(|t| t.record_armed)
+                .unwrap_or(
+                    self.selected_track_idx
+                        .min(self.project.tracks.len().saturating_sub(1)),
+                );
+            let start_pos = self.playhead_samples();
+            match LiveRecorder::start(armed_idx, start_pos) {
+                Ok(rec) => {
+                    self.recorder = Some(rec);
+                    if let Some(ref eng) = self.audio {
+                        eng.set_playing(true);
+                    }
+                    self.status_line = format!("Recording on track {}...", armed_idx + 1);
+                }
+                Err(e) => {
+                    self.status_line = format!("Cannot start recording: {e}");
+                }
+            }
+        }
+    }
+
+    fn split_selected_at_playhead(&mut self) {
+        let Some(sel_id) = self.selected_object_id else {
+            return;
+        };
+        let ph = self.playhead_samples();
+        let prev = self.project.clone();
+        let new_id = self.project.alloc_id();
+        for tr in &mut self.project.tracks {
+            if let Some(oi) = tr.objects.iter().position(|o| o.id == sel_id)
+                && let Some((left, right)) = tr.objects[oi].split_at(ph, new_id)
+            {
+                tr.objects[oi] = left;
+                tr.objects.insert(oi + 1, right);
+                self.selected_object_id = Some(new_id);
+                self.commit_project_change(prev);
+                self.status_line = "Split object at playhead".to_string();
+                return;
+            }
+        }
+    }
+
+    fn delete_selected_object(&mut self) {
+        let Some(sel_id) = self.selected_object_id else {
+            return;
+        };
+        let prev = self.project.clone();
+        for tr in &mut self.project.tracks {
+            if let Some(oi) = tr.objects.iter().position(|o| o.id == sel_id) {
+                tr.objects.remove(oi);
+                self.selected_object_id = None;
+                self.commit_project_change(prev);
+                self.status_line = "Deleted selected object".to_string();
+                return;
+            }
+        }
+    }
+
+    fn duplicate_selected_object(&mut self) {
+        let Some(sel_id) = self.selected_object_id else {
+            return;
+        };
+        let prev = self.project.clone();
+        let new_id = self.project.alloc_id();
+        for tr in &mut self.project.tracks {
+            if let Some(obj) = tr.objects.iter().find(|o| o.id == sel_id).cloned() {
+                let mut dup = obj;
+                dup.id = new_id;
+                dup.name = format!("{} (Copy)", dup.name);
+                dup.timeline_start_samples = dup.timeline_end_samples();
+                tr.objects.push(dup);
+                self.selected_object_id = Some(new_id);
+                self.commit_project_change(prev);
+                self.status_line = "Duplicated selected object".to_string();
+                return;
             }
         }
     }
@@ -235,10 +412,28 @@ impl ForgeDawApp {
                 {
                     eng.toggle_play();
                 }
-                if ui.button("Stop").clicked()
-                    && let Some(ref eng) = self.audio
+                if ui.button("Stop").clicked() {
+                    if self.recorder.is_some() {
+                        self.toggle_record();
+                    }
+                    if let Some(ref eng) = self.audio {
+                        eng.stop();
+                    }
+                }
+                let is_recording = self.recorder.is_some();
+                if ui
+                    .button(
+                        egui::RichText::new(if is_recording { "Stop Rec" } else { "Rec" })
+                            .strong()
+                            .color(if is_recording {
+                                egui::Color32::from_rgb(248, 113, 113)
+                            } else {
+                                egui::Color32::from_rgb(252, 165, 165)
+                            }),
+                    )
+                    .clicked()
                 {
-                    eng.stop();
+                    self.toggle_record();
                 }
                 if ui
                     .selectable_label(self.project.loop_enabled, "Loop")
@@ -248,6 +443,21 @@ impl ForgeDawApp {
                     self.project.loop_enabled = !self.project.loop_enabled;
                     self.commit_project_change(prev);
                 }
+                ui.separator();
+                egui::ComboBox::from_id_salt("snap_grid")
+                    .width(56.0)
+                    .selected_text(format!("Snap: {}", self.snap_grid.label()))
+                    .show_ui(ui, |ui| {
+                        for g in [
+                            SnapGrid::Off,
+                            SnapGrid::Bar,
+                            SnapGrid::Quarter,
+                            SnapGrid::Eighth,
+                            SnapGrid::Sixteenth,
+                        ] {
+                            ui.selectable_value(&mut self.snap_grid, g, g.label());
+                        }
+                    });
 
                 ui.separator();
                 let pos = self.playhead_samples();
@@ -342,9 +552,11 @@ impl ForgeDawApp {
                         Ok(loaded) => {
                             let prev = self.project.clone();
                             self.project = loaded;
+                            let target_sr = self.project.sample_rate;
                             for tr in &self.project.tracks {
                                 for obj in &tr.objects {
-                                    let _ = self.cache.load_clip(&obj.source_path);
+                                    let _ =
+                                        self.cache.load_clip_for_rate(&obj.source_path, target_sr);
                                 }
                             }
                             self.commit_project_change(prev);
@@ -812,15 +1024,51 @@ impl ForgeDawApp {
                                                 !self.project.tracks[ti].solo;
                                             changed = true;
                                         }
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "{:+.1}dB",
-                                                self.project.tracks[ti].gain_db
-                                            ))
-                                            .monospace()
-                                            .small(),
-                                        );
+                                        if ui
+                                            .selectable_label(
+                                                self.project.tracks[ti].record_armed,
+                                                egui::RichText::new("R").color(
+                                                    if self.project.tracks[ti].record_armed {
+                                                        egui::Color32::from_rgb(248, 113, 113)
+                                                    } else {
+                                                        egui::Color32::from_rgb(160, 170, 188)
+                                                    },
+                                                ),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.project.tracks[ti].record_armed =
+                                                !self.project.tracks[ti].record_armed;
+                                        }
+                                        if ui
+                                            .selectable_label(
+                                                self.project.tracks[ti].show_automation,
+                                                egui::RichText::new("A").color(
+                                                    if self.project.tracks[ti].show_automation {
+                                                        egui::Color32::from_rgb(250, 204, 21)
+                                                    } else {
+                                                        egui::Color32::from_rgb(160, 170, 188)
+                                                    },
+                                                ),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.project.tracks[ti].show_automation =
+                                                !self.project.tracks[ti].show_automation;
+                                            if self.project.tracks[ti].show_automation {
+                                                self.project.tracks[ti].volume_auto.enabled = true;
+                                                changed = true;
+                                            }
+                                        }
                                     });
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{:+.1} dB",
+                                            self.project.tracks[ti].gain_db
+                                        ))
+                                        .monospace()
+                                        .small(),
+                                    );
                                 });
                             });
 
@@ -908,6 +1156,40 @@ impl ForgeDawApp {
                                 }
                             }
 
+                            // Visual Fade-In / Fade-Out curve overlays
+                            let fade_in_s = (self.project.tracks[ti].objects[oi].fade_in_samples
+                                as f64
+                                / sr) as f32;
+                            if fade_in_s > 0.001 {
+                                let fi_w = (fade_in_s * self.pixels_per_sec).min(obj_rect.width());
+                                p.line_segment(
+                                    [
+                                        egui::pos2(obj_rect.left(), obj_rect.bottom()),
+                                        egui::pos2(obj_rect.left() + fi_w, obj_rect.top()),
+                                    ],
+                                    egui::Stroke::new(
+                                        1.5_f32,
+                                        egui::Color32::from_rgba_unmultiplied(250, 204, 21, 200),
+                                    ),
+                                );
+                            }
+                            let fade_out_s = (self.project.tracks[ti].objects[oi].fade_out_samples
+                                as f64
+                                / sr) as f32;
+                            if fade_out_s > 0.001 {
+                                let fo_w = (fade_out_s * self.pixels_per_sec).min(obj_rect.width());
+                                p.line_segment(
+                                    [
+                                        egui::pos2(obj_rect.right() - fo_w, obj_rect.top()),
+                                        egui::pos2(obj_rect.right(), obj_rect.bottom()),
+                                    ],
+                                    egui::Stroke::new(
+                                        1.5_f32,
+                                        egui::Color32::from_rgba_unmultiplied(250, 204, 21, 200),
+                                    ),
+                                );
+                            }
+
                             // Object header label + FX count badge
                             let fx_count = self.project.tracks[ti].objects[oi].fx_chain.len();
                             let label = if fx_count > 0 {
@@ -926,25 +1208,148 @@ impl ForgeDawApp {
                                 egui::Color32::WHITE,
                             );
 
-                            // Click / drag interaction on object
+                            // Lock onto the grabbed object on drag_started (Move / TrimLeft / TrimRight)
+                            if lane_resp.drag_started()
+                                && !self.project.tracks[ti].show_automation
+                                && let Some(pt) = lane_resp.interact_pointer_pos()
+                                && obj_rect.contains(pt)
+                            {
+                                self.selected_track_idx = ti;
+                                self.selected_object_id = Some(obj_id);
+                                let mode = if (pt.x - obj_rect.left()).abs() <= 8.0 {
+                                    DragMode::TrimLeft
+                                } else if (obj_rect.right() - pt.x).abs() <= 8.0 {
+                                    DragMode::TrimRight
+                                } else {
+                                    DragMode::Move
+                                };
+                                self.active_drag = Some((ti, obj_id, mode));
+                            }
                             if lane_resp.clicked()
+                                && !self.project.tracks[ti].show_automation
                                 && let Some(pt) = lane_resp.interact_pointer_pos()
                                 && obj_rect.contains(pt)
                             {
                                 self.selected_track_idx = ti;
                                 self.selected_object_id = Some(obj_id);
                             }
-                            if is_sel && lane_resp.dragged() {
+                            if let Some((drag_ti, drag_id, drag_mode)) = self.active_drag
+                                && drag_ti == ti
+                                && drag_id == obj_id
+                                && lane_resp.dragged()
+                            {
                                 let dx = lane_resp.drag_delta().x;
                                 if dx.abs() > 0.1 {
                                     let delta_smp =
                                         (f64::from(dx / self.pixels_per_sec) * sr).round() as i64;
-                                    let cur = self.project.tracks[ti].objects[oi]
-                                        .timeline_start_samples
-                                        as i64;
-                                    self.project.tracks[ti].objects[oi].timeline_start_samples =
-                                        (cur + delta_smp).max(0) as u64;
+                                    let obj = &mut self.project.tracks[ti].objects[oi];
+                                    match drag_mode {
+                                        DragMode::Move => {
+                                            let raw = (obj.timeline_start_samples as i64
+                                                + delta_smp)
+                                                .max(0)
+                                                as u64;
+                                            obj.timeline_start_samples =
+                                                self.snap_grid.snap_samples(
+                                                    raw,
+                                                    self.project.sample_rate,
+                                                    self.project.bpm,
+                                                    self.project.time_sig_num,
+                                                );
+                                        }
+                                        DragMode::TrimLeft => {
+                                            let max_shift =
+                                                obj.length_samples.saturating_sub(256) as i64;
+                                            let min_shift = -(obj.source_offset_samples as i64)
+                                                .min(obj.timeline_start_samples as i64);
+                                            let shift = delta_smp.clamp(min_shift, max_shift);
+                                            if shift >= 0 {
+                                                let s = shift as u64;
+                                                obj.timeline_start_samples =
+                                                    obj.timeline_start_samples.saturating_add(s);
+                                                obj.source_offset_samples =
+                                                    obj.source_offset_samples.saturating_add(s);
+                                                obj.length_samples =
+                                                    obj.length_samples.saturating_sub(s);
+                                            } else {
+                                                let s = (-shift) as u64;
+                                                obj.timeline_start_samples =
+                                                    obj.timeline_start_samples.saturating_sub(s);
+                                                obj.source_offset_samples =
+                                                    obj.source_offset_samples.saturating_sub(s);
+                                                obj.length_samples =
+                                                    obj.length_samples.saturating_add(s);
+                                            }
+                                        }
+                                        DragMode::TrimRight => {
+                                            let new_len = (obj.length_samples as i64 + delta_smp)
+                                                .max(256)
+                                                as u64;
+                                            obj.length_samples = new_len;
+                                        }
+                                    }
                                     changed = true;
+                                }
+                            }
+                        }
+
+                        if lane_resp.drag_stopped() {
+                            self.active_drag = None;
+                        }
+
+                        // Interactive Volume Automation Lane Overlay
+                        if self.project.tracks[ti].show_automation {
+                            let db_to_y = |db: f32| -> f32 {
+                                let norm = ((db.clamp(-48.0, 12.0) + 48.0) / 60.0).clamp(0.0, 1.0);
+                                lane_rect.bottom() - 6.0 - norm * (lane_rect.height() - 12.0)
+                            };
+                            let y_to_db = |y: f32| -> f32 {
+                                let norm = ((lane_rect.bottom() - 6.0 - y)
+                                    / (lane_rect.height() - 12.0).max(1.0))
+                                .clamp(0.0, 1.0);
+                                norm * 60.0 - 48.0
+                            };
+
+                            if (lane_resp.clicked() || lane_resp.dragged())
+                                && let Some(pt) = lane_resp.interact_pointer_pos()
+                                && lane_rect.contains(pt)
+                            {
+                                let secs = ((pt.x - lane_rect.left()) / self.pixels_per_sec)
+                                    + self.scroll_secs;
+                                let raw_smp = (f64::from(secs.max(0.0)) * sr).round() as u64;
+                                let smp = self.snap_grid.snap_samples(
+                                    raw_smp,
+                                    self.project.sample_rate,
+                                    self.project.bpm,
+                                    self.project.time_sig_num,
+                                );
+                                let db = y_to_db(pt.y);
+                                self.project.tracks[ti].volume_auto.enabled = true;
+                                self.project.tracks[ti].volume_auto.upsert_point(smp, db);
+                                changed = true;
+                            }
+
+                            let pts = &self.project.tracks[ti].volume_auto.points;
+                            let mut screen_pts = Vec::with_capacity(pts.len());
+                            for ap in pts {
+                                let ax = lane_rect.left()
+                                    + (((ap.sample_pos as f64 / sr) as f32) - self.scroll_secs)
+                                        * self.pixels_per_sec;
+                                let ay = db_to_y(ap.value);
+                                screen_pts.push(egui::pos2(ax, ay));
+                            }
+                            if screen_pts.len() >= 2 {
+                                p.add(egui::Shape::line(
+                                    screen_pts.clone(),
+                                    egui::Stroke::new(
+                                        2.0_f32,
+                                        egui::Color32::from_rgb(250, 204, 21),
+                                    ),
+                                ));
+                            }
+                            for sp in screen_pts {
+                                if sp.x >= lane_rect.left() && sp.x <= lane_rect.right() {
+                                    p.circle_filled(sp, 4.0, egui::Color32::from_rgb(250, 204, 21));
                                 }
                             }
                         }
@@ -1093,11 +1498,37 @@ fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) -> bool {
 
 impl eframe::App for ForgeDawApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|i| i.key_pressed(egui::Key::Space))
-            && !ctx.wants_keyboard_input()
-            && let Some(ref eng) = self.audio
-        {
-            eng.toggle_play();
+        if !ctx.wants_keyboard_input() {
+            let (space, split, del, undo, redo, dup) = ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::Space),
+                    i.key_pressed(egui::Key::S) && !i.modifiers.ctrl && !i.modifiers.command,
+                    i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
+                    i.key_pressed(egui::Key::Z) && (i.modifiers.ctrl || i.modifiers.command),
+                    i.key_pressed(egui::Key::Y) && (i.modifiers.ctrl || i.modifiers.command),
+                    i.key_pressed(egui::Key::D) && (i.modifiers.ctrl || i.modifiers.command),
+                )
+            });
+            if space && let Some(ref eng) = self.audio {
+                eng.toggle_play();
+            }
+            if split {
+                self.split_selected_at_playhead();
+            }
+            if del {
+                self.delete_selected_object();
+            }
+            if undo && let Some(prev) = self.undo.undo(self.project.clone()) {
+                self.project = prev;
+                self.sync_audio_engine();
+            }
+            if redo && let Some(next) = self.undo.redo(self.project.clone()) {
+                self.project = next;
+                self.sync_audio_engine();
+            }
+            if dup {
+                self.duplicate_selected_object();
+            }
         }
 
         self.draw_transport_bar(ctx);
@@ -1105,7 +1536,7 @@ impl eframe::App for ForgeDawApp {
         self.draw_mixer_dock(ctx);
         self.draw_arrange_timeline(ctx);
 
-        if self.audio.as_ref().is_some_and(LiveAudioEngine::is_playing) {
+        if self.audio.as_ref().is_some_and(LiveAudioEngine::is_playing) || self.recorder.is_some() {
             ctx.request_repaint();
         }
     }

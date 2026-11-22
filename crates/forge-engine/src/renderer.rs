@@ -140,6 +140,52 @@ impl Default for EngineMeters {
     }
 }
 
+impl EngineMeters {
+    /// Copies `src` into `self` without heap allocation when `self.track_peaks_db` already has
+    /// sufficient capacity (pre-sized off the audio thread).
+    #[inline]
+    pub fn copy_from_no_alloc(&mut self, src: &Self) {
+        self.master_peak_l_db = src.master_peak_l_db;
+        self.master_peak_r_db = src.master_peak_r_db;
+        self.spectrum_32_db = src.spectrum_32_db;
+        self.total_pdc_samples = src.total_pdc_samples;
+        let copy_len = src.track_peaks_db.len().min(self.track_peaks_db.capacity());
+        self.track_peaks_db.truncate(copy_len);
+        for (i, &val) in src.track_peaks_db.iter().take(copy_len).enumerate() {
+            if i < self.track_peaks_db.len() {
+                self.track_peaks_db[i] = val;
+            } else {
+                self.track_peaks_db.push(val);
+            }
+        }
+    }
+}
+
+/// Resamples `buf` to `target_sr` using linear interpolation (used when importing clips whose
+/// sample rate differs from the project rate).
+pub fn resample_buffer_linear(buf: &AudioBuffer, target_sr: u32) -> Result<AudioBuffer> {
+    if buf.sample_rate == target_sr || buf.num_frames() == 0 || target_sr == 0 {
+        return Ok(buf.clone());
+    }
+    let src_len = buf.num_frames();
+    let ratio = f64::from(buf.sample_rate) / f64::from(target_sr);
+    let dst_len = ((src_len as f64) / ratio).round().max(1.0) as usize;
+    let mut channels = Vec::with_capacity(buf.channels.len());
+    for ch in &buf.channels {
+        let mut out = Vec::with_capacity(dst_len);
+        for i in 0..dst_len {
+            let src_pos = (i as f64) * ratio;
+            let idx0 = (src_pos.floor() as usize).min(src_len - 1);
+            let idx1 = (idx0 + 1).min(src_len - 1);
+            let frac = src_pos - (idx0 as f64);
+            let s = ch[idx0] + (ch[idx1] - ch[idx0]) * frac;
+            out.push(s);
+        }
+        channels.push(out);
+    }
+    AudioBuffer::from_channels(channels, target_sr)
+}
+
 /// Pre-loaded audio clip cache shared between the UI (for waveform peaks) and the audio engine.
 #[derive(Default, Clone)]
 pub struct ClipCache {
@@ -154,6 +200,23 @@ impl ClipCache {
             return Ok(Arc::clone(existing));
         }
         let buf = Arc::new(AudioBuffer::load(path)?);
+        let peaks = Arc::new(WaveformPeaks::from_buffer(&buf, 256));
+        self.clips.insert(path.to_path_buf(), Arc::clone(&buf));
+        self.peaks.insert(path.to_path_buf(), peaks);
+        Ok(buf)
+    }
+
+    /// Loads a WAV/audio file from disk and resamples it to `target_sr` if its native rate differs,
+    /// guaranteeing pitch, playback speed, and timeline object duration match the project clock.
+    pub fn load_clip_for_rate(&mut self, path: &Path, target_sr: u32) -> Result<Arc<AudioBuffer>> {
+        if let Some(existing) = self.clips.get(path) {
+            if existing.sample_rate == target_sr {
+                return Ok(Arc::clone(existing));
+            }
+        }
+        let raw = AudioBuffer::load(path)?;
+        let converted = resample_buffer_linear(&raw, target_sr)?;
+        let buf = Arc::new(converted);
         let peaks = Arc::new(WaveformPeaks::from_buffer(&buf, 256));
         self.clips.insert(path.to_path_buf(), Arc::clone(&buf));
         self.peaks.insert(path.to_path_buf(), peaks);
@@ -298,6 +361,10 @@ impl ObjectOrientedEngine {
         }
     }
 
+    pub fn sample_rate(&self) -> f64 {
+        self.sample_rate
+    }
+
     pub fn playhead_samples(&self) -> u64 {
         self.playhead_samples
     }
@@ -313,6 +380,82 @@ impl ObjectOrientedEngine {
 
     pub fn meters(&self) -> &EngineMeters {
         &self.meters
+    }
+
+    /// Attempts to update mix, loop, automation, object EQ/fades, and FX parameters in-place
+    /// without resetting DSP state or interrupting live playback.
+    ///
+    /// Returns `true` if updated in-place, or `false` if the project topology (track count,
+    /// object IDs/sources, FX slot variants, or sample rate) changed and a full recompile is needed.
+    pub fn sync_mix_params(&mut self, project: &DawProject) -> bool {
+        let target_sr = f64::from(project.sample_rate.max(8_000));
+        if (self.sample_rate - target_sr).abs() > 1e-3 {
+            return false;
+        }
+        if self.tracks.len() != project.tracks.len()
+            || self.master_insert_cfgs.len() != project.master_inserts.len()
+        {
+            return false;
+        }
+        for (a, b) in self
+            .master_insert_cfgs
+            .iter()
+            .zip(project.master_inserts.iter())
+        {
+            if std::mem::discriminant(a) != std::mem::discriminant(b)
+                || a.is_bypassed() != b.is_bypassed()
+            {
+                return false;
+            }
+        }
+        for (tr_rt, tr_cfg) in self.tracks.iter().zip(project.tracks.iter()) {
+            if tr_rt.config.id != tr_cfg.id
+                || tr_rt.objects.len() != tr_cfg.objects.len()
+                || tr_rt.inserts.len() != tr_cfg.inserts.len()
+            {
+                return false;
+            }
+            for (a, b) in tr_rt.config.inserts.iter().zip(tr_cfg.inserts.iter()) {
+                if std::mem::discriminant(a) != std::mem::discriminant(b)
+                    || a.is_bypassed() != b.is_bypassed()
+                {
+                    return false;
+                }
+            }
+            for (obj_rt, obj_cfg) in tr_rt.objects.iter().zip(tr_cfg.objects.iter()) {
+                if obj_rt.config.id != obj_cfg.id
+                    || obj_rt.config.source_path != obj_cfg.source_path
+                    || obj_rt.fx.len() != obj_cfg.fx_chain.len()
+                {
+                    return false;
+                }
+                for (a, b) in obj_rt.config.fx_chain.iter().zip(obj_cfg.fx_chain.iter()) {
+                    if std::mem::discriminant(a) != std::mem::discriminant(b)
+                        || a.is_bypassed() != b.is_bypassed()
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // Safe to update parameters in-place without clearing DSP delay/reverb/FFT state!
+        self.loop_enabled = project.loop_enabled;
+        self.loop_start = project.loop_start_samples;
+        self.loop_end = project.loop_end_samples;
+        self.master_gain_lin = 10.0_f32.powf(project.master_gain_db.clamp(-48.0, 12.0) / 20.0);
+        self.master_insert_cfgs = project.master_inserts.clone();
+
+        for (tr_rt, tr_cfg) in self.tracks.iter_mut().zip(project.tracks.iter()) {
+            tr_rt.config = tr_cfg.clone();
+            for (obj_rt, obj_cfg) in tr_rt.objects.iter_mut().zip(tr_cfg.objects.iter()) {
+                if obj_rt.config.eq != obj_cfg.eq {
+                    obj_rt.eq = ObjectEqRuntime::new(self.sample_rate, obj_cfg.eq);
+                }
+                obj_rt.config = obj_cfg.clone();
+            }
+        }
+        true
     }
 
     pub fn reset_dsp_state(&mut self) {
@@ -384,15 +527,50 @@ impl ObjectOrientedEngine {
                     let end = obj.config.timeline_end_samples();
                     let (mut ol, mut or_) = if pos >= start && pos < end {
                         let local = pos - start;
-                        let src_idx = (obj.config.source_offset_samples + local) as usize;
                         if let Some(ref clip) = obj.clip {
-                            if src_idx < clip.num_frames() {
-                                let s0 = clip.channels[0][src_idx] as f32;
-                                let s1 = if clip.channels.len() > 1 {
-                                    clip.channels[1][src_idx] as f32
+                            let clip_frames = clip.num_frames();
+                            let (s0, s1, in_bounds) = if f64::from(clip.sample_rate)
+                                == self.sample_rate
+                            {
+                                let src_idx = (obj.config.source_offset_samples + local) as usize;
+                                if src_idx < clip_frames {
+                                    let c0 = clip.channels[0][src_idx] as f32;
+                                    let c1 = if clip.channels.len() > 1 {
+                                        clip.channels[1][src_idx] as f32
+                                    } else {
+                                        c0
+                                    };
+                                    (c0, c1, true)
                                 } else {
-                                    s0
-                                };
+                                    (0.0, 0.0, false)
+                                }
+                            } else if clip_frames > 0 {
+                                let ratio = f64::from(clip.sample_rate) / self.sample_rate;
+                                let src_pos =
+                                    ((obj.config.source_offset_samples + local) as f64) * ratio;
+                                let idx0 = src_pos.floor() as usize;
+                                if idx0 < clip_frames {
+                                    let idx1 = (idx0 + 1).min(clip_frames - 1);
+                                    let frac = src_pos - (idx0 as f64);
+                                    let c0 = (clip.channels[0][idx0]
+                                        + (clip.channels[0][idx1] - clip.channels[0][idx0]) * frac)
+                                        as f32;
+                                    let c1 = if clip.channels.len() > 1 {
+                                        (clip.channels[1][idx0]
+                                            + (clip.channels[1][idx1] - clip.channels[1][idx0])
+                                                * frac)
+                                            as f32
+                                    } else {
+                                        c0
+                                    };
+                                    (c0, c1, true)
+                                } else {
+                                    (0.0, 0.0, false)
+                                }
+                            } else {
+                                (0.0, 0.0, false)
+                            };
+                            if in_bounds {
                                 let fade = obj.config.fade_gain_at(local) as f32;
                                 let g = 10.0_f32.powf(obj.config.gain_db.clamp(-48.0, 24.0) / 20.0)
                                     * fade
@@ -420,15 +598,17 @@ impl ObjectOrientedEngine {
                     tr_r += or_;
                 }
 
-                // Track-level FX inserts + track fader/pan/polarity + inter-track PDC
+                // Track-level FX inserts + track fader/pan/automation/polarity + inter-track PDC
                 for (proc_fx, cfg) in tr.inserts.iter_mut().zip(&tr.config.inserts) {
                     (tr_l, tr_r) = proc_fx.process_stereo(cfg, tr_l, tr_r);
                 }
                 (tr_l, tr_r) = tr.pdc.process(tr_l, tr_r);
 
-                let tg = 10.0_f32.powf(tr.config.gain_db.clamp(-60.0, 12.0) / 20.0)
+                let gain_db = tr.config.volume_auto.evaluate(pos, tr.config.gain_db);
+                let pan = tr.config.pan_auto.evaluate(pos, tr.config.pan);
+                let tg = 10.0_f32.powf(gain_db.clamp(-60.0, 12.0) / 20.0)
                     * if tr.config.phase_invert { -1.0 } else { 1.0 };
-                let (tpl, tpr) = Self::equal_power_pan(tr.config.pan);
+                let (tpl, tpr) = Self::equal_power_pan(pan);
                 tr_l *= tg * tpl;
                 tr_r *= tg * tpr;
 
@@ -515,12 +695,40 @@ impl ObjectOrientedEngine {
     }
 
     /// Bounces the project to a 24-bit WAV file and returns its ITU-R BS.1770-4 [`AuditReport`].
+    ///
+    /// Automatically appends an FX decay tail (up to 3.0 s for active reverb/tail FX) beyond the
+    /// last object boundary so reverb and delay tails are never hard-truncated.
     pub fn bounce_to_wav(
         project: &DawProject,
         cache: &ClipCache,
         output_wav: &Path,
     ) -> Result<AuditReport> {
-        let total = project.total_length_samples() as usize;
+        let mut tail_secs = 0.0_f32;
+        let inspect_fx = |fx: &crate::project::FxSlotConfig, acc: &mut f32| {
+            if !fx.is_bypassed() {
+                if let crate::project::FxSlotConfig::SpaceVerb {
+                    decay_rt60_secs, ..
+                } = fx
+                {
+                    *acc = acc.max((*decay_rt60_secs * 1.5).clamp(0.5, 8.0));
+                }
+            }
+        };
+        for fx in &project.master_inserts {
+            inspect_fx(fx, &mut tail_secs);
+        }
+        for tr in &project.tracks {
+            for fx in &tr.inserts {
+                inspect_fx(fx, &mut tail_secs);
+            }
+            for obj in &tr.objects {
+                for fx in &obj.fx_chain {
+                    inspect_fx(fx, &mut tail_secs);
+                }
+            }
+        }
+        let tail_frames = (f64::from(tail_secs) * f64::from(project.sample_rate)).round() as usize;
+        let total = (project.total_length_samples() as usize).saturating_add(tail_frames);
         let buf = Self::bounce_offline(project, cache, total)?;
         buf.save_wav(output_wav, 24)?;
         Ok(audit_audio(&buf))

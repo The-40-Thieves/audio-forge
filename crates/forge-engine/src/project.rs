@@ -280,7 +280,11 @@ pub struct AudioObject {
     pub phase_invert: bool,
     pub mute: bool,
     pub fade_in_samples: u64,
+    #[serde(default)]
+    pub fade_in_offset_samples: u64,
     pub fade_out_samples: u64,
+    #[serde(default)]
+    pub fade_out_offset_samples: u64,
     pub fade_curve: FadeCurve,
     pub eq: ObjectEq3,
     pub fx_chain: Vec<FxSlotConfig>,
@@ -305,7 +309,9 @@ impl AudioObject {
             phase_invert: false,
             mute: false,
             fade_in_samples: 0,
+            fade_in_offset_samples: 0,
             fade_out_samples: 0,
+            fade_out_offset_samples: 0,
             fade_curve: FadeCurve::EqualPower,
             eq: ObjectEq3::default(),
             fx_chain: Vec::new(),
@@ -318,16 +324,23 @@ impl AudioObject {
             .saturating_add(self.length_samples)
     }
 
-    /// Evaluates the combined fade-in / fade-out gain at `local_sample` (`0..length_samples`).
+    /// Evaluates the combined fade-in / fade-out gain at `local_sample` (`0..length_samples`),
+    /// honoring split fade offsets so splitting inside an active fade preserves the exact envelope.
     #[inline]
     pub fn fade_gain_at(&self, local_sample: u64) -> f64 {
         let mut g = 1.0_f64;
-        if self.fade_in_samples > 0 && local_sample < self.fade_in_samples {
-            let t = (local_sample as f64) / (self.fade_in_samples as f64);
-            g *= self.fade_curve.gain(t);
+        if self.fade_in_samples > 0 {
+            let eff_pos = local_sample.saturating_add(self.fade_in_offset_samples);
+            if eff_pos < self.fade_in_samples {
+                let t = (eff_pos as f64) / (self.fade_in_samples as f64);
+                g *= self.fade_curve.gain(t);
+            }
         }
         if self.fade_out_samples > 0 && self.length_samples > 0 {
-            let remaining = self.length_samples.saturating_sub(local_sample);
+            let remaining = self
+                .length_samples
+                .saturating_sub(local_sample)
+                .saturating_add(self.fade_out_offset_samples);
             if remaining <= self.fade_out_samples {
                 let t = (remaining as f64) / (self.fade_out_samples as f64);
                 g *= self.fade_curve.gain(t);
@@ -338,6 +351,9 @@ impl AudioObject {
 
     /// Splits this object non-destructively at `split_timeline_sample`, returning `(left, right)`
     /// or `None` if `split_timeline_sample` is not strictly inside the object.
+    ///
+    /// Preserves the exact original fade-in and fade-out envelopes even when splitting inside an
+    /// active fade region.
     pub fn split_at(&self, split_timeline_sample: u64, new_right_id: u64) -> Option<(Self, Self)> {
         if split_timeline_sample <= self.timeline_start_samples
             || split_timeline_sample >= self.timeline_end_samples()
@@ -349,8 +365,14 @@ impl AudioObject {
 
         let mut left = self.clone();
         left.length_samples = left_len;
-        left.fade_in_samples = left.fade_in_samples.min(left_len);
-        left.fade_out_samples = 0;
+        let left_out_offset = self.fade_out_offset_samples.saturating_add(right_len);
+        if self.fade_out_samples > 0 && left_out_offset < self.fade_out_samples {
+            left.fade_out_samples = self.fade_out_samples;
+            left.fade_out_offset_samples = left_out_offset;
+        } else {
+            left.fade_out_samples = 0;
+            left.fade_out_offset_samples = 0;
+        }
 
         let mut right = self.clone();
         right.id = new_right_id;
@@ -358,10 +380,71 @@ impl AudioObject {
         right.timeline_start_samples = split_timeline_sample;
         right.source_offset_samples = self.source_offset_samples.saturating_add(left_len);
         right.length_samples = right_len;
-        right.fade_in_samples = 0;
-        right.fade_out_samples = right.fade_out_samples.min(right_len);
+        let right_in_offset = self.fade_in_offset_samples.saturating_add(left_len);
+        if self.fade_in_samples > 0 && right_in_offset < self.fade_in_samples {
+            right.fade_in_samples = self.fade_in_samples;
+            right.fade_in_offset_samples = right_in_offset;
+        } else {
+            right.fade_in_samples = 0;
+            right.fade_in_offset_samples = 0;
+        }
 
         Some((left, right))
+    }
+}
+
+/// A single time-stamped automation breakpoint on a track envelope lane.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AutomationPoint {
+    pub sample_pos: u64,
+    pub value: f32,
+}
+
+/// Piecewise-linear automation lane evaluated with zero heap allocations on the audio thread.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct AutomationLane {
+    pub enabled: bool,
+    pub points: Vec<AutomationPoint>,
+}
+
+impl AutomationLane {
+    /// Inserts or updates a breakpoint at `sample_pos` and keeps `points` sorted by time.
+    pub fn upsert_point(&mut self, sample_pos: u64, value: f32) {
+        if let Some(existing) = self
+            .points
+            .iter_mut()
+            .find(|p| p.sample_pos.abs_diff(sample_pos) <= 128)
+        {
+            existing.sample_pos = sample_pos;
+            existing.value = value;
+        } else {
+            self.points.push(AutomationPoint { sample_pos, value });
+        }
+        self.points.sort_by_key(|p| p.sample_pos);
+    }
+
+    /// Evaluates the lane at `sample_pos` using binary search + linear interpolation (zero alloc).
+    #[inline]
+    pub fn evaluate(&self, sample_pos: u64, fallback: f32) -> f32 {
+        if !self.enabled || self.points.is_empty() {
+            return fallback;
+        }
+        if self.points.len() == 1 || sample_pos <= self.points[0].sample_pos {
+            return self.points[0].value;
+        }
+        let last = self.points[self.points.len() - 1];
+        if sample_pos >= last.sample_pos {
+            return last.value;
+        }
+        let idx = self.points.partition_point(|p| p.sample_pos <= sample_pos);
+        let p0 = self.points[idx.saturating_sub(1)];
+        let p1 = self.points[idx];
+        let span = p1.sample_pos.saturating_sub(p0.sample_pos);
+        if span == 0 {
+            return p1.value;
+        }
+        let t = (sample_pos - p0.sample_pos) as f32 / span as f32;
+        p0.value + (p1.value - p0.value) * t
     }
 }
 
@@ -376,6 +459,14 @@ pub struct Track {
     pub mute: bool,
     pub solo: bool,
     pub phase_invert: bool,
+    #[serde(default)]
+    pub record_armed: bool,
+    #[serde(default)]
+    pub show_automation: bool,
+    #[serde(default)]
+    pub volume_auto: AutomationLane,
+    #[serde(default)]
+    pub pan_auto: AutomationLane,
     pub objects: Vec<AudioObject>,
     pub inserts: Vec<FxSlotConfig>,
 }
@@ -391,6 +482,10 @@ impl Track {
             mute: false,
             solo: false,
             phase_invert: false,
+            record_armed: false,
+            show_automation: false,
+            volume_auto: AutomationLane::default(),
+            pan_auto: AutomationLane::default(),
             objects: Vec::new(),
             inserts: Vec::new(),
         }
