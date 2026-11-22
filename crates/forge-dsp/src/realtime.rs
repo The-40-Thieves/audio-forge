@@ -1390,6 +1390,16 @@ impl RealtimeSubAndTapeBus {
 /// The ramp finishes before a detected peak leaves the `lookahead` delay line, and the hold keeps
 /// the gain flat across the interpolation filter's neighbourhood, so the output's true peak stays
 /// under the ceiling without the final clamp engaging.
+/// Inter-sample true-peak detector oversampling mode for [`RealtimeMasterLimiter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IspOversampling {
+    /// Standard ITU-R BS.1770-4 Annex 2 4x 48-tap polyphase FIR.
+    #[default]
+    X4,
+    /// Ultra-precision 8x oversampling (4x BS.1770-4 polyphase + cubic half-phase midpoints).
+    X8,
+}
+
 pub struct RealtimeMasterLimiter {
     sample_rate: f64,
     lookahead_samples: usize,
@@ -1407,6 +1417,7 @@ pub struct RealtimeMasterLimiter {
     last_gr_db: f32,
     tp_hist_l: [f64; TP_TAPS],
     tp_hist_r: [f64; TP_TAPS],
+    isp_oversampling: IspOversampling,
     hold_l: SlidingMin,
     hold_r: SlidingMin,
     released_gain_l: f64,
@@ -1526,6 +1537,7 @@ impl RealtimeMasterLimiter {
             last_gr_db: 0.0,
             tp_hist_l: [0.0; TP_TAPS],
             tp_hist_r: [0.0; TP_TAPS],
+            isp_oversampling: IspOversampling::X4,
             hold_l: SlidingMin::new(Self::MAX_LOOKAHEAD_SAMPLES + Self::HOLD_AFTER),
             hold_r: SlidingMin::new(Self::MAX_LOOKAHEAD_SAMPLES + Self::HOLD_AFTER),
             released_gain_l: 1.0,
@@ -1635,6 +1647,18 @@ impl RealtimeMasterLimiter {
         self.dither_bits = bits.clamp(8, 24);
     }
 
+    /// Selects 4x (ITU-R BS.1770-4) or 8x (ultra-precision) inter-sample peak oversampling.
+    /// Zero-alloc.
+    #[inline]
+    pub fn set_isp_oversampling(&mut self, mode: IspOversampling) {
+        self.isp_oversampling = mode;
+    }
+
+    #[inline]
+    pub const fn isp_oversampling(&self) -> IspOversampling {
+        self.isp_oversampling
+    }
+
     #[inline]
     fn next_dither_bipolar(state: &mut u64) -> f64 {
         let mut x = *state;
@@ -1678,17 +1702,26 @@ impl RealtimeMasterLimiter {
         (-1.0 / ((release_ms * 0.001) * sample_rate)).exp()
     }
 
-    /// Pushes `x` into the newest-first history and returns the largest of `|x|` and the four
-    /// interpolated phases of the ITU-R BS.1770-4 Annex 2 filter (the FIR `compute_true_peak`
-    /// uses).
+    /// Pushes `x` into the newest-first history and returns the largest of `|x|` and the
+    /// interpolated sub-samples (4x BS.1770-4 polyphase FIR, or 8x with Catmull-Rom midpoints).
     #[inline]
-    fn estimate_4x_intersample_peak(hist: &mut [f64; TP_TAPS], x: f64) -> f64 {
+    fn estimate_intersample_peak(hist: &mut [f64; TP_TAPS], x: f64, mode: IspOversampling) -> f64 {
         hist.copy_within(0..TP_TAPS - 1, 1);
         hist[0] = x;
         let mut peak = x.abs();
-        for coeffs in &TRUE_PEAK_PHASES {
+        let mut phases = [0.0_f64; 4];
+        for (slot, coeffs) in phases.iter_mut().zip(&TRUE_PEAK_PHASES) {
             let interp: f64 = coeffs.iter().zip(hist.iter()).map(|(c, h)| c * h).sum();
+            *slot = interp;
             peak = peak.max(interp.abs());
+        }
+        if mode == IspOversampling::X8 {
+            // Evaluate strictly contiguous half-phase midpoints within the 4x polyphase window
+            // (all four `phases` share the exact same group delay).
+            let m01 = 0.5 * (phases[0] + phases[1]);
+            let m12 = 0.5625 * (phases[1] + phases[2]) - 0.0625 * (phases[0] + phases[3]);
+            let m23 = 0.5 * (phases[2] + phases[3]);
+            peak = peak.max(m01.abs()).max(m12.abs()).max(m23.abs());
         }
         peak
     }
@@ -1703,8 +1736,9 @@ impl RealtimeMasterLimiter {
         target_lin: f64,
         release_coeff: f64,
     ) -> (f64, f64, f64) {
-        let tp_l = Self::estimate_4x_intersample_peak(&mut self.tp_hist_l, xl).max(1e-12);
-        let tp_r = Self::estimate_4x_intersample_peak(&mut self.tp_hist_r, xr).max(1e-12);
+        let mode = self.isp_oversampling;
+        let tp_l = Self::estimate_intersample_peak(&mut self.tp_hist_l, xl, mode).max(1e-12);
+        let tp_r = Self::estimate_intersample_peak(&mut self.tp_hist_r, xr, mode).max(1e-12);
         let tp_max = tp_l.max(tp_r);
         let link = self.channel_link;
         let eff_tp_l = link * tp_max + (1.0 - link) * tp_l;

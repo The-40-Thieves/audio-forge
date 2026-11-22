@@ -213,6 +213,41 @@ fn nam_json_size_limit_enforces_exact_boundary_and_preserves_existing_model() {
     );
 }
 
+#[test]
+fn limiter_8x_isp_spaceverb_decay_eq_and_4x_adaa_clipper_are_stable() {
+    use forge_dsp::{
+        IspOversampling, RealtimeDensityAndClipper, RealtimeFdnReverb, RealtimeMasterLimiter,
+    };
+
+    let mut lim = RealtimeMasterLimiter::new(48_000.0);
+    lim.set_isp_oversampling(IspOversampling::X8);
+    assert_eq!(lim.isp_oversampling(), IspOversampling::X8);
+    for i in 0..4096 {
+        let s =
+            (0.9 * (2.0 * std::f64::consts::PI * 11_025.0 * (i as f64) / 48_000.0).sin()) as f32;
+        let (l, r) = lim.process_stereo_sample(s, s, 6.0, -1.0, 60.0);
+        assert!(l.is_finite() && r.is_finite());
+        assert!(l.abs() <= 1.0 && r.abs() <= 1.0);
+    }
+
+    let mut rev = RealtimeFdnReverb::new(48_000.0);
+    rev.set_decay_eq(1.5, 0.5);
+    rev.set_mod_depth(1.4);
+    for i in 0..4096 {
+        let x = if i == 0 { 0.8_f32 } else { 0.0_f32 };
+        let (l, r) = rev.process_stereo_sample(x, x, 2.5, 0.4, 0.1, 0.0, 0.5);
+        assert!(l.is_finite() && r.is_finite());
+    }
+
+    let mut clip = RealtimeDensityAndClipper::new(48_000.0);
+    for i in 0..2048 {
+        let x = (0.8 * (2.0 * std::f64::consts::PI * 1000.0 * (i as f64) / 48_000.0).sin()) as f32;
+        let (l, r) = clip.process_stereo_sample(x, -x, 0.4, 9.0, -0.5);
+        assert!(l.is_finite() && r.is_finite());
+        assert!(l.abs() < 2.0 && r.abs() < 2.0);
+    }
+}
+
 fn synthetic_wavenet_nam_json(
     channels: usize,
     kernel_size: usize,

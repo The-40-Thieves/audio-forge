@@ -223,6 +223,30 @@ fn drum_trigger_shared_keys_and_voice_ids_do_not_allocate() {
 }
 
 #[test]
+fn limiter_8x_isp_spaceverb_decay_eq_and_4x_clipper_do_not_allocate() {
+    use forge_dsp::{
+        IspOversampling, RealtimeDensityAndClipper, RealtimeFdnReverb, RealtimeMasterLimiter,
+    };
+
+    let mut lim = RealtimeMasterLimiter::new(48_000.0);
+    let mut rev = RealtimeFdnReverb::new(48_000.0);
+    let mut clip = RealtimeDensityAndClipper::new(48_000.0);
+
+    assert_no_allocs("8x ISP + Decay EQ + 4x Clipper", || {
+        lim.set_isp_oversampling(IspOversampling::X8);
+        rev.set_decay_eq(1.3, 0.6);
+        rev.set_mod_depth(1.5);
+        for i in 0..256 {
+            let x = ((i as f32) * 0.1).sin() * 0.5;
+            let (cl, cr) = clip.process_stereo_sample(x, -x, 0.3, 6.0, -0.5);
+            let (rl, rr) = rev.process_stereo_sample(cl, cr, 2.0, 0.35, 0.1, 0.2, 0.3);
+            let (ll, lr) = lim.process_stereo_sample(rl, rr, 3.0, -1.0, 80.0);
+            std::hint::black_box((ll, lr));
+        }
+    });
+}
+
+#[test]
 fn full_wavenet_nam_and_opensoothe_low_latency_do_not_allocate() {
     use forge_dsp::{AnalogHardwareModel, RealtimeNeuralPreamp};
     let mut preamp = RealtimeNeuralPreamp::new(AnalogHardwareModel::Neve1073ClassA);

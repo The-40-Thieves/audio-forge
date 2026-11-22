@@ -1,11 +1,16 @@
 //! Shared lock-free audio-to-GUI telemetry and dark-mode studio metering/spectrum canvas
 //! rendered across all 10 `forge-plug` VST3/CLAP editors.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use forge_dsp::{Biquad, flush_denormal_f64, read_shared_spectrum, sanitize_sample_f32};
 use nih_plug::prelude::{BoolParam, FloatParam, IntParam, Param, ParamSetter};
 use nih_plug_egui::egui;
+use serde::{Deserialize, Serialize};
+
+/// Maximum user-preset or persisted A/B JSON payload accepted (64 KiB).
+pub const MAX_PRESET_JSON_BYTES: usize = 64 * 1024;
 
 /// Sentinel stored in `GuiTelemetry::lufs_momentary` / `true_peak_dbtp` when a plugin does not
 /// publish K-weighted loudness telemetry.
@@ -63,16 +68,71 @@ pub struct FactoryPreset {
     pub values: &'static [(&'static str, f32)],
 }
 
+/// Portable user preset serialized as JSON (`name` + normalized `(param_id, value)` pairs).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UserPreset {
+    pub name: String,
+    pub values: Vec<(String, f32)>,
+}
+
 /// GUI-thread A/B parameter-bank state holding two full normalized snapshots so switching `A <-> B`
-/// updates both the host automation state and DSP via `ParamSetter`.
-#[derive(Debug, Clone, Default)]
+/// updates both the host automation state and DSP via `ParamSetter`. Serializable so plugins can
+/// persist A/B banks across DAW save/reload via `#[persist = "ab-state"]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AbBankState {
     pub active_slot: usize,
     pub slot_a: Vec<(String, f32)>,
     pub slot_b: Vec<(String, f32)>,
+    #[serde(skip)]
+    pub show_json_drawer: bool,
+    #[serde(skip)]
+    pub preset_json_buf: String,
+    #[serde(skip)]
+    pub preset_status: String,
+    #[serde(skip)]
+    pub last_synced_json: String,
 }
 
 impl AbBankState {
+    /// Serializes the A/B bank snapshot to compact JSON.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// Restores an A/B bank snapshot from persisted JSON (bounded by `MAX_PRESET_JSON_BYTES`).
+    pub fn from_json(raw: &str) -> Option<Self> {
+        if raw.is_empty() || raw.len() > MAX_PRESET_JSON_BYTES {
+            return None;
+        }
+        let mut parsed: Self = serde_json::from_str(raw).ok()?;
+        parsed.active_slot = usize::from(parsed.active_slot != 0);
+        for (_, v) in parsed.slot_a.iter_mut().chain(parsed.slot_b.iter_mut()) {
+            *v = if v.is_finite() {
+                v.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+        }
+        Some(parsed)
+    }
+
+    /// Loads persisted A/B state from a `#[persist]` string mutex if present and valid.
+    pub fn load_from_persisted(persisted: &Mutex<String>) -> Self {
+        persisted
+            .lock()
+            .ok()
+            .and_then(|guard| Self::from_json(&guard))
+            .unwrap_or_default()
+    }
+
+    /// Saves current A/B state into a `#[persist]` string mutex.
+    pub fn save_to_persisted(&mut self, persisted: &Mutex<String>) {
+        let json = self.to_json();
+        if let Ok(mut guard) = persisted.lock() {
+            *guard = json.clone();
+        }
+        self.last_synced_json = json;
+    }
     /// Captures current normalized values from `params` into both A and B if uninitialized.
     pub fn ensure_initialized(&mut self, params: &[(&'static str, ParamRef<'_>)]) {
         if self.slot_a.is_empty() {
@@ -158,7 +218,54 @@ pub fn apply_factory_preset(
     }
 }
 
-/// Renders the studio A/B parameter-bank toolbar (`A`, `B`, `A->B`) and curated factory preset pills.
+/// Exports the current parameter values as a pretty-printed [`UserPreset`] JSON string.
+pub fn export_user_preset_json(name: &str, params: &[(&'static str, ParamRef<'_>)]) -> String {
+    let preset = UserPreset {
+        name: name.to_string(),
+        values: snapshot_params(params),
+    };
+    serde_json::to_string_pretty(&preset).unwrap_or_default()
+}
+
+/// Parses a [`UserPreset`] JSON string with size and finite-value validation.
+pub fn import_user_preset_json(raw: &str) -> Result<UserPreset, String> {
+    if raw.trim().is_empty() {
+        return Err("Preset JSON is empty".to_string());
+    }
+    if raw.len() > MAX_PRESET_JSON_BYTES {
+        return Err(format!(
+            "Preset JSON exceeds maximum size ({MAX_PRESET_JSON_BYTES} bytes)"
+        ));
+    }
+    let mut preset: UserPreset =
+        serde_json::from_str(raw).map_err(|e| format!("Invalid preset JSON: {e}"))?;
+    for (_, v) in &mut preset.values {
+        if !v.is_finite() {
+            return Err("Preset contains non-finite parameter value".to_string());
+        }
+        *v = v.clamp(0.0, 1.0);
+    }
+    Ok(preset)
+}
+
+/// Applies a [`UserPreset`] via `apply_fn` (returns the number of matched parameters applied).
+pub fn apply_user_preset_with(
+    params: &[(&'static str, ParamRef<'_>)],
+    preset: &UserPreset,
+    mut apply_fn: impl FnMut(ParamRef<'_>, f32),
+) -> usize {
+    let mut applied = 0_usize;
+    for (target_id, norm) in &preset.values {
+        if let Some((_, pref)) = params.iter().find(|(id, _)| *id == target_id.as_str()) {
+            apply_fn(*pref, *norm);
+            applied += 1;
+        }
+    }
+    applied
+}
+
+/// Renders the studio A/B parameter-bank toolbar (`A`, `B`, `A->B`), curated factory preset pills,
+/// and inline User Preset JSON Export/Import drawer, optionally persisting A/B state into `persisted`.
 pub(crate) fn draw_ab_and_presets_bar(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
@@ -166,7 +273,35 @@ pub(crate) fn draw_ab_and_presets_bar(
     ab: &mut AbBankState,
     presets: &[FactoryPreset],
 ) {
+    draw_ab_and_presets_bar_persisted(ui, setter, params, ab, presets, None);
+}
+
+/// Renders the studio A/B toolbar + factory presets + user JSON preset drawer and saves A/B
+/// snapshots back to `persisted` (`#[persist = "ab-state"]`) on any bank change.
+pub(crate) fn draw_ab_and_presets_bar_persisted(
+    ui: &mut egui::Ui,
+    setter: &ParamSetter,
+    params: &[(&'static str, ParamRef<'_>)],
+    ab: &mut AbBankState,
+    presets: &[FactoryPreset],
+    persisted: Option<&Mutex<String>>,
+) {
+    // If the DAW restored `#[persist = "ab-state"]` after `editor()` was constructed (common in
+    // VST3), pull the newly restored JSON into `ab` before initializing or overwriting it.
+    if let Some(p) = persisted
+        && let Ok(guard) = p.lock()
+        && !guard.is_empty()
+        && *guard != ab.last_synced_json
+        && let Some(mut restored) = AbBankState::from_json(&guard)
+    {
+        restored.last_synced_json = guard.clone();
+        restored.show_json_drawer = ab.show_json_drawer;
+        restored.preset_json_buf = std::mem::take(&mut ab.preset_json_buf);
+        restored.preset_status = std::mem::take(&mut ab.preset_status);
+        *ab = restored;
+    }
     ab.ensure_initialized(params);
+    let mut dirty_ab = false;
     ui.horizontal_wrapped(|ui| {
         let a_active = ab.active_slot == 0;
         let active_col = egui::Color32::from_rgb(74, 222, 128);
@@ -183,6 +318,7 @@ pub(crate) fn draw_ab_and_presets_bar(
             .clicked()
         {
             ab.switch_to(0, params, setter);
+            dirty_ab = true;
         }
         if ui
             .button(
@@ -195,6 +331,7 @@ pub(crate) fn draw_ab_and_presets_bar(
             .clicked()
         {
             ab.switch_to(1, params, setter);
+            dirty_ab = true;
         }
         if ui
             .button(
@@ -207,6 +344,7 @@ pub(crate) fn draw_ab_and_presets_bar(
             .clicked()
         {
             ab.copy_active_to_other(params);
+            dirty_ab = true;
         }
 
         if !presets.is_empty() {
@@ -225,7 +363,68 @@ pub(crate) fn draw_ab_and_presets_bar(
                 }
             }
         }
+
+        ui.separator();
+        if ui
+            .button(
+                egui::RichText::new(if ab.show_json_drawer {
+                    "Hide JSON"
+                } else {
+                    "User Preset JSON"
+                })
+                .small()
+                .color(egui::Color32::from_rgb(192, 132, 252)),
+            )
+            .on_hover_text("Export or import user presets as portable JSON")
+            .clicked()
+        {
+            ab.show_json_drawer = !ab.show_json_drawer;
+            if ab.show_json_drawer && ab.preset_json_buf.is_empty() {
+                ab.preset_json_buf = export_user_preset_json("User Preset", params);
+            }
+        }
     });
+
+    if dirty_ab && let Some(p) = persisted {
+        ab.save_to_persisted(p);
+    }
+
+    if ab.show_json_drawer {
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Export Current").clicked() {
+                    ab.preset_json_buf = export_user_preset_json("User Preset", params);
+                    ab.preset_status = "Exported current parameters".to_string();
+                }
+                if ui.button("Import & Apply").clicked() {
+                    match import_user_preset_json(&ab.preset_json_buf) {
+                        Ok(preset) => {
+                            let n = apply_user_preset_with(params, &preset, |pref, norm| {
+                                pref.set_normalized(setter, norm);
+                            });
+                            ab.preset_status = format!("Applied '{}' ({n} params)", preset.name);
+                        }
+                        Err(e) => {
+                            ab.preset_status = e;
+                        }
+                    }
+                }
+                if !ab.preset_status.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&ab.preset_status)
+                            .small()
+                            .color(egui::Color32::from_rgb(165, 175, 195)),
+                    );
+                }
+            });
+            ui.add(
+                egui::TextEdit::multiline(&mut ab.preset_json_buf)
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace),
+            );
+        });
+    }
     ui.add_space(4.0);
 }
 
@@ -651,15 +850,44 @@ fn draw_compact_meter_bar(ui: &mut egui::Ui, label: &str, norm: f32, fill: egui:
     });
 }
 
+/// Optional draggable horizontal control line overlaid on the 32-band studio spectrum canvas
+/// (e.g. limiter ceiling, spectral sensitivity, or EQ amount).
+pub struct CanvasDragHandle<'a> {
+    pub label: &'static str,
+    pub param: &'a FloatParam,
+    pub color: egui::Color32,
+}
+
 /// Renders the shared ForgeAudio dark-mode studio header, clickable Peak-Hold / Clip indicator,
-/// visual I/O + Gain Reduction bars, and 32-band Real-Time Spectrum analyzer with frequency/dB
-/// graticule, distinct shared-bus masking overlay, and Dynamic Gain-Reduction / Bode curve.
+/// visual I/O + Gain Reduction bars, and 32-band Real-Time Spectrum analyzer.
 pub(crate) fn draw_forge_studio_header_and_spectrum(
     ui: &mut egui::Ui,
     title: &str,
     subtitle: &str,
     telemetry: &GuiTelemetry,
     shared_slot: Option<usize>,
+) {
+    draw_forge_studio_header_and_spectrum_interactive(
+        ui,
+        title,
+        subtitle,
+        telemetry,
+        shared_slot,
+        None,
+        None,
+    );
+}
+
+/// Renders the shared studio header and interactive 32-band spectrum canvas with an optional
+/// draggable horizontal parameter handle (ceiling, sensitivity, or EQ depth).
+pub(crate) fn draw_forge_studio_header_and_spectrum_interactive(
+    ui: &mut egui::Ui,
+    title: &str,
+    subtitle: &str,
+    telemetry: &GuiTelemetry,
+    shared_slot: Option<usize>,
+    setter: Option<&ParamSetter>,
+    drag_handle: Option<CanvasDragHandle<'_>>,
 ) {
     let pk_in = f32::from_bits(telemetry.peak_in_db.load(Ordering::Relaxed));
     let pk_out = f32::from_bits(telemetry.peak_out_db.load(Ordering::Relaxed));
@@ -764,10 +992,13 @@ pub(crate) fn draw_forge_studio_header_and_spectrum(
     ui.add_space(4.0);
 
     // 32-Band Real-Time Spectral + Shared-Bus Ghost Overlay + Dynamic GR / Bode Curve Canvas
-    let (rect, _resp) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 104.0),
-        egui::Sense::hover(),
-    );
+    let sense = if drag_handle.is_some() {
+        egui::Sense::click_and_drag()
+    } else {
+        egui::Sense::hover()
+    };
+    let canvas_h = (ui.available_height() * 0.28).clamp(104.0, 220.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), canvas_h), sense);
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(16, 20, 28));
     painter.rect_stroke(
@@ -871,6 +1102,62 @@ pub(crate) fn draw_forge_studio_header_and_spectrum(
                 egui::Color32::from_rgba_unmultiplied(248, 113, 113, 195),
             ),
         ));
+    }
+
+    // Interactive draggable horizontal handle (e.g., Ceiling / Sensitivity / EQ Depth)
+    if let (Some(handle), Some(setter)) = (drag_handle, setter) {
+        if resp.drag_started() {
+            setter.begin_set_parameter(handle.param);
+        }
+        if (resp.dragged() || resp.clicked())
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            let norm = (1.0 - (pos.y - plot_top) / plot_h).clamp(0.0, 1.0);
+            if resp.clicked() && !resp.dragged() {
+                setter.begin_set_parameter(handle.param);
+                setter.set_parameter_normalized(handle.param, norm);
+                setter.end_set_parameter(handle.param);
+            } else {
+                setter.set_parameter_normalized(handle.param, norm);
+            }
+        }
+        if resp.drag_stopped() {
+            setter.end_set_parameter(handle.param);
+        }
+        let norm = handle.param.unmodulated_normalized_value().clamp(0.0, 1.0);
+        let y = (plot_bottom - norm * plot_h).clamp(plot_top + 2.0, plot_bottom - 2.0);
+        painter.line_segment(
+            [
+                egui::pos2(rect.left() + 6.0, y),
+                egui::pos2(rect.right() - 6.0, y),
+            ],
+            egui::Stroke::new(1.75_f32, handle.color),
+        );
+        let pill_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                rect.right() - 118.0,
+                (y - 9.0).clamp(plot_top, plot_bottom - 18.0),
+            ),
+            egui::vec2(110.0, 16.0),
+        );
+        painter.rect_filled(
+            pill_rect,
+            4.0,
+            egui::Color32::from_rgba_unmultiplied(15, 23, 42, 220),
+        );
+        painter.rect_stroke(
+            pill_rect,
+            4.0,
+            egui::Stroke::new(1.0_f32, handle.color),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            pill_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{}: {}", handle.label, handle.param),
+            egui::FontId::monospace(9.5),
+            handle.color,
+        );
     }
 
     // Frequency axis labels placed at exact log-frequency fractions matching the 32-band analyzer
@@ -1110,5 +1397,42 @@ mod tests {
         // Copy A -> B while on slot A: keeps both slots synchronized.
         ab.copy_active_to_other(&params);
         assert_eq!(ab.slot_a, ab.slot_b);
+    }
+
+    #[test]
+    fn persisted_ab_and_user_preset_json_round_trip_and_enforce_bounds() {
+        use nih_plug::prelude::FloatRange;
+
+        let p_gain = FloatParam::new("Gain", 0.4, FloatRange::Linear { min: 0.0, max: 1.0 });
+        let params = [("gain", ParamRef::Float(&p_gain))];
+
+        let persisted = Mutex::new(String::new());
+        let mut ab = AbBankState {
+            active_slot: 1,
+            slot_a: vec![("gain".to_string(), 0.2)],
+            slot_b: vec![("gain".to_string(), 0.8)],
+            ..AbBankState::default()
+        };
+        ab.save_to_persisted(&persisted);
+
+        let restored = AbBankState::load_from_persisted(&persisted);
+        assert_eq!(restored.active_slot, 1);
+        assert_eq!(restored.slot_a, vec![("gain".to_string(), 0.2)]);
+        assert_eq!(restored.slot_b, vec![("gain".to_string(), 0.8)]);
+
+        let exported = export_user_preset_json("My Custom Master", &params);
+        let imported = import_user_preset_json(&exported).expect("valid preset JSON");
+        assert_eq!(imported.name, "My Custom Master");
+        assert_eq!(imported.values.len(), 1);
+        let mut applied = Vec::new();
+        let count = apply_user_preset_with(&params, &imported, |_p, v| applied.push(v));
+        assert_eq!(count, 1);
+        assert!((applied[0] - 0.4).abs() < 1e-5);
+
+        // Oversized or empty JSON is rejected
+        assert!(import_user_preset_json("").is_err());
+        let huge = "a".repeat(MAX_PRESET_JSON_BYTES + 1);
+        assert!(import_user_preset_json(&huge).is_err());
+        assert!(AbBankState::from_json(&huge).is_none());
     }
 }
