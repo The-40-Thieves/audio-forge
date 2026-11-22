@@ -177,7 +177,6 @@ const PHASE_EQ_PRESETS: &[FactoryPreset] = &[
     FactoryPreset {
         name: "AI De-Harsh Flat",
         values: &[
-            ("delay", 0.50),
             ("inv", 0.0),
             ("eqamt", 0.50),
             ("genre", 0.0),
@@ -187,7 +186,6 @@ const PHASE_EQ_PRESETS: &[FactoryPreset] = &[
     FactoryPreset {
         name: "Modern Hip-Hop",
         values: &[
-            ("delay", 0.50),
             ("inv", 0.0),
             ("eqamt", 0.70),
             ("genre", 0.25),
@@ -1508,6 +1506,10 @@ impl Plugin for ForgeMasterLimiterPlug {
         self.loudness_meter.reset(sr);
         context.set_latency_samples(self.dsp.latency_samples());
         true
+    }
+
+    fn reset(&mut self) {
+        self.loudness_meter.clear();
     }
 
     fn process(

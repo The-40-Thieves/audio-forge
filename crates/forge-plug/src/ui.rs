@@ -293,11 +293,37 @@ pub struct OutputLoudnessMeter {
     blocks: [f64; 30],
     block_head: usize,
     blocks_filled: usize,
-    hist_l: [f64; 4],
-    hist_r: [f64; 4],
+    hist_l: [f64; 12],
+    hist_r: [f64; 12],
     tp_lin: f64,
     tp_decay: f64,
+    sample_rate: f64,
 }
+
+/// ITU-R BS.1770-4 Annex 2 4x polyphase 48-tap (12 taps/phase) true-peak interpolation FIR.
+#[rustfmt::skip]
+const BS1770_TP_PHASES: [[f64; 12]; 4] = [
+    [
+        0.001_708_984_375_0, 0.010_986_328_125_0, -0.019_653_320_312_5, 0.033_203_125_000_0,
+        -0.059_448_242_187_5, 0.137_329_101_562_5, 0.972_167_968_750_0, -0.102_294_921_875_0,
+        0.047_607_421_875_0, -0.026_611_328_125_0, 0.014_892_578_125_0, -0.008_300_781_250_0,
+    ],
+    [
+        -0.029_174_804_687_5, 0.029_296_875_000_0, -0.051_757_812_500_0, 0.089_111_328_125_0,
+        -0.166_503_906_250_0, 0.465_087_890_625_0, 0.779_785_156_250_0, -0.200_317_382_812_5,
+        0.101_562_500_000_0, -0.058_227_539_062_5, 0.033_081_054_687_5, -0.018_920_898_437_5,
+    ],
+    [
+        -0.018_920_898_437_5, 0.033_081_054_687_5, -0.058_227_539_062_5, 0.101_562_500_000_0,
+        -0.200_317_382_812_5, 0.779_785_156_250_0, 0.465_087_890_625_0, -0.166_503_906_250_0,
+        0.089_111_328_125_0, -0.051_757_812_500_0, 0.029_296_875_000_0, -0.029_174_804_687_5,
+    ],
+    [
+        -0.008_300_781_250_0, 0.014_892_578_125_0, -0.026_611_328_125_0, 0.047_607_421_875_0,
+        -0.102_294_921_875_0, 0.972_167_968_750_0, 0.137_329_101_562_5, -0.059_448_242_187_5,
+        0.033_203_125_000_0, -0.019_653_320_312_5, 0.010_986_328_125_0, 0.001_708_984_375_0,
+    ],
+];
 
 impl OutputLoudnessMeter {
     pub fn new(sample_rate: f64) -> Self {
@@ -318,10 +344,11 @@ impl OutputLoudnessMeter {
             blocks: [0.0; 30],
             block_head: 0,
             blocks_filled: 0,
-            hist_l: [0.0; 4],
-            hist_r: [0.0; 4],
+            hist_l: [0.0; 12],
+            hist_r: [0.0; 12],
             tp_lin: 1e-6,
             tp_decay: (-1.0 / (0.350 * sr)).exp(),
+            sample_rate: sr,
         }
     }
 
@@ -329,22 +356,18 @@ impl OutputLoudnessMeter {
         *self = Self::new(sample_rate);
     }
 
+    /// Clears all K-weighted filter, window, and true-peak history at the current sample rate.
+    pub fn clear(&mut self) {
+        self.reset(self.sample_rate);
+    }
+
     #[inline]
-    fn cubic_4x_peak(h: &mut [f64; 4], x: f64) -> f64 {
-        h[0] = h[1];
-        h[1] = h[2];
-        h[2] = h[3];
-        h[3] = x;
-        let (p0, p1, p2, p3) = (h[0], h[1], h[2], h[3]);
-        let mut peak = p1.abs().max(p2.abs()).max(x.abs());
-        for t in [0.25_f64, 0.50, 0.75] {
-            let t2 = t * t;
-            let t3 = t2 * t;
-            let y = 0.5
-                * ((2.0 * p1)
-                    + (-p0 + p2) * t
-                    + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
-                    + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);
+    fn bs1770_4x_peak(hist: &mut [f64; 12], x: f64) -> f64 {
+        hist.copy_within(0..11, 1);
+        hist[0] = x;
+        let mut peak = x.abs();
+        for coeffs in &BS1770_TP_PHASES {
+            let y: f64 = coeffs.iter().zip(hist.iter()).map(|(c, h)| c * h).sum();
             peak = peak.max(y.abs());
         }
         peak
@@ -373,8 +396,8 @@ impl OutputLoudnessMeter {
             self.block_count = 0;
         }
 
-        let tp = Self::cubic_4x_peak(&mut self.hist_l, ol)
-            .max(Self::cubic_4x_peak(&mut self.hist_r, or_));
+        let tp = Self::bs1770_4x_peak(&mut self.hist_l, ol)
+            .max(Self::bs1770_4x_peak(&mut self.hist_r, or_));
         self.tp_lin = flush_denormal_f64((self.tp_lin * self.tp_decay).max(tp)).max(1e-6);
     }
 
