@@ -3,8 +3,231 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use forge_dsp::read_shared_spectrum;
+use forge_dsp::{Biquad, flush_denormal_f64, read_shared_spectrum, sanitize_sample_f32};
+use nih_plug::prelude::{BoolParam, FloatParam, IntParam, Param, ParamSetter};
 use nih_plug_egui::egui;
+
+/// Sentinel stored in `GuiTelemetry::lufs_momentary` / `true_peak_dbtp` when a plugin does not
+/// publish K-weighted loudness telemetry.
+pub const UNSET_LOUDNESS_DB: f32 = -120.0;
+
+/// Safe, zero-`unsafe` handle to any `nih_plug` parameter for A/B state recall and factory presets.
+#[derive(Clone, Copy)]
+pub enum ParamRef<'a> {
+    Float(&'a FloatParam),
+    Int(&'a IntParam),
+    Bool(&'a BoolParam),
+}
+
+impl ParamRef<'_> {
+    #[inline]
+    pub fn normalized(&self) -> f32 {
+        match self {
+            Self::Float(p) => p.unmodulated_normalized_value(),
+            Self::Int(p) => p.unmodulated_normalized_value(),
+            Self::Bool(p) => p.unmodulated_normalized_value(),
+        }
+    }
+
+    #[inline]
+    pub fn set_normalized(&self, setter: &ParamSetter, norm: f32) {
+        let clamped = if norm.is_finite() {
+            norm.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        match self {
+            Self::Float(p) => {
+                setter.begin_set_parameter(*p);
+                setter.set_parameter_normalized(*p, clamped);
+                setter.end_set_parameter(*p);
+            }
+            Self::Int(p) => {
+                setter.begin_set_parameter(*p);
+                setter.set_parameter_normalized(*p, clamped);
+                setter.end_set_parameter(*p);
+            }
+            Self::Bool(p) => {
+                setter.begin_set_parameter(*p);
+                setter.set_parameter_normalized(*p, clamped);
+                setter.end_set_parameter(*p);
+            }
+        }
+    }
+}
+
+/// One curated studio factory preset defined as `(param_id, normalized_value)` pairs.
+#[derive(Debug, Clone, Copy)]
+pub struct FactoryPreset {
+    pub name: &'static str,
+    pub values: &'static [(&'static str, f32)],
+}
+
+/// GUI-thread A/B parameter-bank state holding two full normalized snapshots so switching `A <-> B`
+/// updates both the host automation state and DSP via `ParamSetter`.
+#[derive(Debug, Clone, Default)]
+pub struct AbBankState {
+    pub active_slot: usize,
+    pub slot_a: Vec<(String, f32)>,
+    pub slot_b: Vec<(String, f32)>,
+}
+
+impl AbBankState {
+    /// Captures current normalized values from `params` into both A and B if uninitialized.
+    pub fn ensure_initialized(&mut self, params: &[(&'static str, ParamRef<'_>)]) {
+        if self.slot_a.is_empty() {
+            let snap = snapshot_params(params);
+            self.slot_a = snap.clone();
+            self.slot_b = snap;
+        }
+    }
+
+    /// Switches to `target_slot` (`0` = A, `1` = B): saves current values into the outgoing slot
+    /// and applies the target slot's normalized values through `setter`.
+    pub fn switch_to(
+        &mut self,
+        target_slot: usize,
+        params: &[(&'static str, ParamRef<'_>)],
+        setter: &ParamSetter,
+    ) {
+        self.switch_with(target_slot, params, |pref, norm| {
+            pref.set_normalized(setter, norm);
+        });
+    }
+
+    /// Core bank-switching transition parameterized by `apply_fn` so unit tests can verify
+    /// full A/B snapshot recall across Float/Int/Bool parameters without a live DAW host.
+    pub fn switch_with(
+        &mut self,
+        target_slot: usize,
+        params: &[(&'static str, ParamRef<'_>)],
+        mut apply_fn: impl FnMut(ParamRef<'_>, f32),
+    ) {
+        let target = usize::from(target_slot != 0);
+        self.ensure_initialized(params);
+        if target == self.active_slot {
+            return;
+        }
+        let current = snapshot_params(params);
+        let recalled = if self.active_slot == 0 {
+            self.slot_a = current;
+            &self.slot_b
+        } else {
+            self.slot_b = current;
+            &self.slot_a
+        };
+        for (target_id, norm) in recalled {
+            if let Some((_, pref)) = params.iter().find(|(id, _)| *id == target_id.as_str()) {
+                apply_fn(*pref, *norm);
+            }
+        }
+        self.active_slot = target;
+    }
+
+    /// Copies the active slot's live values into the inactive slot (`A -> B` or `B -> A`).
+    pub fn copy_active_to_other(&mut self, params: &[(&'static str, ParamRef<'_>)]) {
+        let current = snapshot_params(params);
+        if self.active_slot == 0 {
+            self.slot_a = current.clone();
+            self.slot_b = current;
+        } else {
+            self.slot_b = current.clone();
+            self.slot_a = current;
+        }
+    }
+}
+
+/// Captures `(param_id, normalized_value)` for every parameter in `params`.
+pub fn snapshot_params(params: &[(&'static str, ParamRef<'_>)]) -> Vec<(String, f32)> {
+    params
+        .iter()
+        .map(|&(id, pref)| (id.to_string(), pref.normalized()))
+        .collect()
+}
+
+/// Applies a curated [`FactoryPreset`] through `ParamSetter`.
+pub fn apply_factory_preset(
+    params: &[(&'static str, ParamRef<'_>)],
+    setter: &ParamSetter,
+    preset: &FactoryPreset,
+) {
+    for &(target_id, norm) in preset.values {
+        if let Some((_, pref)) = params.iter().find(|(id, _)| *id == target_id) {
+            pref.set_normalized(setter, norm);
+        }
+    }
+}
+
+/// Renders the studio A/B parameter-bank toolbar (`A`, `B`, `A->B`) and curated factory preset pills.
+pub(crate) fn draw_ab_and_presets_bar(
+    ui: &mut egui::Ui,
+    setter: &ParamSetter,
+    params: &[(&'static str, ParamRef<'_>)],
+    ab: &mut AbBankState,
+    presets: &[FactoryPreset],
+) {
+    ab.ensure_initialized(params);
+    ui.horizontal_wrapped(|ui| {
+        let a_active = ab.active_slot == 0;
+        let active_col = egui::Color32::from_rgb(74, 222, 128);
+        let muted_col = egui::Color32::from_rgb(148, 163, 184);
+
+        if ui
+            .button(
+                egui::RichText::new("A")
+                    .monospace()
+                    .strong()
+                    .color(if a_active { active_col } else { muted_col }),
+            )
+            .on_hover_text("Recall parameter bank A")
+            .clicked()
+        {
+            ab.switch_to(0, params, setter);
+        }
+        if ui
+            .button(
+                egui::RichText::new("B")
+                    .monospace()
+                    .strong()
+                    .color(if !a_active { active_col } else { muted_col }),
+            )
+            .on_hover_text("Recall parameter bank B")
+            .clicked()
+        {
+            ab.switch_to(1, params, setter);
+        }
+        if ui
+            .button(
+                egui::RichText::new(if a_active { "A->B" } else { "B->A" })
+                    .monospace()
+                    .small()
+                    .color(egui::Color32::from_rgb(90, 210, 255)),
+            )
+            .on_hover_text("Copy active bank into inactive bank")
+            .clicked()
+        {
+            ab.copy_active_to_other(params);
+        }
+
+        if !presets.is_empty() {
+            ui.separator();
+            ui.label(
+                egui::RichText::new("Presets:")
+                    .small()
+                    .color(egui::Color32::from_rgb(165, 175, 195)),
+            );
+            for preset in presets {
+                if ui
+                    .button(egui::RichText::new(preset.name).small())
+                    .clicked()
+                {
+                    apply_factory_preset(params, setter, preset);
+                }
+            }
+        }
+    });
+    ui.add_space(4.0);
+}
 
 /// Number of scrolling Gain-Reduction history points rendered across the studio canvas.
 pub const GR_HISTORY_LEN: usize = 64;
@@ -23,6 +246,9 @@ pub struct GuiTelemetry {
     pub peak_out_db: AtomicU32,
     pub peak_hold_out_db: AtomicU32,
     pub gr_db: AtomicU32,
+    pub lufs_momentary: AtomicU32,
+    pub lufs_short_term: AtomicU32,
+    pub true_peak_dbtp: AtomicU32,
     pub ab_slot: AtomicU32,
     pub spectrum_frozen: AtomicBool,
 }
@@ -40,9 +266,170 @@ impl Default for GuiTelemetry {
             peak_out_db: AtomicU32::new((-90.0_f32).to_bits()),
             peak_hold_out_db: AtomicU32::new((-90.0_f32).to_bits()),
             gr_db: AtomicU32::new(0.0_f32.to_bits()),
+            lufs_momentary: AtomicU32::new(UNSET_LOUDNESS_DB.to_bits()),
+            lufs_short_term: AtomicU32::new(UNSET_LOUDNESS_DB.to_bits()),
+            true_peak_dbtp: AtomicU32::new(UNSET_LOUDNESS_DB.to_bits()),
             ab_slot: AtomicU32::new(0),
             spectrum_frozen: AtomicBool::new(false),
         }
+    }
+}
+
+/// Zero-allocation audio-thread ITU-R BS.1770-4 sliding-window loudness & 4x output true-peak meter.
+///
+/// Tracks exact 100 ms K-weighted energy sub-blocks in a 30-slot ring:
+/// - **Momentary (400 ms)** = mean energy over the latest 4 blocks (`0.4 s`).
+/// - **Short-Term (3.0 s)** = mean energy over all 30 blocks (`3.0 s`).
+/// - **True Peak (dBTP)** = 4x Catmull-Rom cubic intersample peak measured directly from the
+///   emitted gain-applied output samples.
+pub struct OutputLoudnessMeter {
+    k_shelf_l: Biquad,
+    k_rlb_l: Biquad,
+    k_shelf_r: Biquad,
+    k_rlb_r: Biquad,
+    samples_per_block: usize,
+    block_accum: f64,
+    block_count: usize,
+    blocks: [f64; 30],
+    block_head: usize,
+    blocks_filled: usize,
+    hist_l: [f64; 12],
+    hist_r: [f64; 12],
+    tp_lin: f64,
+    tp_decay: f64,
+    sample_rate: f64,
+}
+
+/// ITU-R BS.1770-4 Annex 2 4x polyphase 48-tap (12 taps/phase) true-peak interpolation FIR.
+#[rustfmt::skip]
+const BS1770_TP_PHASES: [[f64; 12]; 4] = [
+    [
+        0.001_708_984_375_0, 0.010_986_328_125_0, -0.019_653_320_312_5, 0.033_203_125_000_0,
+        -0.059_448_242_187_5, 0.137_329_101_562_5, 0.972_167_968_750_0, -0.102_294_921_875_0,
+        0.047_607_421_875_0, -0.026_611_328_125_0, 0.014_892_578_125_0, -0.008_300_781_250_0,
+    ],
+    [
+        -0.029_174_804_687_5, 0.029_296_875_000_0, -0.051_757_812_500_0, 0.089_111_328_125_0,
+        -0.166_503_906_250_0, 0.465_087_890_625_0, 0.779_785_156_250_0, -0.200_317_382_812_5,
+        0.101_562_500_000_0, -0.058_227_539_062_5, 0.033_081_054_687_5, -0.018_920_898_437_5,
+    ],
+    [
+        -0.018_920_898_437_5, 0.033_081_054_687_5, -0.058_227_539_062_5, 0.101_562_500_000_0,
+        -0.200_317_382_812_5, 0.779_785_156_250_0, 0.465_087_890_625_0, -0.166_503_906_250_0,
+        0.089_111_328_125_0, -0.051_757_812_500_0, 0.029_296_875_000_0, -0.029_174_804_687_5,
+    ],
+    [
+        -0.008_300_781_250_0, 0.014_892_578_125_0, -0.026_611_328_125_0, 0.047_607_421_875_0,
+        -0.102_294_921_875_0, 0.972_167_968_750_0, 0.137_329_101_562_5, -0.059_448_242_187_5,
+        0.033_203_125_000_0, -0.019_653_320_312_5, 0.010_986_328_125_0, 0.001_708_984_375_0,
+    ],
+];
+
+impl OutputLoudnessMeter {
+    pub fn new(sample_rate: f64) -> Self {
+        let sr = if sample_rate.is_finite() {
+            sample_rate.clamp(8_000.0, 768_000.0)
+        } else {
+            48_000.0
+        };
+        let samples_per_block = ((sr * 0.100).round() as usize).max(64);
+        Self {
+            k_shelf_l: Biquad::k_weight_pre_shelf(sr),
+            k_rlb_l: Biquad::k_weight_rlb_highpass(sr),
+            k_shelf_r: Biquad::k_weight_pre_shelf(sr),
+            k_rlb_r: Biquad::k_weight_rlb_highpass(sr),
+            samples_per_block,
+            block_accum: 0.0,
+            block_count: 0,
+            blocks: [0.0; 30],
+            block_head: 0,
+            blocks_filled: 0,
+            hist_l: [0.0; 12],
+            hist_r: [0.0; 12],
+            tp_lin: 1e-6,
+            tp_decay: (-1.0 / (0.350 * sr)).exp(),
+            sample_rate: sr,
+        }
+    }
+
+    pub fn reset(&mut self, sample_rate: f64) {
+        *self = Self::new(sample_rate);
+    }
+
+    /// Clears all K-weighted filter, window, and true-peak history at the current sample rate.
+    pub fn clear(&mut self) {
+        self.reset(self.sample_rate);
+    }
+
+    #[inline]
+    fn bs1770_4x_peak(hist: &mut [f64; 12], x: f64) -> f64 {
+        hist.copy_within(0..11, 1);
+        hist[0] = x;
+        let mut peak = x.abs();
+        for coeffs in &BS1770_TP_PHASES {
+            let y: f64 = coeffs.iter().zip(hist.iter()).map(|(c, h)| c * h).sum();
+            peak = peak.max(y.abs());
+        }
+        peak
+    }
+
+    /// Feeds one emitted stereo output sample into the K-weighted loudness windows and 4x TP meter.
+    #[inline]
+    pub fn push_output_sample(&mut self, out_l: f32, out_r: f32) {
+        let ol = sanitize_sample_f32(out_l);
+        let or_ = sanitize_sample_f32(out_r);
+
+        let kw_l = self
+            .k_rlb_l
+            .process_sample(self.k_shelf_l.process_sample(ol));
+        let kw_r = self
+            .k_rlb_r
+            .process_sample(self.k_shelf_r.process_sample(or_));
+        self.block_accum += kw_l * kw_l + kw_r * kw_r;
+        self.block_count += 1;
+        if self.block_count >= self.samples_per_block {
+            self.blocks[self.block_head] =
+                flush_denormal_f64(self.block_accum / (self.block_count as f64));
+            self.block_head = (self.block_head + 1) % self.blocks.len();
+            self.blocks_filled = (self.blocks_filled + 1).min(self.blocks.len());
+            self.block_accum = 0.0;
+            self.block_count = 0;
+        }
+
+        let tp = Self::bs1770_4x_peak(&mut self.hist_l, ol)
+            .max(Self::bs1770_4x_peak(&mut self.hist_r, or_));
+        self.tp_lin = flush_denormal_f64((self.tp_lin * self.tp_decay).max(tp)).max(1e-6);
+    }
+
+    /// Returns `(momentary_400ms_lufs, short_term_3s_lufs, output_true_peak_dbtp)`.
+    pub fn snapshot(&self) -> (f32, f32, f32) {
+        let partial_mean = if self.block_count > 0 {
+            Some(self.block_accum / (self.block_count as f64))
+        } else {
+            None
+        };
+        let window_lufs = |max_blocks: usize| -> f32 {
+            let n = self.blocks_filled.min(max_blocks);
+            let mut sum = 0.0_f64;
+            for k in 0..n {
+                let idx = (self.block_head + self.blocks.len() - 1 - k) % self.blocks.len();
+                sum += self.blocks[idx];
+            }
+            let mean = if n > 0 {
+                sum / (n as f64)
+            } else {
+                partial_mean.unwrap_or(0.0)
+            };
+            if mean > 1e-10 {
+                ((-0.691 + 10.0 * mean.log10()) as f32).clamp(-90.0, 6.0)
+            } else {
+                -90.0
+            }
+        };
+        let m_lufs = window_lufs(4);
+        let s_lufs = window_lufs(30);
+        let tp_dbtp = (20.0 * self.tp_lin.max(1e-6).log10() as f32).clamp(-90.0, 12.0);
+        (m_lufs, s_lufs, tp_dbtp)
     }
 }
 
@@ -52,6 +439,33 @@ impl GuiTelemetry {
     pub fn reset_peak_hold(&self) {
         self.peak_hold_out_db
             .store((-90.0_f32).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Publishes lock-free ITU-R BS.1770-4 Momentary (400 ms), Short-Term (3 s) LUFS and
+    /// 4x Output True-Peak dBTP telemetry. Non-finite inputs preserve `UNSET_LOUDNESS_DB`.
+    #[inline]
+    pub fn update_loudness_and_tp(&self, lufs_m: f32, lufs_s: f32, tp_dbtp: f32) {
+        let clean_m = if lufs_m.is_finite() {
+            lufs_m.clamp(-90.0, 6.0)
+        } else {
+            UNSET_LOUDNESS_DB
+        };
+        let clean_s = if lufs_s.is_finite() {
+            lufs_s.clamp(-90.0, 6.0)
+        } else {
+            UNSET_LOUDNESS_DB
+        };
+        let clean_tp = if tp_dbtp.is_finite() {
+            tp_dbtp.clamp(-90.0, 12.0)
+        } else {
+            UNSET_LOUDNESS_DB
+        };
+        self.lufs_momentary
+            .store(clean_m.to_bits(), Ordering::Relaxed);
+        self.lufs_short_term
+            .store(clean_s.to_bits(), Ordering::Relaxed);
+        self.true_peak_dbtp
+            .store(clean_tp.to_bits(), Ordering::Relaxed);
     }
 
     /// Toggles live spectrum, shared-bus ghost, and GR history freeze and returns the new state.
@@ -326,6 +740,25 @@ pub(crate) fn draw_forge_studio_header_and_spectrum(
             {
                 telemetry.toggle_spectrum_freeze(shared_slot);
             }
+
+            let lufs_m = f32::from_bits(telemetry.lufs_momentary.load(Ordering::Relaxed));
+            let lufs_s = f32::from_bits(telemetry.lufs_short_term.load(Ordering::Relaxed));
+            let tp_dbtp = f32::from_bits(telemetry.true_peak_dbtp.load(Ordering::Relaxed));
+            if lufs_m > UNSET_LOUDNESS_DB + 1.0
+                && lufs_s > UNSET_LOUDNESS_DB + 1.0
+                && tp_dbtp > UNSET_LOUDNESS_DB + 1.0
+            {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "M {:+5.1} | S {:+5.1} LUFS | TP {:+5.1} dBTP",
+                        lufs_m, lufs_s, tp_dbtp
+                    ))
+                    .monospace()
+                    .small()
+                    .color(egui::Color32::from_rgb(192, 132, 252)),
+                );
+            }
         });
     });
     ui.add_space(4.0);
@@ -566,5 +999,116 @@ mod tests {
             f32::from_bits(tel.spectrum_db[0].load(Ordering::Relaxed)),
             -6.0
         );
+    }
+
+    #[test]
+    fn loudness_and_tp_telemetry_updates_and_preserves_unset_sentinel() {
+        let tel = GuiTelemetry::default();
+        tel.update_loudness_and_tp(-14.2, -15.6, -1.05);
+        assert!(
+            (f32::from_bits(tel.lufs_momentary.load(Ordering::Relaxed)) - (-14.2)).abs() < 1e-4
+        );
+        assert!(
+            (f32::from_bits(tel.lufs_short_term.load(Ordering::Relaxed)) - (-15.6)).abs() < 1e-4
+        );
+        assert!(
+            (f32::from_bits(tel.true_peak_dbtp.load(Ordering::Relaxed)) - (-1.05)).abs() < 1e-4
+        );
+
+        // Non-finite telemetry must restore UNSET_LOUDNESS_DB, never bogus -90.0 dB.
+        tel.update_loudness_and_tp(f32::NAN, f32::NEG_INFINITY, f32::INFINITY);
+        assert_eq!(
+            f32::from_bits(tel.lufs_momentary.load(Ordering::Relaxed)),
+            UNSET_LOUDNESS_DB
+        );
+        assert_eq!(
+            f32::from_bits(tel.lufs_short_term.load(Ordering::Relaxed)),
+            UNSET_LOUDNESS_DB
+        );
+        assert_eq!(
+            f32::from_bits(tel.true_peak_dbtp.load(Ordering::Relaxed)),
+            UNSET_LOUDNESS_DB
+        );
+    }
+
+    #[test]
+    fn output_loudness_meter_tracks_400ms_momentary_3s_short_term_and_true_peak() {
+        let sr = 48_000.0;
+        let mut meter = OutputLoudnessMeter::new(sr);
+        // Feed 1.5 s of 1 kHz stereo sine at -12 dBFS peak (~0.2512)
+        let amp = 10.0_f64.powf(-12.0 / 20.0);
+        for i in 0..(sr as usize * 3 / 2) {
+            let s = (amp * (2.0 * std::f64::consts::PI * 1000.0 * (i as f64) / sr).sin()) as f32;
+            meter.push_output_sample(s, s);
+        }
+        let (m1, s1, tp1) = meter.snapshot();
+        assert!(m1 > -16.0 && m1 < -8.0, "momentary LUFS out of range: {m1}");
+        assert!(
+            s1 > -16.0 && s1 < -8.0,
+            "short-term LUFS out of range: {s1}"
+        );
+        assert!(
+            (tp1 - (-12.0)).abs() < 0.5,
+            "true peak should track -12 dBTP, got {tp1}"
+        );
+
+        // Feed 0.5 s of silence: Momentary (400 ms) must drop to floor while Short-Term (3 s) retains energy.
+        for _ in 0..(sr as usize / 2) {
+            meter.push_output_sample(0.0, 0.0);
+        }
+        let (m2, s2, _) = meter.snapshot();
+        assert!(
+            m2 < -60.0,
+            "400 ms momentary should drop after 500 ms silence, got {m2}"
+        );
+        assert!(
+            s2 > -20.0,
+            "3 s short-term should still hold recent 1.5 s tone, got {s2}"
+        );
+    }
+
+    #[test]
+    fn ab_bank_state_round_trips_and_copies_in_both_directions() {
+        use nih_plug::prelude::{FloatRange, IntRange};
+
+        let p_float = FloatParam::new("Gain", 0.25, FloatRange::Linear { min: 0.0, max: 1.0 });
+        let p_int = IntParam::new("Mode", 1, IntRange::Linear { min: 0, max: 4 });
+        let p_bool = BoolParam::new("Bypass", false);
+        let params = [
+            ("gain", ParamRef::Float(&p_float)),
+            ("mode", ParamRef::Int(&p_int)),
+            ("bypass", ParamRef::Bool(&p_bool)),
+        ];
+
+        let mut ab = AbBankState::default();
+        ab.ensure_initialized(&params);
+        assert_eq!(ab.active_slot, 0);
+        assert_eq!(ab.slot_a.len(), 3);
+        assert_eq!(ab.slot_b.len(), 3);
+
+        // Switch A -> B: records applied values for all 3 param types.
+        ab.slot_b = vec![
+            ("gain".to_string(), 0.75),
+            ("mode".to_string(), 1.0),
+            ("bypass".to_string(), 1.0),
+        ];
+        let mut applied = Vec::new();
+        ab.switch_with(1, &params, |_pref, v| applied.push(v));
+        assert_eq!(ab.active_slot, 1);
+        assert_eq!(applied, vec![0.75, 1.0, 1.0]);
+
+        // Copy B -> A while on slot B: overwrites slot_a with current live values.
+        ab.copy_active_to_other(&params);
+        assert_eq!(ab.slot_a, ab.slot_b);
+
+        // Switch B -> A: recalls slot_a cleanly.
+        let mut applied_back = Vec::new();
+        ab.switch_with(0, &params, |_pref, v| applied_back.push(v));
+        assert_eq!(ab.active_slot, 0);
+        assert_eq!(applied_back.len(), 3);
+
+        // Copy A -> B while on slot A: keeps both slots synchronized.
+        ab.copy_active_to_other(&params);
+        assert_eq!(ab.slot_a, ab.slot_b);
     }
 }
