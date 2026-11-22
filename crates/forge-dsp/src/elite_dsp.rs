@@ -781,12 +781,15 @@ enum WaveNetActivation {
 }
 
 impl WaveNetActivation {
-    fn parse(name: &str) -> Self {
+    fn parse(name: &str) -> forge_core::Result<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
-            "relu" => Self::ReLU,
-            "silu" | "swish" => Self::SiLU,
-            "leakyrelu" | "leaky_relu" => Self::LeakyReLU,
-            _ => Self::Tanh,
+            "" | "tanh" => Ok(Self::Tanh),
+            "relu" => Ok(Self::ReLU),
+            "silu" | "swish" => Ok(Self::SiLU),
+            "leakyrelu" | "leaky_relu" => Ok(Self::LeakyReLU),
+            other => Err(forge_core::ForgeError::InvalidParameter(format!(
+                "Unsupported WaveNet activation '{other}'"
+            ))),
         }
     }
 
@@ -1010,7 +1013,7 @@ impl CompiledWaveNet {
                 channels: lc.channels,
                 kernel_size: lc.kernel_size,
                 gated: lc.gated,
-                activation: WaveNetActivation::parse(&lc.activation),
+                activation: WaveNetActivation::parse(&lc.activation)?,
                 rechannel_w,
                 layers,
                 head_rechannel_w,
@@ -1137,7 +1140,12 @@ impl CompiledWaveNet {
             cur_len = ch;
         }
 
-        let raw = st.head_acc[0] * head_scale;
+        let active_head = arrays
+            .last()
+            .map_or(1, |a| a.head_size)
+            .min(st.head_acc.len());
+        let head_sum: f64 = st.head_acc[..active_head].iter().sum();
+        let raw = head_sum * head_scale;
         flush_denormal_f64((raw * 0.5).tanh() * 2.0)
     }
 

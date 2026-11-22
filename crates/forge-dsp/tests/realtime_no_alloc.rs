@@ -251,7 +251,7 @@ fn full_wavenet_nam_and_opensoothe_low_latency_do_not_allocate() {
 
     let mut soothe = RealtimeOpenSoothe::new(48_000.0);
 
-    assert_no_alloc(|| {
+    assert_no_allocs("WaveNet NAM + OpenSoothe low-latency", || {
         soothe.set_low_latency(true);
         soothe.set_attack_ms(4.0);
         soothe.set_release_ms(45.0);

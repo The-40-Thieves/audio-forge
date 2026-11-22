@@ -542,9 +542,14 @@ impl RealtimeOpenSoothe {
     }
 
     /// Switches between Ultra (2048-pt) and Low-Latency Tracking (256-pt) modes with zero allocations.
+    /// Flushes the newly-selected STFT core in place so stale buffered audio never replays.
     #[inline]
     pub fn set_low_latency(&mut self, low_latency: bool) {
-        self.low_latency = low_latency;
+        if low_latency != self.low_latency {
+            self.low_latency = low_latency;
+            let sr = self.active().sample_rate;
+            self.active_mut().reset(sr);
+        }
     }
 
     pub fn is_low_latency(&self) -> bool {

@@ -716,13 +716,10 @@ impl Plugin for ForgeOpenSoothePlug {
         &mut self,
         buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
-        context: &mut impl ProcessContext<Self>,
+        _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         let low_lat = self.params.low_latency_mode.value();
-        if low_lat != self.dsp.is_low_latency() {
-            self.dsp.set_low_latency(low_lat);
-            context.set_latency_samples(self.latency_samples());
-        }
+        self.dsp.set_low_latency(low_lat);
         let sharp = self.params.sharpness_bins.value() as usize;
         let delta = self.params.delta_listen.value();
         let use_sub_tape = self.params.enable_sub_tape.value();
