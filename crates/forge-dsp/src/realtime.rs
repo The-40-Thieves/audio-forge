@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use crate::elite_dsp::{AllpassDisperser, JilesAthertonHysteresis};
 use crate::loudness_limiter::{
-    Biquad, CytomicSvf, LIMITER_LOOKAHEAD_MS, TRUE_PEAK_PHASES, flush_denormal_f64,
-    sanitize_param_f64, sanitize_sample_f32,
+    Biquad, CytomicSvf, DitherMode, LIMITER_LOOKAHEAD_MS, LimiterStyle, TRUE_PEAK_PHASES,
+    flush_denormal_f64, sanitize_param_f64, sanitize_sample_f32,
 };
 use crate::restoration::{LowBandSplit, MASTERING_18_BANDS_HZ};
 use crate::spectrum::{
@@ -88,11 +88,15 @@ pub struct RealtimeOpenSoothe {
     ring_pos: usize,
     hop_counter: usize,
     spec_scratch: Vec<Complex<f64>>,
+    spec_scratch_r: Vec<Complex<f64>>,
     /// Pre-allocated rustfft scratch, so `process_with_scratch` never allocates per hop.
     fft_scratch: Vec<Complex<f64>>,
     mags_scratch: Vec<f64>,
     smoothed_gains_l: Vec<f64>,
     smoothed_gains_r: Vec<f64>,
+    tilt_db_per_oct: f64,
+    stereo_link: f64,
+    mid_side_balance: f64,
     last_gr_db: f32,
     last_spectrum_db: [f32; 32],
     last_band_gr_db: [f32; 32],
@@ -133,10 +137,14 @@ impl RealtimeOpenSoothe {
             ring_pos: 0,
             hop_counter: 0,
             spec_scratch: vec![Complex::new(0.0, 0.0); fft_size],
+            spec_scratch_r: vec![Complex::new(0.0, 0.0); fft_size],
             fft_scratch: vec![Complex::new(0.0, 0.0); scratch_len],
             mags_scratch: vec![0.0; half_bins],
             smoothed_gains_l: vec![1.0; half_bins],
             smoothed_gains_r: vec![1.0; half_bins],
+            tilt_db_per_oct: 0.0,
+            stereo_link: 1.0,
+            mid_side_balance: 0.0,
             last_gr_db: 0.0,
             last_spectrum_db: [SPECTRUM_FLOOR_DB; SPECTRUM_BANDS],
             last_band_gr_db: [0.0; 32],
@@ -213,6 +221,24 @@ impl RealtimeOpenSoothe {
         self.last_band_gr_db
     }
 
+    /// Sets spectral sensitivity tilt in dB/octave pivoted at 1 kHz (`-6.0..=+6.0`). Zero-alloc.
+    #[inline]
+    pub fn set_tilt_db_per_oct(&mut self, tilt_db_per_oct: f64) {
+        self.tilt_db_per_oct = sanitize_param_f64(tilt_db_per_oct, 0.0, -6.0, 6.0);
+    }
+
+    /// Sets stereo gain linking (`0.0` = dual-mono, `1.0` = linked stereo). Zero-alloc.
+    #[inline]
+    pub fn set_stereo_link(&mut self, stereo_link: f64) {
+        self.stereo_link = sanitize_param_f64(stereo_link, 1.0, 0.0, 1.0);
+    }
+
+    /// Sets Mid/Side focus (`-1.0` = Mid only, `0.0` = balanced, `+1.0` = Side only). Zero-alloc.
+    #[inline]
+    pub fn set_mid_side_balance(&mut self, mid_side_balance: f64) {
+        self.mid_side_balance = sanitize_param_f64(mid_side_balance, 0.0, -1.0, 1.0);
+    }
+
     #[inline]
     pub fn process_stereo_sample(
         &mut self,
@@ -273,31 +299,59 @@ impl RealtimeOpenSoothe {
         let mut band_pow = [0.0_f64; SPECTRUM_BANDS];
 
         let mut min_g_seen = 1.0_f64;
+        let use_ms = self.mid_side_balance.abs() > 1e-4;
+        let ms_focus = [
+            (1.0 - self.mid_side_balance.max(0.0)).clamp(0.0, 1.0),
+            (1.0 + self.mid_side_balance.min(0.0)).clamp(0.0, 1.0),
+        ];
+        // M = 0.5*(L+R) and S = 0.5*(L-R) satisfy M^2 + S^2 = 0.5*(L^2 + R^2), so double the
+        // per-channel spectrum norm in Mid/Side mode to keep displayed levels invariant.
+        let spec_norm = if use_ms {
+            self.spectrum_power_norm
+        } else {
+            0.5 * self.spectrum_power_norm
+        };
 
-        for ch_idx in 0..2 {
-            for i in 0..self.fft_size {
+        // Pass 1: FFT both channels and update both current-hop smoothed gain curves before
+        // applying stereo linking so L and R always share current-hop gains symmetrically.
+        for (ch_idx, &ms_f) in ms_focus.iter().enumerate() {
+            let focus = if use_ms { ms_f } else { 1.0 };
+            let spec = if ch_idx == 0 {
+                &mut self.spec_scratch
+            } else {
+                &mut self.spec_scratch_r
+            };
+            for (i, slot) in spec.iter_mut().enumerate().take(self.fft_size) {
                 let idx = frame_start.wrapping_add(i) & mask_in;
-                let sample = if ch_idx == 0 {
+                let sample = if use_ms {
+                    let l = self.in_ring_l[idx];
+                    let r = self.in_ring_r[idx];
+                    if ch_idx == 0 {
+                        0.5 * (l + r)
+                    } else {
+                        0.5 * (l - r)
+                    }
+                } else if ch_idx == 0 {
                     self.in_ring_l[idx]
                 } else {
                     self.in_ring_r[idx]
                 };
-                self.spec_scratch[i] = Complex::new(sample * self.window[i], 0.0);
+                *slot = Complex::new(sample * self.window[i], 0.0);
             }
 
             self.fft_fwd
-                .process_with_scratch(&mut self.spec_scratch, &mut self.fft_scratch);
+                .process_with_scratch(spec, &mut self.fft_scratch);
 
-            for b in 0..self.half_bins {
-                self.mags_scratch[b] = self.spec_scratch[b].norm().max(1e-12);
+            for (mag, c) in self
+                .mags_scratch
+                .iter_mut()
+                .zip(spec.iter())
+                .take(self.half_bins)
+            {
+                *mag = c.norm().max(1e-12);
             }
             // Input spectrum for the display, summed over both channels before any gain.
-            accumulate_stft_band_power(
-                &self.mags_scratch,
-                bin_hz,
-                0.5 * self.spectrum_power_norm,
-                &mut band_pow,
-            );
+            accumulate_stft_band_power(&self.mags_scratch, bin_hz, spec_norm, &mut band_pow);
 
             let smoothed = if ch_idx == 0 {
                 &mut self.smoothed_gains_l
@@ -311,7 +365,20 @@ impl RealtimeOpenSoothe {
                 .take(self.half_bins - 1)
                 .skip(1)
             {
-                let weight = self.band_weights[b];
+                let base_w = self.band_weights[b] * focus;
+                let weight = if self.tilt_db_per_oct.abs() > 1e-6 && base_w > 0.01 {
+                    let f = (b as f64) * bin_hz;
+                    let tilt_mul = if f > 20.0 {
+                        10.0_f64
+                            .powf((self.tilt_db_per_oct * (f / 1000.0).log2()) / 20.0)
+                            .clamp(0.15, 3.0)
+                    } else {
+                        1.0
+                    };
+                    (base_w * tilt_mul).clamp(0.0, 3.0)
+                } else {
+                    base_w
+                };
                 if weight <= 0.01 {
                     *smoothed_val = 1.0;
                     continue;
@@ -352,39 +419,75 @@ impl RealtimeOpenSoothe {
                 };
                 *smoothed_val = alpha * (*smoothed_val) + (1.0 - alpha) * target_gain;
             }
+        }
 
-            for b in 1..(self.half_bins - 1) {
-                let min_lobe = smoothed[b - 1].min(smoothed[b]).min(smoothed[b + 1]);
-                let avg_lobe = 0.25 * smoothed[b - 1] + 0.50 * smoothed[b] + 0.25 * smoothed[b + 1];
-                let g = 0.65 * min_lobe + 0.35 * avg_lobe;
-                if g < min_g_seen {
-                    min_g_seen = g;
-                }
-                let effective_g = if delta_listen { 1.0 - g } else { g };
-                self.spec_scratch[b] *= effective_g;
-                self.spec_scratch[self.fft_size - b] = self.spec_scratch[b].conj();
+        // Pass 2: Apply symmetric stereo-linked lobe-smoothed gains, IFFT, and overlap-add.
+        for b in 1..(self.half_bins - 1) {
+            let lobe_l = {
+                let min_l = self.smoothed_gains_l[b - 1]
+                    .min(self.smoothed_gains_l[b])
+                    .min(self.smoothed_gains_l[b + 1]);
+                let avg_l = 0.25 * self.smoothed_gains_l[b - 1]
+                    + 0.50 * self.smoothed_gains_l[b]
+                    + 0.25 * self.smoothed_gains_l[b + 1];
+                0.65 * min_l + 0.35 * avg_l
+            };
+            let lobe_r = {
+                let min_r = self.smoothed_gains_r[b - 1]
+                    .min(self.smoothed_gains_r[b])
+                    .min(self.smoothed_gains_r[b + 1]);
+                let avg_r = 0.25 * self.smoothed_gains_r[b - 1]
+                    + 0.50 * self.smoothed_gains_r[b]
+                    + 0.25 * self.smoothed_gains_r[b + 1];
+                0.65 * min_r + 0.35 * avg_r
+            };
+            let (gl, gr) = if !use_ms && self.stereo_link > 1e-4 {
+                let g_link = lobe_l.min(lobe_r);
+                (
+                    self.stereo_link * g_link + (1.0 - self.stereo_link) * lobe_l,
+                    self.stereo_link * g_link + (1.0 - self.stereo_link) * lobe_r,
+                )
+            } else {
+                (lobe_l, lobe_r)
+            };
+            let g_min = gl.min(gr);
+            if g_min < min_g_seen {
+                min_g_seen = g_min;
             }
+            let eff_l = if delta_listen { 1.0 - gl } else { gl };
+            let eff_r = if delta_listen { 1.0 - gr } else { gr };
+            self.spec_scratch[b] *= eff_l;
+            self.spec_scratch[self.fft_size - b] = self.spec_scratch[b].conj();
+            self.spec_scratch_r[b] *= eff_r;
+            self.spec_scratch_r[self.fft_size - b] = self.spec_scratch_r[b].conj();
+        }
 
-            if delta_listen {
-                self.spec_scratch[0] = Complex::new(0.0, 0.0);
-                self.spec_scratch[self.half_bins - 1] = Complex::new(0.0, 0.0);
+        if delta_listen {
+            self.spec_scratch[0] = Complex::new(0.0, 0.0);
+            self.spec_scratch[self.half_bins - 1] = Complex::new(0.0, 0.0);
+            self.spec_scratch_r[0] = Complex::new(0.0, 0.0);
+            self.spec_scratch_r[self.half_bins - 1] = Complex::new(0.0, 0.0);
+        }
+
+        self.fft_inv
+            .process_with_scratch(&mut self.spec_scratch, &mut self.fft_scratch);
+        self.fft_inv
+            .process_with_scratch(&mut self.spec_scratch_r, &mut self.fft_scratch);
+
+        let out_base = self.ring_pos;
+        for i in 0..self.fft_size {
+            let w = self.window[i];
+            let val_l = self.spec_scratch[i].re * inv_n * w;
+            let val_r = self.spec_scratch_r[i].re * inv_n * w;
+            let idx = out_base.wrapping_add(i) & mask_out;
+            if use_ms {
+                self.out_ring_l[idx] += val_l + val_r;
+                self.out_ring_r[idx] += val_l - val_r;
+            } else {
+                self.out_ring_l[idx] += val_l;
+                self.out_ring_r[idx] += val_r;
             }
-
-            self.fft_inv
-                .process_with_scratch(&mut self.spec_scratch, &mut self.fft_scratch);
-
-            let out_base = self.ring_pos;
-            for i in 0..self.fft_size {
-                let w = self.window[i];
-                let val = self.spec_scratch[i].re * inv_n * w;
-                let idx = out_base.wrapping_add(i) & mask_out;
-                if ch_idx == 0 {
-                    self.out_ring_l[idx] += val;
-                    self.norm_ring[idx] += w * w;
-                } else {
-                    self.out_ring_r[idx] += val;
-                }
-            }
+            self.norm_ring[idx] += w * w;
         }
 
         self.last_gr_db = (-20.0 * min_g_seen.max(1e-6).log10()) as f32;
@@ -431,8 +534,14 @@ pub struct RealtimeOpenSpacer {
     sc_spec: Vec<Complex<f64>>,
     /// Pre-allocated rustfft scratch, so `process_with_scratch` never allocates per hop.
     fft_scratch: Vec<Complex<f64>>,
+    spectrum_power_norm: f64,
+    mags_scratch: Vec<f64>,
     smoothed_gains: Vec<f64>,
+    delta_listen: bool,
+    mid_side_balance: f64,
     last_carve_db: f32,
+    last_spectrum_db: [f32; SPECTRUM_BANDS],
+    last_carve_bands_db: [f32; SPECTRUM_BANDS],
 }
 
 impl RealtimeOpenSpacer {
@@ -449,6 +558,7 @@ impl RealtimeOpenSpacer {
         let window: Vec<f64> = (0..fft_size)
             .map(|i| 0.5 * (1.0 - (2.0 * PI * (i as f64) / (fft_size as f64)).cos()))
             .collect();
+        let spectrum_power_norm = stft_band_power_norm(&window);
 
         Self {
             sample_rate: sample_rate.max(8000.0),
@@ -470,8 +580,14 @@ impl RealtimeOpenSpacer {
             tgt_spec_r: vec![Complex::new(0.0, 0.0); fft_size],
             sc_spec: vec![Complex::new(0.0, 0.0); fft_size],
             fft_scratch: vec![Complex::new(0.0, 0.0); scratch_len],
+            spectrum_power_norm,
+            mags_scratch: vec![0.0; half_bins],
             smoothed_gains: vec![1.0; half_bins],
+            delta_listen: false,
+            mid_side_balance: 0.0,
             last_carve_db: 0.0,
+            last_spectrum_db: [SPECTRUM_FLOOR_DB; SPECTRUM_BANDS],
+            last_carve_bands_db: [0.0; SPECTRUM_BANDS],
         }
     }
 
@@ -493,10 +609,34 @@ impl RealtimeOpenSpacer {
         self.ring_pos = 0;
         self.hop_counter = 0;
         self.last_carve_db = 0.0;
+        self.last_spectrum_db = [SPECTRUM_FLOOR_DB; SPECTRUM_BANDS];
+        self.last_carve_bands_db = [0.0; SPECTRUM_BANDS];
     }
 
     pub fn last_carve_db(&self) -> f32 {
         self.last_carve_db
+    }
+
+    /// Returns the latest 32-band target input spectrum in dBFS (updated per STFT hop).
+    pub fn last_spectrum_db(&self) -> [f32; SPECTRUM_BANDS] {
+        self.last_spectrum_db
+    }
+
+    /// Returns the latest 32-band dynamic carve gain reduction in dB (0..=24 dB, updated per hop).
+    pub fn last_carve_bands_db(&self) -> [f32; SPECTRUM_BANDS] {
+        self.last_carve_bands_db
+    }
+
+    /// Enables Delta-Listen mode to solo *only* the carved frequencies. Zero-alloc.
+    #[inline]
+    pub fn set_delta_listen(&mut self, delta_listen: bool) {
+        self.delta_listen = delta_listen;
+    }
+
+    /// Sets Mid/Side carving focus (`-1.0` = Mid only, `0.0` = balanced, `+1.0` = Side only). Zero-alloc.
+    #[inline]
+    pub fn set_mid_side_balance(&mut self, mid_side_balance: f64) {
+        self.mid_side_balance = sanitize_param_f64(mid_side_balance, 0.0, -1.0, 1.0);
     }
 
     #[inline]
@@ -552,11 +692,22 @@ impl RealtimeOpenSpacer {
         let inv_n = 1.0 / (self.fft_size as f64);
         let min_gain = 10.0_f64.powf(-max_cut_db.clamp(0.5, 24.0) / 20.0);
 
+        let use_ms = self.mid_side_balance.abs() > 1e-4;
+        let mid_scale = (1.0 - self.mid_side_balance.max(0.0)).clamp(0.0, 1.0);
+        let side_scale = (1.0 + self.mid_side_balance.min(0.0)).clamp(0.0, 1.0);
+
         for i in 0..self.fft_size {
             let idx = frame_start.wrapping_add(i) & mask_in;
             let w = self.window[i];
-            self.tgt_spec_l[i] = Complex::new(self.tgt_ring_l[idx] * w, 0.0);
-            self.tgt_spec_r[i] = Complex::new(self.tgt_ring_r[idx] * w, 0.0);
+            let l = self.tgt_ring_l[idx] * w;
+            let r = self.tgt_ring_r[idx] * w;
+            if use_ms {
+                self.tgt_spec_l[i] = Complex::new(0.5 * (l + r), 0.0);
+                self.tgt_spec_r[i] = Complex::new(0.5 * (l - r), 0.0);
+            } else {
+                self.tgt_spec_l[i] = Complex::new(l, 0.0);
+                self.tgt_spec_r[i] = Complex::new(r, 0.0);
+            }
             self.sc_spec[i] = Complex::new(self.sc_ring[idx] * w, 0.0);
         }
 
@@ -566,6 +717,21 @@ impl RealtimeOpenSpacer {
             .process_with_scratch(&mut self.tgt_spec_r, &mut self.fft_scratch);
         self.fft_fwd
             .process_with_scratch(&mut self.sc_spec, &mut self.fft_scratch);
+
+        let mut band_pow = [0.0_f64; SPECTRUM_BANDS];
+        let spec_norm = if use_ms {
+            self.spectrum_power_norm
+        } else {
+            0.5 * self.spectrum_power_norm
+        };
+        for b in 0..self.half_bins {
+            self.mags_scratch[b] = self.tgt_spec_l[b].norm().max(1e-12);
+        }
+        accumulate_stft_band_power(&self.mags_scratch, bin_hz, spec_norm, &mut band_pow);
+        for b in 0..self.half_bins {
+            self.mags_scratch[b] = self.tgt_spec_r[b].norm().max(1e-12);
+        }
+        accumulate_stft_band_power(&self.mags_scratch, bin_hz, spec_norm, &mut band_pow);
 
         let mut min_g_seen = 1.0_f64;
 
@@ -589,16 +755,34 @@ impl RealtimeOpenSpacer {
         }
 
         for b in 1..(self.half_bins - 1) {
-            let g = 0.25 * self.smoothed_gains[b - 1]
+            let g_raw = 0.25 * self.smoothed_gains[b - 1]
                 + 0.50 * self.smoothed_gains[b]
                 + 0.25 * self.smoothed_gains[b + 1];
-            if g < min_g_seen {
-                min_g_seen = g;
+            if g_raw < min_g_seen {
+                min_g_seen = g_raw;
             }
-            self.tgt_spec_l[b] *= g;
+            let (gl, gr) = if use_ms {
+                let gm = (1.0 - mid_scale * (1.0 - g_raw)).clamp(0.0, 1.0);
+                let gs = (1.0 - side_scale * (1.0 - g_raw)).clamp(0.0, 1.0);
+                (gm, gs)
+            } else {
+                (g_raw, g_raw)
+            };
+            let (egl, egr) = if self.delta_listen {
+                (1.0 - gl, 1.0 - gr)
+            } else {
+                (gl, gr)
+            };
+            self.tgt_spec_l[b] *= egl;
             self.tgt_spec_l[self.fft_size - b] = self.tgt_spec_l[b].conj();
-            self.tgt_spec_r[b] *= g;
+            self.tgt_spec_r[b] *= egr;
             self.tgt_spec_r[self.fft_size - b] = self.tgt_spec_r[b].conj();
+        }
+        if self.delta_listen {
+            self.tgt_spec_l[0] = Complex::new(0.0, 0.0);
+            self.tgt_spec_l[self.half_bins - 1] = Complex::new(0.0, 0.0);
+            self.tgt_spec_r[0] = Complex::new(0.0, 0.0);
+            self.tgt_spec_r[self.half_bins - 1] = Complex::new(0.0, 0.0);
         }
 
         self.fft_inv
@@ -610,12 +794,38 @@ impl RealtimeOpenSpacer {
         for i in 0..self.fft_size {
             let w = self.window[i];
             let idx = out_base.wrapping_add(i) & mask_out;
-            self.out_ring_l[idx] += self.tgt_spec_l[i].re * inv_n * w;
-            self.out_ring_r[idx] += self.tgt_spec_r[i].re * inv_n * w;
+            let a = self.tgt_spec_l[i].re * inv_n * w;
+            let b = self.tgt_spec_r[i].re * inv_n * w;
+            if use_ms {
+                self.out_ring_l[idx] += a + b;
+                self.out_ring_r[idx] += a - b;
+            } else {
+                self.out_ring_l[idx] += a;
+                self.out_ring_r[idx] += b;
+            }
             self.norm_ring[idx] += w * w;
         }
 
         self.last_carve_db = (-20.0 * min_g_seen.max(1e-6).log10()) as f32;
+        for (band_idx, &p) in band_pow.iter().enumerate() {
+            let db = if p > 0.0 {
+                (10.0 * p.log10()) as f32
+            } else {
+                SPECTRUM_FLOOR_DB
+            };
+            self.last_spectrum_db[band_idx] = db.clamp(SPECTRUM_FLOOR_DB, 6.0);
+        }
+        for band_idx in 0..SPECTRUM_BANDS {
+            let (b_lo, b_hi) = stft_band_bins(band_idx, bin_hz, self.half_bins);
+            let mut min_band_g = 1.0_f64;
+            for &g in &self.smoothed_gains[b_lo..=b_hi] {
+                if g < min_band_g {
+                    min_band_g = g;
+                }
+            }
+            self.last_carve_bands_db[band_idx] =
+                (-20.0 * min_band_g.max(1e-6).log10()).clamp(0.0, 24.0) as f32;
+        }
     }
 }
 
@@ -1056,14 +1266,28 @@ pub struct RealtimeMasterLimiter {
     last_gr_db: f32,
     tp_hist_l: [f64; TP_TAPS],
     tp_hist_r: [f64; TP_TAPS],
-    hold: SlidingMin,
-    released_gain: f64,
-    ramp: Vec<f64>,
+    hold_l: SlidingMin,
+    hold_r: SlidingMin,
+    released_gain_l: f64,
+    released_gain_r: f64,
+    ramp_l: Vec<f64>,
+    ramp_r: Vec<f64>,
     ramp_len: usize,
     ramp_pos: usize,
-    ramp_sum: f64,
+    ramp_sum_l: f64,
+    ramp_sum_r: f64,
     last_target_lin: f64,
     last_release_coeff: f64,
+    style: LimiterStyle,
+    channel_link: f64,
+    dither_mode: DitherMode,
+    dither_bits: u16,
+    dither_rng_l: u64,
+    dither_rng_r: u64,
+    dither_e1_l: f64,
+    dither_e2_l: f64,
+    dither_e1_r: f64,
+    dither_e2_r: f64,
 }
 
 /// Taps per phase of the true-peak interpolation filter.
@@ -1161,14 +1385,28 @@ impl RealtimeMasterLimiter {
             last_gr_db: 0.0,
             tp_hist_l: [0.0; TP_TAPS],
             tp_hist_r: [0.0; TP_TAPS],
-            hold: SlidingMin::new(Self::MAX_LOOKAHEAD_SAMPLES + Self::HOLD_AFTER),
-            released_gain: 1.0,
-            ramp: vec![1.0; Self::MAX_LOOKAHEAD_SAMPLES],
+            hold_l: SlidingMin::new(Self::MAX_LOOKAHEAD_SAMPLES + Self::HOLD_AFTER),
+            hold_r: SlidingMin::new(Self::MAX_LOOKAHEAD_SAMPLES + Self::HOLD_AFTER),
+            released_gain_l: 1.0,
+            released_gain_r: 1.0,
+            ramp_l: vec![1.0; Self::MAX_LOOKAHEAD_SAMPLES],
+            ramp_r: vec![1.0; Self::MAX_LOOKAHEAD_SAMPLES],
             ramp_len: 1,
             ramp_pos: 0,
-            ramp_sum: 1.0,
+            ramp_sum_l: 1.0,
+            ramp_sum_r: 1.0,
             last_target_lin: 1.0,
             last_release_coeff: 0.0,
+            style: LimiterStyle::Transparent,
+            channel_link: 1.0,
+            dither_mode: DitherMode::None,
+            dither_bits: 24,
+            dither_rng_l: 0x9E37_79B9_7F4A_7C15,
+            dither_rng_r: 0x2545_F491_4F6C_DD1D,
+            dither_e1_l: 0.0,
+            dither_e2_l: 0.0,
+            dither_e1_r: 0.0,
+            dither_e2_r: 0.0,
         };
         limiter.reset(sr);
         limiter
@@ -1198,14 +1436,24 @@ impl RealtimeMasterLimiter {
         self.last_gr_db = 0.0;
         self.tp_hist_l = [0.0; TP_TAPS];
         self.tp_hist_r = [0.0; TP_TAPS];
-        self.hold.reset(self.lookahead_samples + Self::HOLD_AFTER);
-        self.released_gain = 1.0;
+        self.hold_l.reset(self.lookahead_samples + Self::HOLD_AFTER);
+        self.hold_r.reset(self.lookahead_samples + Self::HOLD_AFTER);
+        self.released_gain_l = 1.0;
+        self.released_gain_r = 1.0;
         self.ramp_len = self.lookahead_samples - Self::RAMP_MARGIN;
-        self.ramp.fill(1.0);
+        self.ramp_l.fill(1.0);
+        self.ramp_r.fill(1.0);
         self.ramp_pos = 0;
-        self.ramp_sum = self.ramp_len as f64;
+        self.ramp_sum_l = self.ramp_len as f64;
+        self.ramp_sum_r = self.ramp_len as f64;
         self.last_target_lin = 10.0_f64.powf((-1.0 - Self::CEILING_MARGIN_DB) / 20.0);
         self.last_release_coeff = Self::release_coeff(sr, 85.0);
+        self.dither_rng_l = 0x9E37_79B9_7F4A_7C15;
+        self.dither_rng_r = 0x2545_F491_4F6C_DD1D;
+        self.dither_e1_l = 0.0;
+        self.dither_e2_l = 0.0;
+        self.dither_e1_r = 0.0;
+        self.dither_e2_r = 0.0;
     }
 
     /// Passes a frame through the lookahead delay without limiting, so a bypassed limiter keeps
@@ -1227,6 +1475,64 @@ impl RealtimeMasterLimiter {
         (self.last_lufs, self.last_true_peak_dbtp, self.last_gr_db)
     }
 
+    /// Sets the mastering release topology (`Transparent`, `Punchy`, `Dynamic`, `Aggressive`). Zero-alloc.
+    #[inline]
+    pub fn set_style(&mut self, style: LimiterStyle) {
+        self.style = style;
+    }
+
+    /// Sets stereo channel linking (`0.0..=1.0`). Zero-alloc.
+    #[inline]
+    pub fn set_channel_link(&mut self, channel_link: f64) {
+        self.channel_link = sanitize_param_f64(channel_link, 1.0, 0.0, 1.0);
+    }
+
+    /// Sets real-time output dithering / noise shaping (`8..=24` bits). Zero-alloc.
+    #[inline]
+    pub fn set_dither(&mut self, mode: DitherMode, bits: u16) {
+        self.dither_mode = mode;
+        self.dither_bits = bits.clamp(8, 24);
+    }
+
+    #[inline]
+    fn next_dither_bipolar(state: &mut u64) -> f64 {
+        let mut x = *state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        *state = x;
+        let bits = x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11;
+        (bits as f64) * (1.0 / ((1_u64 << 53) as f64)) - 0.5
+    }
+
+    #[inline]
+    fn apply_rt_dither(
+        mode: DitherMode,
+        bits: u16,
+        x: f64,
+        rng: &mut u64,
+        e1: &mut f64,
+        e2: &mut f64,
+    ) -> f64 {
+        if mode == DitherMode::None {
+            return x;
+        }
+        let full_scale = (1_u64 << (bits - 1)) as f64;
+        let max_code = full_scale - 1.0;
+        let min_code = -full_scale;
+        let scaled = x.clamp(-1.0, 1.0) * full_scale;
+        let tpdf = Self::next_dither_bipolar(rng) + Self::next_dither_bipolar(rng);
+        let shaped = match mode {
+            DitherMode::None | DitherMode::Tpdf => scaled,
+            DitherMode::NoiseShapedHighPass => scaled + 1.623 * (*e1) - 0.692 * (*e2),
+        };
+        let q = (shaped + tpdf).round().clamp(min_code, max_code);
+        let err = flush_denormal_f64(shaped - q);
+        *e2 = *e1;
+        *e1 = err;
+        q / full_scale
+    }
+
     fn release_coeff(sample_rate: f64, release_ms: f64) -> f64 {
         (-1.0 / ((release_ms * 0.001) * sample_rate)).exp()
     }
@@ -1246,8 +1552,8 @@ impl RealtimeMasterLimiter {
         peak
     }
 
-    /// Runs one frame through the detector, the hold and the attack ramp. Returns the true peak
-    /// detected on this frame and the gain for the frame leaving the delay line now.
+    /// Runs one frame through the per-channel detector, hold, and attack ramp honoring
+    /// `channel_link` (`0.0` = dual-mono, `1.0` = linked stereo). Returns `(max_tp, gain_l, gain_r)`.
     #[inline]
     fn advance_gain(
         &mut self,
@@ -1255,34 +1561,58 @@ impl RealtimeMasterLimiter {
         xr: f64,
         target_lin: f64,
         release_coeff: f64,
-    ) -> (f64, f64) {
-        let tp_l = Self::estimate_4x_intersample_peak(&mut self.tp_hist_l, xl);
-        let tp_r = Self::estimate_4x_intersample_peak(&mut self.tp_hist_r, xr);
-        let tp = tp_l.max(tp_r).max(1e-12);
-        let required_gain = if tp > target_lin {
-            target_lin / tp
+    ) -> (f64, f64, f64) {
+        let tp_l = Self::estimate_4x_intersample_peak(&mut self.tp_hist_l, xl).max(1e-12);
+        let tp_r = Self::estimate_4x_intersample_peak(&mut self.tp_hist_r, xr).max(1e-12);
+        let tp_max = tp_l.max(tp_r);
+        let link = self.channel_link;
+        let eff_tp_l = link * tp_max + (1.0 - link) * tp_l;
+        let eff_tp_r = link * tp_max + (1.0 - link) * tp_r;
+
+        let req_l = if eff_tp_l > target_lin {
+            target_lin / eff_tp_l
+        } else {
+            1.0
+        };
+        let req_r = if eff_tp_r > target_lin {
+            target_lin / eff_tp_r
         } else {
             1.0
         };
 
-        let held = self.hold.push(required_gain);
-        self.released_gain = if held < self.released_gain {
-            held
+        let held_l = self.hold_l.push(req_l);
+        let held_r = self.hold_r.push(req_r);
+        self.released_gain_l = if held_l < self.released_gain_l {
+            held_l
         } else {
-            flush_denormal_f64(release_coeff * self.released_gain + (1.0 - release_coeff) * held)
-                .min(held)
+            flush_denormal_f64(
+                release_coeff * self.released_gain_l + (1.0 - release_coeff) * held_l,
+            )
+            .min(held_l)
+        };
+        self.released_gain_r = if held_r < self.released_gain_r {
+            held_r
+        } else {
+            flush_denormal_f64(
+                release_coeff * self.released_gain_r + (1.0 - release_coeff) * held_r,
+            )
+            .min(held_r)
         };
 
-        self.ramp_sum += self.released_gain - self.ramp[self.ramp_pos];
-        self.ramp[self.ramp_pos] = self.released_gain;
+        self.ramp_sum_l += self.released_gain_l - self.ramp_l[self.ramp_pos];
+        self.ramp_sum_r += self.released_gain_r - self.ramp_r[self.ramp_pos];
+        self.ramp_l[self.ramp_pos] = self.released_gain_l;
+        self.ramp_r[self.ramp_pos] = self.released_gain_r;
         self.ramp_pos += 1;
         if self.ramp_pos == self.ramp_len {
             self.ramp_pos = 0;
-            // Re-sum once per lap so the running sum cannot drift.
-            self.ramp_sum = self.ramp[..self.ramp_len].iter().sum();
+            self.ramp_sum_l = self.ramp_l[..self.ramp_len].iter().sum();
+            self.ramp_sum_r = self.ramp_r[..self.ramp_len].iter().sum();
         }
-        let gain = (self.ramp_sum / self.ramp_len as f64).clamp(1e-6, 1.0);
-        (tp, gain)
+        let inv_ramp = 1.0 / (self.ramp_len as f64);
+        let gain_l = (self.ramp_sum_l * inv_ramp).clamp(1e-6, 1.0);
+        let gain_r = (self.ramp_sum_r * inv_ramp).clamp(1e-6, 1.0);
+        ((tp_l * gain_l).max(tp_r * gain_r), gain_l, gain_r)
     }
 
     #[inline]
@@ -1298,7 +1628,7 @@ impl RealtimeMasterLimiter {
     /// ITU-R BS.1770-4 K-weighted momentary loudness tracker (400 ms time constant), plus the
     /// telemetry the editor reads.
     #[inline]
-    fn update_meter(&mut self, out_l: f64, out_r: f64, tp: f64, ceiling_lin: f64) {
+    fn update_meter(&mut self, out_l: f64, out_r: f64, out_tp_est: f64, ceiling_lin: f64) {
         let kw_l = self
             .k_r1b_l
             .process_sample(self.k_shelf_l.process_sample(out_l));
@@ -1312,8 +1642,7 @@ impl RealtimeMasterLimiter {
                 .max(1e-12);
 
         self.last_lufs = (-0.691 + 10.0 * self.momentary_energy.log10()) as f32;
-        self.last_true_peak_dbtp =
-            (20.0 * (tp * self.envelope_gain).min(ceiling_lin).max(1e-9).log10()) as f32;
+        self.last_true_peak_dbtp = (20.0 * out_tp_est.min(ceiling_lin).max(1e-9).log10()) as f32;
         self.last_gr_db = (-20.0 * self.envelope_gain.max(1e-6).log10()) as f32;
     }
 
@@ -1331,20 +1660,60 @@ impl RealtimeMasterLimiter {
         let clean_rel_ms = sanitize_param_f64(release_ms, 85.0, 10.0, 1000.0);
         let drive = 10.0_f64.powf(clean_drive_db / 20.0);
         let ceiling_lin = 10.0_f64.powf(clean_ceil_db / 20.0);
-        let target_lin = 10.0_f64.powf((clean_ceil_db - Self::CEILING_MARGIN_DB) / 20.0);
-        let release_coeff = Self::release_coeff(self.sample_rate, clean_rel_ms);
+        let base_target_lin = 10.0_f64.powf((clean_ceil_db - Self::CEILING_MARGIN_DB) / 20.0);
+        // Reserve headroom for TPDF/noise-shaped dither peak excursion (including 4x intersample
+        // overshoot at low bit depths such as 8-bit) so dithered output stays under `ceiling_lin`.
+        let target_lin = if self.dither_mode != DitherMode::None {
+            let lsb = 1.0 / ((1_u64 << (self.dither_bits - 1)) as f64);
+            let reserve = match self.dither_mode {
+                DitherMode::None => 0.0,
+                DitherMode::Tpdf => 3.5 * lsb,
+                DitherMode::NoiseShapedHighPass => 6.0 * lsb,
+            };
+            (base_target_lin - reserve).max(1e-6)
+        } else {
+            base_target_lin
+        };
+        let style_rel_mul = match self.style {
+            LimiterStyle::Transparent => 1.0,
+            LimiterStyle::Punchy => 0.65,
+            LimiterStyle::Dynamic => 1.45,
+            LimiterStyle::Aggressive => 0.45,
+        };
+        let eff_rel_ms = (clean_rel_ms * style_rel_mul).clamp(10.0, 1000.0);
+        let release_coeff = Self::release_coeff(self.sample_rate, eff_rel_ms);
         self.last_target_lin = target_lin;
         self.last_release_coeff = release_coeff;
 
         let dl = sanitize_sample_f32(in_l) * drive;
         let dr = sanitize_sample_f32(in_r) * drive;
-        let (tp, gain) = self.advance_gain(dl, dr, target_lin, release_coeff);
-        self.envelope_gain = gain;
+        let (tp, gain_l, gain_r) = self.advance_gain(dl, dr, target_lin, release_coeff);
+        self.envelope_gain = gain_l.min(gain_r);
         let (delayed_l, delayed_r) = self.swap_delay(dl as f32, dr as f32);
 
         // Safety net only: the ramp has already brought every detected peak under `target_lin`.
-        let out_l = (f64::from(delayed_l) * gain).clamp(-ceiling_lin, ceiling_lin);
-        let out_r = (f64::from(delayed_r) * gain).clamp(-ceiling_lin, ceiling_lin);
+        let mut out_l = (f64::from(delayed_l) * gain_l).clamp(-ceiling_lin, ceiling_lin);
+        let mut out_r = (f64::from(delayed_r) * gain_r).clamp(-ceiling_lin, ceiling_lin);
+        if self.dither_mode != DitherMode::None {
+            out_l = Self::apply_rt_dither(
+                self.dither_mode,
+                self.dither_bits,
+                out_l,
+                &mut self.dither_rng_l,
+                &mut self.dither_e1_l,
+                &mut self.dither_e2_l,
+            )
+            .clamp(-ceiling_lin, ceiling_lin);
+            out_r = Self::apply_rt_dither(
+                self.dither_mode,
+                self.dither_bits,
+                out_r,
+                &mut self.dither_rng_r,
+                &mut self.dither_e1_r,
+                &mut self.dither_e2_r,
+            )
+            .clamp(-ceiling_lin, ceiling_lin);
+        }
         self.update_meter(out_l, out_r, tp, ceiling_lin);
 
         (

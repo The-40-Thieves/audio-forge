@@ -12,7 +12,9 @@ use forge_core::{AudioBuffer, AuditReport, ForgeError, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::elite_dsp::{GenreTonalTarget, compute_genre_tonal_balance_eq};
-use crate::loudness_limiter::{audit_audio, normalize_and_limit};
+use crate::loudness_limiter::{
+    DitherMode, LimiterStyle, MasteringLimiterConfig, audit_audio, normalize_and_limit_with_config,
+};
 use crate::restoration::{
     RestorationConfig, apply_18_band_eq, clean_vocal_surgical, compute_reference_match_eq,
     run_full_restoration_chain,
@@ -170,6 +172,14 @@ pub struct DeliveryOptions {
     /// Extra vocal clean-up (de-click, de-plosive, breath gate). Use on vocal stems only.
     pub vocal: bool,
     pub tone_match: Option<ToneMatch>,
+    /// Mastering limiter lookahead & release topology.
+    pub limiter_style: LimiterStyle,
+    /// Stereo channel linking (`0.0` = dual-mono, `1.0` = linked stereo).
+    pub channel_link: f64,
+    /// Optional mastering dither / psychoacoustic noise shaping.
+    pub dither: DitherMode,
+    /// Target integer bit depth when dithering (`8..=24`, typically `16` or `24`).
+    pub dither_bits: u16,
 }
 
 impl DeliveryOptions {
@@ -181,6 +191,10 @@ impl DeliveryOptions {
             defizz: true,
             vocal: false,
             tone_match: None,
+            limiter_style: LimiterStyle::Transparent,
+            channel_link: 1.0,
+            dither: DitherMode::None,
+            dither_bits: 24,
         }
     }
 }
@@ -244,12 +258,38 @@ pub fn deliver(
         None => {}
     }
 
-    let mastered = normalize_and_limit(&work, target.loudness_lufs(), target.ceiling_dbtp())?;
-    stages.push(format!(
+    if !options.channel_link.is_finite() || !(0.0..=1.0).contains(&options.channel_link) {
+        return Err(ForgeError::InvalidParameter(format!(
+            "channel_link ({}) must be finite and in 0.0..=1.0",
+            options.channel_link
+        )));
+    }
+    let mastered = normalize_and_limit_with_config(
+        &work,
+        &MasteringLimiterConfig {
+            target_lufs: target.loudness_lufs(),
+            ceiling_dbtp: target.ceiling_dbtp(),
+            style: options.limiter_style,
+            channel_link: options.channel_link,
+            dither: options.dither,
+            dither_bits: options.dither_bits,
+        },
+    )?;
+    let mut master_stage = format!(
         "master: {:.1} LUFS, {:.1} dBTP true-peak limit",
         target.loudness_lufs(),
         target.ceiling_dbtp()
-    ));
+    );
+    if options.limiter_style != LimiterStyle::Transparent {
+        master_stage.push_str(&format!(" ({:?})", options.limiter_style));
+    }
+    if options.dither != DitherMode::None {
+        master_stage.push_str(&format!(
+            ", {:?} {}-bit dither",
+            options.dither, options.dither_bits
+        ));
+    }
+    stages.push(master_stage);
 
     let after = audit_audio(&mastered);
     let checks = delivery_checks(&after, target);
