@@ -737,6 +737,62 @@ pub enum AnalogHardwareModel {
     StuderA800Tape,
 }
 
+/// Maximum `.nam` JSON payload accepted (4 MiB) to prevent memory exhaustion on malformed files.
+pub const MAX_NAM_JSON_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum total dilated Conv1D layers in a `.nam` WaveNet profile.
+pub const MAX_WAVENET_LAYERS: usize = 24;
+/// Maximum channels per dilated layer in a `.nam` WaveNet profile.
+pub const MAX_WAVENET_CHANNELS: usize = 16;
+/// Maximum Conv1D kernel size in a `.nam` WaveNet profile.
+pub const MAX_WAVENET_KERNEL_SIZE: usize = 7;
+/// Maximum dilation factor in a `.nam` WaveNet profile.
+pub const MAX_WAVENET_DILATION: usize = 512;
+
+/// Layer-array block configuration inside a Neural Amp Modeler (`.nam`) WaveNet JSON.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NamLayerArrayConfig {
+    #[serde(default = "default_one")]
+    pub input_size: usize,
+    #[serde(default = "default_one")]
+    pub condition_size: usize,
+    #[serde(default = "default_one")]
+    pub head_size: usize,
+    #[serde(default = "default_one")]
+    pub channels: usize,
+    #[serde(default = "default_kernel_size")]
+    pub kernel_size: usize,
+    #[serde(default)]
+    pub dilations: Vec<usize>,
+    #[serde(default = "default_activation")]
+    pub activation: String,
+    #[serde(default)]
+    pub gated: bool,
+    #[serde(default)]
+    pub head_bias: bool,
+}
+
+fn default_one() -> usize {
+    1
+}
+fn default_kernel_size() -> usize {
+    3
+}
+fn default_activation() -> String {
+    "Tanh".to_string()
+}
+fn default_head_scale() -> f64 {
+    1.0
+}
+
+/// Top-level `config` section of a `.nam` WaveNet JSON profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NamWaveNetConfig {
+    #[serde(default)]
+    pub layers: Vec<NamLayerArrayConfig>,
+    #[serde(default = "default_head_scale")]
+    pub head_scale: f64,
+}
+
 /// Parsed Neural Amp Modeler (`.nam`) WaveNet JSON profile (`sdatkinson/NeuralAmpModelerPlugin` format).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamWaveNetProfile {
@@ -745,11 +801,400 @@ pub struct NamWaveNetProfile {
     #[serde(default)]
     pub architecture: String,
     #[serde(default)]
+    pub config: Option<NamWaveNetConfig>,
+    #[serde(default)]
     pub weights: Vec<f64>,
 }
 
-/// Maximum `.nam` JSON payload accepted (4 MiB) to prevent memory exhaustion on malformed files.
-pub const MAX_NAM_JSON_BYTES: usize = 4 * 1024 * 1024;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaveNetActivation {
+    Tanh,
+    ReLU,
+    SiLU,
+    LeakyReLU,
+}
+
+impl WaveNetActivation {
+    fn parse(name: &str) -> forge_core::Result<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "" | "tanh" => Ok(Self::Tanh),
+            "relu" => Ok(Self::ReLU),
+            "silu" | "swish" => Ok(Self::SiLU),
+            "leakyrelu" | "leaky_relu" => Ok(Self::LeakyReLU),
+            other => Err(forge_core::ForgeError::InvalidParameter(format!(
+                "Unsupported WaveNet activation '{other}'"
+            ))),
+        }
+    }
+
+    #[inline]
+    fn apply(self, x: f64) -> f64 {
+        match self {
+            Self::Tanh => x.tanh(),
+            Self::ReLU => x.max(0.0),
+            Self::SiLU => x / (1.0 + (-x).exp()),
+            Self::LeakyReLU => {
+                if x >= 0.0 {
+                    x
+                } else {
+                    0.01 * x
+                }
+            }
+        }
+    }
+}
+
+struct WaveNetDilatedLayer {
+    dilation: usize,
+    ring_mask: usize,
+    ring_len: usize,
+    conv_w: Vec<f64>,
+    conv_b: Vec<f64>,
+    mixin_w: Vec<f64>,
+    one_by_one_w: Vec<f64>,
+    one_by_one_b: Vec<f64>,
+}
+
+struct WaveNetLayerArray {
+    input_size: usize,
+    condition_size: usize,
+    head_size: usize,
+    channels: usize,
+    kernel_size: usize,
+    gated: bool,
+    activation: WaveNetActivation,
+    rechannel_w: Vec<f64>,
+    layers: Vec<WaveNetDilatedLayer>,
+    head_rechannel_w: Vec<f64>,
+    head_rechannel_b: Option<Vec<f64>>,
+}
+
+struct WaveNetChannelState {
+    /// Flattened ring buffer per dilated layer across all arrays: `[c * ring_len + pos]`.
+    rings: Vec<Vec<f64>>,
+    ring_pos: Vec<usize>,
+    x_buf: Vec<f64>,
+    next_buf: Vec<f64>,
+    conv_buf: Vec<f64>,
+    head_acc: Vec<f64>,
+}
+
+impl WaveNetChannelState {
+    fn new(arrays: &[WaveNetLayerArray]) -> Self {
+        let mut rings = Vec::new();
+        let mut max_ch = 1_usize;
+        let mut max_head = 1_usize;
+        for arr in arrays {
+            max_ch = max_ch.max(arr.channels).max(arr.input_size);
+            max_head = max_head.max(arr.head_size);
+            for layer in &arr.layers {
+                rings.push(vec![0.0; arr.channels * layer.ring_len]);
+            }
+        }
+        let ring_pos = vec![0; rings.len()];
+        Self {
+            rings,
+            ring_pos,
+            x_buf: vec![0.0; max_ch],
+            next_buf: vec![0.0; max_ch],
+            conv_buf: vec![0.0; max_ch * 2],
+            head_acc: vec![0.0; max_head],
+        }
+    }
+
+    fn reset(&mut self) {
+        for ring in &mut self.rings {
+            ring.fill(0.0);
+        }
+        self.ring_pos.fill(0);
+        self.x_buf.fill(0.0);
+        self.next_buf.fill(0.0);
+        self.conv_buf.fill(0.0);
+        self.head_acc.fill(0.0);
+    }
+}
+
+struct CompiledWaveNet {
+    arrays: Vec<WaveNetLayerArray>,
+    head_scale: f64,
+    state_l: WaveNetChannelState,
+    state_r: WaveNetChannelState,
+}
+
+impl CompiledWaveNet {
+    fn from_profile(profile: &NamWaveNetProfile) -> forge_core::Result<Self> {
+        let cfg = profile.config.as_ref().ok_or_else(|| {
+            forge_core::ForgeError::InvalidParameter("WaveNet profile missing 'config'".into())
+        })?;
+        if cfg.layers.is_empty() {
+            return Err(forge_core::ForgeError::InvalidParameter(
+                "WaveNet config must contain at least one layer array".into(),
+            ));
+        }
+
+        let mut total_layers = 0_usize;
+        let mut cursor = 0_usize;
+        let weights = &profile.weights;
+        let mut take = |count: usize, label: &str| -> forge_core::Result<Vec<f64>> {
+            let end = cursor.checked_add(count).ok_or_else(|| {
+                forge_core::ForgeError::InvalidParameter("WaveNet weight count overflow".into())
+            })?;
+            if end > weights.len() {
+                return Err(forge_core::ForgeError::InvalidParameter(format!(
+                    "WaveNet weights truncated while reading {label}: need {end}, have {}",
+                    weights.len()
+                )));
+            }
+            let slice = &weights[cursor..end];
+            cursor = end;
+            let mut out = Vec::with_capacity(count);
+            for &w in slice {
+                if !w.is_finite() {
+                    return Err(forge_core::ForgeError::InvalidParameter(format!(
+                        "WaveNet weight in {label} is non-finite"
+                    )));
+                }
+                out.push(w.clamp(-16.0, 16.0));
+            }
+            Ok(out)
+        };
+
+        let mut arrays = Vec::with_capacity(cfg.layers.len());
+        for (arr_idx, lc) in cfg.layers.iter().enumerate() {
+            if lc.channels == 0 || lc.channels > MAX_WAVENET_CHANNELS {
+                return Err(forge_core::ForgeError::InvalidParameter(format!(
+                    "WaveNet array {arr_idx} channels ({}) must be in 1..={MAX_WAVENET_CHANNELS}",
+                    lc.channels
+                )));
+            }
+            if lc.input_size == 0 || lc.input_size > MAX_WAVENET_CHANNELS {
+                return Err(forge_core::ForgeError::InvalidParameter(format!(
+                    "WaveNet array {arr_idx} input_size ({}) must be in 1..={MAX_WAVENET_CHANNELS}",
+                    lc.input_size
+                )));
+            }
+            if lc.condition_size == 0 || lc.condition_size > MAX_WAVENET_CHANNELS {
+                return Err(forge_core::ForgeError::InvalidParameter(format!(
+                    "WaveNet array {arr_idx} condition_size ({}) must be in 1..={MAX_WAVENET_CHANNELS}",
+                    lc.condition_size
+                )));
+            }
+            if lc.head_size == 0 || lc.head_size > MAX_WAVENET_CHANNELS {
+                return Err(forge_core::ForgeError::InvalidParameter(format!(
+                    "WaveNet array {arr_idx} head_size ({}) must be in 1..={MAX_WAVENET_CHANNELS}",
+                    lc.head_size
+                )));
+            }
+            if lc.kernel_size == 0 || lc.kernel_size > MAX_WAVENET_KERNEL_SIZE {
+                return Err(forge_core::ForgeError::InvalidParameter(format!(
+                    "WaveNet array {arr_idx} kernel_size ({}) must be in 1..={MAX_WAVENET_KERNEL_SIZE}",
+                    lc.kernel_size
+                )));
+            }
+            if lc.dilations.is_empty() {
+                return Err(forge_core::ForgeError::InvalidParameter(format!(
+                    "WaveNet array {arr_idx} must have at least one dilation"
+                )));
+            }
+            total_layers += lc.dilations.len();
+            if total_layers > MAX_WAVENET_LAYERS {
+                return Err(forge_core::ForgeError::InvalidParameter(format!(
+                    "WaveNet total dilated layers ({total_layers}) exceeds maximum {MAX_WAVENET_LAYERS}"
+                )));
+            }
+
+            let rechannel_w = take(lc.channels * lc.input_size, "rechannel")?;
+            let out_ch = if lc.gated {
+                lc.channels * 2
+            } else {
+                lc.channels
+            };
+            let mut layers = Vec::with_capacity(lc.dilations.len());
+            for &dilation in &lc.dilations {
+                if dilation == 0 || dilation > MAX_WAVENET_DILATION {
+                    return Err(forge_core::ForgeError::InvalidParameter(format!(
+                        "WaveNet dilation ({dilation}) must be in 1..={MAX_WAVENET_DILATION}"
+                    )));
+                }
+                let conv_w = take(out_ch * lc.channels * lc.kernel_size, "conv.weight")?;
+                let conv_b = take(out_ch, "conv.bias")?;
+                let mixin_w = take(out_ch * lc.condition_size, "input_mixin.weight")?;
+                let one_by_one_w = take(lc.channels * lc.channels, "1x1.weight")?;
+                let one_by_one_b = take(lc.channels, "1x1.bias")?;
+                let needed = (lc.kernel_size - 1) * dilation + 1;
+                let ring_len = needed.next_power_of_two();
+                layers.push(WaveNetDilatedLayer {
+                    dilation,
+                    ring_mask: ring_len - 1,
+                    ring_len,
+                    conv_w,
+                    conv_b,
+                    mixin_w,
+                    one_by_one_w,
+                    one_by_one_b,
+                });
+            }
+            let head_rechannel_w = take(lc.head_size * lc.channels, "head_rechannel.weight")?;
+            let head_rechannel_b = if lc.head_bias {
+                Some(take(lc.head_size, "head_rechannel.bias")?)
+            } else {
+                None
+            };
+            arrays.push(WaveNetLayerArray {
+                input_size: lc.input_size,
+                condition_size: lc.condition_size,
+                head_size: lc.head_size,
+                channels: lc.channels,
+                kernel_size: lc.kernel_size,
+                gated: lc.gated,
+                activation: WaveNetActivation::parse(&lc.activation)?,
+                rechannel_w,
+                layers,
+                head_rechannel_w,
+                head_rechannel_b,
+            });
+        }
+
+        // Standard NAM WaveNet appends head_scale as the final scalar weight if present.
+        let head_scale = if cursor < weights.len() && weights[cursor].is_finite() {
+            weights[cursor].clamp(-4.0, 4.0)
+        } else {
+            sanitize_param_f64(cfg.head_scale, 1.0, -4.0, 4.0)
+        };
+
+        let state_l = WaveNetChannelState::new(&arrays);
+        let state_r = WaveNetChannelState::new(&arrays);
+        Ok(Self {
+            arrays,
+            head_scale,
+            state_l,
+            state_r,
+        })
+    }
+
+    #[inline]
+    fn process_channel(
+        arrays: &[WaveNetLayerArray],
+        head_scale: f64,
+        st: &mut WaveNetChannelState,
+        x_in: f64,
+    ) -> f64 {
+        let mut flat_layer_idx = 0_usize;
+        let mut cur_len = 1_usize;
+        st.x_buf[0] = x_in;
+        st.head_acc.fill(0.0);
+
+        for arr in arrays {
+            let ch = arr.channels;
+            let in_sz = arr.input_size.min(cur_len);
+            // Input rechannel: next_buf[0..ch] = rechannel_w * x_buf[0..in_sz]
+            for c in 0..ch {
+                let mut acc = 0.0;
+                let row = c * arr.input_size;
+                for ic in 0..in_sz {
+                    acc += arr.rechannel_w[row + ic] * st.x_buf[ic];
+                }
+                st.next_buf[c] = acc;
+            }
+            st.x_buf[..ch].copy_from_slice(&st.next_buf[..ch]);
+
+            let out_ch = if arr.gated { ch * 2 } else { ch };
+            let ks = arr.kernel_size;
+
+            for layer in &arr.layers {
+                let ring = &mut st.rings[flat_layer_idx];
+                let pos = st.ring_pos[flat_layer_idx];
+                let mask = layer.ring_mask;
+                let rlen = layer.ring_len;
+
+                // Push current x_buf into dilated ring buffer
+                for c in 0..ch {
+                    ring[c * rlen + pos] = st.x_buf[c];
+                }
+
+                // Dilated causal Conv1D + input_mixin (condition = x_in on channel 0)
+                for oc in 0..out_ch {
+                    let mut sum = layer.conv_b[oc];
+                    // Condition input mixin (scalar audio input x_in)
+                    sum += layer.mixin_w[oc * arr.condition_size] * x_in;
+                    let w_base = oc * ch * ks;
+                    for ic in 0..ch {
+                        let ic_ring = ic * rlen;
+                        let ic_w = w_base + ic * ks;
+                        for k in 0..ks {
+                            let lag = (ks - 1 - k) * layer.dilation;
+                            let ridx = pos.wrapping_sub(lag) & mask;
+                            sum += layer.conv_w[ic_w + k] * ring[ic_ring + ridx];
+                        }
+                    }
+                    st.conv_buf[oc] = sum;
+                }
+
+                // Activation (gated tanh*sigmoid or pointwise activation)
+                for c in 0..ch {
+                    let act = if arr.gated {
+                        let z_f = arr.activation.apply(st.conv_buf[c]);
+                        let z_g = 1.0 / (1.0 + (-st.conv_buf[c + ch]).exp());
+                        z_f * z_g
+                    } else {
+                        arr.activation.apply(st.conv_buf[c])
+                    };
+                    st.next_buf[c] = act;
+                }
+
+                // 1x1 residual projection + skip accumulation
+                for c in 0..ch {
+                    let mut proj = layer.one_by_one_b[c];
+                    let row = c * ch;
+                    for ic in 0..ch {
+                        proj += layer.one_by_one_w[row + ic] * st.next_buf[ic];
+                    }
+                    st.x_buf[c] = flush_denormal_f64(st.x_buf[c] + proj);
+                }
+
+                // Accumulate into head skip buffer (last layer output contributes to head)
+                for hc in 0..arr.head_size {
+                    let row = hc * ch;
+                    let mut hsum = 0.0;
+                    for ic in 0..ch {
+                        hsum += arr.head_rechannel_w[row + ic] * st.next_buf[ic];
+                    }
+                    st.head_acc[hc] += hsum;
+                }
+
+                st.ring_pos[flat_layer_idx] = (pos + 1) & mask;
+                flat_layer_idx += 1;
+            }
+
+            if let Some(ref hb) = arr.head_rechannel_b {
+                for (acc, &b) in st.head_acc.iter_mut().zip(hb.iter()) {
+                    *acc += b;
+                }
+            }
+            cur_len = ch;
+        }
+
+        let active_head = arrays
+            .last()
+            .map_or(1, |a| a.head_size)
+            .min(st.head_acc.len());
+        let head_sum: f64 = st.head_acc[..active_head].iter().sum();
+        let raw = head_sum * head_scale;
+        flush_denormal_f64((raw * 0.5).tanh() * 2.0)
+    }
+
+    #[inline]
+    fn process_stereo(&mut self, x_l: f64, x_r: f64) -> (f64, f64) {
+        let y_l = Self::process_channel(&self.arrays, self.head_scale, &mut self.state_l, x_l);
+        let y_r = Self::process_channel(&self.arrays, self.head_scale, &mut self.state_r, x_r);
+        (y_l, y_r)
+    }
+
+    fn reset(&mut self) {
+        self.state_l.reset();
+        self.state_r.reset();
+    }
+}
 
 impl NamWaveNetProfile {
     /// Parses a `.nam` JSON string and extracts normalized dilated causal WaveNet tap weights
@@ -790,6 +1235,7 @@ impl NamWaveNetProfile {
 pub struct RealtimeNeuralPreamp {
     model: AnalogHardwareModel,
     custom_nam_taps: Option<[f64; 5]>,
+    wavenet: Option<CompiledWaveNet>,
     dilation_buf_l: [f64; 16],
     dilation_buf_r: [f64; 16],
     pos: usize,
@@ -806,6 +1252,7 @@ impl RealtimeNeuralPreamp {
         Self {
             model,
             custom_nam_taps: None,
+            wavenet: None,
             dilation_buf_l: [0.0; 16],
             dilation_buf_r: [0.0; 16],
             pos: 0,
@@ -822,15 +1269,53 @@ impl RealtimeNeuralPreamp {
         self.model = model;
     }
 
-    /// Loads custom WaveNet tap weights from a Neural Amp Modeler (`.nam`) JSON string.
+    /// Returns `true` when a full multi-layer dilated Conv1D WaveNet `.nam` model is active.
+    pub fn is_full_wavenet_loaded(&self) -> bool {
+        self.wavenet.is_some()
+    }
+
+    /// Resets all ring buffers and filter states in place with zero heap allocations.
+    pub fn reset(&mut self) {
+        self.dilation_buf_l.fill(0.0);
+        self.dilation_buf_r.fill(0.0);
+        self.pos = 0;
+        self.adaa_l = AdaaTanh::default();
+        self.adaa_r = AdaaTanh::default();
+        self.dc_block_x_l = 0.0;
+        self.dc_block_y_l = 0.0;
+        self.dc_block_x_r = 0.0;
+        self.dc_block_y_r = 0.0;
+        if let Some(ref mut wn) = self.wavenet {
+            wn.reset();
+        }
+    }
+
+    /// Loads either a full dilated Conv1D WaveNet `.nam` profile (`config.layers` present) or
+    /// legacy 5-tap `.nam` JSON weights. On any validation error, existing state is preserved.
     pub fn load_nam_json(&mut self, json_str: &str) -> forge_core::Result<()> {
+        if json_str.len() > MAX_NAM_JSON_BYTES {
+            return Err(forge_core::ForgeError::InvalidParameter(format!(
+                ".nam JSON exceeds maximum size ({MAX_NAM_JSON_BYTES} bytes)"
+            )));
+        }
+        let parsed: NamWaveNetProfile = serde_json::from_str(json_str).map_err(|e| {
+            forge_core::ForgeError::InvalidParameter(format!("Invalid .nam JSON profile: {e}"))
+        })?;
+        if parsed.config.as_ref().is_some_and(|c| !c.layers.is_empty()) {
+            let compiled = CompiledWaveNet::from_profile(&parsed)?;
+            self.wavenet = Some(compiled);
+            self.custom_nam_taps = None;
+            return Ok(());
+        }
         let taps = NamWaveNetProfile::parse_nam_taps(json_str)?;
         self.custom_nam_taps = Some(taps);
+        self.wavenet = None;
         Ok(())
     }
 
     pub fn clear_custom_nam(&mut self) {
         self.custom_nam_taps = None;
+        self.wavenet = None;
     }
 
     #[inline]
@@ -877,35 +1362,40 @@ impl RealtimeNeuralPreamp {
         let xl = sanitize_sample_f32(in_l).clamp(-16.0, 16.0);
         let xr = sanitize_sample_f32(in_r).clamp(-16.0, 16.0);
 
-        let p = self.pos & 15;
-        let p1 = self.pos.wrapping_sub(1) & 15;
-        let p4 = self.pos.wrapping_sub(4) & 15;
-        let p12 = self.pos.wrapping_sub(12) & 15;
+        let (raw_l, raw_r) = if let Some(ref mut wn) = self.wavenet {
+            wn.process_stereo(xl * drive, xr * drive)
+        } else {
+            let p = self.pos & 15;
+            let p1 = self.pos.wrapping_sub(1) & 15;
+            let p4 = self.pos.wrapping_sub(4) & 15;
+            let p12 = self.pos.wrapping_sub(12) & 15;
 
-        self.dilation_buf_l[p] = xl;
-        self.dilation_buf_r[p] = xr;
-        self.pos = self.pos.wrapping_add(1);
+            self.dilation_buf_l[p] = xl;
+            self.dilation_buf_r[p] = xr;
+            self.pos = self.pos.wrapping_add(1);
 
-        let raw_l = Self::wavenet_residual_cell(
-            xl,
-            self.dilation_buf_l[p1],
-            self.dilation_buf_l[p4],
-            self.dilation_buf_l[p12],
-            drive,
-            self.model,
-            self.custom_nam_taps,
-            &mut self.adaa_l,
-        );
-        let raw_r = Self::wavenet_residual_cell(
-            xr,
-            self.dilation_buf_r[p1],
-            self.dilation_buf_r[p4],
-            self.dilation_buf_r[p12],
-            drive,
-            self.model,
-            self.custom_nam_taps,
-            &mut self.adaa_r,
-        );
+            let l = Self::wavenet_residual_cell(
+                xl,
+                self.dilation_buf_l[p1],
+                self.dilation_buf_l[p4],
+                self.dilation_buf_l[p12],
+                drive,
+                self.model,
+                self.custom_nam_taps,
+                &mut self.adaa_l,
+            );
+            let r = Self::wavenet_residual_cell(
+                xr,
+                self.dilation_buf_r[p1],
+                self.dilation_buf_r[p4],
+                self.dilation_buf_r[p12],
+                drive,
+                self.model,
+                self.custom_nam_taps,
+                &mut self.adaa_r,
+            );
+            (l, r)
+        };
 
         // DC blocker (removes any tube/transformer even-harmonic DC shift)
         let dc_l = flush_denormal_f64(raw_l - self.dc_block_x_l + 0.9985 * self.dc_block_y_l);
