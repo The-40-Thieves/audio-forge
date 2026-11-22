@@ -1,0 +1,22 @@
+[package]
+name = "forge-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Real-Time Object-Oriented Multitrack DAW Audio Engine, PDC Mixer & Project Model for ForgeStudio"
+
+[dependencies]
+cpal.workspace = true
+forge-core = { path = "../forge-core" }
+forge-dsp = { path = "../forge-dsp" }
+forge-vocal = { path = "../forge-vocal" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+assert_no_alloc = { git = "https://github.com/robbert-vdh/rust-assert-no-alloc.git", branch = "feature/nested-permit-forbid", features = ["warn_debug"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,528 @@
+//! Real-time & offline Object-Oriented multitrack renderer with per-object FX chains,
+//! 3-band per-object EQ, Plugin Delay Compensation (PDC), and BS.1770-4 master metering.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use forge_core::{AudioBuffer, AuditReport, Result};
+use forge_dsp::{Biquad, RealtimeSpectrumAnalyzer32, audit_audio, flush_denormal_f64};
+
+use crate::fx::FxProcessor;
+use crate::project::{AudioObject, DawProject, ObjectEq3, Track, WaveformPeaks};
+
+/// Simple pre-allocated stereo delay line for sample-accurate Plugin Delay Compensation (PDC).
+struct PdcDelayLine {
+    buf_l: Vec<f32>,
+    buf_r: Vec<f32>,
+    write_pos: usize,
+    delay_samples: usize,
+}
+
+impl PdcDelayLine {
+    fn new(delay_samples: usize) -> Self {
+        let len = delay_samples.max(1);
+        Self {
+            buf_l: vec![0.0; len],
+            buf_r: vec![0.0; len],
+            write_pos: 0,
+            delay_samples,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
+        if self.delay_samples == 0 {
+            return (in_l, in_r);
+        }
+        let out_l = self.buf_l[self.write_pos];
+        let out_r = self.buf_r[self.write_pos];
+        self.buf_l[self.write_pos] = in_l;
+        self.buf_r[self.write_pos] = in_r;
+        self.write_pos = (self.write_pos + 1) % self.buf_l.len();
+        (out_l, out_r)
+    }
+
+    fn reset(&mut self) {
+        self.buf_l.fill(0.0);
+        self.buf_r.fill(0.0);
+        self.write_pos = 0;
+    }
+}
+
+/// Stereo 3-band per-object EQ state (120 Hz low, 1.2 kHz mid, 6.5 kHz high).
+struct ObjectEqRuntime {
+    low_l: Biquad,
+    low_r: Biquad,
+    mid_l: Biquad,
+    mid_r: Biquad,
+    high_l: Biquad,
+    high_r: Biquad,
+    flat: bool,
+}
+
+impl ObjectEqRuntime {
+    fn new(sr: f64, eq: ObjectEq3) -> Self {
+        Self {
+            low_l: Biquad::peaking_eq(sr, 120.0, 0.7, f64::from(eq.low_db.clamp(-18.0, 18.0))),
+            low_r: Biquad::peaking_eq(sr, 120.0, 0.7, f64::from(eq.low_db.clamp(-18.0, 18.0))),
+            mid_l: Biquad::peaking_eq(sr, 1200.0, 0.9, f64::from(eq.mid_db.clamp(-18.0, 18.0))),
+            mid_r: Biquad::peaking_eq(sr, 1200.0, 0.9, f64::from(eq.mid_db.clamp(-18.0, 18.0))),
+            high_l: Biquad::peaking_eq(sr, 6500.0, 0.7, f64::from(eq.high_db.clamp(-18.0, 18.0))),
+            high_r: Biquad::peaking_eq(sr, 6500.0, 0.7, f64::from(eq.high_db.clamp(-18.0, 18.0))),
+            flat: eq.is_flat(),
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, l: f32, r: f32) -> (f32, f32) {
+        if self.flat {
+            return (l, r);
+        }
+        let mut xl = f64::from(l);
+        let mut xr = f64::from(r);
+        xl = self.low_l.process_sample(xl);
+        xr = self.low_r.process_sample(xr);
+        xl = self.mid_l.process_sample(xl);
+        xr = self.mid_r.process_sample(xr);
+        xl = self.high_l.process_sample(xl);
+        xr = self.high_r.process_sample(xr);
+        (flush_denormal_f64(xl) as f32, flush_denormal_f64(xr) as f32)
+    }
+
+    fn reset(&mut self) {
+        self.low_l.reset();
+        self.low_r.reset();
+        self.mid_l.reset();
+        self.mid_r.reset();
+        self.high_l.reset();
+        self.high_r.reset();
+    }
+}
+
+struct ObjectRuntime {
+    config: AudioObject,
+    clip: Option<Arc<AudioBuffer>>,
+    eq: ObjectEqRuntime,
+    fx: Vec<FxProcessor>,
+    pdc: PdcDelayLine,
+    fx_latency: usize,
+}
+
+struct TrackRuntime {
+    config: Track,
+    objects: Vec<ObjectRuntime>,
+    inserts: Vec<FxProcessor>,
+    pdc: PdcDelayLine,
+    total_latency: usize,
+    peak_db: f32,
+}
+
+/// Live meter snapshot published from the audio engine to the DAW GUI.
+#[derive(Debug, Clone)]
+pub struct EngineMeters {
+    pub master_peak_l_db: f32,
+    pub master_peak_r_db: f32,
+    pub spectrum_32_db: [f32; 32],
+    pub track_peaks_db: Vec<f32>,
+    pub total_pdc_samples: usize,
+}
+
+impl Default for EngineMeters {
+    fn default() -> Self {
+        Self {
+            master_peak_l_db: -90.0,
+            master_peak_r_db: -90.0,
+            spectrum_32_db: [-90.0; 32],
+            track_peaks_db: Vec::new(),
+            total_pdc_samples: 0,
+        }
+    }
+}
+
+/// Pre-loaded audio clip cache shared between the UI (for waveform peaks) and the audio engine.
+#[derive(Default, Clone)]
+pub struct ClipCache {
+    clips: HashMap<PathBuf, Arc<AudioBuffer>>,
+    peaks: HashMap<PathBuf, Arc<WaveformPeaks>>,
+}
+
+impl ClipCache {
+    /// Loads a WAV/audio file from disk (or returns cached buffer) and computes waveform peaks.
+    pub fn load_clip(&mut self, path: &Path) -> Result<Arc<AudioBuffer>> {
+        if let Some(existing) = self.clips.get(path) {
+            return Ok(Arc::clone(existing));
+        }
+        let buf = Arc::new(AudioBuffer::load(path)?);
+        let peaks = Arc::new(WaveformPeaks::from_buffer(&buf, 256));
+        self.clips.insert(path.to_path_buf(), Arc::clone(&buf));
+        self.peaks.insert(path.to_path_buf(), peaks);
+        Ok(buf)
+    }
+
+    /// Inserts an already-constructed in-memory `AudioBuffer` (ideal for tests & synthetic stems).
+    pub fn insert_memory_clip(&mut self, path: PathBuf, buf: AudioBuffer) -> Arc<AudioBuffer> {
+        let arc = Arc::new(buf);
+        let peaks = Arc::new(WaveformPeaks::from_buffer(&arc, 256));
+        self.clips.insert(path.clone(), Arc::clone(&arc));
+        self.peaks.insert(path, peaks);
+        arc
+    }
+
+    pub fn get_clip(&self, path: &Path) -> Option<Arc<AudioBuffer>> {
+        self.clips.get(path).cloned()
+    }
+
+    pub fn get_peaks(&self, path: &Path) -> Option<Arc<WaveformPeaks>> {
+        self.peaks.get(path).cloned()
+    }
+}
+
+/// Samplitude-inspired **Object-Oriented Multitrack Audio Engine** with automatic PDC.
+///
+/// Compiles a [`DawProject`] + [`ClipCache`] into a zero-allocation per-sample execution graph
+/// supporting per-object FX chains, per-object fades/EQ, track inserts, solo/mute, and master bus.
+pub struct ObjectOrientedEngine {
+    sample_rate: f64,
+    playhead_samples: u64,
+    loop_enabled: bool,
+    loop_start: u64,
+    loop_end: u64,
+    master_gain_lin: f32,
+    master_insert_cfgs: Vec<crate::project::FxSlotConfig>,
+    master_inserts: Vec<FxProcessor>,
+    tracks: Vec<TrackRuntime>,
+    analyzer: RealtimeSpectrumAnalyzer32,
+    total_pdc_samples: usize,
+    meters: EngineMeters,
+}
+
+impl ObjectOrientedEngine {
+    /// Compiles `project` into an executable real-time audio graph (runs off-audio-thread).
+    pub fn compile(project: &DawProject, cache: &ClipCache) -> Self {
+        let sr = f64::from(project.sample_rate.max(8_000));
+        let mut tracks = Vec::with_capacity(project.tracks.len());
+        let mut max_track_latency = 0_usize;
+
+        for track in &project.tracks {
+            let mut obj_runtimes = Vec::with_capacity(track.objects.len());
+            let mut max_obj_latency = 0_usize;
+
+            for obj in &track.objects {
+                let fx: Vec<FxProcessor> = obj
+                    .fx_chain
+                    .iter()
+                    .map(|c| FxProcessor::from_config(c, sr))
+                    .collect();
+                let fx_latency: usize = fx
+                    .iter()
+                    .zip(&obj.fx_chain)
+                    .map(|(p, c)| p.latency_samples(c))
+                    .sum();
+                max_obj_latency = max_obj_latency.max(fx_latency);
+                obj_runtimes.push(ObjectRuntime {
+                    config: obj.clone(),
+                    clip: cache.get_clip(&obj.source_path),
+                    eq: ObjectEqRuntime::new(sr, obj.eq),
+                    fx,
+                    pdc: PdcDelayLine::new(0),
+                    fx_latency,
+                });
+            }
+
+            // Align all objects within the same track to `max_obj_latency`
+            for obj_rt in &mut obj_runtimes {
+                let pad = max_obj_latency.saturating_sub(obj_rt.fx_latency);
+                obj_rt.pdc = PdcDelayLine::new(pad);
+            }
+
+            let inserts: Vec<FxProcessor> = track
+                .inserts
+                .iter()
+                .map(|c| FxProcessor::from_config(c, sr))
+                .collect();
+            let track_fx_lat: usize = inserts
+                .iter()
+                .zip(&track.inserts)
+                .map(|(p, c)| p.latency_samples(c))
+                .sum();
+            let total_latency = max_obj_latency + track_fx_lat;
+            max_track_latency = max_track_latency.max(total_latency);
+
+            tracks.push(TrackRuntime {
+                config: track.clone(),
+                objects: obj_runtimes,
+                inserts,
+                pdc: PdcDelayLine::new(0),
+                total_latency,
+                peak_db: -90.0,
+            });
+        }
+
+        // Align all parallel tracks to `max_track_latency` for sample-accurate PDC
+        for tr in &mut tracks {
+            let pad = max_track_latency.saturating_sub(tr.total_latency);
+            tr.pdc = PdcDelayLine::new(pad);
+        }
+
+        let master_inserts: Vec<FxProcessor> = project
+            .master_inserts
+            .iter()
+            .map(|c| FxProcessor::from_config(c, sr))
+            .collect();
+        let master_lat: usize = master_inserts
+            .iter()
+            .zip(&project.master_inserts)
+            .map(|(p, c)| p.latency_samples(c))
+            .sum();
+        let total_pdc_samples = max_track_latency + master_lat;
+
+        let track_peaks_db = vec![-90.0; tracks.len()];
+        Self {
+            sample_rate: sr,
+            playhead_samples: 0,
+            loop_enabled: project.loop_enabled,
+            loop_start: project.loop_start_samples,
+            loop_end: project.loop_end_samples,
+            master_gain_lin: 10.0_f32.powf(project.master_gain_db.clamp(-48.0, 12.0) / 20.0),
+            master_insert_cfgs: project.master_inserts.clone(),
+            master_inserts,
+            tracks,
+            analyzer: RealtimeSpectrumAnalyzer32::new(sr),
+            total_pdc_samples,
+            meters: EngineMeters {
+                track_peaks_db,
+                total_pdc_samples,
+                ..EngineMeters::default()
+            },
+        }
+    }
+
+    pub fn playhead_samples(&self) -> u64 {
+        self.playhead_samples
+    }
+
+    pub fn set_playhead_samples(&mut self, pos: u64) {
+        self.playhead_samples = pos;
+        self.reset_dsp_state();
+    }
+
+    pub fn total_pdc_samples(&self) -> usize {
+        self.total_pdc_samples
+    }
+
+    pub fn meters(&self) -> &EngineMeters {
+        &self.meters
+    }
+
+    pub fn reset_dsp_state(&mut self) {
+        let sr = self.sample_rate;
+        for tr in &mut self.tracks {
+            tr.pdc.reset();
+            for ins in &mut tr.inserts {
+                ins.reset(sr);
+            }
+            for obj in &mut tr.objects {
+                obj.pdc.reset();
+                obj.eq.reset();
+                for fx in &mut obj.fx {
+                    fx.reset(sr);
+                }
+            }
+        }
+        for ins in &mut self.master_inserts {
+            ins.reset(sr);
+        }
+        self.analyzer.reset(sr);
+    }
+
+    #[inline]
+    fn equal_power_pan(pan: f32) -> (f32, f32) {
+        let p = (pan.clamp(-1.0, 1.0) + 1.0) * 0.5;
+        let angle = p * std::f32::consts::FRAC_PI_2;
+        (
+            angle.cos() * std::f32::consts::SQRT_2,
+            angle.sin() * std::f32::consts::SQRT_2,
+        )
+    }
+
+    /// Renders `out_l.len()` stereo samples starting at `self.playhead_samples` with zero
+    /// heap allocations and advances `self.playhead_samples`.
+    pub fn render_block(&mut self, out_l: &mut [f32], out_r: &mut [f32]) {
+        let frames = out_l.len().min(out_r.len());
+        let any_solo = self.tracks.iter().any(|t| t.config.solo);
+        let mut master_pk_l = 1e-6_f32;
+        let mut master_pk_r = 1e-6_f32;
+
+        for tr in &mut self.tracks {
+            tr.peak_db = -90.0;
+        }
+
+        for i in 0..frames {
+            let pos = self.playhead_samples;
+            let mut mix_l = 0.0_f32;
+            let mut mix_r = 0.0_f32;
+
+            for tr in &mut self.tracks {
+                let audible = if any_solo {
+                    tr.config.solo
+                } else {
+                    !tr.config.mute
+                };
+                if !audible {
+                    continue;
+                }
+
+                let mut tr_l = 0.0_f32;
+                let mut tr_r = 0.0_f32;
+
+                for obj in &mut tr.objects {
+                    if obj.config.mute {
+                        continue;
+                    }
+                    let start = obj.config.timeline_start_samples;
+                    let end = obj.config.timeline_end_samples();
+                    let (mut ol, mut or_) = if pos >= start && pos < end {
+                        let local = pos - start;
+                        let src_idx = (obj.config.source_offset_samples + local) as usize;
+                        if let Some(ref clip) = obj.clip {
+                            if src_idx < clip.num_frames() {
+                                let s0 = clip.channels[0][src_idx] as f32;
+                                let s1 = if clip.channels.len() > 1 {
+                                    clip.channels[1][src_idx] as f32
+                                } else {
+                                    s0
+                                };
+                                let fade = obj.config.fade_gain_at(local) as f32;
+                                let g = 10.0_f32.powf(obj.config.gain_db.clamp(-48.0, 24.0) / 20.0)
+                                    * fade
+                                    * if obj.config.phase_invert { -1.0 } else { 1.0 };
+                                let (pl, pr) = Self::equal_power_pan(obj.config.pan);
+                                (s0 * g * pl, s1 * g * pr)
+                            } else {
+                                (0.0, 0.0)
+                            }
+                        } else {
+                            (0.0, 0.0)
+                        }
+                    } else {
+                        (0.0, 0.0)
+                    };
+
+                    // Run per-object 3-band EQ & per-object FX chain + intra-track PDC
+                    (ol, or_) = obj.eq.process(ol, or_);
+                    for (proc_fx, cfg) in obj.fx.iter_mut().zip(&obj.config.fx_chain) {
+                        (ol, or_) = proc_fx.process_stereo(cfg, ol, or_);
+                    }
+                    (ol, or_) = obj.pdc.process(ol, or_);
+
+                    tr_l += ol;
+                    tr_r += or_;
+                }
+
+                // Track-level FX inserts + track fader/pan/polarity + inter-track PDC
+                for (proc_fx, cfg) in tr.inserts.iter_mut().zip(&tr.config.inserts) {
+                    (tr_l, tr_r) = proc_fx.process_stereo(cfg, tr_l, tr_r);
+                }
+                (tr_l, tr_r) = tr.pdc.process(tr_l, tr_r);
+
+                let tg = 10.0_f32.powf(tr.config.gain_db.clamp(-60.0, 12.0) / 20.0)
+                    * if tr.config.phase_invert { -1.0 } else { 1.0 };
+                let (tpl, tpr) = Self::equal_power_pan(tr.config.pan);
+                tr_l *= tg * tpl;
+                tr_r *= tg * tpr;
+
+                let pk = tr_l.abs().max(tr_r.abs());
+                let pk_db = 20.0 * pk.max(1e-5).log10();
+                if pk_db > tr.peak_db {
+                    tr.peak_db = pk_db;
+                }
+
+                mix_l += tr_l;
+                mix_r += tr_r;
+            }
+
+            // Master bus inserts & gain
+            for (proc_fx, cfg) in self.master_inserts.iter_mut().zip(&self.master_insert_cfgs) {
+                (mix_l, mix_r) = proc_fx.process_stereo(cfg, mix_l, mix_r);
+            }
+            mix_l *= self.master_gain_lin;
+            mix_r *= self.master_gain_lin;
+
+            if !mix_l.is_finite() {
+                mix_l = 0.0;
+            }
+            if !mix_r.is_finite() {
+                mix_r = 0.0;
+            }
+
+            self.analyzer.push_stereo_sample(mix_l, mix_r);
+            master_pk_l = master_pk_l.max(mix_l.abs());
+            master_pk_r = master_pk_r.max(mix_r.abs());
+
+            out_l[i] = mix_l;
+            out_r[i] = mix_r;
+
+            let next_pos = pos.saturating_add(1);
+            if self.loop_enabled && self.loop_end > self.loop_start && next_pos >= self.loop_end {
+                self.playhead_samples = self.loop_start;
+            } else {
+                self.playhead_samples = next_pos;
+            }
+        }
+
+        self.meters.master_peak_l_db = 20.0 * master_pk_l.max(1e-5).log10();
+        self.meters.master_peak_r_db = 20.0 * master_pk_r.max(1e-5).log10();
+        self.meters.spectrum_32_db = self.analyzer.snapshot_db();
+        self.meters.track_peaks_db.clear();
+        for tr in &self.tracks {
+            self.meters.track_peaks_db.push(tr.peak_db);
+        }
+    }
+
+    /// Renders the full project offline from sample `0` to `total_frames` (compensating for PDC)
+    /// into a stereo 64-bit [`AudioBuffer`].
+    pub fn bounce_offline(
+        project: &DawProject,
+        cache: &ClipCache,
+        total_frames: usize,
+    ) -> Result<AudioBuffer> {
+        let mut engine = Self::compile(project, cache);
+        engine.loop_enabled = false;
+        let pdc = engine.total_pdc_samples();
+        let render_len = total_frames.saturating_add(pdc);
+
+        let mut ch_l = Vec::with_capacity(total_frames);
+        let mut ch_r = Vec::with_capacity(total_frames);
+        let mut blk_l = vec![0.0_f32; 512];
+        let mut blk_r = vec![0.0_f32; 512];
+
+        let mut rendered = 0_usize;
+        while rendered < render_len {
+            let chunk = (render_len - rendered).min(512);
+            engine.render_block(&mut blk_l[..chunk], &mut blk_r[..chunk]);
+            for i in 0..chunk {
+                let global_idx = rendered + i;
+                if global_idx >= pdc && ch_l.len() < total_frames {
+                    ch_l.push(f64::from(blk_l[i]));
+                    ch_r.push(f64::from(blk_r[i]));
+                }
+            }
+            rendered += chunk;
+        }
+
+        AudioBuffer::from_channels(vec![ch_l, ch_r], project.sample_rate)
+    }
+
+    /// Bounces the project to a 24-bit WAV file and returns its ITU-R BS.1770-4 [`AuditReport`].
+    pub fn bounce_to_wav(
+        project: &DawProject,
+        cache: &ClipCache,
+        output_wav: &Path,
+    ) -> Result<AuditReport> {
+        let total = project.total_length_samples() as usize;
+        let buf = Self::bounce_offline(project, cache, total)?;
+        buf.save_wav(output_wav, 24)?;
+        Ok(audit_audio(&buf))
+    }
+}

@@ -1,0 +1,19 @@
+[package]
+name = "forge-daw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ForgeStudio DAW — Open-Source Samplitude-Style Object-Oriented Mixing & Mastering DAW"
+
+[[bin]]
+name = "forge-daw"
+path = "src/main.rs"
+
+[dependencies]
+eframe.workspace = true
+forge-core = { path = "../forge-core" }
+forge-engine = { path = "../forge-engine" }
+
+[lints]
+workspace = true
