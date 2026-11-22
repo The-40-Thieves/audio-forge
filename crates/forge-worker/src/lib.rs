@@ -18,7 +18,11 @@ mod dsp_split;
 mod local_gpu;
 mod routing;
 
-pub use local_gpu::{BUILD_SOURCE_ROOT, LocalWorkerCommand, resolve_worker_script};
+pub use local_gpu::{
+    BUILD_SOURCE_ROOT, LocalWorkerCommand, MidiTranscribeResult, NeuralDenoiseResult,
+    resolve_default_local_worker, resolve_worker_script, run_local_neural_denoise,
+    run_local_transcribe_midi,
+};
 pub use routing::{
     BackendUsed, SeparationConfig, SeparationReport, WorkerBackend, parse_backend, separate_stems,
 };

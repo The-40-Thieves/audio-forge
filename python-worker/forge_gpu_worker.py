@@ -6,14 +6,12 @@ and exits immediately after writing artifacts to disk so 100% of VRAM and system
 are returned to REAPER 7.82.
 
 Supported tasks:
-- `separate`: Mel-Band-RoFormer (Kim Vocal, MIT), then an optional BS-RoFormer de-reverb of
-  the vocal. Returns two stems, `vocals` and `other` (the instrumental); drums, bass, guitar
-  and keys are always `None`.
+- `separate`: Mel-Band-RoFormer (Kim Vocal, MIT) + optional BS-RoFormer de-reverb (`--stems 2`),
+  or HTDemucs 6-stem separation (`--stems 6`: vocals, drums, bass, guitar, keys, other).
 - `denoise`: Neural audio denoising via DeepFilterNet3 (`df.enhance`) with automatic fallback
   to Mel-Band-RoFormer denoise (`audio-separator`) for heavy noise/room rescue.
+- `transcribe`: Polyphonic audio-to-MIDI transcription via Spotify `basic-pitch`.
 - `yue2-remote`: Calls mrfakename/yue2-3b or a custom Colab YuE2-3B endpoint.
-
-There is no 6-stem separation or audio-to-MIDI transcription task.
 """
 
 from __future__ import annotations
@@ -26,10 +24,15 @@ from pathlib import Path
 
 # Normalized stem tags (lowercase, alphanumerics only) for each role.
 VOCAL_TAGS = frozenset({"vocals", "vocal"})
-INSTRUMENTAL_TAGS = frozenset({"instrumental", "instrumentals"})
+INSTRUMENTAL_TAGS = frozenset({"instrumental", "instrumentals", "other"})
+DRUMS_TAGS = frozenset({"drums", "drum"})
+BASS_TAGS = frozenset({"bass"})
+GUITAR_TAGS = frozenset({"guitar"})
+KEYS_TAGS = frozenset({"piano", "keys", "keyboard"})
 DRY_TAGS = frozenset({"noreverb", "dry"})
 DENOISED_TAGS = frozenset({"dry", "nonoise", "denoised", "clean"})
 DENOISE_ROFORMER_MODEL = "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt"
+SIX_STEM_MODEL = "htdemucs_6s.yaml"
 
 
 def stem_tag(filename: str) -> str | None:
@@ -63,11 +66,15 @@ def pick_stem(
 
 
 def run_separate(
-    input_path: Path, output_dir: Path, dereverb: bool = True
+    input_path: Path, output_dir: Path, dereverb: bool = True, stems: int = 2
 ) -> dict[str, str | None]:
-    if not input_path.is_file():
-        raise FileNotFoundError(f"Input audio file not found: {input_path}")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if stems not in {2, 6}:
+        raise ValueError(f"stems must be 2 or 6, got {stems!r}")
+    resolved_input = input_path.resolve()
+    if not resolved_input.is_file():
+        raise FileNotFoundError(f"Input audio file not found: {resolved_input}")
+    resolved_output = output_dir.resolve()
+    resolved_output.mkdir(parents=True, exist_ok=True)
     try:
         from audio_separator.separator import Separator
     except ImportError as exc:
@@ -76,19 +83,43 @@ def run_separate(
             "Run: uv pip install 'audio-separator[gpu]'"
         ) from exc
 
-    sep = Separator(output_dir=str(output_dir), output_format="WAV")
+    sep = Separator(output_dir=str(resolved_output), output_format="WAV")
+    if stems == 6:
+        sep.load_model(model_filename=SIX_STEM_MODEL)
+        files = sep.separate(str(resolved_input))
+        vocal_file = pick_stem(files, VOCAL_TAGS, resolved_output)
+        if dereverb and vocal_file and vocal_file.exists():
+            sep.load_model(model_filename="deverb_bs_roformer_8_384dim_10depth.ckpt")
+            deverb_files = sep.separate(str(vocal_file))
+            vocal_file = (
+                pick_stem(deverb_files, DRY_TAGS, resolved_output) or vocal_file
+            )
+        drums = pick_stem(files, DRUMS_TAGS, resolved_output)
+        bass = pick_stem(files, BASS_TAGS, resolved_output)
+        guitar = pick_stem(files, GUITAR_TAGS, resolved_output)
+        keys = pick_stem(files, KEYS_TAGS, resolved_output)
+        other = pick_stem(files, INSTRUMENTAL_TAGS, resolved_output)
+        return {
+            "vocals": str(vocal_file) if vocal_file else None,
+            "drums": str(drums) if drums else None,
+            "bass": str(bass) if bass else None,
+            "guitar": str(guitar) if guitar else None,
+            "keys": str(keys) if keys else None,
+            "other": str(other) if other else None,
+        }
+
     # 1. Mel-Band-RoFormer Kim Vocal (MIT license, ~11 dB SDR)
     sep.load_model(model_filename="model_mel_band_roformer_kim_vocals.ckpt")
-    primary_files = sep.separate(str(input_path))
+    primary_files = sep.separate(str(resolved_input))
 
-    vocal_file = pick_stem(primary_files, VOCAL_TAGS, output_dir)
-    inst_file = pick_stem(primary_files, INSTRUMENTAL_TAGS, output_dir)
+    vocal_file = pick_stem(primary_files, VOCAL_TAGS, resolved_output)
+    inst_file = pick_stem(primary_files, INSTRUMENTAL_TAGS, resolved_output)
 
     # 2. Optional BS-RoFormer De-Reverb on isolated vocal stem
     if dereverb and vocal_file and vocal_file.exists():
         sep.load_model(model_filename="deverb_bs_roformer_8_384dim_10depth.ckpt")
         deverb_files = sep.separate(str(vocal_file))
-        vocal_file = pick_stem(deverb_files, DRY_TAGS, output_dir) or vocal_file
+        vocal_file = pick_stem(deverb_files, DRY_TAGS, resolved_output) or vocal_file
 
     return {
         "vocals": str(vocal_file) if vocal_file else None,
@@ -98,6 +129,31 @@ def run_separate(
         "keys": None,
         "other": str(inst_file) if inst_file else None,
     }
+
+
+def run_transcribe(input_path: Path, output_dir: Path) -> dict[str, str]:
+    """Run polyphonic audio-to-MIDI transcription via Spotify basic-pitch."""
+    resolved_input = input_path.resolve()
+    if not resolved_input.is_file():
+        raise FileNotFoundError(f"Input audio file not found: {resolved_input}")
+    resolved_output = output_dir.resolve()
+    resolved_output.mkdir(parents=True, exist_ok=True)
+    try:
+        from basic_pitch.inference import predict
+    except ImportError as exc:
+        raise RuntimeError(
+            "basic-pitch is not installed in the worker venv. "
+            "Run: uv pip install basic-pitch"
+        ) from exc
+
+    _model_output, midi_data, _note_events = predict(str(resolved_input))
+    out_midi = (
+        resolved_output / f"{_safe_stem(resolved_input)}_basic_pitch.mid"
+    ).resolve()
+    if not out_midi.is_relative_to(resolved_output):
+        raise ValueError(f"Refusing to write outside output directory: {out_midi}")
+    midi_data.write(str(out_midi))
+    return {"midi": str(out_midi)}
 
 
 def _safe_stem(path: Path) -> str:
@@ -229,11 +285,19 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sep_p = sub.add_parser(
-        "separate", help="Run Mel-Band-RoFormer + BS-RoFormer De-Reverb"
+        "separate",
+        help="Run Mel-Band-RoFormer (2-stem) or HTDemucs (6-stem) separation",
     )
     sep_p.add_argument("--input", type=Path, required=True)
     sep_p.add_argument("--output-dir", type=Path, required=True)
     sep_p.add_argument("--no-dereverb", action="store_true")
+    sep_p.add_argument("--stems", type=int, default=2, choices=[2, 6])
+
+    tr_p = sub.add_parser(
+        "transcribe", help="Run polyphonic audio-to-MIDI transcription via basic-pitch"
+    )
+    tr_p.add_argument("--input", type=Path, required=True)
+    tr_p.add_argument("--output-dir", type=Path, required=True)
 
     den_p = sub.add_parser(
         "denoise", help="Run neural denoising (DeepFilterNet3 / Mel-Band-RoFormer)"
@@ -271,8 +335,14 @@ def main() -> int:
     try:
         if args.command == "separate":
             res = run_separate(
-                args.input, args.output_dir, dereverb=not args.no_dereverb
+                args.input,
+                args.output_dir,
+                dereverb=not args.no_dereverb,
+                stems=args.stems,
             )
+            print(json.dumps(res))
+        elif args.command == "transcribe":
+            res = run_transcribe(args.input, args.output_dir)
             print(json.dumps(res))
         elif args.command == "denoise":
             res = run_denoise(
