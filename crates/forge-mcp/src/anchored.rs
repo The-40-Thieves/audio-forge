@@ -73,17 +73,6 @@ impl PathSandbox {
         })
     }
 
-    /// Confirms `path` is a regular file reachable inside its root.
-    pub fn verify_file(&self, path: &Path) -> Result<(), ForgeError> {
-        self.anchored(path, |dir, rel| {
-            if dir.open(rel)?.metadata()?.is_file() {
-                Ok(())
-            } else {
-                Err(io::Error::other("not a regular file"))
-            }
-        })
-    }
-
     /// Confirms `path` is a directory reachable inside its root.
     pub fn verify_dir(&self, path: &Path) -> Result<(), ForgeError> {
         self.anchored(path, |dir, rel| {

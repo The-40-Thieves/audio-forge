@@ -1,0 +1,32 @@
+---
+# Codacy Static Code Analysis configuration for ForgeAudio (audio-forge)
+# Focuses static analysis on production Rust, Python, and JSFX sources while excluding
+# vendored crates, build outputs, generated artifacts, and test fixtures.
+
+exclude_paths:
+  - "vendor/**"
+  - "target/**"
+  - "**/tests/**"
+  - "python-worker/test_*.py"
+  - "docs/**"
+  - ".entire/**"
+  - ".github/**"
+  - "assets/**"
+
+engines:
+  clippy:
+    enabled: true
+  pylint:
+    enabled: false
+  ruff:
+    enabled: true
+  duplication:
+    enabled: true
+    exclude_paths:
+      - "plugins/**"
+      - "crates/forge-plug/**"
+  metrics:
+    enabled: true
+    exclude_paths:
+      - "crates/forge-dsp/**"
+      - "crates/forge-plug/**"
