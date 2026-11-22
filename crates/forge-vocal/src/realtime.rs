@@ -63,6 +63,10 @@ pub struct RealtimeVocalTune {
     retune_speed_ms: f64,
     retune_amount: f64,
     humanize: f64,
+    formant_shift_st: f64,
+    formant_eq_l: forge_dsp::Biquad,
+    formant_eq_r: forge_dsp::Biquad,
+    applied_formant_st: f64,
     wet_mix: f64,
     current_ratio: f64,
     target_ratio: f64,
@@ -73,7 +77,7 @@ pub struct RealtimeVocalTune {
 
 impl RealtimeVocalTune {
     const RING_LEN: usize = 8192;
-    const YIN_WIN: usize = 1024;
+    const YIN_WIN: usize = 2048;
     const YIN_HOP: usize = 128;
 
     pub fn new(sample_rate: f64) -> Self {
@@ -106,6 +110,10 @@ impl RealtimeVocalTune {
             retune_speed_ms: 25.0,
             retune_amount: 0.85,
             humanize: 0.15,
+            formant_shift_st: 0.0,
+            formant_eq_l: forge_dsp::Biquad::peaking_eq(sr, 1200.0, 0.8, 0.0),
+            formant_eq_r: forge_dsp::Biquad::peaking_eq(sr, 1200.0, 0.8, 0.0),
+            applied_formant_st: 0.0,
             wet_mix: 1.0,
             current_ratio: 1.0,
             target_ratio: 1.0,
@@ -139,12 +147,15 @@ impl RealtimeVocalTune {
         self.detected_hz = 0.0;
         self.target_hz = 0.0;
         self.correction_cents = 0.0;
+        self.formant_eq_l = forge_dsp::Biquad::peaking_eq(sr, 1200.0, 0.8, 0.0);
+        self.formant_eq_r = forge_dsp::Biquad::peaking_eq(sr, 1200.0, 0.8, 0.0);
+        self.applied_formant_st = 0.0;
     }
 
-    /// Algorithmic latency in samples (`grain_len / 2`, ~`10.7 ms` at 48 kHz).
+    /// Algorithmic latency in samples (`grain_len / 2 + 16`, matching the latency-aligned dry tap).
     #[inline]
     pub fn latency_samples(&self) -> u32 {
-        (self.grain_len / 2) as u32
+        (self.grain_len / 2 + 16) as u32
     }
 
     #[inline]
@@ -178,6 +189,23 @@ impl RealtimeVocalTune {
         } else {
             0.15
         };
+    }
+
+    #[inline]
+    pub fn set_formant_shift_st(&mut self, semitones: f64) {
+        self.formant_shift_st = if semitones.is_finite() {
+            semitones.clamp(-12.0, 12.0)
+        } else {
+            0.0
+        };
+        if (self.formant_shift_st - self.applied_formant_st).abs() > 0.05 {
+            self.applied_formant_st = self.formant_shift_st;
+            let fc = (1200.0 * 2.0_f64.powf(self.formant_shift_st / 18.0)).clamp(350.0, 4200.0);
+            let gain_db = (self.formant_shift_st * 0.45).clamp(-5.5, 5.5);
+            let design = forge_dsp::Biquad::peaking_eq(self.sample_rate, fc, 0.85, gain_db);
+            self.formant_eq_l.set_coeffs(&design);
+            self.formant_eq_r.set_coeffs(&design);
+        }
     }
 
     #[inline]
@@ -363,28 +391,45 @@ impl RealtimeVocalTune {
             self.current_ratio = alpha * self.current_ratio + (1.0 - alpha) * self.target_ratio;
         }
 
-        // Dual-grain Hann-windowed PSOLA ring-buffer pitch shifter (stereo-locked)
-        let g = self.grain_len as f64;
-        let rate = 1.0 - self.current_ratio;
-        self.grain_phase = (self.grain_phase + rate).rem_euclid(g);
-        let phase_a = self.grain_phase;
-        let phase_b = (phase_a + g * 0.5).rem_euclid(g);
-
-        let w_a = 0.5 * (1.0 - (2.0 * PI * phase_a / g).cos());
-        let w_b = 1.0 - w_a;
-
-        let delay_a = phase_a + 16.0;
-        let delay_b = phase_b + 16.0;
-
-        let wet_l = w_a * Self::read_linear(&self.ring_l, self.ring_mask, self.write_pos, delay_a)
-            + w_b * Self::read_linear(&self.ring_l, self.ring_mask, self.write_pos, delay_b);
-        let wet_r = w_a * Self::read_linear(&self.ring_r, self.ring_mask, self.write_pos, delay_a)
-            + w_b * Self::read_linear(&self.ring_r, self.ring_mask, self.write_pos, delay_b);
-
         // Latency-aligned dry tap (grain_len / 2 + 16)
         let dry_delay = (self.grain_len / 2 + 16) as f64;
         let dry_l = Self::read_linear(&self.ring_l, self.ring_mask, self.write_pos, dry_delay);
         let dry_r = Self::read_linear(&self.ring_r, self.ring_mask, self.write_pos, dry_delay);
+
+        // When correction is effectively off (ratio == 1.0 and amount == 0), bypass grain shift
+        // transparently so disabling correction never colors vocal tone.
+        let (mut wet_l, mut wet_r) = if self.retune_amount <= 1e-4
+            && (self.current_ratio - 1.0).abs() < 1e-4
+        {
+            self.target_ratio = 1.0;
+            (dry_l, dry_r)
+        } else {
+            let g = self.grain_len as f64;
+            let rate = 1.0 - self.current_ratio;
+            self.grain_phase = (self.grain_phase + rate).rem_euclid(g);
+            let phase_a = self.grain_phase;
+            let phase_b = (phase_a + g * 0.5).rem_euclid(g);
+
+            let w_a = 0.5 * (1.0 - (2.0 * PI * phase_a / g).cos());
+            let w_b = 1.0 - w_a;
+
+            let delay_a = phase_a + 16.0;
+            let delay_b = phase_b + 16.0;
+
+            (
+                w_a * Self::read_linear(&self.ring_l, self.ring_mask, self.write_pos, delay_a)
+                    + w_b
+                        * Self::read_linear(&self.ring_l, self.ring_mask, self.write_pos, delay_b),
+                w_a * Self::read_linear(&self.ring_r, self.ring_mask, self.write_pos, delay_a)
+                    + w_b
+                        * Self::read_linear(&self.ring_r, self.ring_mask, self.write_pos, delay_b),
+            )
+        };
+
+        if self.applied_formant_st.abs() > 0.05 {
+            wet_l = self.formant_eq_l.process_sample(wet_l);
+            wet_r = self.formant_eq_r.process_sample(wet_r);
+        }
 
         self.write_pos = self.write_pos.wrapping_add(1);
 

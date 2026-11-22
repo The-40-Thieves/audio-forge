@@ -21,8 +21,7 @@ mod ui;
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(test)]
 use forge_dsp::read_shared_spectrum;
@@ -3103,9 +3102,39 @@ impl Vst3Plugin for ForgeSpaceVerbAndPreampPlug {
 // 11. FORGE VOCAL TUNE (REAL-TIME LOW-LATENCY YIN + PSOLA PITCH CORRECTOR)
 // ============================================================================
 
+/// Lock-free pitch tracking readout shared between `ForgeVocalTunePlug`'s audio thread and GUI.
+#[derive(Default)]
+struct VocalPitchTelemetry {
+    detected_hz: AtomicU32,
+    target_hz: AtomicU32,
+    correction_cents: AtomicU32,
+}
+
+impl VocalPitchTelemetry {
+    #[inline]
+    fn update(&self, detected: f64, target: f64, cents: f64) {
+        self.detected_hz
+            .store((detected as f32).to_bits(), Ordering::Relaxed);
+        self.target_hz
+            .store((target as f32).to_bits(), Ordering::Relaxed);
+        self.correction_cents
+            .store((cents as f32).to_bits(), Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn snapshot(&self) -> (f32, f32, f32) {
+        (
+            f32::from_bits(self.detected_hz.load(Ordering::Relaxed)),
+            f32::from_bits(self.target_hz.load(Ordering::Relaxed)),
+            f32::from_bits(self.correction_cents.load(Ordering::Relaxed)),
+        )
+    }
+}
+
 pub struct ForgeVocalTunePlug {
     params: Arc<VocalTuneParams>,
     telemetry: Arc<GuiTelemetry>,
+    pitch_telemetry: Arc<VocalPitchTelemetry>,
     analyzer: RealtimeSpectrumAnalyzer32,
     dsp: RealtimeVocalTune,
     sample_rate: f64,
@@ -3125,6 +3154,8 @@ pub struct VocalTuneParams {
     pub retune_amount: FloatParam,
     #[id = "human"]
     pub humanize: FloatParam,
+    #[id = "formant"]
+    pub formant_shift_st: FloatParam,
     #[id = "mix"]
     pub wet_mix: FloatParam,
 }
@@ -3191,6 +3222,16 @@ impl Default for VocalTuneParams {
             )
             .with_value_to_string(formatters::v2s_f32_percentage(0))
             .with_string_to_value(formatters::s2v_f32_percentage()),
+            formant_shift_st: FloatParam::new(
+                "Formant Shift",
+                0.0,
+                FloatRange::Linear {
+                    min: -12.0,
+                    max: 12.0,
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(1))
+            .with_unit(" st"),
             wet_mix: FloatParam::new("Wet Mix", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
                 .with_value_to_string(formatters::v2s_f32_percentage(0))
                 .with_string_to_value(formatters::s2v_f32_percentage()),
@@ -3203,6 +3244,7 @@ impl Default for ForgeVocalTunePlug {
         Self {
             params: Arc::new(VocalTuneParams::default()),
             telemetry: Arc::new(GuiTelemetry::default()),
+            pitch_telemetry: Arc::new(VocalPitchTelemetry::default()),
             analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
             dsp: RealtimeVocalTune::new(48_000.0),
             sample_rate: 48_000.0,
@@ -3234,6 +3276,7 @@ impl Plugin for ForgeVocalTunePlug {
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         let params = self.params.clone();
         let telemetry = self.telemetry.clone();
+        let pitch_tel = self.pitch_telemetry.clone();
         create_egui_editor(
             self.params.editor_state.clone(),
             AbBankState::default(),
@@ -3243,16 +3286,32 @@ impl Plugin for ForgeVocalTunePlug {
                     draw_forge_studio_header_and_spectrum(
                         ui,
                         "FORGE VOCAL TUNE",
-                        "Low-Latency Streaming YIN F0 + Scale-Locked Dual-Grain PSOLA Pitch Corrector (~10.7 ms)",
+                        "Low-Latency Streaming YIN F0 + Scale-Locked Dual-Grain PSOLA Pitch Corrector",
                         &telemetry,
                         None,
                     );
+                    let (det_hz, tgt_hz, cents) = pitch_tel.snapshot();
+                    let pitch_text = if det_hz > 20.0 {
+                        format!(
+                            "LIVE PITCH   Detected: {:6.1} Hz  ->  Target: {:6.1} Hz  ({:+5.1} ct)",
+                            det_hz, tgt_hz, cents
+                        )
+                    } else {
+                        "LIVE PITCH   Unvoiced / Silence".to_string()
+                    };
+                    ui.label(
+                        egui::RichText::new(pitch_text)
+                            .monospace()
+                            .color(egui::Color32::from_rgb(56, 189, 248)),
+                    );
+                    ui.add_space(4.0);
                     let param_refs = [
                         ("key", ParamRef::Int(&params.key_root)),
                         ("scale", ParamRef::Int(&params.scale_mode)),
                         ("speed", ParamRef::Float(&params.retune_speed_ms)),
                         ("amt", ParamRef::Float(&params.retune_amount)),
                         ("human", ParamRef::Float(&params.humanize)),
+                        ("formant", ParamRef::Float(&params.formant_shift_st)),
                         ("mix", ParamRef::Float(&params.wet_mix)),
                     ];
                     draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, VOCAL_TUNE_PRESETS);
@@ -3280,6 +3339,12 @@ impl Plugin for ForgeVocalTunePlug {
                             ui.end_row();
                             ui.label("Humanize (Vibrato)");
                             ui.add(widgets::ParamSlider::for_param(&params.humanize, setter));
+                            ui.end_row();
+                            ui.label("Formant Shift (st)");
+                            ui.add(widgets::ParamSlider::for_param(
+                                &params.formant_shift_st,
+                                setter,
+                            ));
                             ui.end_row();
                             ui.label("Wet Mix");
                             ui.add(widgets::ParamSlider::for_param(&params.wet_mix, setter));
@@ -3328,6 +3393,8 @@ impl Plugin for ForgeVocalTunePlug {
             .set_retune_amount(f64::from(self.params.retune_amount.value()));
         self.dsp
             .set_humanize(f64::from(self.params.humanize.value()));
+        self.dsp
+            .set_formant_shift_st(f64::from(self.params.formant_shift_st.value()));
         self.dsp.set_wet_mix(f64::from(self.params.wet_mix.value()));
 
         for mut channel_samples in buffer.iter_samples() {
@@ -3345,6 +3412,11 @@ impl Plugin for ForgeVocalTunePlug {
                 *s1 = out_r;
             }
         }
+        self.pitch_telemetry.update(
+            self.dsp.detected_hz(),
+            self.dsp.target_hz(),
+            self.dsp.correction_cents(),
+        );
         let corr_vis = (self.dsp.correction_cents() / 25.0) as f32;
         self.telemetry
             .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &[corr_vis; 32]);
