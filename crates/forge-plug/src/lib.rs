@@ -37,8 +37,53 @@ use forge_dsp::{
 use nih_plug::prelude::*;
 use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
 
-pub use ui::GuiTelemetry;
-use ui::draw_forge_studio_header_and_spectrum;
+pub use ui::{AbBankState, FactoryPreset, GuiTelemetry, ParamRef};
+use ui::{draw_ab_and_presets_bar, draw_forge_studio_header_and_spectrum};
+
+const OPENSOOTHE_PRESETS: &[FactoryPreset] = &[
+    FactoryPreset {
+        name: "Vocal De-Harsh",
+        values: &[
+            ("sens", 0.25),
+            ("depth", 0.35),
+            ("sharp", 0.25),
+            ("delta", 0.0),
+        ],
+    },
+    FactoryPreset {
+        name: "AI Fizz Rescue",
+        values: &[
+            ("sens", 0.15),
+            ("depth", 0.60),
+            ("sharp", 0.35),
+            ("delta", 0.0),
+        ],
+    },
+    FactoryPreset {
+        name: "Gentle Master",
+        values: &[
+            ("sens", 0.40),
+            ("depth", 0.20),
+            ("sharp", 0.50),
+            ("delta", 0.0),
+        ],
+    },
+];
+
+const LIMITER_PRESETS: &[FactoryPreset] = &[
+    FactoryPreset {
+        name: "Spotify -1 dBTP",
+        values: &[("drive", 0.45), ("ceil", 0.85), ("rel", 0.18)],
+    },
+    FactoryPreset {
+        name: "Club Loud",
+        values: &[("drive", 0.65), ("ceil", 0.90), ("rel", 0.08)],
+    },
+    FactoryPreset {
+        name: "Transparent Master",
+        values: &[("drive", 0.40), ("ceil", 0.85), ("rel", 0.35)],
+    },
+];
 
 // ============================================================================
 // 1. FORGE OPENSOOTHE DE-FIZZ (CLAP + VST3 Flagship)
@@ -254,9 +299,9 @@ impl Plugin for ForgeOpenSoothePlug {
         let telemetry = self.telemetry.clone();
         create_egui_editor(
             self.params.editor_state.clone(),
-            (),
+            AbBankState::default(),
             |_, _| {},
-            move |egui_ctx, setter, _state| {
+            move |egui_ctx, setter, ab_state| {
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
                     let slot = shared_spectrum_slot_index(params.shared_bus_slot.value() as usize);
                     draw_forge_studio_header_and_spectrum(
@@ -266,6 +311,17 @@ impl Plugin for ForgeOpenSoothePlug {
                         &telemetry,
                         slot,
                     );
+                    let param_refs = [
+                        ("sens", ParamRef::Float(&params.sensitivity_db)),
+                        ("depth", ParamRef::Float(&params.max_depth_db)),
+                        ("sharp", ParamRef::Int(&params.sharpness_bins)),
+                        ("delta", ParamRef::Bool(&params.delta_listen)),
+                        ("submono", ParamRef::Bool(&params.enable_sub_tape)),
+                        ("tape", ParamRef::Float(&params.tape_drive)),
+                        ("limit", ParamRef::Bool(&params.enable_limiter)),
+                        ("ceil", ParamRef::Float(&params.ceiling_dbtp)),
+                    ];
+                    draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, OPENSOOTHE_PRESETS);
                     egui::Grid::new("opensoothe_grid")
                         .num_columns(2)
                         .spacing([16.0, 8.0])
@@ -1199,9 +1255,9 @@ impl Plugin for ForgeMasterLimiterPlug {
         let telemetry = self.telemetry.clone();
         create_egui_editor(
             self.params.editor_state.clone(),
-            (),
+            AbBankState::default(),
             |_, _| {},
-            move |egui_ctx, setter, _state| {
+            move |egui_ctx, setter, ab_state| {
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
                     draw_forge_studio_header_and_spectrum(
                         ui,
@@ -1210,6 +1266,12 @@ impl Plugin for ForgeMasterLimiterPlug {
                         &telemetry,
                         None,
                     );
+                    let param_refs = [
+                        ("drive", ParamRef::Float(&params.drive_db)),
+                        ("ceil", ParamRef::Float(&params.ceiling_dbtp)),
+                        ("rel", ParamRef::Float(&params.release_ms)),
+                    ];
+                    draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, LIMITER_PRESETS);
                     egui::Grid::new("limiter_grid")
                         .num_columns(2)
                         .spacing([16.0, 8.0])
@@ -1257,8 +1319,9 @@ impl Plugin for ForgeMasterLimiterPlug {
             let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
             let (out_l, out_r) = self.dsp.process_stereo_sample(in_l, in_r, drive, ceil, rel);
             self.analyzer.push_stereo_sample(out_l, out_r);
-            let (_lufs, _dbtp, gr) = self.dsp.telemetry();
+            let (lufs, dbtp, gr) = self.dsp.telemetry();
             self.telemetry.update_peaks(in_l, in_r, out_l, out_r, -gr);
+            self.telemetry.update_loudness_and_tp(lufs, dbtp);
             if let Some(s0) = channel_samples.get_mut(0) {
                 *s0 = out_l;
             }

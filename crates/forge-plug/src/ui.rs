@@ -4,7 +4,225 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use forge_dsp::read_shared_spectrum;
+use nih_plug::prelude::{BoolParam, FloatParam, IntParam, Param, ParamSetter};
 use nih_plug_egui::egui;
+
+/// Sentinel stored in `GuiTelemetry::lufs_momentary` / `true_peak_dbtp` when a plugin does not
+/// publish K-weighted loudness telemetry.
+pub const UNSET_LOUDNESS_DB: f32 = -120.0;
+
+/// Safe, zero-`unsafe` handle to any `nih_plug` parameter for A/B state recall and factory presets.
+#[derive(Clone, Copy)]
+pub enum ParamRef<'a> {
+    Float(&'a FloatParam),
+    Int(&'a IntParam),
+    Bool(&'a BoolParam),
+}
+
+impl ParamRef<'_> {
+    #[inline]
+    pub fn normalized(&self) -> f32 {
+        match self {
+            Self::Float(p) => p.unmodulated_normalized_value(),
+            Self::Int(p) => p.unmodulated_normalized_value(),
+            Self::Bool(p) => p.unmodulated_normalized_value(),
+        }
+    }
+
+    #[inline]
+    pub fn set_normalized(&self, setter: &ParamSetter, norm: f32) {
+        let clamped = if norm.is_finite() {
+            norm.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        match self {
+            Self::Float(p) => {
+                setter.begin_set_parameter(*p);
+                setter.set_parameter_normalized(*p, clamped);
+                setter.end_set_parameter(*p);
+            }
+            Self::Int(p) => {
+                setter.begin_set_parameter(*p);
+                setter.set_parameter_normalized(*p, clamped);
+                setter.end_set_parameter(*p);
+            }
+            Self::Bool(p) => {
+                setter.begin_set_parameter(*p);
+                setter.set_parameter_normalized(*p, clamped);
+                setter.end_set_parameter(*p);
+            }
+        }
+    }
+}
+
+/// One curated studio factory preset defined as `(param_id, normalized_value)` pairs.
+#[derive(Debug, Clone, Copy)]
+pub struct FactoryPreset {
+    pub name: &'static str,
+    pub values: &'static [(&'static str, f32)],
+}
+
+/// GUI-thread A/B parameter-bank state holding two full normalized snapshots so switching `A <-> B`
+/// updates both the host automation state and DSP via `ParamSetter`.
+#[derive(Debug, Clone, Default)]
+pub struct AbBankState {
+    pub active_slot: usize,
+    pub slot_a: Vec<(String, f32)>,
+    pub slot_b: Vec<(String, f32)>,
+}
+
+impl AbBankState {
+    /// Captures current normalized values from `params` into both A and B if uninitialized.
+    pub fn ensure_initialized(&mut self, params: &[(&'static str, ParamRef<'_>)]) {
+        if self.slot_a.is_empty() {
+            let snap = snapshot_params(params);
+            self.slot_a = snap.clone();
+            self.slot_b = snap;
+        }
+    }
+
+    /// Switches to `target_slot` (`0` = A, `1` = B): saves current values into the outgoing slot
+    /// and applies the target slot's normalized values through `setter`.
+    pub fn switch_to(
+        &mut self,
+        target_slot: usize,
+        params: &[(&'static str, ParamRef<'_>)],
+        setter: &ParamSetter,
+    ) {
+        let target = usize::from(target_slot != 0);
+        self.ensure_initialized(params);
+        if target == self.active_slot {
+            return;
+        }
+        let current = snapshot_params(params);
+        if self.active_slot == 0 {
+            self.slot_a = current;
+            apply_snapshot(params, setter, &self.slot_b);
+        } else {
+            self.slot_b = current;
+            apply_snapshot(params, setter, &self.slot_a);
+        }
+        self.active_slot = target;
+    }
+
+    /// Copies the active slot's live values into the inactive slot (`A -> B` or `B -> A`).
+    pub fn copy_active_to_other(&mut self, params: &[(&'static str, ParamRef<'_>)]) {
+        let current = snapshot_params(params);
+        if self.active_slot == 0 {
+            self.slot_a = current.clone();
+            self.slot_b = current;
+        } else {
+            self.slot_b = current.clone();
+            self.slot_a = current;
+        }
+    }
+}
+
+/// Captures `(param_id, normalized_value)` for every parameter in `params`.
+pub fn snapshot_params(params: &[(&'static str, ParamRef<'_>)]) -> Vec<(String, f32)> {
+    params
+        .iter()
+        .map(|&(id, pref)| (id.to_string(), pref.normalized()))
+        .collect()
+}
+
+/// Applies `(param_id, normalized_value)` pairs through `ParamSetter` (host-automation safe).
+pub fn apply_snapshot(
+    params: &[(&'static str, ParamRef<'_>)],
+    setter: &ParamSetter,
+    values: &[(String, f32)],
+) {
+    for (target_id, norm) in values {
+        if let Some((_, pref)) = params.iter().find(|(id, _)| *id == target_id.as_str()) {
+            pref.set_normalized(setter, *norm);
+        }
+    }
+}
+
+/// Applies a curated [`FactoryPreset`] through `ParamSetter`.
+pub fn apply_factory_preset(
+    params: &[(&'static str, ParamRef<'_>)],
+    setter: &ParamSetter,
+    preset: &FactoryPreset,
+) {
+    for &(target_id, norm) in preset.values {
+        if let Some((_, pref)) = params.iter().find(|(id, _)| *id == target_id) {
+            pref.set_normalized(setter, norm);
+        }
+    }
+}
+
+/// Renders the studio A/B parameter-bank toolbar (`A`, `B`, `A->B`) and curated factory preset pills.
+pub(crate) fn draw_ab_and_presets_bar(
+    ui: &mut egui::Ui,
+    setter: &ParamSetter,
+    params: &[(&'static str, ParamRef<'_>)],
+    ab: &mut AbBankState,
+    presets: &[FactoryPreset],
+) {
+    ab.ensure_initialized(params);
+    ui.horizontal_wrapped(|ui| {
+        let a_active = ab.active_slot == 0;
+        let active_col = egui::Color32::from_rgb(74, 222, 128);
+        let muted_col = egui::Color32::from_rgb(148, 163, 184);
+
+        if ui
+            .button(
+                egui::RichText::new("A")
+                    .monospace()
+                    .strong()
+                    .color(if a_active { active_col } else { muted_col }),
+            )
+            .on_hover_text("Recall parameter bank A")
+            .clicked()
+        {
+            ab.switch_to(0, params, setter);
+        }
+        if ui
+            .button(
+                egui::RichText::new("B")
+                    .monospace()
+                    .strong()
+                    .color(if !a_active { active_col } else { muted_col }),
+            )
+            .on_hover_text("Recall parameter bank B")
+            .clicked()
+        {
+            ab.switch_to(1, params, setter);
+        }
+        if ui
+            .button(
+                egui::RichText::new(if a_active { "A->B" } else { "B->A" })
+                    .monospace()
+                    .small()
+                    .color(egui::Color32::from_rgb(90, 210, 255)),
+            )
+            .on_hover_text("Copy active bank into inactive bank")
+            .clicked()
+        {
+            ab.copy_active_to_other(params);
+        }
+
+        if !presets.is_empty() {
+            ui.separator();
+            ui.label(
+                egui::RichText::new("Presets:")
+                    .small()
+                    .color(egui::Color32::from_rgb(165, 175, 195)),
+            );
+            for preset in presets {
+                if ui
+                    .button(egui::RichText::new(preset.name).small())
+                    .clicked()
+                {
+                    apply_factory_preset(params, setter, preset);
+                }
+            }
+        }
+    });
+    ui.add_space(4.0);
+}
 
 /// Number of scrolling Gain-Reduction history points rendered across the studio canvas.
 pub const GR_HISTORY_LEN: usize = 64;
@@ -23,6 +241,8 @@ pub struct GuiTelemetry {
     pub peak_out_db: AtomicU32,
     pub peak_hold_out_db: AtomicU32,
     pub gr_db: AtomicU32,
+    pub lufs_momentary: AtomicU32,
+    pub true_peak_dbtp: AtomicU32,
     pub ab_slot: AtomicU32,
     pub spectrum_frozen: AtomicBool,
 }
@@ -40,6 +260,8 @@ impl Default for GuiTelemetry {
             peak_out_db: AtomicU32::new((-90.0_f32).to_bits()),
             peak_hold_out_db: AtomicU32::new((-90.0_f32).to_bits()),
             gr_db: AtomicU32::new(0.0_f32.to_bits()),
+            lufs_momentary: AtomicU32::new(UNSET_LOUDNESS_DB.to_bits()),
+            true_peak_dbtp: AtomicU32::new(UNSET_LOUDNESS_DB.to_bits()),
             ab_slot: AtomicU32::new(0),
             spectrum_frozen: AtomicBool::new(false),
         }
@@ -52,6 +274,25 @@ impl GuiTelemetry {
     pub fn reset_peak_hold(&self) {
         self.peak_hold_out_db
             .store((-90.0_f32).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Publishes lock-free ITU-R BS.1770-4 Momentary LUFS and 4x True-Peak dBTP telemetry.
+    #[inline]
+    pub fn update_loudness_and_tp(&self, lufs_m: f32, tp_dbtp: f32) {
+        let clean_lufs = if lufs_m.is_finite() {
+            lufs_m.clamp(-90.0, 6.0)
+        } else {
+            -90.0
+        };
+        let clean_tp = if tp_dbtp.is_finite() {
+            tp_dbtp.clamp(-90.0, 12.0)
+        } else {
+            -90.0
+        };
+        self.lufs_momentary
+            .store(clean_lufs.to_bits(), Ordering::Relaxed);
+        self.true_peak_dbtp
+            .store(clean_tp.to_bits(), Ordering::Relaxed);
     }
 
     /// Toggles live spectrum, shared-bus ghost, and GR history freeze and returns the new state.
@@ -326,6 +567,21 @@ pub(crate) fn draw_forge_studio_header_and_spectrum(
             {
                 telemetry.toggle_spectrum_freeze(shared_slot);
             }
+
+            let lufs_m = f32::from_bits(telemetry.lufs_momentary.load(Ordering::Relaxed));
+            let tp_dbtp = f32::from_bits(telemetry.true_peak_dbtp.load(Ordering::Relaxed));
+            if lufs_m > UNSET_LOUDNESS_DB + 1.0 && tp_dbtp > UNSET_LOUDNESS_DB + 1.0 {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "M {:+5.1} LUFS | TP {:+5.1} dBTP",
+                        lufs_m, tp_dbtp
+                    ))
+                    .monospace()
+                    .small()
+                    .color(egui::Color32::from_rgb(192, 132, 252)),
+                );
+            }
         });
     });
     ui.add_space(4.0);
@@ -565,6 +821,28 @@ mod tests {
         assert_eq!(
             f32::from_bits(tel.spectrum_db[0].load(Ordering::Relaxed)),
             -6.0
+        );
+    }
+
+    #[test]
+    fn loudness_and_tp_telemetry_updates_and_sanitizes() {
+        let tel = GuiTelemetry::default();
+        tel.update_loudness_and_tp(-14.2, -1.05);
+        assert!(
+            (f32::from_bits(tel.lufs_momentary.load(Ordering::Relaxed)) - (-14.2)).abs() < 1e-4
+        );
+        assert!(
+            (f32::from_bits(tel.true_peak_dbtp.load(Ordering::Relaxed)) - (-1.05)).abs() < 1e-4
+        );
+
+        tel.update_loudness_and_tp(f32::NAN, f32::INFINITY);
+        assert_eq!(
+            f32::from_bits(tel.lufs_momentary.load(Ordering::Relaxed)),
+            -90.0
+        );
+        assert_eq!(
+            f32::from_bits(tel.true_peak_dbtp.load(Ordering::Relaxed)),
+            -90.0
         );
     }
 }
