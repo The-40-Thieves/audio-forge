@@ -304,6 +304,20 @@ pub struct OpenSootheParams {
     pub stereo_link: FloatParam,
     #[id = "msbal"]
     pub mid_side_balance: FloatParam,
+    #[id = "lowlat"]
+    pub low_latency_mode: BoolParam,
+    #[id = "atk"]
+    pub attack_ms: FloatParam,
+    #[id = "rel"]
+    pub release_ms: FloatParam,
+    #[id = "hard"]
+    pub hard_mode: BoolParam,
+    #[id = "foc_lo"]
+    pub focus_low_db: FloatParam,
+    #[id = "foc_mid"]
+    pub focus_mid_db: FloatParam,
+    #[id = "foc_hi"]
+    pub focus_high_db: FloatParam,
 }
 
 impl Default for OpenSootheParams {
@@ -391,6 +405,60 @@ impl Default for OpenSootheParams {
                 },
             )
             .with_value_to_string(formatters::v2s_f32_rounded(2)),
+            low_latency_mode: BoolParam::new("Low-Latency Tracking", false),
+            attack_ms: FloatParam::new(
+                "Attack",
+                10.0,
+                FloatRange::Skewed {
+                    min: 1.0,
+                    max: 100.0,
+                    factor: FloatRange::skew_factor(-1.5),
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(1))
+            .with_unit(" ms"),
+            release_ms: FloatParam::new(
+                "Release",
+                55.0,
+                FloatRange::Skewed {
+                    min: 10.0,
+                    max: 500.0,
+                    factor: FloatRange::skew_factor(-1.5),
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(1))
+            .with_unit(" ms"),
+            hard_mode: BoolParam::new("Hard Mode (Surgical)", false),
+            focus_low_db: FloatParam::new(
+                "Focus Low (<400 Hz)",
+                0.0,
+                FloatRange::Linear {
+                    min: -12.0,
+                    max: 12.0,
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(1))
+            .with_unit(" dB"),
+            focus_mid_db: FloatParam::new(
+                "Focus Mid (0.4-4 kHz)",
+                0.0,
+                FloatRange::Linear {
+                    min: -12.0,
+                    max: 12.0,
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(1))
+            .with_unit(" dB"),
+            focus_high_db: FloatParam::new(
+                "Focus High (>4 kHz)",
+                0.0,
+                FloatRange::Linear {
+                    min: -12.0,
+                    max: 12.0,
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(1))
+            .with_unit(" dB"),
         }
     }
 }
@@ -528,6 +596,13 @@ impl Plugin for ForgeOpenSoothePlug {
                         ("tilt", ParamRef::Float(&params.tilt_db_per_oct)),
                         ("slink", ParamRef::Float(&params.stereo_link)),
                         ("ms", ParamRef::Float(&params.mid_side_balance)),
+                        ("lowlat", ParamRef::Bool(&params.low_latency_mode)),
+                        ("atk", ParamRef::Float(&params.attack_ms)),
+                        ("rel", ParamRef::Float(&params.release_ms)),
+                        ("hard", ParamRef::Bool(&params.hard_mode)),
+                        ("foc_lo", ParamRef::Float(&params.focus_low_db)),
+                        ("foc_mid", ParamRef::Float(&params.focus_mid_db)),
+                        ("foc_hi", ParamRef::Float(&params.focus_high_db)),
                     ];
                     draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, OPENSOOTHE_PRESETS);
                     egui::ScrollArea::vertical()
@@ -580,6 +655,34 @@ impl Plugin for ForgeOpenSoothePlug {
                                     ui.label("Mid/Side Focus (-1 M .. +1 S)");
                                     ui.add(widgets::ParamSlider::for_param(&params.mid_side_balance, setter));
                                     ui.end_row();
+
+                                    ui.label("Low-Latency Tracking (~5.3 ms)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.low_latency_mode, setter));
+                                    ui.end_row();
+
+                                    ui.label("Attack (ms)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.attack_ms, setter));
+                                    ui.end_row();
+
+                                    ui.label("Release (ms)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.release_ms, setter));
+                                    ui.end_row();
+
+                                    ui.label("Hard Mode (Surgical vs Soft)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.hard_mode, setter));
+                                    ui.end_row();
+
+                                    ui.label("Focus Low (<400 Hz)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.focus_low_db, setter));
+                                    ui.end_row();
+
+                                    ui.label("Focus Mid (0.4-4 kHz)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.focus_mid_db, setter));
+                                    ui.end_row();
+
+                                    ui.label("Focus High (>4 kHz)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.focus_high_db, setter));
+                                    ui.end_row();
                                 });
                         });
                 });
@@ -594,6 +697,8 @@ impl Plugin for ForgeOpenSoothePlug {
         context: &mut impl InitContext<Self>,
     ) -> bool {
         self.sample_rate = f64::from(buffer_config.sample_rate);
+        self.dsp
+            .set_low_latency(self.params.low_latency_mode.value());
         self.reset();
         context.set_latency_samples(self.latency_samples());
         true
@@ -611,8 +716,13 @@ impl Plugin for ForgeOpenSoothePlug {
         &mut self,
         buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
-        _context: &mut impl ProcessContext<Self>,
+        context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        let low_lat = self.params.low_latency_mode.value();
+        if low_lat != self.dsp.is_low_latency() {
+            self.dsp.set_low_latency(low_lat);
+            context.set_latency_samples(self.latency_samples());
+        }
         let sharp = self.params.sharpness_bins.value() as usize;
         let delta = self.params.delta_listen.value();
         let use_sub_tape = self.params.enable_sub_tape.value();
@@ -625,6 +735,16 @@ impl Plugin for ForgeOpenSoothePlug {
             .set_stereo_link(f64::from(self.params.stereo_link.value()));
         self.dsp
             .set_mid_side_balance(f64::from(self.params.mid_side_balance.value()));
+        self.dsp
+            .set_attack_ms(f64::from(self.params.attack_ms.value()));
+        self.dsp
+            .set_release_ms(f64::from(self.params.release_ms.value()));
+        self.dsp.set_hard_mode(self.params.hard_mode.value());
+        self.dsp.set_focus_eq(
+            f64::from(self.params.focus_low_db.value()),
+            f64::from(self.params.focus_mid_db.value()),
+            f64::from(self.params.focus_high_db.value()),
+        );
 
         for mut channel_samples in buffer.iter_samples() {
             let sens = f64::from(self.params.sensitivity_db.smoothed.next());
