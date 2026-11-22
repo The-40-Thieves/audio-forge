@@ -37,7 +37,7 @@ use forge_dsp::{
 use nih_plug::prelude::*;
 use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
 
-pub use ui::{AbBankState, FactoryPreset, GuiTelemetry, ParamRef};
+pub use ui::{AbBankState, FactoryPreset, GuiTelemetry, OutputLoudnessMeter, ParamRef};
 use ui::{draw_ab_and_presets_bar, draw_forge_studio_header_and_spectrum};
 
 const OPENSOOTHE_PRESETS: &[FactoryPreset] = &[
@@ -48,6 +48,10 @@ const OPENSOOTHE_PRESETS: &[FactoryPreset] = &[
             ("depth", 0.35),
             ("sharp", 0.25),
             ("delta", 0.0),
+            ("submono", 0.0),
+            ("tape", 0.0),
+            ("limit", 0.0),
+            ("ceil", 0.85),
         ],
     },
     FactoryPreset {
@@ -57,6 +61,10 @@ const OPENSOOTHE_PRESETS: &[FactoryPreset] = &[
             ("depth", 0.60),
             ("sharp", 0.35),
             ("delta", 0.0),
+            ("submono", 1.0),
+            ("tape", 0.15),
+            ("limit", 1.0),
+            ("ceil", 0.85),
         ],
     },
     FactoryPreset {
@@ -66,6 +74,75 @@ const OPENSOOTHE_PRESETS: &[FactoryPreset] = &[
             ("depth", 0.20),
             ("sharp", 0.50),
             ("delta", 0.0),
+            ("submono", 0.0),
+            ("tape", 0.10),
+            ("limit", 1.0),
+            ("ceil", 0.85),
+        ],
+    },
+];
+
+const OPENSPACER_PRESETS: &[FactoryPreset] = &[
+    FactoryPreset {
+        name: "Vocal Pocket",
+        values: &[
+            ("amt", 0.45),
+            ("maxcut", 0.35),
+            ("lowhz", 0.18),
+            ("highhz", 0.45),
+            ("kickmode", 0.0),
+        ],
+    },
+    FactoryPreset {
+        name: "Kick -> Sub",
+        values: &[
+            ("amt", 0.65),
+            ("maxcut", 0.50),
+            ("lowhz", 0.02),
+            ("highhz", 0.08),
+            ("kickmode", 1.0),
+        ],
+    },
+];
+
+const VOCAL_SURGICAL_PRESETS: &[FactoryPreset] = &[
+    FactoryPreset {
+        name: "Clean Lead",
+        values: &[
+            ("declick", 0.40),
+            ("deplosive", 0.45),
+            ("deess", 0.55),
+            ("gate", 0.35),
+        ],
+    },
+    FactoryPreset {
+        name: "Broadcast Dry",
+        values: &[
+            ("declick", 0.60),
+            ("deplosive", 0.70),
+            ("deess", 0.45),
+            ("gate", 0.50),
+        ],
+    },
+];
+
+const SUB_TAPE_PRESETS: &[FactoryPreset] = &[
+    FactoryPreset {
+        name: "Tight Club Sub",
+        values: &[
+            ("cutoff", 0.38),
+            ("sub", 0.35),
+            ("width", 0.55),
+            ("drive", 0.25),
+        ],
+    },
+    FactoryPreset {
+        name: "Warm 15 IPS",
+        values: &[
+            ("cutoff", 0.30),
+            ("sub", 0.20),
+            ("width", 0.50),
+            ("drive", 0.55),
         ],
     },
 ];
@@ -82,6 +159,103 @@ const LIMITER_PRESETS: &[FactoryPreset] = &[
     FactoryPreset {
         name: "Transparent Master",
         values: &[("drive", 0.40), ("ceil", 0.85), ("rel", 0.35)],
+    },
+];
+
+const DRUM_TRIGGER_PRESETS: &[FactoryPreset] = &[
+    FactoryPreset {
+        name: "Tight Kit",
+        values: &[("thresh", 0.55), ("neosoul", 0.0)],
+    },
+    FactoryPreset {
+        name: "Neo-Soul Chords",
+        values: &[("thresh", 0.50), ("neosoul", 1.0)],
+    },
+];
+
+const PHASE_EQ_PRESETS: &[FactoryPreset] = &[
+    FactoryPreset {
+        name: "AI De-Harsh Flat",
+        values: &[
+            ("delay", 0.50),
+            ("inv", 0.0),
+            ("eqamt", 0.50),
+            ("genre", 0.0),
+            ("autogain", 1.0),
+        ],
+    },
+    FactoryPreset {
+        name: "Modern Hip-Hop",
+        values: &[
+            ("delay", 0.50),
+            ("inv", 0.0),
+            ("eqamt", 0.70),
+            ("genre", 0.25),
+            ("autogain", 1.0),
+        ],
+    },
+];
+
+const SPLITEQ_PRESETS: &[FactoryPreset] = &[
+    FactoryPreset {
+        name: "Drum Punch",
+        values: &[
+            ("tr_low", 0.62),
+            ("tr_mid", 0.55),
+            ("tr_high", 0.60),
+            ("tn_low", 0.48),
+            ("tn_mid", 0.45),
+            ("tn_high", 0.50),
+        ],
+    },
+    FactoryPreset {
+        name: "Vocal Air",
+        values: &[
+            ("tr_low", 0.50),
+            ("tr_mid", 0.45),
+            ("tr_high", 0.45),
+            ("tn_low", 0.50),
+            ("tn_mid", 0.54),
+            ("tn_high", 0.62),
+        ],
+    },
+];
+
+const DENSITY_CLIPPER_PRESETS: &[FactoryPreset] = &[
+    FactoryPreset {
+        name: "Glue Bus",
+        values: &[("density", 0.25), ("clip", 0.20), ("ceil", 0.85)],
+    },
+    FactoryPreset {
+        name: "Loud Master Clip",
+        values: &[("density", 0.40), ("clip", 0.45), ("ceil", 0.90)],
+    },
+];
+
+const SPACEVERB_PRESETS: &[FactoryPreset] = &[
+    FactoryPreset {
+        name: "Vocal Hall",
+        values: &[
+            ("model", 0.0),
+            ("pdrive", 0.25),
+            ("decay", 0.60),
+            ("damp", 0.45),
+            ("shimmer", 0.12),
+            ("duck", 0.60),
+            ("mix", 0.22),
+        ],
+    },
+    FactoryPreset {
+        name: "Lush Shimmer",
+        values: &[
+            ("model", 0.67),
+            ("pdrive", 0.35),
+            ("decay", 0.82),
+            ("damp", 0.30),
+            ("shimmer", 0.45),
+            ("duck", 0.40),
+            ("mix", 0.38),
+        ],
     },
 ];
 
@@ -320,6 +494,7 @@ impl Plugin for ForgeOpenSoothePlug {
                         ("tape", ParamRef::Float(&params.tape_drive)),
                         ("limit", ParamRef::Bool(&params.enable_limiter)),
                         ("ceil", ParamRef::Float(&params.ceiling_dbtp)),
+                        ("bus_slot", ParamRef::Int(&params.shared_bus_slot)),
                     ];
                     draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, OPENSOOTHE_PRESETS);
                     egui::Grid::new("opensoothe_grid")
@@ -583,9 +758,9 @@ impl Plugin for ForgeOpenSpacerPlug {
         let telemetry = self.telemetry.clone();
         create_egui_editor(
             self.params.editor_state.clone(),
-            (),
+            AbBankState::default(),
             |_, _| {},
-            move |egui_ctx, setter, _state| {
+            move |egui_ctx, setter, ab_state| {
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
                     draw_forge_studio_header_and_spectrum(
                         ui,
@@ -594,6 +769,14 @@ impl Plugin for ForgeOpenSpacerPlug {
                         &telemetry,
                         None,
                     );
+                    let param_refs = [
+                        ("amt", ParamRef::Float(&params.amount)),
+                        ("maxcut", ParamRef::Float(&params.max_cut_db)),
+                        ("lowhz", ParamRef::Float(&params.low_hz)),
+                        ("highhz", ParamRef::Float(&params.high_hz)),
+                        ("kickmode", ParamRef::Bool(&params.kick_bass_mode)),
+                    ];
+                    draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, OPENSPACER_PRESETS);
                     egui::Grid::new("openspacer_grid")
                         .num_columns(2)
                         .spacing([16.0, 8.0])
@@ -845,9 +1028,9 @@ impl Plugin for ForgeVocalSurgicalPlug {
         let telemetry = self.telemetry.clone();
         create_egui_editor(
             self.params.editor_state.clone(),
-            (),
+            AbBankState::default(),
             |_, _| {},
-            move |egui_ctx, setter, _state| {
+            move |egui_ctx, setter, ab_state| {
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
                     draw_forge_studio_header_and_spectrum(
                         ui,
@@ -855,6 +1038,19 @@ impl Plugin for ForgeVocalSurgicalPlug {
                         "Zero-Latency Mouth De-Click, Dynamic Plosive Suppressor, Split-Band De-Esser & Breath Gate",
                         &telemetry,
                         None,
+                    );
+                    let param_refs = [
+                        ("declick", ParamRef::Float(&params.declick_sensitivity)),
+                        ("deplosive", ParamRef::Float(&params.deplosive_strength)),
+                        ("deess", ParamRef::Float(&params.deess_threshold_db)),
+                        ("gate", ParamRef::Float(&params.breath_gate_db)),
+                    ];
+                    draw_ab_and_presets_bar(
+                        ui,
+                        setter,
+                        &param_refs,
+                        ab_state,
+                        VOCAL_SURGICAL_PRESETS,
                     );
                     egui::Grid::new("vocal_surgical_grid")
                         .num_columns(2)
@@ -1053,9 +1249,9 @@ impl Plugin for ForgeSubAndTapePlug {
         let telemetry = self.telemetry.clone();
         create_egui_editor(
             self.params.editor_state.clone(),
-            (),
+            AbBankState::default(),
             |_, _| {},
-            move |egui_ctx, setter, _state| {
+            move |egui_ctx, setter, ab_state| {
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
                     draw_forge_studio_header_and_spectrum(
                         ui,
@@ -1064,6 +1260,13 @@ impl Plugin for ForgeSubAndTapePlug {
                         &telemetry,
                         None,
                     );
+                    let param_refs = [
+                        ("cutoff", ParamRef::Float(&params.mono_cutoff_hz)),
+                        ("sub", ParamRef::Float(&params.sub_reinforce)),
+                        ("width", ParamRef::Float(&params.stereo_width)),
+                        ("drive", ParamRef::Float(&params.tape_drive)),
+                    ];
+                    draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, SUB_TAPE_PRESETS);
                     egui::Grid::new("subtape_grid")
                         .num_columns(2)
                         .spacing([16.0, 8.0])
@@ -1164,6 +1367,7 @@ pub struct ForgeMasterLimiterPlug {
     params: Arc<MasterLimiterParams>,
     telemetry: Arc<GuiTelemetry>,
     analyzer: RealtimeSpectrumAnalyzer32,
+    loudness_meter: OutputLoudnessMeter,
     dsp: RealtimeMasterLimiter,
 }
 
@@ -1224,6 +1428,7 @@ impl Default for ForgeMasterLimiterPlug {
             params: Arc::new(MasterLimiterParams::default()),
             telemetry: Arc::new(GuiTelemetry::default()),
             analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
+            loudness_meter: OutputLoudnessMeter::new(48_000.0),
             dsp: RealtimeMasterLimiter::new(48_000.0),
         }
     }
@@ -1300,6 +1505,7 @@ impl Plugin for ForgeMasterLimiterPlug {
         let sr = f64::from(buffer_config.sample_rate);
         self.dsp.reset(sr);
         self.analyzer.reset(sr);
+        self.loudness_meter.reset(sr);
         context.set_latency_samples(self.dsp.latency_samples());
         true
     }
@@ -1319,9 +1525,9 @@ impl Plugin for ForgeMasterLimiterPlug {
             let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
             let (out_l, out_r) = self.dsp.process_stereo_sample(in_l, in_r, drive, ceil, rel);
             self.analyzer.push_stereo_sample(out_l, out_r);
-            let (lufs, dbtp, gr) = self.dsp.telemetry();
+            self.loudness_meter.push_output_sample(out_l, out_r);
+            let (_lufs, _dbtp, gr) = self.dsp.telemetry();
             self.telemetry.update_peaks(in_l, in_r, out_l, out_r, -gr);
-            self.telemetry.update_loudness_and_tp(lufs, dbtp);
             if let Some(s0) = channel_samples.get_mut(0) {
                 *s0 = out_l;
             }
@@ -1330,6 +1536,9 @@ impl Plugin for ForgeMasterLimiterPlug {
             }
         }
         let (_lufs, _dbtp, gr) = self.dsp.telemetry();
+        let (lufs_m, lufs_s, out_tp) = self.loudness_meter.snapshot();
+        self.telemetry
+            .update_loudness_and_tp(lufs_m, lufs_s, out_tp);
         self.telemetry
             .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &[-gr; 32]);
         ProcessStatus::Normal
@@ -1447,9 +1656,9 @@ impl Plugin for ForgeDrumTriggerPlug {
         let telemetry = self.telemetry.clone();
         create_egui_editor(
             self.params.editor_state.clone(),
-            (),
+            AbBankState::default(),
             |_, _| {},
-            move |egui_ctx, setter, _state| {
+            move |egui_ctx, setter, ab_state| {
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
                     draw_forge_studio_header_and_spectrum(
                         ui,
@@ -1457,6 +1666,17 @@ impl Plugin for ForgeDrumTriggerPlug {
                         "Real-Time Audio-to-MIDI 3-Band Drum Transient Replacer (C1/D1/F#1) & Neo-Soul Chord Voicer",
                         &telemetry,
                         None,
+                    );
+                    let param_refs = [
+                        ("thresh", ParamRef::Float(&params.threshold_db)),
+                        ("neosoul", ParamRef::Bool(&params.expand_midi_chords)),
+                    ];
+                    draw_ab_and_presets_bar(
+                        ui,
+                        setter,
+                        &param_refs,
+                        ab_state,
+                        DRUM_TRIGGER_PRESETS,
                     );
                     egui::Grid::new("drum_trigger_grid")
                         .num_columns(2)
@@ -1759,9 +1979,9 @@ impl Plugin for ForgePhaseAndMatchPlug {
         let telemetry = self.telemetry.clone();
         create_egui_editor(
             self.params.editor_state.clone(),
-            (),
+            AbBankState::default(),
             |_, _| {},
-            move |egui_ctx, setter, _state| {
+            move |egui_ctx, setter, ab_state| {
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
                     draw_forge_studio_header_and_spectrum(
                         ui,
@@ -1770,6 +1990,14 @@ impl Plugin for ForgePhaseAndMatchPlug {
                         &telemetry,
                         None,
                     );
+                    let param_refs = [
+                        ("delay", ParamRef::Int(&params.delay_samples)),
+                        ("inv", ParamRef::Bool(&params.invert_polarity)),
+                        ("eqamt", ParamRef::Float(&params.ai_warmth_eq_amount)),
+                        ("genre", ParamRef::Int(&params.genre_target_idx)),
+                        ("autogain", ParamRef::Bool(&params.auto_gain_comp)),
+                    ];
+                    draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, PHASE_EQ_PRESETS);
                     egui::Grid::new("phase_eq_grid")
                         .num_columns(2)
                         .spacing([16.0, 8.0])
@@ -1990,9 +2218,9 @@ impl Plugin for ForgeSplitEqPlug {
         let telemetry = self.telemetry.clone();
         create_egui_editor(
             self.params.editor_state.clone(),
-            (),
+            AbBankState::default(),
             |_, _| {},
-            move |egui_ctx, setter, _state| {
+            move |egui_ctx, setter, ab_state| {
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
                     draw_forge_studio_header_and_spectrum(
                         ui,
@@ -2001,6 +2229,15 @@ impl Plugin for ForgeSplitEqPlug {
                         &telemetry,
                         None,
                     );
+                    let param_refs = [
+                        ("tr_low", ParamRef::Float(&params.trans_low_db)),
+                        ("tr_mid", ParamRef::Float(&params.trans_mid_db)),
+                        ("tr_high", ParamRef::Float(&params.trans_high_db)),
+                        ("tn_low", ParamRef::Float(&params.tonal_low_db)),
+                        ("tn_mid", ParamRef::Float(&params.tonal_mid_db)),
+                        ("tn_high", ParamRef::Float(&params.tonal_high_db)),
+                    ];
+                    draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, SPLITEQ_PRESETS);
                     egui::Grid::new("spliteq_grid")
                         .num_columns(2)
                         .spacing([16.0, 8.0])
@@ -2228,9 +2465,9 @@ impl Plugin for ForgeDensityClipperPlug {
         let telemetry = self.telemetry.clone();
         create_egui_editor(
             self.params.editor_state.clone(),
-            (),
+            AbBankState::default(),
             |_, _| {},
-            move |egui_ctx, setter, _state| {
+            move |egui_ctx, setter, ab_state| {
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
                     draw_forge_studio_header_and_spectrum(
                         ui,
@@ -2238,6 +2475,18 @@ impl Plugin for ForgeDensityClipperPlug {
                         "Upward Low-Level Density Lifter + 2x Oversampled Anti-Derivative Anti-Aliased Soft Clipper",
                         &telemetry,
                         None,
+                    );
+                    let param_refs = [
+                        ("density", ParamRef::Float(&params.upward_density)),
+                        ("clip", ParamRef::Float(&params.clip_drive_db)),
+                        ("ceil", ParamRef::Float(&params.ceiling_db)),
+                    ];
+                    draw_ab_and_presets_bar(
+                        ui,
+                        setter,
+                        &param_refs,
+                        ab_state,
+                        DENSITY_CLIPPER_PRESETS,
                     );
                     egui::Grid::new("density_grid")
                         .num_columns(2)
@@ -2517,9 +2766,9 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
         let telemetry = self.telemetry.clone();
         create_egui_editor(
             self.params.editor_state.clone(),
-            (),
+            AbBankState::default(),
             |_, _| {},
-            move |egui_ctx, setter, _state| {
+            move |egui_ctx, setter, ab_state| {
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
                     draw_forge_studio_header_and_spectrum(
                         ui,
@@ -2528,6 +2777,16 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
                         &telemetry,
                         None,
                     );
+                    let param_refs = [
+                        ("model", ParamRef::Int(&params.neural_model_idx)),
+                        ("pdrive", ParamRef::Float(&params.preamp_drive)),
+                        ("decay", ParamRef::Float(&params.reverb_decay)),
+                        ("damp", ParamRef::Float(&params.reverb_damping)),
+                        ("shimmer", ParamRef::Float(&params.shimmer_amount)),
+                        ("duck", ParamRef::Float(&params.vocal_ducking)),
+                        ("mix", ParamRef::Float(&params.wet_mix)),
+                    ];
+                    draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, SPACEVERB_PRESETS);
                     egui::Grid::new("spaceverb_grid")
                         .num_columns(2)
                         .spacing([16.0, 8.0])
