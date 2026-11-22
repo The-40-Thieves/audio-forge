@@ -462,11 +462,9 @@ pub fn shift_vocal_pitch_formant_preserved(
         return Ok(buffer.clone());
     }
 
-    let grain_len = ((sr * 0.032).round() as usize).max(256); // 32ms grain for vocal fundamental
     let sibilant_half_win = ((sr * 0.006).round() as usize).max(64);
     let sib_stride = ((sr * 0.000_67).round() as usize).max(16); // ~32 samples at 48 kHz
     let sib_alpha = (-((sib_stride as f64) / sr) / 0.001_55).exp(); // ~1.55 ms smoothing across all SRs
-    let grain_f = grain_len as f64;
     let mut out_channels = Vec::with_capacity(buffer.num_channels());
 
     // Helper to interpolate semitone shift at time `t`
@@ -526,6 +524,19 @@ pub fn shift_vocal_pitch_formant_preserved(
             )
         }
     };
+
+    // Pitch-adaptive grain window: tighter 22 ms grain for large upward shifts (> +4 st) to
+    // suppress comb-filtering, wider 38 ms grain for large downward shifts (< -4 st) to preserve
+    // low-fundamental smoothness, and 32 ms nominal grain for standard tuning.
+    let grain_secs = if representative_shift > 4.0 {
+        0.022
+    } else if representative_shift < -4.0 {
+        0.038
+    } else {
+        0.032
+    };
+    let grain_len = ((sr * grain_secs).round() as usize).max(256);
+    let grain_f = grain_len as f64;
 
     for ch in &buffer.channels {
         let mut out_ch = vec![0.0_f64; frames];

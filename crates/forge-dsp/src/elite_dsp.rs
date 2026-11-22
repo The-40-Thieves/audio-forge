@@ -427,6 +427,17 @@ impl RealtimeFdnReverb {
         }
     }
 
+    /// Selects the physical early-reflection room geometry (`Plate`, `Hall`, `Chamber`, `Room`,
+    /// `Ambient`) by retuning the 8 Moorer ER taps in place with zero heap allocations.
+    #[inline]
+    pub fn set_room_geometry(&mut self, geometry: ReverbRoomGeometry) {
+        let max_tap = self.pre_delay_buf.len().saturating_sub(2).max(1);
+        let taps_ms = geometry.er_taps_ms();
+        for (dst, &ms) in self.er_taps_samples.iter_mut().zip(&taps_ms) {
+            *dst = ((ms * 0.001 * self.sample_rate).round() as usize).clamp(1, max_tap);
+        }
+    }
+
     /// Resets all reverb state. Clears buffers in place (zero audio-thread allocations) when
     /// `sample_rate` matches the already-configured rate.
     pub fn reset(&mut self, sample_rate: f64) {
@@ -655,10 +666,18 @@ pub struct NamWaveNetProfile {
     pub weights: Vec<f64>,
 }
 
+/// Maximum `.nam` JSON payload accepted (4 MiB) to prevent memory exhaustion on malformed files.
+pub const MAX_NAM_JSON_BYTES: usize = 4 * 1024 * 1024;
+
 impl NamWaveNetProfile {
     /// Parses a `.nam` JSON string and extracts normalized dilated causal WaveNet tap weights
     /// `[w0, w1, w4, w12, bias_asym]` with bounded L1 energy so arbitrary `.nam` files cannot explode.
     pub fn parse_nam_taps(json_str: &str) -> forge_core::Result<[f64; 5]> {
+        if json_str.len() > MAX_NAM_JSON_BYTES {
+            return Err(forge_core::ForgeError::InvalidParameter(format!(
+                ".nam JSON exceeds maximum size ({MAX_NAM_JSON_BYTES} bytes)"
+            )));
+        }
         let parsed: Self = serde_json::from_str(json_str).map_err(|e| {
             forge_core::ForgeError::InvalidParameter(format!("Invalid .nam JSON profile: {e}"))
         })?;
