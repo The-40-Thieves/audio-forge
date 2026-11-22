@@ -606,13 +606,26 @@ fn tool_deliver(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, Forge
     options.repair = bool_arg(args, "repair", true);
     options.defizz = bool_arg(args, "defizz", true);
     options.vocal = bool_arg(args, "vocal", false);
-    if let Some(style) = args.get("limiter_style").and_then(Value::as_str) {
-        options.limiter_style = parse_limiter_style(style)?;
+    match args.get("limiter_style") {
+        None | Some(Value::Null) => {}
+        Some(raw) => {
+            let style = raw.as_str().ok_or_else(|| {
+                ForgeError::InvalidParameter("'limiter_style' must be a string".into())
+            })?;
+            options.limiter_style = parse_limiter_style(style)?;
+        }
     }
     options.channel_link = bounded_f64_arg(args, "channel_link", 1.0, 0.0, 1.0)?;
-    if let Some(dither) = args.get("dither").and_then(Value::as_str) {
-        options.dither = parse_dither_mode(dither)?;
-    }
+    let explicit_dither = match args.get("dither") {
+        None | Some(Value::Null) => false,
+        Some(raw) => {
+            let dither = raw
+                .as_str()
+                .ok_or_else(|| ForgeError::InvalidParameter("'dither' must be a string".into()))?;
+            options.dither = parse_dither_mode(dither)?;
+            true
+        }
+    };
     let dither_bits = match args.get("dither_bits") {
         None | Some(Value::Null) => 24_u16,
         Some(raw) => {
@@ -639,6 +652,8 @@ fn tool_deliver(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, Forge
     if options.dither != DitherMode::None {
         let pcm_bits = if options.dither_bits <= 16 { 16 } else { 24 };
         sandbox.save_wav_no_dither(&master, &output, pcm_bits)?;
+    } else if explicit_dither {
+        sandbox.save_wav_no_dither(&master, &output, 24)?;
     } else {
         sandbox.save_wav(&master, &output, 24)?;
     }
@@ -721,22 +736,22 @@ fn tool_spectral_unmask(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutpu
 fn tool_neural_denoise(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
     let input = path_arg(args, "input", sandbox)?;
     let output_dir = path_arg(args, "output_dir", sandbox)?;
-    let backend = str_arg_or(args, "backend", "auto");
-    let valid_backends = [
-        "auto",
-        "deepfilternet",
-        "deepfilternet3",
-        "mel-band-roformer",
-        "roformer",
-    ];
-    if !valid_backends
-        .iter()
-        .any(|b| b.eq_ignore_ascii_case(backend))
-    {
-        return Err(ForgeError::InvalidParameter(format!(
-            "unknown 'backend' '{backend}' (expected auto, deepfilternet, deepfilternet3, mel-band-roformer, or roformer)"
-        )));
-    }
+    let raw_backend = match args.get("backend") {
+        None | Some(Value::Null) => "auto",
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| ForgeError::InvalidParameter("'backend' must be a string".into()))?,
+    };
+    let backend = match raw_backend.trim().to_ascii_lowercase().as_str() {
+        "auto" => "auto",
+        "deepfilternet" | "deepfilternet3" => "deepfilternet",
+        "mel-band-roformer" | "roformer" => "mel-band-roformer",
+        other => {
+            return Err(ForgeError::InvalidParameter(format!(
+                "unknown 'backend' '{other}' (expected auto, deepfilternet, deepfilternet3, mel-band-roformer, or roformer)"
+            )));
+        }
+    };
     let attenuation_limit_db = match args.get("attenuation_limit_db") {
         None | Some(Value::Null) => None,
         Some(_) => Some(bounded_f64_arg(

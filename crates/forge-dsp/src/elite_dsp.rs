@@ -476,14 +476,16 @@ impl RealtimeFdnReverb {
         if geometry == self.room_geometry {
             return;
         }
-        self.er_taps_prev = self.er_taps_samples;
+        if self.er_xfade_rem == 0 {
+            self.er_taps_prev = self.er_taps_samples;
+            self.er_xfade_rem = self.er_xfade_len;
+        }
         self.room_geometry = geometry;
         let max_tap = self.pre_delay_buf.len().saturating_sub(2).max(1);
         let taps_ms = geometry.er_taps_ms();
         for (dst, &ms) in self.er_taps_samples.iter_mut().zip(&taps_ms) {
             *dst = ((ms * 0.001 * self.sample_rate).round() as usize).clamp(1, max_tap);
         }
-        self.er_xfade_rem = self.er_xfade_len;
     }
 
     /// Returns the currently selected early-reflection room geometry.
