@@ -5,11 +5,11 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use forge_core::AudioBuffer;
 use forge_dsp::{
-    DeFizzConfig, DeliveryOptions, DeliveryTarget, GenreTonalTarget, RestorationConfig, ToneMatch,
-    UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw, apply_18_band_eq,
-    apply_spectral_defizz, apply_spectral_unmask, audit_audio, clean_vocal_surgical,
-    compute_genre_tonal_balance_eq, compute_reference_match_eq, deliver, normalize_and_limit,
-    run_full_restoration_chain,
+    DeFizzConfig, DeliveryOptions, DeliveryTarget, DitherMode, GenreTonalTarget, LimiterStyle,
+    RestorationConfig, ToneMatch, UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw,
+    apply_18_band_eq, apply_spectral_defizz, apply_spectral_unmask, audit_audio,
+    clean_vocal_surgical, compute_genre_tonal_balance_eq, compute_reference_match_eq, deliver,
+    normalize_and_limit, run_full_restoration_chain,
 };
 use forge_reaper::{
     ReaperProjectBuilder, ReaperTrackSpec, ReleaseMetadata, TempFileGuard, install_jsfx_plugins,
@@ -65,6 +65,15 @@ enum Commands {
         /// Output only the removed harshness/fizz (Delta listen mode)
         #[arg(long)]
         delta_listen: bool,
+        /// Spectral sensitivity tilt in dB/octave pivoted at 1 kHz (-6.0 to +6.0)
+        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+        tilt: f64,
+        /// Stereo gain linking (0.0 = dual-mono, 1.0 = linked stereo)
+        #[arg(long, default_value_t = 1.0)]
+        stereo_link: f64,
+        /// Mid/Side focus (-1.0 = Mid only, 0.0 = balanced, +1.0 = Side only)
+        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+        mid_side: f64,
         /// Fundamental hum frequency (50 or 60 Hz) to notch out with 10 harmonics
         #[arg(long, default_value_t = 60.0)]
         hum_hz: f64,
@@ -86,6 +95,12 @@ enum Commands {
         /// Mode: `vocal` (200Hz-7.5kHz) or `kick` (30Hz-130Hz)
         #[arg(long, default_value = "vocal")]
         mode: String,
+        /// Solo only the carved frequencies removed by the sidechain (Delta listen)
+        #[arg(long)]
+        delta_listen: bool,
+        /// Mid/Side carving focus (-1.0 = Mid only, 0.0 = balanced, +1.0 = Side only)
+        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+        mid_side: f64,
     },
 
     /// Align multi-mic phase & polarity via GCC-PHAT cross-correlation (Auto-Align equivalent)
@@ -173,6 +188,18 @@ enum Commands {
         /// Genre tonal-balance target (`pop`, `hiphop`, `neosoul`, `edm`, `rock`, `jazz`)
         #[arg(long, conflicts_with = "reference")]
         genre: Option<String>,
+        /// Limiter topology (`transparent`, `punchy`, `dynamic`, `aggressive`)
+        #[arg(long, default_value = "transparent")]
+        limiter_style: String,
+        /// Stereo channel link (0.0 = dual-mono, 1.0 = linked stereo)
+        #[arg(long, default_value_t = 1.0)]
+        channel_link: f64,
+        /// Mastering output dither (`none`, `tpdf`, `noise-shaped`)
+        #[arg(long, default_value = "none")]
+        dither: String,
+        /// Bit depth for dithering (8..=24, typically 16 or 24)
+        #[arg(long, default_value_t = 24)]
+        dither_bits: u16,
     },
 
     /// Master audio to ITU-R BS.1770-4 LUFS target, -1.0 dBTP True-Peak ceiling, Reference Match EQ & ISO 3901 ISRC
@@ -322,6 +349,9 @@ async fn main() -> anyhow::Result<()> {
             defizz_sensitivity,
             defizz_depth,
             delta_listen,
+            tilt,
+            stereo_link,
+            mid_side,
             hum_hz,
             tape_drive,
         } => {
@@ -336,6 +366,9 @@ async fn main() -> anyhow::Result<()> {
                 sensitivity_db: defizz_sensitivity,
                 max_depth_db: defizz_depth,
                 delta_listen,
+                tilt_db_per_oct: tilt,
+                stereo_link,
+                mid_side_balance: mid_side,
                 ..DeFizzConfig::default()
             };
             let cleaned = apply_spectral_defizz(&stage1, &defizz_cfg)?;
@@ -354,14 +387,18 @@ async fn main() -> anyhow::Result<()> {
             sidechain,
             output,
             mode,
+            delta_listen,
+            mid_side,
         } => {
             let t_buf = AudioBuffer::load(&target)?;
             let sc_buf = AudioBuffer::load(&sidechain)?;
-            let cfg = if mode.eq_ignore_ascii_case("kick") {
+            let mut cfg = if mode.eq_ignore_ascii_case("kick") {
                 UnmaskConfig::kick_over_bass()
             } else {
                 UnmaskConfig::vocal_over_instruments()
             };
+            cfg.delta_listen = delta_listen;
+            cfg.mid_side_balance = mid_side;
             let unmasked = apply_spectral_unmask(&t_buf, &sc_buf, &cfg)?;
             unmasked.save_wav(&output, 24)?;
             println!("Sidechain-unmasked stem written to {}", output.display());
@@ -552,6 +589,10 @@ async fn main() -> anyhow::Result<()> {
             vocal,
             reference,
             genre,
+            limiter_style,
+            channel_link,
+            dither,
+            dither_bits,
         } => {
             let target = match (lufs, ceiling_dbtp) {
                 (Some(lufs), Some(ceiling)) => DeliveryTarget::custom(lufs, ceiling)?,
@@ -561,6 +602,19 @@ async fn main() -> anyhow::Result<()> {
             options.repair = !no_repair;
             options.defizz = !no_defizz;
             options.vocal = vocal;
+            options.limiter_style = match limiter_style.to_ascii_lowercase().as_str() {
+                "punchy" => LimiterStyle::Punchy,
+                "dynamic" => LimiterStyle::Dynamic,
+                "aggressive" => LimiterStyle::Aggressive,
+                _ => LimiterStyle::Transparent,
+            };
+            options.channel_link = channel_link;
+            options.dither = match dither.to_ascii_lowercase().as_str() {
+                "tpdf" => DitherMode::Tpdf,
+                "noise-shaped" | "noise_shaped" | "shaped" => DitherMode::NoiseShapedHighPass,
+                _ => DitherMode::None,
+            };
+            options.dither_bits = dither_bits;
             options.tone_match = match (reference, genre) {
                 (Some(path), _) => Some(ToneMatch::Reference(AudioBuffer::load(&path)?)),
                 (None, Some(g)) => Some(ToneMatch::Genre(GenreTonalTarget::parse(&g))),

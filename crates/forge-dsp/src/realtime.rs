@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use crate::elite_dsp::{AllpassDisperser, JilesAthertonHysteresis};
 use crate::loudness_limiter::{
-    Biquad, CytomicSvf, LIMITER_LOOKAHEAD_MS, TRUE_PEAK_PHASES, flush_denormal_f64,
-    sanitize_param_f64, sanitize_sample_f32,
+    Biquad, CytomicSvf, DitherMode, LIMITER_LOOKAHEAD_MS, LimiterStyle, TRUE_PEAK_PHASES,
+    flush_denormal_f64, sanitize_param_f64, sanitize_sample_f32,
 };
 use crate::restoration::{LowBandSplit, MASTERING_18_BANDS_HZ};
 use crate::spectrum::{
@@ -93,6 +93,9 @@ pub struct RealtimeOpenSoothe {
     mags_scratch: Vec<f64>,
     smoothed_gains_l: Vec<f64>,
     smoothed_gains_r: Vec<f64>,
+    tilt_db_per_oct: f64,
+    stereo_link: f64,
+    mid_side_balance: f64,
     last_gr_db: f32,
     last_spectrum_db: [f32; 32],
     last_band_gr_db: [f32; 32],
@@ -137,6 +140,9 @@ impl RealtimeOpenSoothe {
             mags_scratch: vec![0.0; half_bins],
             smoothed_gains_l: vec![1.0; half_bins],
             smoothed_gains_r: vec![1.0; half_bins],
+            tilt_db_per_oct: 0.0,
+            stereo_link: 1.0,
+            mid_side_balance: 0.0,
             last_gr_db: 0.0,
             last_spectrum_db: [SPECTRUM_FLOOR_DB; SPECTRUM_BANDS],
             last_band_gr_db: [0.0; 32],
@@ -213,6 +219,24 @@ impl RealtimeOpenSoothe {
         self.last_band_gr_db
     }
 
+    /// Sets spectral sensitivity tilt in dB/octave pivoted at 1 kHz (`-6.0..=+6.0`). Zero-alloc.
+    #[inline]
+    pub fn set_tilt_db_per_oct(&mut self, tilt_db_per_oct: f64) {
+        self.tilt_db_per_oct = sanitize_param_f64(tilt_db_per_oct, 0.0, -6.0, 6.0);
+    }
+
+    /// Sets stereo gain linking (`0.0` = dual-mono, `1.0` = linked stereo). Zero-alloc.
+    #[inline]
+    pub fn set_stereo_link(&mut self, stereo_link: f64) {
+        self.stereo_link = sanitize_param_f64(stereo_link, 1.0, 0.0, 1.0);
+    }
+
+    /// Sets Mid/Side focus (`-1.0` = Mid only, `0.0` = balanced, `+1.0` = Side only). Zero-alloc.
+    #[inline]
+    pub fn set_mid_side_balance(&mut self, mid_side_balance: f64) {
+        self.mid_side_balance = sanitize_param_f64(mid_side_balance, 0.0, -1.0, 1.0);
+    }
+
     #[inline]
     pub fn process_stereo_sample(
         &mut self,
@@ -273,11 +297,25 @@ impl RealtimeOpenSoothe {
         let mut band_pow = [0.0_f64; SPECTRUM_BANDS];
 
         let mut min_g_seen = 1.0_f64;
+        let use_ms = self.mid_side_balance.abs() > 1e-4;
+        let ms_focus = [
+            (1.0 - self.mid_side_balance.max(0.0)).clamp(0.0, 1.0),
+            (1.0 + self.mid_side_balance.min(0.0)).clamp(0.0, 1.0),
+        ];
 
-        for ch_idx in 0..2 {
+        for (ch_idx, &ms_f) in ms_focus.iter().enumerate() {
+            let focus = if use_ms { ms_f } else { 1.0 };
             for i in 0..self.fft_size {
                 let idx = frame_start.wrapping_add(i) & mask_in;
-                let sample = if ch_idx == 0 {
+                let sample = if use_ms {
+                    let l = self.in_ring_l[idx];
+                    let r = self.in_ring_r[idx];
+                    if ch_idx == 0 {
+                        0.5 * (l + r)
+                    } else {
+                        0.5 * (l - r)
+                    }
+                } else if ch_idx == 0 {
                     self.in_ring_l[idx]
                 } else {
                     self.in_ring_r[idx]
@@ -311,7 +349,20 @@ impl RealtimeOpenSoothe {
                 .take(self.half_bins - 1)
                 .skip(1)
             {
-                let weight = self.band_weights[b];
+                let base_w = self.band_weights[b] * focus;
+                let weight = if self.tilt_db_per_oct.abs() > 1e-6 && base_w > 0.01 {
+                    let f = (b as f64) * bin_hz;
+                    let tilt_mul = if f > 20.0 {
+                        10.0_f64
+                            .powf((self.tilt_db_per_oct * (f / 1000.0).log2()) / 20.0)
+                            .clamp(0.15, 3.0)
+                    } else {
+                        1.0
+                    };
+                    (base_w * tilt_mul).clamp(0.0, 3.0)
+                } else {
+                    base_w
+                };
                 if weight <= 0.01 {
                     *smoothed_val = 1.0;
                     continue;
@@ -353,10 +404,22 @@ impl RealtimeOpenSoothe {
                 *smoothed_val = alpha * (*smoothed_val) + (1.0 - alpha) * target_gain;
             }
 
+            let (cur_gains, other_gains) = if ch_idx == 0 {
+                (&self.smoothed_gains_l, &self.smoothed_gains_r)
+            } else {
+                (&self.smoothed_gains_r, &self.smoothed_gains_l)
+            };
             for b in 1..(self.half_bins - 1) {
-                let min_lobe = smoothed[b - 1].min(smoothed[b]).min(smoothed[b + 1]);
-                let avg_lobe = 0.25 * smoothed[b - 1] + 0.50 * smoothed[b] + 0.25 * smoothed[b + 1];
-                let g = 0.65 * min_lobe + 0.35 * avg_lobe;
+                let min_lobe = cur_gains[b - 1].min(cur_gains[b]).min(cur_gains[b + 1]);
+                let avg_lobe =
+                    0.25 * cur_gains[b - 1] + 0.50 * cur_gains[b] + 0.25 * cur_gains[b + 1];
+                let g_ch = 0.65 * min_lobe + 0.35 * avg_lobe;
+                let g = if !use_ms && self.stereo_link > 1e-4 {
+                    let g_link = g_ch.min(other_gains[b]);
+                    self.stereo_link * g_link + (1.0 - self.stereo_link) * g_ch
+                } else {
+                    g_ch
+                };
                 if g < min_g_seen {
                     min_g_seen = g;
                 }
@@ -378,7 +441,16 @@ impl RealtimeOpenSoothe {
                 let w = self.window[i];
                 let val = self.spec_scratch[i].re * inv_n * w;
                 let idx = out_base.wrapping_add(i) & mask_out;
-                if ch_idx == 0 {
+                if use_ms {
+                    if ch_idx == 0 {
+                        self.out_ring_l[idx] += val;
+                        self.out_ring_r[idx] += val;
+                        self.norm_ring[idx] += w * w;
+                    } else {
+                        self.out_ring_l[idx] += val;
+                        self.out_ring_r[idx] -= val;
+                    }
+                } else if ch_idx == 0 {
                     self.out_ring_l[idx] += val;
                     self.norm_ring[idx] += w * w;
                 } else {
@@ -432,6 +504,8 @@ pub struct RealtimeOpenSpacer {
     /// Pre-allocated rustfft scratch, so `process_with_scratch` never allocates per hop.
     fft_scratch: Vec<Complex<f64>>,
     smoothed_gains: Vec<f64>,
+    delta_listen: bool,
+    mid_side_balance: f64,
     last_carve_db: f32,
 }
 
@@ -471,6 +545,8 @@ impl RealtimeOpenSpacer {
             sc_spec: vec![Complex::new(0.0, 0.0); fft_size],
             fft_scratch: vec![Complex::new(0.0, 0.0); scratch_len],
             smoothed_gains: vec![1.0; half_bins],
+            delta_listen: false,
+            mid_side_balance: 0.0,
             last_carve_db: 0.0,
         }
     }
@@ -497,6 +573,18 @@ impl RealtimeOpenSpacer {
 
     pub fn last_carve_db(&self) -> f32 {
         self.last_carve_db
+    }
+
+    /// Enables Delta-Listen mode to solo *only* the carved frequencies. Zero-alloc.
+    #[inline]
+    pub fn set_delta_listen(&mut self, delta_listen: bool) {
+        self.delta_listen = delta_listen;
+    }
+
+    /// Sets Mid/Side carving focus (`-1.0` = Mid only, `0.0` = balanced, `+1.0` = Side only). Zero-alloc.
+    #[inline]
+    pub fn set_mid_side_balance(&mut self, mid_side_balance: f64) {
+        self.mid_side_balance = sanitize_param_f64(mid_side_balance, 0.0, -1.0, 1.0);
     }
 
     #[inline]
@@ -552,11 +640,22 @@ impl RealtimeOpenSpacer {
         let inv_n = 1.0 / (self.fft_size as f64);
         let min_gain = 10.0_f64.powf(-max_cut_db.clamp(0.5, 24.0) / 20.0);
 
+        let use_ms = self.mid_side_balance.abs() > 1e-4;
+        let mid_scale = (1.0 - self.mid_side_balance.max(0.0)).clamp(0.0, 1.0);
+        let side_scale = (1.0 + self.mid_side_balance.min(0.0)).clamp(0.0, 1.0);
+
         for i in 0..self.fft_size {
             let idx = frame_start.wrapping_add(i) & mask_in;
             let w = self.window[i];
-            self.tgt_spec_l[i] = Complex::new(self.tgt_ring_l[idx] * w, 0.0);
-            self.tgt_spec_r[i] = Complex::new(self.tgt_ring_r[idx] * w, 0.0);
+            let l = self.tgt_ring_l[idx] * w;
+            let r = self.tgt_ring_r[idx] * w;
+            if use_ms {
+                self.tgt_spec_l[i] = Complex::new(0.5 * (l + r), 0.0);
+                self.tgt_spec_r[i] = Complex::new(0.5 * (l - r), 0.0);
+            } else {
+                self.tgt_spec_l[i] = Complex::new(l, 0.0);
+                self.tgt_spec_r[i] = Complex::new(r, 0.0);
+            }
             self.sc_spec[i] = Complex::new(self.sc_ring[idx] * w, 0.0);
         }
 
@@ -589,16 +688,34 @@ impl RealtimeOpenSpacer {
         }
 
         for b in 1..(self.half_bins - 1) {
-            let g = 0.25 * self.smoothed_gains[b - 1]
+            let g_raw = 0.25 * self.smoothed_gains[b - 1]
                 + 0.50 * self.smoothed_gains[b]
                 + 0.25 * self.smoothed_gains[b + 1];
-            if g < min_g_seen {
-                min_g_seen = g;
+            if g_raw < min_g_seen {
+                min_g_seen = g_raw;
             }
-            self.tgt_spec_l[b] *= g;
+            let (gl, gr) = if use_ms {
+                let gm = (1.0 - mid_scale * (1.0 - g_raw)).clamp(0.0, 1.0);
+                let gs = (1.0 - side_scale * (1.0 - g_raw)).clamp(0.0, 1.0);
+                (gm, gs)
+            } else {
+                (g_raw, g_raw)
+            };
+            let (egl, egr) = if self.delta_listen {
+                (1.0 - gl, 1.0 - gr)
+            } else {
+                (gl, gr)
+            };
+            self.tgt_spec_l[b] *= egl;
             self.tgt_spec_l[self.fft_size - b] = self.tgt_spec_l[b].conj();
-            self.tgt_spec_r[b] *= g;
+            self.tgt_spec_r[b] *= egr;
             self.tgt_spec_r[self.fft_size - b] = self.tgt_spec_r[b].conj();
+        }
+        if self.delta_listen {
+            self.tgt_spec_l[0] = Complex::new(0.0, 0.0);
+            self.tgt_spec_l[self.half_bins - 1] = Complex::new(0.0, 0.0);
+            self.tgt_spec_r[0] = Complex::new(0.0, 0.0);
+            self.tgt_spec_r[self.half_bins - 1] = Complex::new(0.0, 0.0);
         }
 
         self.fft_inv
@@ -610,8 +727,15 @@ impl RealtimeOpenSpacer {
         for i in 0..self.fft_size {
             let w = self.window[i];
             let idx = out_base.wrapping_add(i) & mask_out;
-            self.out_ring_l[idx] += self.tgt_spec_l[i].re * inv_n * w;
-            self.out_ring_r[idx] += self.tgt_spec_r[i].re * inv_n * w;
+            let a = self.tgt_spec_l[i].re * inv_n * w;
+            let b = self.tgt_spec_r[i].re * inv_n * w;
+            if use_ms {
+                self.out_ring_l[idx] += a + b;
+                self.out_ring_r[idx] += a - b;
+            } else {
+                self.out_ring_l[idx] += a;
+                self.out_ring_r[idx] += b;
+            }
             self.norm_ring[idx] += w * w;
         }
 
@@ -1064,6 +1188,16 @@ pub struct RealtimeMasterLimiter {
     ramp_sum: f64,
     last_target_lin: f64,
     last_release_coeff: f64,
+    style: LimiterStyle,
+    channel_link: f64,
+    dither_mode: DitherMode,
+    dither_bits: u16,
+    dither_rng_l: u64,
+    dither_rng_r: u64,
+    dither_e1_l: f64,
+    dither_e2_l: f64,
+    dither_e1_r: f64,
+    dither_e2_r: f64,
 }
 
 /// Taps per phase of the true-peak interpolation filter.
@@ -1169,6 +1303,16 @@ impl RealtimeMasterLimiter {
             ramp_sum: 1.0,
             last_target_lin: 1.0,
             last_release_coeff: 0.0,
+            style: LimiterStyle::Transparent,
+            channel_link: 1.0,
+            dither_mode: DitherMode::None,
+            dither_bits: 24,
+            dither_rng_l: 0x9E37_79B9_7F4A_7C15,
+            dither_rng_r: 0x2545_F491_4F6C_DD1D,
+            dither_e1_l: 0.0,
+            dither_e2_l: 0.0,
+            dither_e1_r: 0.0,
+            dither_e2_r: 0.0,
         };
         limiter.reset(sr);
         limiter
@@ -1225,6 +1369,64 @@ impl RealtimeMasterLimiter {
 
     pub fn telemetry(&self) -> (f32, f32, f32) {
         (self.last_lufs, self.last_true_peak_dbtp, self.last_gr_db)
+    }
+
+    /// Sets the mastering release topology (`Transparent`, `Punchy`, `Dynamic`, `Aggressive`). Zero-alloc.
+    #[inline]
+    pub fn set_style(&mut self, style: LimiterStyle) {
+        self.style = style;
+    }
+
+    /// Sets stereo channel linking (`0.0..=1.0`). Zero-alloc.
+    #[inline]
+    pub fn set_channel_link(&mut self, channel_link: f64) {
+        self.channel_link = sanitize_param_f64(channel_link, 1.0, 0.0, 1.0);
+    }
+
+    /// Sets real-time output dithering / noise shaping (`8..=24` bits). Zero-alloc.
+    #[inline]
+    pub fn set_dither(&mut self, mode: DitherMode, bits: u16) {
+        self.dither_mode = mode;
+        self.dither_bits = bits.clamp(8, 24);
+    }
+
+    #[inline]
+    fn next_dither_bipolar(state: &mut u64) -> f64 {
+        let mut x = *state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        *state = x;
+        let bits = x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11;
+        (bits as f64) * (1.0 / ((1_u64 << 53) as f64)) - 0.5
+    }
+
+    #[inline]
+    fn apply_rt_dither(
+        mode: DitherMode,
+        bits: u16,
+        x: f64,
+        rng: &mut u64,
+        e1: &mut f64,
+        e2: &mut f64,
+    ) -> f64 {
+        if mode == DitherMode::None {
+            return x;
+        }
+        let full_scale = (1_u64 << (bits - 1)) as f64;
+        let max_code = full_scale - 1.0;
+        let min_code = -full_scale;
+        let scaled = x.clamp(-1.0, 1.0) * full_scale;
+        let tpdf = Self::next_dither_bipolar(rng) + Self::next_dither_bipolar(rng);
+        let shaped = match mode {
+            DitherMode::None | DitherMode::Tpdf => scaled,
+            DitherMode::NoiseShapedHighPass => scaled + 1.623 * (*e1) - 0.692 * (*e2),
+        };
+        let q = (shaped + tpdf).round().clamp(min_code, max_code);
+        let err = flush_denormal_f64(shaped - q);
+        *e2 = *e1;
+        *e1 = err;
+        q / full_scale
     }
 
     fn release_coeff(sample_rate: f64, release_ms: f64) -> f64 {
@@ -1332,7 +1534,14 @@ impl RealtimeMasterLimiter {
         let drive = 10.0_f64.powf(clean_drive_db / 20.0);
         let ceiling_lin = 10.0_f64.powf(clean_ceil_db / 20.0);
         let target_lin = 10.0_f64.powf((clean_ceil_db - Self::CEILING_MARGIN_DB) / 20.0);
-        let release_coeff = Self::release_coeff(self.sample_rate, clean_rel_ms);
+        let style_rel_mul = match self.style {
+            LimiterStyle::Transparent => 1.0,
+            LimiterStyle::Punchy => 0.65,
+            LimiterStyle::Dynamic => 1.45,
+            LimiterStyle::Aggressive => 0.45,
+        };
+        let eff_rel_ms = (clean_rel_ms * style_rel_mul).clamp(10.0, 1000.0);
+        let release_coeff = Self::release_coeff(self.sample_rate, eff_rel_ms);
         self.last_target_lin = target_lin;
         self.last_release_coeff = release_coeff;
 
@@ -1343,8 +1552,28 @@ impl RealtimeMasterLimiter {
         let (delayed_l, delayed_r) = self.swap_delay(dl as f32, dr as f32);
 
         // Safety net only: the ramp has already brought every detected peak under `target_lin`.
-        let out_l = (f64::from(delayed_l) * gain).clamp(-ceiling_lin, ceiling_lin);
-        let out_r = (f64::from(delayed_r) * gain).clamp(-ceiling_lin, ceiling_lin);
+        let mut out_l = (f64::from(delayed_l) * gain).clamp(-ceiling_lin, ceiling_lin);
+        let mut out_r = (f64::from(delayed_r) * gain).clamp(-ceiling_lin, ceiling_lin);
+        if self.dither_mode != DitherMode::None {
+            out_l = Self::apply_rt_dither(
+                self.dither_mode,
+                self.dither_bits,
+                out_l,
+                &mut self.dither_rng_l,
+                &mut self.dither_e1_l,
+                &mut self.dither_e2_l,
+            )
+            .clamp(-ceiling_lin, ceiling_lin);
+            out_r = Self::apply_rt_dither(
+                self.dither_mode,
+                self.dither_bits,
+                out_r,
+                &mut self.dither_rng_r,
+                &mut self.dither_e1_r,
+                &mut self.dither_e2_r,
+            )
+            .clamp(-ceiling_lin, ceiling_lin);
+        }
         self.update_meter(out_l, out_r, tp, ceiling_lin);
 
         (
