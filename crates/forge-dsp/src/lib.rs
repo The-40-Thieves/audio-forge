@@ -20,9 +20,9 @@ pub use drum_midi::{DrumTriggerNotes, NoteMsg};
 pub use dtw_align::{StretchMarker, align_vocal_double_dtw};
 pub use elite_dsp::{
     AdaaSin, AdaaTanh, AllpassDisperser, AnalogHardwareModel, AutoGainCompensator,
-    GenreTonalTarget, JilesAthertonHysteresis, NamWaveNetProfile, Oversampler2x,
-    RealtimeDensityAndClipper, RealtimeFdnReverb, RealtimeNeuralPreamp,
-    RealtimeTransientTonalSplit, compute_genre_tonal_balance_eq,
+    GenreTonalTarget, JilesAthertonHysteresis, MAX_NAM_JSON_BYTES, NamWaveNetProfile,
+    Oversampler2x, RealtimeDensityAndClipper, RealtimeFdnReverb, RealtimeNeuralPreamp,
+    RealtimeTransientTonalSplit, ReverbRoomGeometry, compute_genre_tonal_balance_eq,
 };
 pub use loudness_limiter::{
     Biquad, CytomicSvf, DitherMode, LIMITER_LOOKAHEAD_MS, LIMITER_RELEASE_MS, LimiterStyle,

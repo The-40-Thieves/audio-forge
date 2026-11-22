@@ -346,6 +346,37 @@ impl RealtimeDensityAndClipper {
 // 4. 8x8 HADAMARD FDN ALGORITHMIC REVERB WITH VOCAL DUCKING & OCTAVE SHIMMER
 // ============================================================================
 
+/// Physical early-reflection room geometry presets for [`RealtimeFdnReverb`]
+/// (Dragonfly Reverb `Hibiki` / Valhalla VintageVerb / FabFilter Pro-R 2 room modes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReverbRoomGeometry {
+    /// Dense, immediate metallic plate reflections (`2.1 ms` to `18.6 ms`).
+    Plate,
+    /// Large concert hall reflections (`4.3 ms` to `33.4 ms`, default).
+    #[default]
+    Hall,
+    /// Tight studio echo chamber (`3.2 ms` to `24.8 ms`).
+    Chamber,
+    /// Intimate wood/drum room (`1.8 ms` to `14.5 ms`).
+    Room,
+    /// Wide, diffuse ambient bloom (`6.5 ms` to `41.2 ms`).
+    Ambient,
+}
+
+impl ReverbRoomGeometry {
+    /// Returns the 8 Moorer stereo early-reflection tap times in milliseconds.
+    #[inline]
+    pub const fn er_taps_ms(self) -> [f64; 8] {
+        match self {
+            Self::Plate => [2.1, 4.3, 6.8, 9.1, 11.7, 14.2, 16.5, 18.6],
+            Self::Hall => [4.3, 7.9, 11.6, 15.2, 19.8, 24.1, 28.7, 33.4],
+            Self::Chamber => [3.2, 5.9, 8.7, 11.8, 15.1, 18.4, 21.6, 24.8],
+            Self::Room => [1.8, 3.4, 5.1, 6.9, 8.8, 10.7, 12.6, 14.5],
+            Self::Ambient => [6.5, 11.3, 16.4, 21.7, 26.9, 31.8, 36.7, 41.2],
+        }
+    }
+}
+
 /// Real-Time **Moorer Early Reflections + 4-Stage Allpass Diffuser + 8x8 Fast Walsh-Hadamard FDN Reverb**
 /// (**Forge SpaceVerb** — Dragonfly Reverb `Hibiki` / Valhalla VintageVerb / FabFilter Pro-R 2 architecture).
 ///
@@ -358,6 +389,7 @@ impl RealtimeDensityAndClipper {
 /// - **Vocal Sidechain Ducking** + **+12 Semitone Octave Shimmer** dual-grain pitch-shifted feedback injection
 pub struct RealtimeFdnReverb {
     sample_rate: f64,
+    room_geometry: ReverbRoomGeometry,
     pre_delay_buf: Vec<f64>,
     pre_delay_write: usize,
     er_taps_samples: [usize; 8],
@@ -405,6 +437,7 @@ impl RealtimeFdnReverb {
 
         Self {
             sample_rate: sr,
+            room_geometry: ReverbRoomGeometry::Hall,
             pre_delay_buf: vec![0.0; pre_len],
             pre_delay_write: 0,
             er_taps_samples,
@@ -425,6 +458,30 @@ impl RealtimeFdnReverb {
             shimmer_write: 0,
             shimmer_phase: 0.0,
         }
+    }
+
+    /// Selects the physical early-reflection room geometry (`Plate`, `Hall`, `Chamber`, `Room`,
+    /// `Ambient`) by retuning the 8 Moorer ER taps in place with zero heap allocations.
+    #[inline]
+    pub fn set_room_geometry(&mut self, geometry: ReverbRoomGeometry) {
+        self.room_geometry = geometry;
+        let max_tap = self.pre_delay_buf.len().saturating_sub(2).max(1);
+        let taps_ms = geometry.er_taps_ms();
+        for (dst, &ms) in self.er_taps_samples.iter_mut().zip(&taps_ms) {
+            *dst = ((ms * 0.001 * self.sample_rate).round() as usize).clamp(1, max_tap);
+        }
+    }
+
+    /// Returns the currently selected early-reflection room geometry.
+    #[inline]
+    pub const fn room_geometry(&self) -> ReverbRoomGeometry {
+        self.room_geometry
+    }
+
+    /// Returns the active 8 Moorer early-reflection tap offsets in samples.
+    #[inline]
+    pub const fn er_taps_samples(&self) -> [usize; 8] {
+        self.er_taps_samples
     }
 
     /// Resets all reverb state. Clears buffers in place (zero audio-thread allocations) when
@@ -451,7 +508,9 @@ impl RealtimeFdnReverb {
             self.shimmer_write = 0;
             self.shimmer_phase = 0.0;
         } else {
+            let saved_geometry = self.room_geometry;
             *self = Self::new(sr);
+            self.set_room_geometry(saved_geometry);
         }
     }
 
@@ -655,10 +714,18 @@ pub struct NamWaveNetProfile {
     pub weights: Vec<f64>,
 }
 
+/// Maximum `.nam` JSON payload accepted (4 MiB) to prevent memory exhaustion on malformed files.
+pub const MAX_NAM_JSON_BYTES: usize = 4 * 1024 * 1024;
+
 impl NamWaveNetProfile {
     /// Parses a `.nam` JSON string and extracts normalized dilated causal WaveNet tap weights
     /// `[w0, w1, w4, w12, bias_asym]` with bounded L1 energy so arbitrary `.nam` files cannot explode.
     pub fn parse_nam_taps(json_str: &str) -> forge_core::Result<[f64; 5]> {
+        if json_str.len() > MAX_NAM_JSON_BYTES {
+            return Err(forge_core::ForgeError::InvalidParameter(format!(
+                ".nam JSON exceeds maximum size ({MAX_NAM_JSON_BYTES} bytes)"
+            )));
+        }
         let parsed: Self = serde_json::from_str(json_str).map_err(|e| {
             forge_core::ForgeError::InvalidParameter(format!("Invalid .nam JSON profile: {e}"))
         })?;

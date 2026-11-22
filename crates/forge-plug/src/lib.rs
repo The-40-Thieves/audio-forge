@@ -31,8 +31,8 @@ use forge_dsp::{
     LimiterStyle, NoteMsg, RealtimeDensityAndClipper, RealtimeDrumTrigger, RealtimeFdnReverb,
     RealtimeMasterLimiter, RealtimeMasteringEq18, RealtimeNeuralPreamp, RealtimeOpenSoothe,
     RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSpectrumAnalyzer32, RealtimeSubAndTapeBus,
-    RealtimeTransientTonalSplit, RealtimeVocalSurgical, SpectrumBusOwner, clear_shared_spectrum,
-    publish_shared_spectrum, shared_spectrum_slot_index,
+    RealtimeTransientTonalSplit, RealtimeVocalSurgical, ReverbRoomGeometry, SpectrumBusOwner,
+    clear_shared_spectrum, publish_shared_spectrum, shared_spectrum_slot_index,
 };
 use nih_plug::prelude::*;
 use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
@@ -2432,6 +2432,8 @@ pub struct SpaceVerbAndPreampParams {
     pub vocal_ducking: FloatParam,
     #[id = "mix"]
     pub wet_mix: FloatParam,
+    #[id = "room"]
+    pub room_geometry: IntParam,
 }
 
 /// Bottom of the stored `decay` knob range. The stored range is kept as it was so saved state
@@ -2502,7 +2504,7 @@ fn string_to_reverb_decay_knob(text: &str) -> Option<f32> {
 impl Default for SpaceVerbAndPreampParams {
     fn default() -> Self {
         Self {
-            editor_state: EguiState::from_size(680, 390),
+            editor_state: EguiState::from_size(680, 430),
             neural_model_idx: IntParam::new(
                 "Neural Preamp (0=Neve1073,1=1176AllBtn,2=V76Tube,3=StuderA800)",
                 0,
@@ -2552,6 +2554,22 @@ impl Default for SpaceVerbAndPreampParams {
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
             .with_value_to_string(formatters::v2s_f32_rounded(3)),
+            room_geometry: IntParam::new("Room Geometry", 1, IntRange::Linear { min: 0, max: 4 })
+                .with_value_to_string(Arc::new(|v| match v {
+                    0 => "Plate".to_string(),
+                    2 => "Chamber".to_string(),
+                    3 => "Room".to_string(),
+                    4 => "Ambient".to_string(),
+                    _ => "Hall".to_string(),
+                }))
+                .with_string_to_value(Arc::new(|s| match s.trim().to_ascii_lowercase().as_str() {
+                    "0" | "plate" => Some(0),
+                    "1" | "hall" => Some(1),
+                    "2" | "chamber" => Some(2),
+                    "3" | "room" => Some(3),
+                    "4" | "ambient" => Some(4),
+                    _ => None,
+                })),
         }
     }
 }
@@ -2630,6 +2648,9 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
                             ui.label("Reverb Wet Mix");
                             ui.add(widgets::ParamSlider::for_param(&params.wet_mix, setter));
                             ui.end_row();
+                            ui.label("Room Geometry");
+                            ui.add(widgets::ParamSlider::for_param(&params.room_geometry, setter));
+                            ui.end_row();
                         });
                 });
             },
@@ -2662,6 +2683,14 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
             _ => AnalogHardwareModel::Neve1073ClassA,
         };
         self.preamp_dsp.set_model(model);
+        let room_geometry = match self.params.room_geometry.value() {
+            0 => ReverbRoomGeometry::Plate,
+            2 => ReverbRoomGeometry::Chamber,
+            3 => ReverbRoomGeometry::Room,
+            4 => ReverbRoomGeometry::Ambient,
+            _ => ReverbRoomGeometry::Hall,
+        };
+        self.reverb_dsp.set_room_geometry(room_geometry);
         let decay = reverb_decay_knob_to_rt60_secs(self.params.reverb_decay.value());
         let damp = f64::from(self.params.reverb_damping.value());
         let shimmer = f64::from(self.params.shimmer_amount.value());
