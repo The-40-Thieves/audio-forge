@@ -12,11 +12,13 @@
 
 pub mod audio_io;
 pub mod fx;
+pub mod midi;
 pub mod project;
 pub mod renderer;
 
 pub use audio_io::{LiveAudioEngine, LiveRecorder};
 pub use fx::FxProcessor;
+pub use midi::{MidiClip, MidiNote, PolySynth, SynthPreset};
 pub use project::{
     AudioObject, AutomationLane, AutomationPoint, AuxBus, DawProject, FadeCurve, FxSlotConfig,
     MAX_PROJECT_JSON_BYTES, MAX_UNDO_DEPTH, ObjectEq3, PROJECT_SCHEMA_VERSION, TimelineMarker,
@@ -311,5 +313,78 @@ mod tests {
         assert_eq!(tr.objects[0].fade_curve, FadeCurve::EqualPower);
         assert_eq!(tr.objects[1].fade_curve, FadeCurve::EqualPower);
         assert_eq!(tr.overlap_regions(), vec![(3600, 4800)]);
+    }
+
+    #[test]
+    fn elastic_time_stretch_and_pitch_shift_work() {
+        let sr = 48_000_u32;
+        let frames = 8192_usize;
+        let mut cache = ClipCache::default();
+        let clip_path = PathBuf::from("mem://elastic.wav");
+        cache.insert_memory_clip(clip_path.clone(), sine_clip(sr, frames, 440.0, 0.5));
+
+        let mut proj = DawProject::new("Elastic Test", sr, 120.0);
+        proj.master_inserts.clear();
+        let mut obj = AudioObject::new(10, "Stretched", clip_path, frames as u64);
+        obj.time_stretch = 0.75;
+        obj.pitch_semitones = 5.0;
+        proj.tracks[0].objects.push(obj);
+
+        let out = ObjectOrientedEngine::bounce_offline(&proj, &cache, frames).unwrap();
+        let energy: f64 = out.channels[0].iter().map(|s| s * s).sum();
+        assert!(out.channels[0].iter().all(|s| s.is_finite()));
+        assert!(
+            energy > 10.0,
+            "elastic stretched+pitched audio should produce clean audible output, got {energy}"
+        );
+    }
+
+    #[test]
+    fn midi_poly_synth_renders_polyphonic_chord() {
+        let sr = 48_000_u32;
+        let cache = ClipCache::default();
+        let mut proj = DawProject::new("MIDI Synth Test", sr, 120.0);
+        proj.master_inserts.clear();
+        proj.tracks[0].synth_preset = SynthPreset::ElectricPiano;
+        let cid = proj.alloc_id();
+        proj.tracks[0]
+            .midi_clips
+            .push(MidiClip::demo_am7_progression(cid, sr, 120.0));
+
+        let out = ObjectOrientedEngine::bounce_offline(&proj, &cache, 16_384).unwrap();
+        let energy: f64 = out.channels[0].iter().map(|s| s * s).sum();
+        assert!(out.channels[0].iter().all(|s| s.is_finite()));
+        assert!(
+            energy > 5.0,
+            "MIDI PolySynth chord progression should produce audible stereo energy, got {energy}"
+        );
+    }
+
+    #[test]
+    fn batch_stem_export_writes_per_track_wavs() {
+        let sr = 48_000_u32;
+        let frames = 4096_usize;
+        let mut cache = ClipCache::default();
+        let clip_path = PathBuf::from("mem://stem.wav");
+        cache.insert_memory_clip(clip_path.clone(), sine_clip(sr, frames, 220.0, 0.35));
+
+        let mut proj = DawProject::new("Stem Export Test", sr, 120.0);
+        proj.tracks[0].objects.push(AudioObject::new(
+            10,
+            "Vox",
+            clip_path.clone(),
+            frames as u64,
+        ));
+        let mid_id = proj.alloc_id();
+        proj.tracks[1]
+            .midi_clips
+            .push(MidiClip::demo_am7_progression(mid_id, sr, 120.0));
+
+        let dir = tempfile::tempdir().unwrap();
+        let stems = ObjectOrientedEngine::bounce_stems(&proj, &cache, dir.path()).unwrap();
+        assert_eq!(stems.len(), 2);
+        for s in &stems {
+            assert!(s.is_file(), "expected stem WAV at {}", s.display());
+        }
     }
 }

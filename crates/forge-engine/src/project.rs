@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use forge_core::{AudioBuffer, ForgeError, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::midi::{MidiClip, SynthPreset};
+
 /// Current `.forgeproj` JSON schema version.
 pub const PROJECT_SCHEMA_VERSION: u32 = 1;
 /// Maximum `.forgeproj` JSON file size accepted (16 MiB) to prevent memory exhaustion.
@@ -263,10 +265,14 @@ impl FxSlotConfig {
     }
 }
 
+fn default_one_f32() -> f32 {
+    1.0
+}
+
 /// Samplitude-style **Audio Object** living on a track timeline.
 ///
 /// Every object carries its own non-destructive clip bounds, fades, gain/pan/polarity,
-/// 3-band EQ, and **per-object FX chain** independent of the host track.
+/// elastic time-stretch & pitch-shift, 3-band EQ, and **per-object FX chain** independent of the host track.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AudioObject {
     pub id: u64,
@@ -286,6 +292,10 @@ pub struct AudioObject {
     #[serde(default)]
     pub fade_out_offset_samples: u64,
     pub fade_curve: FadeCurve,
+    #[serde(default = "default_one_f32")]
+    pub time_stretch: f32,
+    #[serde(default)]
+    pub pitch_semitones: f32,
     pub eq: ObjectEq3,
     pub fx_chain: Vec<FxSlotConfig>,
 }
@@ -313,6 +323,8 @@ impl AudioObject {
             fade_out_samples: 0,
             fade_out_offset_samples: 0,
             fade_curve: FadeCurve::EqualPower,
+            time_stretch: 1.0,
+            pitch_semitones: 0.0,
             eq: ObjectEq3::default(),
             fx_chain: Vec::new(),
         }
@@ -503,6 +515,10 @@ pub struct Track {
     pub pan_auto: AutomationLane,
     #[serde(default)]
     pub sends: Vec<TrackSend>,
+    #[serde(default)]
+    pub midi_clips: Vec<MidiClip>,
+    #[serde(default)]
+    pub synth_preset: SynthPreset,
     pub objects: Vec<AudioObject>,
     pub inserts: Vec<FxSlotConfig>,
 }
@@ -523,6 +539,8 @@ impl Track {
             volume_auto: AutomationLane::default(),
             pan_auto: AutomationLane::default(),
             sends: Vec::new(),
+            midi_clips: Vec::new(),
+            synth_preset: SynthPreset::default(),
             objects: Vec::new(),
             inserts: Vec::new(),
         }
@@ -687,16 +705,25 @@ impl DawProject {
         id
     }
 
-    /// Total timeline length in samples across all objects (minimum 10 seconds).
+    /// Total timeline length in samples across all audio objects and MIDI clips (minimum 10 seconds).
     pub fn total_length_samples(&self) -> u64 {
-        let max_end = self
+        let max_audio = self
             .tracks
             .iter()
             .flat_map(|t| t.objects.iter())
             .map(AudioObject::timeline_end_samples)
             .max()
             .unwrap_or(0);
-        max_end.max(u64::from(self.sample_rate) * 10)
+        let max_midi = self
+            .tracks
+            .iter()
+            .flat_map(|t| t.midi_clips.iter())
+            .map(MidiClip::timeline_end_samples)
+            .max()
+            .unwrap_or(0);
+        max_audio
+            .max(max_midi)
+            .max(u64::from(self.sample_rate) * 10)
     }
 
     /// Finds `(track_index, object_index)` by `object_id`.

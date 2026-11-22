@@ -15,7 +15,7 @@ use eframe::egui;
 use forge_core::AudioBuffer;
 use forge_engine::{
     AudioObject, ClipCache, DawProject, FadeCurve, FxSlotConfig, LiveAudioEngine, LiveRecorder,
-    ObjectOrientedEngine, TimelineMarker, TrackSend, UndoStack,
+    MidiClip, MidiNote, ObjectOrientedEngine, SynthPreset, TimelineMarker, TrackSend, UndoStack,
 };
 
 fn main() -> eframe::Result {
@@ -89,6 +89,13 @@ enum DragMode {
     TrimRight,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InspectorTab {
+    Object,
+    PianoRoll,
+    TrackBusFx,
+}
+
 struct ForgeDawApp {
     project: DawProject,
     undo: UndoStack,
@@ -97,6 +104,7 @@ struct ForgeDawApp {
     recorder: Option<LiveRecorder>,
     selected_track_idx: usize,
     selected_object_id: Option<u64>,
+    inspector_tab: InspectorTab,
     active_drag: Option<(usize, u64, DragMode)>,
     snap_grid: SnapGrid,
     auto_crossfade: bool,
@@ -135,6 +143,7 @@ impl ForgeDawApp {
             recorder: None,
             selected_track_idx: 0,
             selected_object_id: None,
+            inspector_tab: InspectorTab::Object,
             active_drag: None,
             snap_grid: SnapGrid::Quarter,
             auto_crossfade: true,
@@ -382,6 +391,41 @@ impl ForgeDawApp {
         self.status_line = format!("Added marker M{idx} at sample {pos}");
     }
 
+    fn add_demo_midi_clip(&mut self) {
+        let prev = self.project.clone();
+        let id = self.project.alloc_id();
+        let mut clip =
+            MidiClip::demo_am7_progression(id, self.project.sample_rate, self.project.bpm);
+        clip.timeline_start_samples = self.playhead_samples();
+        let tr_idx = self
+            .selected_track_idx
+            .min(self.project.tracks.len().saturating_sub(1));
+        self.project.tracks[tr_idx].midi_clips.push(clip);
+        self.inspector_tab = InspectorTab::PianoRoll;
+        self.commit_project_change(prev);
+        self.status_line = format!(
+            "Inserted 4-bar Am7 MIDI Progression onto track {} ({})",
+            tr_idx + 1,
+            self.project.tracks[tr_idx].synth_preset.label()
+        );
+    }
+
+    fn export_stems(&mut self) {
+        let out_dir = PathBuf::from("stems_export");
+        match ObjectOrientedEngine::bounce_stems(&self.project, &self.cache, &out_dir) {
+            Ok(paths) => {
+                self.status_line = format!(
+                    "Exported {} PDC-aligned 24-bit WAV stems into '{}'",
+                    paths.len(),
+                    out_dir.display()
+                );
+            }
+            Err(e) => {
+                self.status_line = format!("Stem export failed: {e}");
+            }
+        }
+    }
+
     fn bounce_master(&mut self) {
         let out_path = PathBuf::from(self.bounce_path_buf.trim());
         match ObjectOrientedEngine::bounce_to_wav(&self.project, &self.cache, &out_path) {
@@ -528,6 +572,9 @@ impl ForgeDawApp {
                 if ui.button("+ Demo Clip").clicked() {
                     self.add_demo_clip();
                 }
+                if ui.button("+ MIDI").clicked() {
+                    self.add_demo_midi_clip();
+                }
                 if ui.button("+ Track").clicked() {
                     let prev = self.project.clone();
                     let n = self.project.tracks.len() + 1;
@@ -540,6 +587,9 @@ impl ForgeDawApp {
                 ui.checkbox(&mut self.auto_crossfade, "XFade");
                 if ui.button("Bounce Master").clicked() {
                     self.bounce_master();
+                }
+                if ui.button("Export Stems").clicked() {
+                    self.export_stems();
                 }
                 ui.checkbox(&mut self.show_mixer, "Mixer");
             });
@@ -603,12 +653,39 @@ impl ForgeDawApp {
             .min_width(310.0)
             .default_width(340.0)
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.inspector_tab, InspectorTab::Object, "Object");
+                    ui.selectable_value(
+                        &mut self.inspector_tab,
+                        InspectorTab::PianoRoll,
+                        "Piano Roll",
+                    );
+                    ui.selectable_value(
+                        &mut self.inspector_tab,
+                        InspectorTab::TrackBusFx,
+                        "Track/Bus FX",
+                    );
+                });
+                ui.separator();
+
+                match self.inspector_tab {
+                    InspectorTab::PianoRoll => {
+                        self.draw_piano_roll_inspector(ui);
+                        return;
+                    }
+                    InspectorTab::TrackBusFx => {
+                        self.draw_track_bus_fx_inspector(ui);
+                        return;
+                    }
+                    InspectorTab::Object => {}
+                }
+
                 ui.heading(
                     egui::RichText::new("OBJECT EDITOR")
                         .color(egui::Color32::from_rgb(251, 146, 60)),
                 );
                 ui.label(
-                    egui::RichText::new("Samplitude-Style Per-Object EQ, Fades & FX Chain")
+                    egui::RichText::new("Samplitude-Style Per-Object Elastic, EQ, Fades & FX")
                         .small()
                         .color(egui::Color32::from_rgb(148, 163, 184)),
                 );
@@ -666,6 +743,24 @@ impl ForgeDawApp {
                                     changed |= ui.checkbox(&mut obj.phase_invert, "Invert").changed();
                                     changed |= ui.checkbox(&mut obj.mute, "Mute").changed();
                                 });
+                                ui.end_row();
+
+                                ui.label("Time Stretch");
+                                changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut obj.time_stretch, 0.5..=2.0)
+                                            .suffix("x"),
+                                    )
+                                    .changed();
+                                ui.end_row();
+
+                                ui.label("Pitch Shift");
+                                changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut obj.pitch_semitones, -12.0..=12.0)
+                                            .suffix(" st"),
+                                    )
+                                    .changed();
                                 ui.end_row();
                             });
 
@@ -797,6 +892,218 @@ impl ForgeDawApp {
                     self.commit_project_change(prev_snapshot);
                 }
             });
+    }
+
+    fn draw_piano_roll_inspector(&mut self, ui: &mut egui::Ui) {
+        ui.heading(
+            egui::RichText::new("MIDI PIANO ROLL & SYNTH")
+                .color(egui::Color32::from_rgb(192, 132, 252)),
+        );
+        let tr_idx = self
+            .selected_track_idx
+            .min(self.project.tracks.len().saturating_sub(1));
+        ui.label(
+            egui::RichText::new(format!("Track: {}", self.project.tracks[tr_idx].name))
+                .small()
+                .color(egui::Color32::from_rgb(148, 163, 184)),
+        );
+        ui.separator();
+
+        let prev = self.project.clone();
+        let mut changed = false;
+
+        ui.horizontal(|ui| {
+            ui.label("Synth:");
+            egui::ComboBox::from_id_salt("track_synth_preset")
+                .selected_text(self.project.tracks[tr_idx].synth_preset.label())
+                .show_ui(ui, |ui| {
+                    for preset in SynthPreset::ALL {
+                        if ui
+                            .selectable_value(
+                                &mut self.project.tracks[tr_idx].synth_preset,
+                                preset,
+                                preset.label(),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    }
+                });
+        });
+
+        if self.project.tracks[tr_idx].midi_clips.is_empty() {
+            ui.add_space(12.0);
+            if ui.button("+ Create 4-Bar Am7 MIDI Clip").clicked() {
+                self.add_demo_midi_clip();
+            }
+            if changed {
+                self.commit_project_change(prev);
+            }
+            return;
+        }
+
+        // Interactive 16-step × 13-note (C4..=C5) Piano Roll Grid for the first MIDI clip on track
+        let sr = f64::from(self.project.sample_rate.max(8_000));
+        let step_smp = (((60.0 / self.project.bpm.max(30.0)) * 0.25) * sr).round() as u64;
+        let next_note_id = self.project.alloc_id();
+
+        ui.label(
+            egui::RichText::new("Click cells to toggle 16th-note MIDI events (C4–C5):")
+                .small()
+                .color(egui::Color32::from_rgb(148, 163, 184)),
+        );
+
+        let note_names = [
+            "C5", "B4", "A#4", "A4", "G#4", "G4", "F#4", "F4", "E4", "D#4", "D4", "C#4", "C4",
+        ];
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let clip = &mut self.project.tracks[tr_idx].midi_clips[0];
+            for (row, name) in note_names.iter().enumerate() {
+                let pitch = (72 - row) as u8;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    ui.add_sized(
+                        [28.0, 16.0],
+                        egui::Label::new(egui::RichText::new(*name).monospace().small()),
+                    );
+                    for step in 0..16_u64 {
+                        let start = step * step_smp;
+                        let existing_idx = clip.notes.iter().position(|n| {
+                            n.pitch == pitch && n.start_samples.abs_diff(start) < step_smp / 2
+                        });
+                        let active = existing_idx.is_some();
+                        let col = if active {
+                            egui::Color32::from_rgb(192, 132, 252)
+                        } else if step % 4 == 0 {
+                            egui::Color32::from_rgb(38, 46, 62)
+                        } else {
+                            egui::Color32::from_rgb(24, 30, 42)
+                        };
+                        let btn = egui::Button::new("")
+                            .fill(col)
+                            .min_size(egui::vec2(15.0, 15.0));
+                        if ui.add(btn).clicked() {
+                            if let Some(idx) = existing_idx {
+                                clip.notes.remove(idx);
+                            } else {
+                                clip.notes.push(MidiNote {
+                                    id: next_note_id + step * 16 + row as u64,
+                                    start_samples: start,
+                                    length_samples: step_smp.saturating_mul(9) / 10,
+                                    pitch,
+                                    velocity: 0.82,
+                                });
+                            }
+                            changed = true;
+                        }
+                    }
+                });
+            }
+        });
+
+        if changed {
+            self.commit_project_change(prev);
+        }
+    }
+
+    fn draw_track_bus_fx_inspector(&mut self, ui: &mut egui::Ui) {
+        ui.heading(
+            egui::RichText::new("TRACK, AUX & MASTER FX")
+                .color(egui::Color32::from_rgb(56, 189, 248)),
+        );
+        let tr_idx = self
+            .selected_track_idx
+            .min(self.project.tracks.len().saturating_sub(1));
+        let prev = self.project.clone();
+        let mut changed = false;
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            type FxPreset = (&'static str, fn() -> FxSlotConfig);
+            let presets: [FxPreset; 8] = [
+                (
+                    "Forge OpenSoothe De-Fizz",
+                    FxSlotConfig::default_open_soothe,
+                ),
+                ("Forge Vocal Surgical", FxSlotConfig::default_vocal_surgical),
+                ("Forge Vocal Tune", FxSlotConfig::default_vocal_tune),
+                ("Forge SubMono & Tape", FxSlotConfig::default_sub_mono_tape),
+                ("Forge SplitEQ", FxSlotConfig::default_split_eq),
+                (
+                    "Forge Density & Clipper",
+                    FxSlotConfig::default_density_clipper,
+                ),
+                ("Forge SpaceVerb FDN", FxSlotConfig::default_space_verb),
+                ("Forge Master Limiter", FxSlotConfig::default_master_limiter),
+            ];
+
+            ui.label(
+                egui::RichText::new(format!(
+                    "Track Inserts: {}",
+                    self.project.tracks[tr_idx].name
+                ))
+                .strong(),
+            );
+            egui::ComboBox::from_id_salt("add_track_fx")
+                .selected_text("+ Add Track Insert...")
+                .show_ui(ui, |ui| {
+                    for (label, make_fn) in presets {
+                        if ui.selectable_label(false, label).clicked() {
+                            self.project.tracks[tr_idx].inserts.push(make_fn());
+                            changed = true;
+                        }
+                    }
+                });
+            let mut rm_tr = None;
+            for (idx, fx) in self.project.tracks[tr_idx].inserts.iter_mut().enumerate() {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(fx.display_name());
+                        if ui.small_button("X").clicked() {
+                            rm_tr = Some(idx);
+                        }
+                    });
+                    changed |= draw_fx_slot_controls(ui, fx);
+                });
+            }
+            if let Some(rm) = rm_tr {
+                self.project.tracks[tr_idx].inserts.remove(rm);
+                changed = true;
+            }
+
+            ui.separator();
+            ui.label(egui::RichText::new("Master Bus Inserts").strong());
+            egui::ComboBox::from_id_salt("add_master_fx")
+                .selected_text("+ Add Master Insert...")
+                .show_ui(ui, |ui| {
+                    for (label, make_fn) in presets {
+                        if ui.selectable_label(false, label).clicked() {
+                            self.project.master_inserts.push(make_fn());
+                            changed = true;
+                        }
+                    }
+                });
+            let mut rm_m = None;
+            for (idx, fx) in self.project.master_inserts.iter_mut().enumerate() {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(fx.display_name());
+                        if ui.small_button("X").clicked() {
+                            rm_m = Some(idx);
+                        }
+                    });
+                    changed |= draw_fx_slot_controls(ui, fx);
+                });
+            }
+            if let Some(rm) = rm_m {
+                self.project.master_inserts.remove(rm);
+                changed = true;
+            }
+        });
+
+        if changed {
+            self.commit_project_change(prev);
+        }
     }
 
     fn draw_mixer_dock(&mut self, ctx: &egui::Context) {
@@ -1402,6 +1709,66 @@ impl ForgeDawApp {
 
                         if lane_resp.drag_stopped() {
                             self.active_drag = None;
+                        }
+
+                        // Render MIDI Clips with miniature piano-roll note bars
+                        for mc in &self.project.tracks[ti].midi_clips {
+                            let ms = (mc.timeline_start_samples as f64 / sr) as f32;
+                            let ml = (mc.length_samples as f64 / sr) as f32;
+                            let mx0 =
+                                lane_rect.left() + (ms - self.scroll_secs) * self.pixels_per_sec;
+                            let mw = (ml * self.pixels_per_sec).max(20.0);
+                            let mrect = egui::Rect::from_min_size(
+                                egui::pos2(mx0, lane_rect.top() + 4.0),
+                                egui::vec2(mw, lane_rect.height() - 8.0),
+                            );
+                            p.rect_filled(
+                                mrect,
+                                4.0,
+                                egui::Color32::from_rgba_unmultiplied(168, 85, 247, 55),
+                            );
+                            p.rect_stroke(
+                                mrect,
+                                4.0,
+                                egui::Stroke::new(1.25_f32, egui::Color32::from_rgb(192, 132, 252)),
+                                egui::StrokeKind::Inside,
+                            );
+                            p.text(
+                                egui::pos2(mrect.left() + 6.0, mrect.top() + 10.0),
+                                egui::Align2::LEFT_CENTER,
+                                format!("MIDI: {}", mc.name),
+                                egui::FontId::proportional(10.5),
+                                egui::Color32::from_rgb(233, 213, 255),
+                            );
+                            for note in &mc.notes {
+                                let nx0 = mrect.left()
+                                    + ((note.start_samples as f64 / sr) as f32)
+                                        * self.pixels_per_sec;
+                                let nw = (((note.length_samples as f64 / sr) as f32)
+                                    * self.pixels_per_sec)
+                                    .max(3.0);
+                                let pitch_norm =
+                                    ((f32::from(note.pitch) - 44.0) / 32.0).clamp(0.0, 1.0);
+                                let ny =
+                                    mrect.bottom() - 6.0 - pitch_norm * (mrect.height() - 22.0);
+                                if nx0 + nw >= lane_rect.left() && nx0 <= lane_rect.right() {
+                                    p.rect_filled(
+                                        egui::Rect::from_min_size(
+                                            egui::pos2(nx0, ny),
+                                            egui::vec2(nw, 3.5),
+                                        ),
+                                        1.0,
+                                        egui::Color32::from_rgb(216, 180, 254),
+                                    );
+                                }
+                            }
+                            if lane_resp.clicked()
+                                && let Some(pt) = lane_resp.interact_pointer_pos()
+                                && mrect.contains(pt)
+                            {
+                                self.selected_track_idx = ti;
+                                self.inspector_tab = InspectorTab::PianoRoll;
+                            }
                         }
 
                         // Highlight automatic Equal-Power Crossfade overlap zones

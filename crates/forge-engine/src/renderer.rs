@@ -9,6 +9,7 @@ use forge_core::{AudioBuffer, AuditReport, Result};
 use forge_dsp::{Biquad, RealtimeSpectrumAnalyzer32, audit_audio, flush_denormal_f64};
 
 use crate::fx::FxProcessor;
+use crate::midi::PolySynth;
 use crate::project::{AudioObject, AuxBus, DawProject, ObjectEq3, Track, WaveformPeaks};
 
 /// Simple pre-allocated stereo delay line for sample-accurate Plugin Delay Compensation (PDC).
@@ -112,6 +113,7 @@ struct ObjectRuntime {
 struct TrackRuntime {
     config: Track,
     objects: Vec<ObjectRuntime>,
+    synth: PolySynth,
     inserts: Vec<FxProcessor>,
     pdc: PdcDelayLine,
     total_latency: usize,
@@ -326,6 +328,7 @@ impl ObjectOrientedEngine {
             tracks.push(TrackRuntime {
                 config: track.clone(),
                 objects: obj_runtimes,
+                synth: PolySynth::new(sr),
                 inserts,
                 pdc: PdcDelayLine::new(0),
                 total_latency,
@@ -521,6 +524,7 @@ impl ObjectOrientedEngine {
         let sr = self.sample_rate;
         for tr in &mut self.tracks {
             tr.pdc.reset();
+            tr.synth.reset(sr);
             for ins in &mut tr.inserts {
                 ins.reset(sr);
             }
@@ -545,6 +549,91 @@ impl ObjectOrientedEngine {
             ins.reset(sr);
         }
         self.analyzer.reset(sr);
+    }
+
+    #[inline]
+    fn sample_clip_interp(clip: &AudioBuffer, src_pos: f64) -> (f32, f32, bool) {
+        let clip_frames = clip.num_frames();
+        if clip_frames == 0 || src_pos < 0.0 || !src_pos.is_finite() {
+            return (0.0, 0.0, false);
+        }
+        let idx0 = src_pos.floor() as usize;
+        if idx0 >= clip_frames {
+            return (0.0, 0.0, false);
+        }
+        let idx1 = (idx0 + 1).min(clip_frames - 1);
+        let frac = src_pos - (idx0 as f64);
+        let c0 = (clip.channels[0][idx0] + (clip.channels[0][idx1] - clip.channels[0][idx0]) * frac)
+            as f32;
+        let c1 = if clip.channels.len() > 1 {
+            (clip.channels[1][idx0] + (clip.channels[1][idx1] - clip.channels[1][idx0]) * frac)
+                as f32
+        } else {
+            c0
+        };
+        (c0, c1, true)
+    }
+
+    #[inline]
+    fn read_object_elastic_stereo(
+        clip: &AudioBuffer,
+        obj: &AudioObject,
+        local: u64,
+        engine_sr: f64,
+    ) -> (f32, f32, bool) {
+        let sr_ratio = f64::from(clip.sample_rate) / engine_sr.max(8_000.0);
+        let stretch = f64::from(obj.time_stretch.clamp(0.5, 2.0));
+        let pitch_st = f64::from(obj.pitch_semitones.clamp(-12.0, 12.0));
+        let is_elastic = (stretch - 1.0).abs() > 1e-4 || pitch_st.abs() > 1e-3;
+
+        if !is_elastic {
+            if (sr_ratio - 1.0).abs() < 1e-6 {
+                let src_idx = (obj.source_offset_samples + local) as usize;
+                let clip_frames = clip.num_frames();
+                if src_idx < clip_frames {
+                    let c0 = clip.channels[0][src_idx] as f32;
+                    let c1 = if clip.channels.len() > 1 {
+                        clip.channels[1][src_idx] as f32
+                    } else {
+                        c0
+                    };
+                    return (c0, c1, true);
+                }
+                return (0.0, 0.0, false);
+            }
+            let src_pos = ((obj.source_offset_samples + local) as f64) * sr_ratio;
+            return Self::sample_clip_interp(clip, src_pos);
+        }
+
+        // Zero-alloc Dual-Grain Hann Overlap-Add Elastic Time-Stretch & Pitch-Shift
+        const GRAIN_LEN: f64 = 2048.0;
+        const HALF_GRAIN: f64 = 1024.0;
+        let pitch_ratio = 2.0_f64.powf(pitch_st / 12.0);
+        let local_f = local as f64;
+        let src_off_f = (obj.source_offset_samples as f64) * sr_ratio;
+
+        let mut out_l = 0.0_f32;
+        let mut out_r = 0.0_f32;
+        let mut any_in = false;
+
+        for g in 0..2 {
+            let shifted = local_f + (g as f64) * HALF_GRAIN;
+            let phase = shifted.rem_euclid(GRAIN_LEN);
+            let anchor = shifted - phase;
+            let u = phase / GRAIN_LEN;
+            let win = (std::f64::consts::PI * u).sin();
+            let w = (win * win) as f32;
+            let src_pos = src_off_f
+                + anchor * stretch * sr_ratio
+                + (phase - HALF_GRAIN) * pitch_ratio * sr_ratio;
+            let (gl, gr, ok) = Self::sample_clip_interp(clip, src_pos);
+            if ok {
+                out_l += gl * w;
+                out_r += gr * w;
+                any_in = true;
+            }
+        }
+        (out_l, out_r, any_in)
     }
 
     #[inline]
@@ -601,48 +690,12 @@ impl ObjectOrientedEngine {
                     let (mut ol, mut or_) = if pos >= start && pos < end {
                         let local = pos - start;
                         if let Some(ref clip) = obj.clip {
-                            let clip_frames = clip.num_frames();
-                            let (s0, s1, in_bounds) = if f64::from(clip.sample_rate)
-                                == self.sample_rate
-                            {
-                                let src_idx = (obj.config.source_offset_samples + local) as usize;
-                                if src_idx < clip_frames {
-                                    let c0 = clip.channels[0][src_idx] as f32;
-                                    let c1 = if clip.channels.len() > 1 {
-                                        clip.channels[1][src_idx] as f32
-                                    } else {
-                                        c0
-                                    };
-                                    (c0, c1, true)
-                                } else {
-                                    (0.0, 0.0, false)
-                                }
-                            } else if clip_frames > 0 {
-                                let ratio = f64::from(clip.sample_rate) / self.sample_rate;
-                                let src_pos =
-                                    ((obj.config.source_offset_samples + local) as f64) * ratio;
-                                let idx0 = src_pos.floor() as usize;
-                                if idx0 < clip_frames {
-                                    let idx1 = (idx0 + 1).min(clip_frames - 1);
-                                    let frac = src_pos - (idx0 as f64);
-                                    let c0 = (clip.channels[0][idx0]
-                                        + (clip.channels[0][idx1] - clip.channels[0][idx0]) * frac)
-                                        as f32;
-                                    let c1 = if clip.channels.len() > 1 {
-                                        (clip.channels[1][idx0]
-                                            + (clip.channels[1][idx1] - clip.channels[1][idx0])
-                                                * frac)
-                                            as f32
-                                    } else {
-                                        c0
-                                    };
-                                    (c0, c1, true)
-                                } else {
-                                    (0.0, 0.0, false)
-                                }
-                            } else {
-                                (0.0, 0.0, false)
-                            };
+                            let (s0, s1, in_bounds) = Self::read_object_elastic_stereo(
+                                clip,
+                                &obj.config,
+                                local,
+                                self.sample_rate,
+                            );
                             if in_bounds {
                                 let fade = obj.config.fade_gain_at(local) as f32;
                                 let g = 10.0_f32.powf(obj.config.gain_db.clamp(-48.0, 24.0) / 20.0)
@@ -669,6 +722,15 @@ impl ObjectOrientedEngine {
 
                     tr_l += ol;
                     tr_r += or_;
+                }
+
+                // Render built-in zero-alloc 16-voice PolySynth for any MIDI clips on this track
+                if !tr.config.midi_clips.is_empty() {
+                    let (ml, mr) =
+                        tr.synth
+                            .render_sample(&tr.config.midi_clips, tr.config.synth_preset, pos);
+                    tr_l += ml;
+                    tr_r += mr;
                 }
 
                 // Track-level FX inserts + track fader/pan/automation/polarity + inter-track PDC
@@ -862,5 +924,45 @@ impl ObjectOrientedEngine {
         let buf = Self::bounce_offline(project, cache, total)?;
         buf.save_wav(output_wav, 24)?;
         Ok(audit_audio(&buf))
+    }
+
+    /// Samplitude-style **Batch Multi-Track Stem Export**: renders every unmuted track as its own
+    /// PDC-aligned 24-bit stereo WAV stem inside `output_dir` and returns the written file paths.
+    pub fn bounce_stems(
+        project: &DawProject,
+        cache: &ClipCache,
+        output_dir: &Path,
+    ) -> Result<Vec<PathBuf>> {
+        std::fs::create_dir_all(output_dir)?;
+        let total = project.total_length_samples() as usize;
+        let mut written = Vec::new();
+
+        for (ti, tr) in project.tracks.iter().enumerate() {
+            if tr.mute || (tr.objects.is_empty() && tr.midi_clips.is_empty()) {
+                continue;
+            }
+            let mut stem_proj = project.clone();
+            for (j, t) in stem_proj.tracks.iter_mut().enumerate() {
+                t.solo = j == ti;
+                t.mute = j != ti;
+            }
+            let safe_name: String = tr
+                .name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            let stem_path = output_dir.join(format!("{safe_name}.wav"));
+            let buf = Self::bounce_offline(&stem_proj, cache, total)?;
+            buf.save_wav(&stem_path, 24)?;
+            written.push(stem_path);
+        }
+
+        Ok(written)
     }
 }

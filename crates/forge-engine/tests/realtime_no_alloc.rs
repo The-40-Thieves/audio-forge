@@ -5,7 +5,8 @@
 use assert_no_alloc::{AllocDisabler, assert_no_alloc, violation_count};
 use forge_core::AudioBuffer;
 use forge_engine::{
-    AudioObject, ClipCache, DawProject, FxSlotConfig, ObjectOrientedEngine, TrackSend,
+    AudioObject, ClipCache, DawProject, FxSlotConfig, MidiClip, ObjectOrientedEngine, SynthPreset,
+    TrackSend,
 };
 use std::path::PathBuf;
 
@@ -32,6 +33,8 @@ fn object_oriented_engine_render_block_is_zero_alloc() {
 
     let obj_id = project.alloc_id();
     let mut obj = AudioObject::new(obj_id, "Lead Vocal", clip_path.clone(), 8192);
+    obj.time_stretch = 0.85;
+    obj.pitch_semitones = 3.0;
     obj.eq.low_db = 1.5;
     obj.eq.mid_db = -1.0;
     obj.eq.high_db = 2.0;
@@ -39,6 +42,12 @@ fn object_oriented_engine_render_block_is_zero_alloc() {
     obj.fx_chain.push(FxSlotConfig::default_vocal_surgical());
     obj.fx_chain.push(FxSlotConfig::default_vocal_tune());
     project.tracks[0].objects.push(obj);
+
+    let midi_id = project.alloc_id();
+    project.tracks[1].synth_preset = SynthPreset::WarmSawPad;
+    project.tracks[1]
+        .midi_clips
+        .push(MidiClip::demo_am7_progression(midi_id, 48_000, 120.0));
 
     let obj2_id = project.alloc_id();
     let mut obj2 = AudioObject::new(obj2_id, "Bass", clip_path, 8192);
