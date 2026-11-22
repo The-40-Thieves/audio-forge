@@ -166,12 +166,12 @@ fn stem_swapped_after_the_worker_ran_fails_verification() {
     let outside = tempfile::tempdir().expect("outside");
     write_tone(&root.path().join("mix.wav"));
     let decoy = outside.path().join("decoy.wav");
-    write_tone(&decoy);
+    std::fs::write(&decoy, b"sentinel").expect("write decoy");
     let sb = PathSandbox::new([root.path().to_path_buf()]).expect("sandbox");
     let stems = root.path().join("session").join("stems");
     let (_guard, fired) = swap_once("session/stems/03_Bass_Stem.wav", move || {
         let stem = stems.join("03_Bass_Stem.wav");
-        std::fs::remove_file(&stem).expect("remove stem");
+        let _ = std::fs::remove_file(&stem);
         symlink(&decoy, &stem).expect("symlink stem to outside");
     });
 
@@ -180,12 +180,16 @@ fn stem_swapped_after_the_worker_ran_fails_verification() {
         "forge_ingest_to_reaper",
         json!({ "input": "mix.wav", "output_dir": "session" }),
     );
-    // The bass stem is not read again after separation, so only the post-run check sees it.
     assert!(fired.get(), "the swap hook never ran");
     assert!(
         is_error,
         "a stem swapped for an outside link was accepted: {text}"
     );
     assert!(text.contains("sandbox root handle"), "{text}");
+    assert_eq!(
+        std::fs::read(outside.path().join("decoy.wav")).expect("decoy intact"),
+        b"sentinel",
+        "write escaped through swapped stem symlink"
+    );
     assert!(!root.path().join("session/ForgeAudio_Session.rpp").exists());
 }
