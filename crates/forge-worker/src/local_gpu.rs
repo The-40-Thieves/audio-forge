@@ -11,6 +11,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use forge_core::{ForgeError, Result, StemBundle};
+use serde::{Deserialize, Serialize};
 
 /// Location of the worker script inside the repository.
 const SCRIPT_REL: &str = "python-worker/forge_gpu_worker.py";
@@ -93,6 +94,115 @@ pub(crate) fn separate(
     serde_json::from_str(last_line).map_err(|e| {
         ForgeError::WorkerError(format!(
             "GPU worker printed no stem JSON ({e}): {last_line}"
+        ))
+    })
+}
+
+/// Output of `forge_gpu_worker.py denoise`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NeuralDenoiseResult {
+    pub denoised: PathBuf,
+    pub backend: String,
+}
+
+/// Output of `forge_gpu_worker.py transcribe`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MidiTranscribeResult {
+    pub midi: PathBuf,
+}
+
+/// Resolves the default local GPU worker command from `FORGE_GPU_WORKER_SCRIPT` or
+/// `BUILD_SOURCE_ROOT`.
+pub fn resolve_default_local_worker() -> Result<LocalWorkerCommand> {
+    let override_path = std::env::var_os("FORGE_GPU_WORKER_SCRIPT").map(PathBuf::from);
+    let script = resolve_worker_script(override_path, Some(Path::new(BUILD_SOURCE_ROOT)))
+        .ok_or_else(|| {
+            ForgeError::WorkerError(
+                "Could not locate python-worker/forge_gpu_worker.py; set FORGE_GPU_WORKER_SCRIPT"
+                    .to_string(),
+            )
+        })?;
+    Ok(LocalWorkerCommand::uv(&script))
+}
+
+/// Runs neural denoising (`DeepFilterNet3` / `Mel-Band-RoFormer`) via the local Python GPU worker.
+pub fn run_local_neural_denoise(
+    worker: &LocalWorkerCommand,
+    input_path: &Path,
+    output_dir: &Path,
+    backend: &str,
+    attenuation_limit_db: Option<f64>,
+    timeout: Duration,
+) -> Result<NeuralDenoiseResult> {
+    let mut cmd = Command::new(&worker.program);
+    cmd.args(&worker.args)
+        .arg("denoise")
+        .arg("--input")
+        .arg(input_path)
+        .arg("--output-dir")
+        .arg(output_dir)
+        .arg("--backend")
+        .arg(backend);
+    if let Some(lim) = attenuation_limit_db {
+        if !lim.is_finite() || !(0.0..=100.0).contains(&lim) {
+            return Err(ForgeError::InvalidParameter(format!(
+                "attenuation_limit_db ({lim}) must be finite and in 0..=100"
+            )));
+        }
+        cmd.arg("--attenuation-limit-db").arg(format!("{lim}"));
+    }
+    let out = run_with_timeout(cmd, timeout)?;
+    if !out.status.success() {
+        return Err(ForgeError::WorkerError(format!(
+            "GPU worker denoise exited with {}: {}",
+            out.status,
+            stderr_excerpt(&out.stderr)
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let last_line = stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    serde_json::from_str(last_line).map_err(|e| {
+        ForgeError::WorkerError(format!(
+            "GPU worker printed no denoise JSON ({e}): {last_line}"
+        ))
+    })
+}
+
+/// Runs polyphonic audio-to-MIDI transcription (`basic-pitch`) via the local Python GPU worker.
+pub fn run_local_transcribe_midi(
+    worker: &LocalWorkerCommand,
+    input_path: &Path,
+    output_dir: &Path,
+    timeout: Duration,
+) -> Result<MidiTranscribeResult> {
+    let mut cmd = Command::new(&worker.program);
+    cmd.args(&worker.args)
+        .arg("transcribe")
+        .arg("--input")
+        .arg(input_path)
+        .arg("--output-dir")
+        .arg(output_dir);
+    let out = run_with_timeout(cmd, timeout)?;
+    if !out.status.success() {
+        return Err(ForgeError::WorkerError(format!(
+            "GPU worker transcribe exited with {}: {}",
+            out.status,
+            stderr_excerpt(&out.stderr)
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let last_line = stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    serde_json::from_str(last_line).map_err(|e| {
+        ForgeError::WorkerError(format!(
+            "GPU worker printed no transcribe JSON ({e}): {last_line}"
         ))
     })
 }
