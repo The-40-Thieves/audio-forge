@@ -115,6 +115,23 @@ impl Oversampler2x {
     }
 }
 
+/// Zero-allocation 4x Polyphase Half-Band Upsampler & Downsampler (cascaded 2x stages)
+/// for ultra-low-aliasing nonlinear clipping and saturation stages.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Oversampler4x {
+    outer: Oversampler2x,
+    inner: Oversampler2x,
+}
+
+impl Oversampler4x {
+    /// Upsamples `x` to 4x rate, applies nonlinear closure `f`, and decimates cleanly back to 1x.
+    #[inline]
+    pub fn process<F: FnMut(f64) -> f64>(&mut self, x_raw: f64, mut f: F) -> f64 {
+        let inner = &mut self.inner;
+        self.outer.process(x_raw, |s2| inner.process(s2, &mut f))
+    }
+}
+
 // ============================================================================
 // 2. REAL-TIME STRUCTURAL TRANSIENT / TONAL SPLIT ENGINE (Eventide SplitEQ style)
 // ============================================================================
@@ -240,8 +257,8 @@ pub struct RealtimeDensityAndClipper {
     rms_env: [f64; 3],
     adaa_l: [AdaaTanh; 3],
     adaa_r: [AdaaTanh; 3],
-    oversampler_l: [Oversampler2x; 3],
-    oversampler_r: [Oversampler2x; 3],
+    oversampler_l: [Oversampler4x; 3],
+    oversampler_r: [Oversampler4x; 3],
 }
 
 impl RealtimeDensityAndClipper {
@@ -258,8 +275,8 @@ impl RealtimeDensityAndClipper {
             rms_env: [1e-4; 3],
             adaa_l: [AdaaTanh::default(); 3],
             adaa_r: [AdaaTanh::default(); 3],
-            oversampler_l: [Oversampler2x::default(); 3],
-            oversampler_r: [Oversampler2x::default(); 3],
+            oversampler_l: [Oversampler4x::default(); 3],
+            oversampler_r: [Oversampler4x::default(); 3],
         }
     }
 
@@ -400,6 +417,10 @@ pub struct RealtimeFdnReverb {
     delay_lens: [usize; 8],
     write_pos: [usize; 8],
     damp_state: [f64; 8],
+    low_shelf_state: [f64; 8],
+    decay_low_mult: f64,
+    decay_high_mult: f64,
+    mod_depth: f64,
     low_cut_l: Biquad,
     low_cut_r: Biquad,
     lfo_phase: f64,
@@ -448,6 +469,10 @@ impl RealtimeFdnReverb {
             delay_lens,
             write_pos: [0; 8],
             damp_state: [0.0; 8],
+            low_shelf_state: [0.0; 8],
+            decay_low_mult: 1.0,
+            decay_high_mult: 1.0,
+            mod_depth: 1.0,
             low_cut_l: Biquad::highpass(sr, 180.0, FRAC_1_SQRT_2),
             low_cut_r: Biquad::highpass(sr, 180.0, FRAC_1_SQRT_2),
             lfo_phase: 0.0,
@@ -484,6 +509,21 @@ impl RealtimeFdnReverb {
         self.er_taps_samples
     }
 
+    /// Sets Decay Rate EQ multipliers (`0.25..=2.0`) for low (`<350 Hz`) and high (`>4 kHz`)
+    /// bands relative to the midband RT60 (Pro-R 2 / Valhalla Decay EQ). Zero-alloc.
+    #[inline]
+    pub fn set_decay_eq(&mut self, low_mult: f64, high_mult: f64) {
+        self.decay_low_mult = sanitize_param_f64(low_mult, 1.0, 0.25, 2.0);
+        self.decay_high_mult = sanitize_param_f64(high_mult, 1.0, 0.25, 2.0);
+    }
+
+    /// Sets FDN chorus modulation depth multiplier (`0.0` = static, `1.0` = nominal, `2.0` = lush).
+    /// Zero-alloc.
+    #[inline]
+    pub fn set_mod_depth(&mut self, depth: f64) {
+        self.mod_depth = sanitize_param_f64(depth, 1.0, 0.0, 2.0);
+    }
+
     /// Resets all reverb state. Clears buffers in place (zero audio-thread allocations) when
     /// `sample_rate` matches the already-configured rate.
     pub fn reset(&mut self, sample_rate: f64) {
@@ -500,6 +540,7 @@ impl RealtimeFdnReverb {
             }
             self.write_pos = [0; 8];
             self.damp_state = [0.0; 8];
+            self.low_shelf_state = [0.0; 8];
             self.low_cut_l.reset();
             self.low_cut_r.reset();
             self.lfo_phase = 0.0;
@@ -509,8 +550,13 @@ impl RealtimeFdnReverb {
             self.shimmer_phase = 0.0;
         } else {
             let saved_geometry = self.room_geometry;
+            let saved_lo = self.decay_low_mult;
+            let saved_hi = self.decay_high_mult;
+            let saved_mod = self.mod_depth;
             *self = Self::new(sr);
             self.set_room_geometry(saved_geometry);
+            self.set_decay_eq(saved_lo, saved_hi);
+            self.set_mod_depth(saved_mod);
         }
     }
 
@@ -621,7 +667,7 @@ impl RealtimeFdnReverb {
         // 3. Read from 8 LFO-modulated FDN delay lines with fractional linear interpolation
         // (eliminates integer-index zipper clicks and keeps chorus depth constant in ms across SRs)
         self.lfo_phase = (self.lfo_phase + 0.65 / self.sample_rate).fract();
-        let mod_depth_samples = 0.000_125 * self.sample_rate; // 0.125 ms (~6 samples at 48 kHz)
+        let mod_depth_samples = 0.000_125 * self.sample_rate * self.mod_depth;
         let mut outs = [0.0_f64; 8];
         for (i, out_val) in outs.iter_mut().enumerate() {
             let len = self.delay_lens[i];
@@ -641,16 +687,32 @@ impl RealtimeFdnReverb {
         let mut wet_l = (outs[0] + outs[2] + outs[4] + outs[6]) * 0.5 + er_l * 0.35;
         let mut wet_r = (outs[1] + outs[3] + outs[5] + outs[7]) * 0.5 + er_r * 0.35;
 
-        // 4. Orthogonal 8x8 Walsh-Hadamard mixing + RT60 feedback + HF damping
+        // 4. Orthogonal 8x8 Walsh-Hadamard mixing + RT60 feedback + Decay Rate EQ (low/high)
         Self::fast_hadamard_8(&mut outs);
         let rt60 = sanitize_param_f64(decay_rt60_secs, 2.4, 0.2, 20.0);
+        let rt60_lo = (rt60 * self.decay_low_mult).clamp(0.15, 24.0);
+        let rt60_hi = (rt60 * self.decay_high_mult).clamp(0.15, 24.0);
         let damp = sanitize_param_f64(damping, 0.35, 0.05, 0.90);
+        let low_alpha = (-2.0 * PI * 350.0 / self.sample_rate).exp();
 
         for (i, &out_val) in outs.iter().enumerate() {
             let delay_sec = (self.delay_lens[i] as f64) / self.sample_rate;
-            let fb_gain = 10.0_f64.powf(-3.0 * delay_sec / rt60).min(0.985);
+            let fb_mid = 10.0_f64.powf(-3.0 * delay_sec / rt60).min(0.985);
+            let fb_lo = 10.0_f64.powf(-3.0 * delay_sec / rt60_lo).min(0.985);
+            let fb_hi = 10.0_f64.powf(-3.0 * delay_sec / rt60_hi).min(0.985);
+
+            // Split feedback into low (<350 Hz), mid, and damped high bands for independent RT60
+            self.low_shelf_state[i] = flush_denormal_f64(
+                low_alpha * self.low_shelf_state[i] + (1.0 - low_alpha) * out_val,
+            );
+            let lo_part = self.low_shelf_state[i];
+            let hi_mid = out_val - lo_part;
             self.damp_state[i] =
-                flush_denormal_f64((1.0 - damp) * out_val + damp * self.damp_state[i]);
+                flush_denormal_f64((1.0 - damp) * hi_mid + damp * self.damp_state[i]);
+            let mid_part = self.damp_state[i];
+            let hi_part = hi_mid - mid_part;
+            let fb_sig = lo_part * fb_lo + mid_part * fb_mid + hi_part * fb_hi;
+
             let base_inj = if i % 2 == 0 {
                 0.65 * diff_sig + 0.35 * send_l
             } else {
@@ -658,8 +720,7 @@ impl RealtimeFdnReverb {
             };
             let input_inj = base_inj * 0.25 + shimmer_sig * 0.18;
             let w_pos = self.write_pos[i];
-            self.delay_lines[i][w_pos] =
-                flush_denormal_f64(input_inj + self.damp_state[i] * fb_gain);
+            self.delay_lines[i][w_pos] = flush_denormal_f64(input_inj + fb_sig);
             self.write_pos[i] = (w_pos + 1) % self.delay_lens[i];
         }
 

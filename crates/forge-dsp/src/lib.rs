@@ -21,8 +21,9 @@ pub use dtw_align::{StretchMarker, align_vocal_double_dtw};
 pub use elite_dsp::{
     AdaaSin, AdaaTanh, AllpassDisperser, AnalogHardwareModel, AutoGainCompensator,
     GenreTonalTarget, JilesAthertonHysteresis, MAX_NAM_JSON_BYTES, NamWaveNetProfile,
-    Oversampler2x, RealtimeDensityAndClipper, RealtimeFdnReverb, RealtimeNeuralPreamp,
-    RealtimeTransientTonalSplit, ReverbRoomGeometry, compute_genre_tonal_balance_eq,
+    Oversampler2x, Oversampler4x, RealtimeDensityAndClipper, RealtimeFdnReverb,
+    RealtimeNeuralPreamp, RealtimeTransientTonalSplit, ReverbRoomGeometry,
+    compute_genre_tonal_balance_eq,
 };
 pub use loudness_limiter::{
     Biquad, CytomicSvf, DitherMode, LIMITER_LOOKAHEAD_MS, LIMITER_RELEASE_MS, LimiterStyle,
@@ -32,9 +33,9 @@ pub use loudness_limiter::{
 };
 pub use phase_align::{PhaseAlignmentResult, align_phase_gcc_phat};
 pub use realtime::{
-    ParamSmoother, RealtimeDrumTrigger, RealtimeMasterLimiter, RealtimeMasteringEq18,
-    RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSubAndTapeBus,
-    RealtimeVocalSurgical,
+    IspOversampling, ParamSmoother, RealtimeDrumTrigger, RealtimeMasterLimiter,
+    RealtimeMasteringEq18, RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner,
+    RealtimeSubAndTapeBus, RealtimeVocalSurgical,
 };
 pub use restoration::{
     MASTERING_18_BANDS_HZ, RestorationConfig, apply_18_band_eq, apply_analog_console_and_tape,
