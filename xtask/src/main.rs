@@ -16,7 +16,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const STANDALONE_PLUGINS: [(&str, &str); 10] = [
+pub const STANDALONE_PLUGINS: [(&str, &str); 11] = [
     (
         "forge-opensoothe",
         "Forge OpenSoothe De-Fizz (2048-pt OLA STFT Dynamic Spectral Resonance & AI Fizz Suppressor)",
@@ -56,6 +56,10 @@ pub const STANDALONE_PLUGINS: [(&str, &str); 10] = [
     (
         "forge-spaceverb",
         "Forge SpaceVerb FDN & Neural Preamp (Dilated WaveNet Preamp + 8x8 Hadamard FDN Shimmer/Ducking Reverb)",
+    ),
+    (
+        "forge-vocal-tune",
+        "Forge Vocal Tune (Real-Time Low-Latency YIN + PSOLA Scale-Locked Pitch Corrector)",
     ),
 ];
 

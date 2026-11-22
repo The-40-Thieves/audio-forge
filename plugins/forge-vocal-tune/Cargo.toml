@@ -1,0 +1,17 @@
+[package]
+name = "forge-vocal-tune"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Standalone VST3 & CLAP Plugin: Forge Vocal Tune (Real-Time Low-Latency YIN + PSOLA Scale-Locked Pitch Corrector)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+forge-plug = { path = "../../crates/forge-plug" }
+nih_plug.workspace = true
+
+[lints]
+workspace = true

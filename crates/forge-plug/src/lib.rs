@@ -20,8 +20,7 @@
 mod ui;
 
 use std::num::NonZeroU32;
-#[cfg(test)]
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
@@ -34,6 +33,7 @@ use forge_dsp::{
     RealtimeSubAndTapeBus, RealtimeTransientTonalSplit, RealtimeVocalSurgical, ReverbRoomGeometry,
     SpectrumBusOwner, clear_shared_spectrum, publish_shared_spectrum, shared_spectrum_slot_index,
 };
+use forge_vocal::{RealtimeVocalTune, VocalTuneScaleMode};
 use nih_plug::prelude::*;
 use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
 
@@ -259,6 +259,31 @@ const SPACEVERB_PRESETS: &[FactoryPreset] = &[
             ("shimmer", 0.45),
             ("duck", 0.40),
             ("mix", 0.38),
+        ],
+    },
+];
+
+const VOCAL_TUNE_PRESETS: &[FactoryPreset] = &[
+    FactoryPreset {
+        name: "Natural Pop",
+        values: &[
+            ("speed", 0.25),
+            ("amt", 0.78),
+            ("human", 0.30),
+            ("mix", 1.0),
+        ],
+    },
+    FactoryPreset {
+        name: "Hard Trap Tune",
+        values: &[("speed", 0.0), ("amt", 1.0), ("human", 0.0), ("mix", 1.0)],
+    },
+    FactoryPreset {
+        name: "Subtle Polish",
+        values: &[
+            ("speed", 0.45),
+            ("amt", 0.55),
+            ("human", 0.45),
+            ("mix", 0.85),
         ],
     },
 ];
@@ -3336,7 +3361,353 @@ impl Vst3Plugin for ForgeSpaceVerbAndPreampPlug {
     ];
 }
 
-// Export all 10 plugins into the all-in-one CLAP/VST3 bundle when `all-in-one-export` is enabled.
+// ============================================================================
+// 11. FORGE VOCAL TUNE (REAL-TIME LOW-LATENCY YIN + PSOLA PITCH CORRECTOR)
+// ============================================================================
+
+/// Lock-free pitch tracking readout shared between `ForgeVocalTunePlug`'s audio thread and GUI.
+#[derive(Default)]
+struct VocalPitchTelemetry {
+    detected_hz: AtomicU32,
+    target_hz: AtomicU32,
+    correction_cents: AtomicU32,
+}
+
+impl VocalPitchTelemetry {
+    #[inline]
+    fn update(&self, detected: f64, target: f64, cents: f64) {
+        self.detected_hz
+            .store((detected as f32).to_bits(), Ordering::Relaxed);
+        self.target_hz
+            .store((target as f32).to_bits(), Ordering::Relaxed);
+        self.correction_cents
+            .store((cents as f32).to_bits(), Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn snapshot(&self) -> (f32, f32, f32) {
+        (
+            f32::from_bits(self.detected_hz.load(Ordering::Relaxed)),
+            f32::from_bits(self.target_hz.load(Ordering::Relaxed)),
+            f32::from_bits(self.correction_cents.load(Ordering::Relaxed)),
+        )
+    }
+}
+
+pub struct ForgeVocalTunePlug {
+    params: Arc<VocalTuneParams>,
+    telemetry: Arc<GuiTelemetry>,
+    pitch_telemetry: Arc<VocalPitchTelemetry>,
+    analyzer: RealtimeSpectrumAnalyzer32,
+    dsp: RealtimeVocalTune,
+    sample_rate: f64,
+}
+
+#[derive(Params)]
+pub struct VocalTuneParams {
+    #[persist = "editor-state"]
+    pub editor_state: Arc<EguiState>,
+    #[id = "key"]
+    pub key_root: IntParam,
+    #[id = "scale"]
+    pub scale_mode: IntParam,
+    #[id = "speed"]
+    pub retune_speed_ms: FloatParam,
+    #[id = "amt"]
+    pub retune_amount: FloatParam,
+    #[id = "human"]
+    pub humanize: FloatParam,
+    #[id = "formant"]
+    pub formant_shift_st: FloatParam,
+    #[id = "mix"]
+    pub wet_mix: FloatParam,
+}
+
+const KEY_ROOT_NAMES: [&str; 12] = [
+    "C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B",
+];
+
+impl Default for VocalTuneParams {
+    fn default() -> Self {
+        Self {
+            editor_state: EguiState::from_size(680, 380),
+            key_root: IntParam::new("Key Root", 0, IntRange::Linear { min: 0, max: 11 })
+                .with_value_to_string(Arc::new(|v| {
+                    KEY_ROOT_NAMES[(v.clamp(0, 11)) as usize].to_string()
+                }))
+                .with_string_to_value(Arc::new(|s| {
+                    let t = s.trim();
+                    if let Ok(n) = t.parse::<i32>() {
+                        return (0..=11).contains(&n).then_some(n);
+                    }
+                    KEY_ROOT_NAMES
+                        .iter()
+                        .position(|k| k.eq_ignore_ascii_case(t))
+                        .map(|i| i as i32)
+                })),
+            scale_mode: IntParam::new("Scale Mode", 0, IntRange::Linear { min: 0, max: 4 })
+                .with_value_to_string(Arc::new(|v| match v {
+                    1 => "Major".to_string(),
+                    2 => "Minor".to_string(),
+                    3 => "Pentatonic Minor".to_string(),
+                    4 => "Pentatonic Major".to_string(),
+                    _ => "Chromatic".to_string(),
+                }))
+                .with_string_to_value(Arc::new(|s| match s.trim().to_ascii_lowercase().as_str() {
+                    "0" | "chromatic" => Some(0),
+                    "1" | "major" => Some(1),
+                    "2" | "minor" => Some(2),
+                    "3" | "pentatonic minor" | "pentmin" => Some(3),
+                    "4" | "pentatonic major" | "pentmaj" => Some(4),
+                    _ => None,
+                })),
+            retune_speed_ms: FloatParam::new(
+                "Retune Speed",
+                25.0,
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 100.0,
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(1))
+            .with_unit(" ms"),
+            retune_amount: FloatParam::new(
+                "Correction Amount",
+                0.85,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_value_to_string(formatters::v2s_f32_percentage(0))
+            .with_string_to_value(formatters::s2v_f32_percentage()),
+            humanize: FloatParam::new(
+                "Humanize (Vibrato)",
+                0.15,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_value_to_string(formatters::v2s_f32_percentage(0))
+            .with_string_to_value(formatters::s2v_f32_percentage()),
+            formant_shift_st: FloatParam::new(
+                "Formant Shift",
+                0.0,
+                FloatRange::Linear {
+                    min: -12.0,
+                    max: 12.0,
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(1))
+            .with_unit(" st"),
+            wet_mix: FloatParam::new("Wet Mix", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_value_to_string(formatters::v2s_f32_percentage(0))
+                .with_string_to_value(formatters::s2v_f32_percentage()),
+        }
+    }
+}
+
+impl Default for ForgeVocalTunePlug {
+    fn default() -> Self {
+        Self {
+            params: Arc::new(VocalTuneParams::default()),
+            telemetry: Arc::new(GuiTelemetry::default()),
+            pitch_telemetry: Arc::new(VocalPitchTelemetry::default()),
+            analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
+            dsp: RealtimeVocalTune::new(48_000.0),
+            sample_rate: 48_000.0,
+        }
+    }
+}
+
+impl Plugin for ForgeVocalTunePlug {
+    const NAME: &'static str = "Forge Vocal Tune";
+    const VENDOR: &'static str = "The 40 Thieves (ForgeAudio)";
+    const URL: &'static str = "https://github.com/The-40-Thieves/audio-forge";
+    const EMAIL: &'static str = "audio@the40thieves.org";
+    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+
+    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+        main_input_channels: NonZeroU32::new(2),
+        main_output_channels: NonZeroU32::new(2),
+        ..AudioIOLayout::const_default()
+    }];
+
+    const SAMPLE_ACCURATE_AUTOMATION: bool = true;
+    type SysExMessage = ();
+    type BackgroundTask = ();
+
+    fn params(&self) -> Arc<dyn Params> {
+        self.params.clone()
+    }
+
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        let params = self.params.clone();
+        let telemetry = self.telemetry.clone();
+        let pitch_tel = self.pitch_telemetry.clone();
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            AbBankState::default(),
+            |_, _| {},
+            move |egui_ctx, setter, ab_state| {
+                egui::CentralPanel::default().show(egui_ctx, |ui| {
+                    draw_forge_studio_header_and_spectrum(
+                        ui,
+                        "FORGE VOCAL TUNE",
+                        "Low-Latency Streaming YIN F0 + Scale-Locked Dual-Grain PSOLA Pitch Corrector",
+                        &telemetry,
+                        None,
+                    );
+                    let (det_hz, tgt_hz, cents) = pitch_tel.snapshot();
+                    let pitch_text = if det_hz > 20.0 {
+                        format!(
+                            "LIVE PITCH   Detected: {:6.1} Hz  ->  Target: {:6.1} Hz  ({:+5.1} ct)",
+                            det_hz, tgt_hz, cents
+                        )
+                    } else {
+                        "LIVE PITCH   Unvoiced / Silence".to_string()
+                    };
+                    ui.label(
+                        egui::RichText::new(pitch_text)
+                            .monospace()
+                            .color(egui::Color32::from_rgb(56, 189, 248)),
+                    );
+                    ui.add_space(4.0);
+                    let param_refs = [
+                        ("key", ParamRef::Int(&params.key_root)),
+                        ("scale", ParamRef::Int(&params.scale_mode)),
+                        ("speed", ParamRef::Float(&params.retune_speed_ms)),
+                        ("amt", ParamRef::Float(&params.retune_amount)),
+                        ("human", ParamRef::Float(&params.humanize)),
+                        ("formant", ParamRef::Float(&params.formant_shift_st)),
+                        ("mix", ParamRef::Float(&params.wet_mix)),
+                    ];
+                    draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, VOCAL_TUNE_PRESETS);
+                    egui::Grid::new("vocal_tune_grid")
+                        .num_columns(2)
+                        .spacing([16.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("Key Root");
+                            ui.add(widgets::ParamSlider::for_param(&params.key_root, setter));
+                            ui.end_row();
+                            ui.label("Scale Mode");
+                            ui.add(widgets::ParamSlider::for_param(&params.scale_mode, setter));
+                            ui.end_row();
+                            ui.label("Retune Speed (ms)");
+                            ui.add(widgets::ParamSlider::for_param(
+                                &params.retune_speed_ms,
+                                setter,
+                            ));
+                            ui.end_row();
+                            ui.label("Correction Amount");
+                            ui.add(widgets::ParamSlider::for_param(
+                                &params.retune_amount,
+                                setter,
+                            ));
+                            ui.end_row();
+                            ui.label("Humanize (Vibrato)");
+                            ui.add(widgets::ParamSlider::for_param(&params.humanize, setter));
+                            ui.end_row();
+                            ui.label("Formant Shift (st)");
+                            ui.add(widgets::ParamSlider::for_param(
+                                &params.formant_shift_st,
+                                setter,
+                            ));
+                            ui.end_row();
+                            ui.label("Wet Mix");
+                            ui.add(widgets::ParamSlider::for_param(&params.wet_mix, setter));
+                            ui.end_row();
+                        });
+                });
+            },
+        )
+    }
+
+    fn initialize(
+        &mut self,
+        _audio_io_layout: &AudioIOLayout,
+        buffer_config: &BufferConfig,
+        context: &mut impl InitContext<Self>,
+    ) -> bool {
+        self.sample_rate = f64::from(buffer_config.sample_rate);
+        self.reset();
+        context.set_latency_samples(self.dsp.latency_samples());
+        true
+    }
+
+    fn reset(&mut self) {
+        self.dsp.reset(self.sample_rate);
+        self.analyzer.reset(self.sample_rate);
+    }
+
+    fn process(
+        &mut self,
+        buffer: &mut Buffer,
+        _aux: &mut AuxiliaryBuffers,
+        _context: &mut impl ProcessContext<Self>,
+    ) -> ProcessStatus {
+        let key_root = self.params.key_root.value().clamp(0, 11) as u8;
+        let scale_mode = match self.params.scale_mode.value() {
+            1 => VocalTuneScaleMode::Major,
+            2 => VocalTuneScaleMode::Minor,
+            3 => VocalTuneScaleMode::PentatonicMinor,
+            4 => VocalTuneScaleMode::PentatonicMajor,
+            _ => VocalTuneScaleMode::Chromatic,
+        };
+        self.dsp.set_key_and_scale(key_root, scale_mode);
+        self.dsp
+            .set_retune_speed_ms(f64::from(self.params.retune_speed_ms.value()));
+        self.dsp
+            .set_retune_amount(f64::from(self.params.retune_amount.value()));
+        self.dsp
+            .set_humanize(f64::from(self.params.humanize.value()));
+        self.dsp
+            .set_formant_shift_st(f64::from(self.params.formant_shift_st.value()));
+        self.dsp.set_wet_mix(f64::from(self.params.wet_mix.value()));
+
+        for mut channel_samples in buffer.iter_samples() {
+            let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
+            let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
+            let (out_l, out_r) = self.dsp.process_stereo_sample(in_l, in_r);
+            self.analyzer.push_stereo_sample(out_l, out_r);
+            let corr_vis = (self.dsp.correction_cents() / 100.0) as f32;
+            self.telemetry
+                .update_peaks(in_l, in_r, out_l, out_r, corr_vis);
+            if let Some(s0) = channel_samples.get_mut(0) {
+                *s0 = out_l;
+            }
+            if let Some(s1) = channel_samples.get_mut(1) {
+                *s1 = out_r;
+            }
+        }
+        self.pitch_telemetry.update(
+            self.dsp.detected_hz(),
+            self.dsp.target_hz(),
+            self.dsp.correction_cents(),
+        );
+        let corr_vis = (self.dsp.correction_cents() / 25.0) as f32;
+        self.telemetry
+            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &[corr_vis; 32]);
+        ProcessStatus::Normal
+    }
+}
+
+impl ClapPlugin for ForgeVocalTunePlug {
+    const CLAP_ID: &'static str = "org.the40thieves.forge-audio.vocal-tune";
+    const CLAP_DESCRIPTION: Option<&'static str> = Some(
+        "Real-Time Low-Latency Streaming YIN F0 + Scale-Locked Dual-Grain PSOLA Vocal Pitch Corrector",
+    );
+    const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
+    const CLAP_SUPPORT_URL: Option<&'static str> = Some(Self::URL);
+    const CLAP_FEATURES: &'static [ClapFeature] = &[
+        ClapFeature::AudioEffect,
+        ClapFeature::PitchShifter,
+        ClapFeature::Stereo,
+    ];
+}
+
+impl Vst3Plugin for ForgeVocalTunePlug {
+    const VST3_CLASS_ID: [u8; 16] = *b"ForgeVocalTune01";
+    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
+        &[Vst3SubCategory::Fx, Vst3SubCategory::PitchShift];
+}
+
+// Export all 11 plugins into the all-in-one CLAP/VST3 bundle when `all-in-one-export` is enabled.
 // Individual standalone VST3/CLAP plugins live in `plugins/forge-*` and export one plugin per bundle.
 #[cfg(feature = "all-in-one-export")]
 nih_export_clap!(
@@ -3349,7 +3720,8 @@ nih_export_clap!(
     ForgePhaseAndMatchPlug,
     ForgeSplitEqPlug,
     ForgeDensityClipperPlug,
-    ForgeSpaceVerbAndPreampPlug
+    ForgeSpaceVerbAndPreampPlug,
+    ForgeVocalTunePlug
 );
 #[cfg(feature = "all-in-one-export")]
 nih_export_vst3!(
@@ -3362,7 +3734,8 @@ nih_export_vst3!(
     ForgePhaseAndMatchPlug,
     ForgeSplitEqPlug,
     ForgeDensityClipperPlug,
-    ForgeSpaceVerbAndPreampPlug
+    ForgeSpaceVerbAndPreampPlug,
+    ForgeVocalTunePlug
 );
 
 #[cfg(test)]
@@ -3409,6 +3782,7 @@ mod tests {
         let p8 = ForgeSplitEqPlug::default();
         let p9 = ForgeDensityClipperPlug::default();
         let p10 = ForgeSpaceVerbAndPreampPlug::default();
+        let p11 = ForgeVocalTunePlug::default();
 
         assert!(!p1.params().param_map().is_empty());
         assert!(!p2.params().param_map().is_empty());
@@ -3420,6 +3794,7 @@ mod tests {
         assert!(!p8.params().param_map().is_empty());
         assert!(!p9.params().param_map().is_empty());
         assert!(!p10.params().param_map().is_empty());
+        assert!(!p11.params().param_map().is_empty());
     }
 
     /// The shared spectrum bus is process-wide and tests run on parallel threads, so every test

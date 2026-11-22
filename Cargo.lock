@@ -1259,6 +1259,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-vocal-tune"
+version = "0.1.0"
+dependencies = [
+ "forge-plug",
+ "nih_plug",
+]
+
+[[package]]
 name = "forge-worker"
 version = "0.1.0"
 dependencies = [
