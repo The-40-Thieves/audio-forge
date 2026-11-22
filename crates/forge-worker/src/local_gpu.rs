@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 const SCRIPT_REL: &str = "python-worker/forge_gpu_worker.py";
 /// Longest stderr excerpt carried into an error message.
 const STDERR_EXCERPT: usize = 600;
+/// Maximum allowed wall-clock timeout for a local GPU worker subprocess (1 hour).
+pub const MAX_WORKER_TIMEOUT: Duration = Duration::from_secs(3_600);
 
 /// The program and leading arguments that launch the local GPU worker. The task arguments
 /// (`separate --input ... --output-dir ...`) are appended to `args`.
@@ -218,6 +220,16 @@ pub(crate) struct WorkerOutput {
 /// timeout the process tree is killed and the reader threads are abandoned (a surviving
 /// grandchild may hold the pipes open after the worker itself exits).
 pub(crate) fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<WorkerOutput> {
+    if timeout.is_zero() || timeout > MAX_WORKER_TIMEOUT {
+        return Err(ForgeError::InvalidParameter(format!(
+            "worker timeout ({:.3} s) must be > 0 and <= {} s",
+            timeout.as_secs_f64(),
+            MAX_WORKER_TIMEOUT.as_secs()
+        )));
+    }
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        ForgeError::InvalidParameter("worker timeout overflows Instant".to_string())
+    })?;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -228,7 +240,6 @@ pub(crate) fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<Wo
     })?;
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
-    let deadline = Instant::now() + timeout;
     let timed_out = |child: &mut Child| {
         kill_tree(child);
         ForgeError::WorkerError(format!(
@@ -332,6 +343,159 @@ fn kill_tree(child: &mut Child) {
 fn kill_tree(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(test)]
+mod client_tests {
+    use super::*;
+
+    fn mock_worker_echo(stdout_lines: &[&str], exit_code: i32) -> LocalWorkerCommand {
+        #[cfg(unix)]
+        {
+            let mut script = String::new();
+            for line in stdout_lines {
+                let escaped = line.replace('\'', "'\\''");
+                script.push_str(&format!("printf '%s\\n' '{escaped}'; "));
+            }
+            script.push_str(&format!("exit {exit_code}; #"));
+            LocalWorkerCommand {
+                program: "sh".into(),
+                args: vec!["-c".into(), script.into(), "mock-worker".into()],
+            }
+        }
+        #[cfg(windows)]
+        {
+            let mut script = String::new();
+            for line in stdout_lines {
+                let escaped = line.replace('\'', "''");
+                script.push_str(&format!("Write-Output '{escaped}'; "));
+            }
+            script.push_str(&format!("exit {exit_code}; #"));
+            LocalWorkerCommand {
+                program: "powershell".into(),
+                args: vec!["-NoProfile".into(), "-Command".into(), script.into()],
+            }
+        }
+    }
+
+    #[test]
+    fn denoise_client_parses_json_after_log_lines() {
+        let worker = mock_worker_echo(
+            &[
+                "Loading DeepFilterNet3...",
+                r#"{"denoised":"/tmp/out/vocals_denoised.wav","backend":"deepfilternet3"}"#,
+            ],
+            0,
+        );
+        let res = run_local_neural_denoise(
+            &worker,
+            Path::new("vocals.wav"),
+            Path::new("/tmp/out"),
+            "auto",
+            Some(18.0),
+            Duration::from_secs(10),
+        )
+        .expect("denoise json");
+        assert_eq!(res.backend, "deepfilternet3");
+        assert_eq!(res.denoised, PathBuf::from("/tmp/out/vocals_denoised.wav"));
+    }
+
+    #[test]
+    fn denoise_client_rejects_invalid_attenuation_and_timeout() {
+        let worker = mock_worker_echo(&[], 0);
+        for bad in [-1.0, 101.0, f64::NAN, f64::INFINITY] {
+            let err = run_local_neural_denoise(
+                &worker,
+                Path::new("in.wav"),
+                Path::new("out"),
+                "auto",
+                Some(bad),
+                Duration::from_secs(10),
+            )
+            .expect_err("invalid attenuation");
+            assert!(err.to_string().contains("attenuation_limit_db"), "{err}");
+        }
+        for bad_timeout in [Duration::ZERO, Duration::MAX] {
+            let err = run_local_neural_denoise(
+                &worker,
+                Path::new("in.wav"),
+                Path::new("out"),
+                "auto",
+                None,
+                bad_timeout,
+            )
+            .expect_err("invalid timeout");
+            assert!(err.to_string().contains("timeout"), "{err}");
+        }
+    }
+
+    #[test]
+    fn denoise_client_reports_nonzero_exit_and_malformed_json() {
+        let fail_worker = mock_worker_echo(&["boom"], 2);
+        assert!(
+            run_local_neural_denoise(
+                &fail_worker,
+                Path::new("in.wav"),
+                Path::new("out"),
+                "auto",
+                None,
+                Duration::from_secs(10),
+            )
+            .is_err()
+        );
+
+        let bad_json_worker = mock_worker_echo(&["not-json"], 0);
+        let err = run_local_neural_denoise(
+            &bad_json_worker,
+            Path::new("in.wav"),
+            Path::new("out"),
+            "auto",
+            None,
+            Duration::from_secs(10),
+        )
+        .expect_err("malformed json");
+        assert!(err.to_string().contains("denoise JSON"), "{err}");
+    }
+
+    #[test]
+    fn transcribe_client_parses_json_and_handles_failures() {
+        let worker = mock_worker_echo(
+            &[
+                "Running basic-pitch...",
+                r#"{"midi":"/tmp/out/piano_basic_pitch.mid"}"#,
+            ],
+            0,
+        );
+        let res = run_local_transcribe_midi(
+            &worker,
+            Path::new("piano.wav"),
+            Path::new("/tmp/out"),
+            Duration::from_secs(10),
+        )
+        .expect("transcribe json");
+        assert_eq!(res.midi, PathBuf::from("/tmp/out/piano_basic_pitch.mid"));
+
+        let bad_worker = mock_worker_echo(&["not-json"], 0);
+        assert!(
+            run_local_transcribe_midi(
+                &bad_worker,
+                Path::new("piano.wav"),
+                Path::new("/tmp/out"),
+                Duration::from_secs(10),
+            )
+            .is_err()
+        );
+
+        assert!(
+            run_local_transcribe_midi(
+                &worker,
+                Path::new("piano.wav"),
+                Path::new("/tmp/out"),
+                Duration::MAX,
+            )
+            .is_err()
+        );
+    }
 }
 
 #[cfg(all(test, unix))]

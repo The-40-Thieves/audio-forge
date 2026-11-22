@@ -24,7 +24,9 @@ use forge_vocal::{
     track_vocal_pitch,
 };
 use forge_worker::{
-    SeparationConfig, generate_music_lyria, index_drum_sample_library, separate_stems,
+    SeparationConfig, generate_music_lyria, index_drum_sample_library,
+    resolve_default_local_worker, run_local_neural_denoise, run_local_transcribe_midi,
+    separate_stems,
 };
 
 #[derive(Parser)]
@@ -263,6 +265,36 @@ enum Commands {
         /// Model ID (`lyria-3.5` or `lyria-3-clip-preview`)
         #[arg(long, default_value = "lyria-3.5")]
         model: String,
+    },
+
+    /// Neural audio denoising via DeepFilterNet3 or Mel-Band-RoFormer (local Python GPU worker)
+    Denoise {
+        /// Input audio file
+        input: PathBuf,
+        /// Output directory for denoised audio
+        #[arg(short, long)]
+        output_dir: PathBuf,
+        /// Backend (`auto`, `deepfilternet3`, or `roformer`)
+        #[arg(long, default_value = "auto")]
+        backend: String,
+        /// Optional attenuation limit in dB (0..=100, DeepFilterNet3)
+        #[arg(long)]
+        attenuation_limit_db: Option<f64>,
+        /// Worker timeout in seconds (1..=3600)
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
+    },
+
+    /// Polyphonic audio-to-MIDI transcription via basic-pitch (local Python GPU worker)
+    Transcribe {
+        /// Input audio file
+        input: PathBuf,
+        /// Output directory for transcribed MIDI
+        #[arg(short, long)]
+        output_dir: PathBuf,
+        /// Worker timeout in seconds (1..=3600)
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
     },
 }
 
@@ -858,6 +890,40 @@ async fn main() -> anyhow::Result<()> {
             if let Some(l) = lyrics {
                 println!("\nGenerated Structure / Lyrics:\n{l}");
             }
+        }
+
+        Commands::Denoise {
+            input,
+            output_dir,
+            backend,
+            attenuation_limit_db,
+            timeout_secs,
+        } => {
+            let worker = resolve_default_local_worker()?;
+            let res = run_local_neural_denoise(
+                &worker,
+                &input,
+                &output_dir,
+                &backend,
+                attenuation_limit_db,
+                std::time::Duration::from_secs(timeout_secs),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&res)?);
+        }
+
+        Commands::Transcribe {
+            input,
+            output_dir,
+            timeout_secs,
+        } => {
+            let worker = resolve_default_local_worker()?;
+            let res = run_local_transcribe_midi(
+                &worker,
+                &input,
+                &output_dir,
+                std::time::Duration::from_secs(timeout_secs),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&res)?);
         }
     }
 

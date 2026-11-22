@@ -289,8 +289,18 @@ class SixStemAndTranscribeTests(TestCase):
             inp = out / "full_mix.wav"
             inp.write_bytes(b"RIFF")
             res = worker.run_separate(inp, out, dereverb=False, stems=6)
-            for key in ("vocals", "drums", "bass", "guitar", "keys", "other"):
+            expected = {
+                "vocals": "full_mix_(Vocals)_htdemucs_6s.wav",
+                "drums": "full_mix_(Drums)_htdemucs_6s.wav",
+                "bass": "full_mix_(Bass)_htdemucs_6s.wav",
+                "guitar": "full_mix_(Guitar)_htdemucs_6s.wav",
+                "keys": "full_mix_(Piano)_htdemucs_6s.wav",
+                "other": "full_mix_(Other)_htdemucs_6s.wav",
+            }
+            for key, filename in expected.items():
                 self.assertIsNotNone(res[key], f"missing 6-stem slot: {key}")
+                self.assertEqual(Path(res[key]).name, filename)
+                self.assertTrue(Path(res[key]).is_file())
 
     def test_transcribe_writes_midi_file(self) -> None:
         class FakeMidi:
