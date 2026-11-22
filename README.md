@@ -79,6 +79,8 @@ READY
 | `forge_vocal_suite` | Scale-locked pitch correction, formant-preserving shifting and harmonies. |
 | `forge_music_theory_midi` | Voice-led chord and bass MIDI, optional reharmonization, and an ABC score. |
 | `forge_master_distrokid` | Low-level mastering with an explicit LUFS and ceiling, reference-match EQ and ISRC tagging. |
+| `forge_neural_denoise` | Neural audio denoising via DeepFilterNet3 or Mel-Band-RoFormer on the local Python GPU worker. |
+| `forge_transcribe_midi` | Polyphonic audio-to-MIDI transcription via basic-pitch on the local Python GPU worker. |
 
 ### Delivery targets
 

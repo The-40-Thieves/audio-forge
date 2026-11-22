@@ -101,6 +101,17 @@ impl PathSandbox {
         buf.save_wav_to_writer(file, bits, &path.display().to_string())
     }
 
+    /// Writes an already-dithered `buf` as a WAV file without adding a second dither stage.
+    pub fn save_wav_no_dither(
+        &self,
+        buf: &AudioBuffer,
+        path: &Path,
+        bits: u16,
+    ) -> Result<(), ForgeError> {
+        let file = BufWriter::new(self.create_file(path)?);
+        buf.save_wav_no_dither_to_writer(file, bits, &path.display().to_string())
+    }
+
     /// Writes `bytes` to a file created through the root handle.
     pub fn write_bytes(&self, path: &Path, bytes: &[u8]) -> Result<(), ForgeError> {
         let mut file = self.create_file(path)?;

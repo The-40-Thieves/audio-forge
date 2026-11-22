@@ -17,10 +17,11 @@ mod toctou_tests;
 
 use forge_core::{AudioBuffer, ForgeError, StemBundle};
 use forge_dsp::{
-    DeFizzConfig, DeliveryOptions, DeliveryTarget, GenreTonalTarget, RestorationConfig, ToneMatch,
-    UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw, apply_18_band_eq,
-    apply_spectral_defizz, apply_spectral_unmask, audit_audio, clean_vocal_surgical,
-    compute_reference_match_eq, deliver, normalize_and_limit, run_full_restoration_chain,
+    DeFizzConfig, DeliveryOptions, DeliveryTarget, DitherMode, GenreTonalTarget, LimiterStyle,
+    RestorationConfig, ToneMatch, UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw,
+    apply_18_band_eq, apply_spectral_defizz, apply_spectral_unmask, audit_audio,
+    clean_vocal_surgical, compute_reference_match_eq, deliver, normalize_and_limit,
+    run_full_restoration_chain,
 };
 use forge_reaper::{
     ReaperProjectBuilder, ReaperTrackSpec, ReleaseMetadata, install_jsfx_plugins, jsfx_install_dir,
@@ -42,6 +43,7 @@ use std::any::Any;
 use std::io::{self, BufRead, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -271,7 +273,11 @@ fn tool_definitions() -> Vec<Value> {
                     "output": { "type": "string" },
                     "vocal": { "type": "boolean", "default": false },
                     "defizz_depth_db": { "type": "number", "default": 9.0 },
-                    "sensitivity_db": { "type": "number", "default": 3.5 }
+                    "sensitivity_db": { "type": "number", "default": 3.5 },
+                    "tilt": { "type": "number", "default": 0.0, "description": "Spectral tilt in dB/oct (-6.0..=6.0)" },
+                    "stereo_link": { "type": "number", "default": 1.0, "description": "Stereo link ratio (0.0..=1.0)" },
+                    "mid_side": { "type": "number", "default": 0.0, "description": "Mid/Side balance (-1.0=Mid only, 0.0=linked, +1.0=Side only)" },
+                    "delta": { "type": "boolean", "default": false, "description": "Audition only the removed spectral resonance delta" }
                 },
                 "required": ["input", "output"]
             }
@@ -285,7 +291,9 @@ fn tool_definitions() -> Vec<Value> {
                     "target": { "type": "string" },
                     "sidechain": { "type": "string" },
                     "output": { "type": "string" },
-                    "kick_bass_mode": { "type": "boolean", "default": false }
+                    "kick_bass_mode": { "type": "boolean", "default": false },
+                    "mid_side": { "type": "number", "default": 0.0, "description": "Mid/Side balance (-1.0=Mid only, 0.0=linked, +1.0=Side only)" },
+                    "delta": { "type": "boolean", "default": false, "description": "Audition only the carved sidechain delta" }
                 },
                 "required": ["target", "sidechain", "output"]
             }
@@ -366,9 +374,41 @@ fn tool_definitions() -> Vec<Value> {
                     "defizz": { "type": "boolean", "default": true },
                     "vocal": { "type": "boolean", "default": false, "description": "Vocal clean-up; use on vocal stems only" },
                     "reference": { "type": "string", "description": "Reference track WAV for 18-band tone match" },
-                    "genre": { "type": "string", "description": "Genre tonal-balance target (pop, hiphop, neosoul, edm, rock, jazz); ignored when reference is set" }
+                    "genre": { "type": "string", "description": "Genre tonal-balance target (pop, hiphop, neosoul, edm, rock, jazz); ignored when reference is set" },
+                    "limiter_style": { "type": "string", "enum": ["transparent", "punchy", "dynamic", "aggressive"], "default": "transparent" },
+                    "channel_link": { "type": "number", "default": 1.0, "description": "Stereo limiter channel link ratio (0.0..=1.0)" },
+                    "dither": { "type": "string", "enum": ["none", "tpdf", "noise-shaped"], "default": "none" },
+                    "dither_bits": { "type": "integer", "default": 24, "description": "Target bit depth for dither (8..=24)" }
                 },
                 "required": ["input", "output"]
+            }
+        }),
+        json!({
+            "name": "forge_neural_denoise",
+            "description": "Run neural audio denoising via DeepFilterNet3 or Mel-Band-RoFormer on the local Python GPU worker, confined to the MCP path sandbox.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "input": { "type": "string", "description": "Input audio file" },
+                    "output_dir": { "type": "string", "description": "Output directory for denoised audio" },
+                    "backend": { "type": "string", "enum": ["auto", "deepfilternet", "deepfilternet3", "mel-band-roformer", "roformer"], "default": "auto" },
+                    "attenuation_limit_db": { "type": "number", "description": "Optional attenuation limit in dB (0..=100, DeepFilterNet3)" },
+                    "timeout_secs": { "type": "integer", "default": 300, "description": "Worker timeout in seconds (1..=3600)" }
+                },
+                "required": ["input", "output_dir"]
+            }
+        }),
+        json!({
+            "name": "forge_transcribe_midi",
+            "description": "Run polyphonic audio-to-MIDI transcription via basic-pitch on the local Python GPU worker, confined to the MCP path sandbox.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "input": { "type": "string", "description": "Input audio file" },
+                    "output_dir": { "type": "string", "description": "Output directory for transcribed MIDI" },
+                    "timeout_secs": { "type": "integer", "default": 300, "description": "Worker timeout in seconds (1..=3600)" }
+                },
+                "required": ["input", "output_dir"]
             }
         }),
         json!({
@@ -468,6 +508,65 @@ fn str_arg_or<'a>(args: &'a Value, key: &str, default: &'a str) -> &'a str {
     args.get(key).and_then(Value::as_str).unwrap_or(default)
 }
 
+fn bounded_f64_arg(
+    args: &Value,
+    key: &str,
+    default: f64,
+    min: f64,
+    max: f64,
+) -> Result<f64, ForgeError> {
+    let v = match args.get(key) {
+        None | Some(Value::Null) => default,
+        Some(raw) => raw
+            .as_f64()
+            .ok_or_else(|| ForgeError::InvalidParameter(format!("'{key}' must be a number")))?,
+    };
+    if !v.is_finite() || !(min..=max).contains(&v) {
+        return Err(ForgeError::InvalidParameter(format!(
+            "'{key}' ({v}) must be finite and in {min}..={max}"
+        )));
+    }
+    Ok(v)
+}
+
+fn timeout_secs_arg(args: &Value) -> Result<Duration, ForgeError> {
+    let secs = match args.get("timeout_secs") {
+        None | Some(Value::Null) => 300_u64,
+        Some(raw) => raw.as_u64().ok_or_else(|| {
+            ForgeError::InvalidParameter("'timeout_secs' must be a positive integer".into())
+        })?,
+    };
+    if !(1..=3600).contains(&secs) {
+        return Err(ForgeError::InvalidParameter(format!(
+            "'timeout_secs' ({secs}) must be in 1..=3600"
+        )));
+    }
+    Ok(Duration::from_secs(secs))
+}
+
+fn parse_limiter_style(raw: &str) -> Result<LimiterStyle, ForgeError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "transparent" => Ok(LimiterStyle::Transparent),
+        "punchy" => Ok(LimiterStyle::Punchy),
+        "dynamic" => Ok(LimiterStyle::Dynamic),
+        "aggressive" => Ok(LimiterStyle::Aggressive),
+        other => Err(ForgeError::InvalidParameter(format!(
+            "unknown 'limiter_style' '{other}' (expected transparent, punchy, dynamic, or aggressive)"
+        ))),
+    }
+}
+
+fn parse_dither_mode(raw: &str) -> Result<DitherMode, ForgeError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" => Ok(DitherMode::None),
+        "tpdf" => Ok(DitherMode::Tpdf),
+        "noise-shaped" | "noise_shaped" | "shaped" => Ok(DitherMode::NoiseShapedHighPass),
+        other => Err(ForgeError::InvalidParameter(format!(
+            "unknown 'dither' '{other}' (expected none, tpdf, or noise-shaped)"
+        ))),
+    }
+}
+
 type ToolHandler = fn(&Value, &PathSandbox) -> Result<ToolOutput, ForgeError>;
 
 /// Runs one tool. Every path argument, and every path derived from one, is resolved
@@ -487,6 +586,8 @@ fn dispatch_tool(
         "forge_music_theory_midi" => tool_music_theory_midi,
         "forge_master_distrokid" => tool_master_distrokid,
         "forge_ingest_to_reaper" => tool_ingest_to_reaper,
+        "forge_neural_denoise" => tool_neural_denoise,
+        "forge_transcribe_midi" => tool_transcribe_midi,
         _ => {
             return Err(ForgeError::InvalidParameter(format!(
                 "Unknown tool: {name}"
@@ -505,6 +606,28 @@ fn tool_deliver(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, Forge
     options.repair = bool_arg(args, "repair", true);
     options.defizz = bool_arg(args, "defizz", true);
     options.vocal = bool_arg(args, "vocal", false);
+    if let Some(style) = args.get("limiter_style").and_then(Value::as_str) {
+        options.limiter_style = parse_limiter_style(style)?;
+    }
+    options.channel_link = bounded_f64_arg(args, "channel_link", 1.0, 0.0, 1.0)?;
+    if let Some(dither) = args.get("dither").and_then(Value::as_str) {
+        options.dither = parse_dither_mode(dither)?;
+    }
+    let dither_bits = match args.get("dither_bits") {
+        None | Some(Value::Null) => 24_u16,
+        Some(raw) => {
+            let v = raw.as_u64().ok_or_else(|| {
+                ForgeError::InvalidParameter("'dither_bits' must be an integer in 8..=24".into())
+            })?;
+            if !(8..=24).contains(&v) {
+                return Err(ForgeError::InvalidParameter(format!(
+                    "'dither_bits' ({v}) must be in 8..=24"
+                )));
+            }
+            v as u16
+        }
+    };
+    options.dither_bits = dither_bits;
     if let Some(reference) = reference {
         options.tone_match = Some(ToneMatch::Reference(sandbox.load_audio(&reference)?));
     } else if let Some(genre) = args.get("genre").and_then(Value::as_str) {
@@ -513,7 +636,12 @@ fn tool_deliver(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, Forge
 
     let buf = sandbox.load_audio(&input)?;
     let (master, report) = deliver(&buf, &options)?;
-    sandbox.save_wav(&master, &output, 24)?;
+    if options.dither != DitherMode::None {
+        let pcm_bits = if options.dither_bits <= 16 { 16 } else { 24 };
+        sandbox.save_wav_no_dither(&master, &output, pcm_bits)?;
+    } else {
+        sandbox.save_wav(&master, &output, 24)?;
+    }
     sandbox.write_json(&report_path, &report)?;
     Ok(ToolOutput {
         success: report.ready,
@@ -537,6 +665,10 @@ fn tool_restore_and_defizz(args: &Value, sandbox: &PathSandbox) -> Result<ToolOu
     let config = DeFizzConfig {
         sensitivity_db: f64_arg(args, "sensitivity_db", 3.5),
         max_depth_db: f64_arg(args, "defizz_depth_db", 9.0),
+        tilt_db_per_oct: bounded_f64_arg(args, "tilt", 0.0, -6.0, 6.0)?,
+        stereo_link: bounded_f64_arg(args, "stereo_link", 1.0, 0.0, 1.0)?,
+        mid_side_balance: bounded_f64_arg(args, "mid_side", 0.0, -1.0, 1.0)?,
+        delta_listen: bool_arg(args, "delta", false),
         ..DeFizzConfig::default()
     };
 
@@ -563,17 +695,76 @@ fn tool_spectral_unmask(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutpu
     let sidechain = path_arg(args, "sidechain", sandbox)?;
     let output = path_arg(args, "output", sandbox)?;
     let kick_bass = bool_arg(args, "kick_bass_mode", false);
+    let mid_side = bounded_f64_arg(args, "mid_side", 0.0, -1.0, 1.0)?;
+    let delta = bool_arg(args, "delta", false);
 
     let target_buf = sandbox.load_audio(&target)?;
     let sc_buf = sandbox.load_audio(&sidechain)?;
-    let cfg = if kick_bass {
+    let mut cfg = if kick_bass {
         UnmaskConfig::kick_over_bass()
     } else {
         UnmaskConfig::vocal_over_instruments()
     };
+    cfg.mid_side_balance = mid_side;
+    cfg.delta_listen = delta;
     let unmasked = apply_spectral_unmask(&target_buf, &sc_buf, &cfg)?;
     sandbox.save_wav(&unmasked, &output, 24)?;
-    Ok(json!({ "output": output, "kick_bass_mode": kick_bass }).into())
+    Ok(json!({
+        "output": output,
+        "kick_bass_mode": kick_bass,
+        "mid_side": mid_side,
+        "delta": delta
+    })
+    .into())
+}
+
+fn tool_neural_denoise(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
+    let input = path_arg(args, "input", sandbox)?;
+    let output_dir = path_arg(args, "output_dir", sandbox)?;
+    let backend = str_arg_or(args, "backend", "auto");
+    let valid_backends = [
+        "auto",
+        "deepfilternet",
+        "deepfilternet3",
+        "mel-band-roformer",
+        "roformer",
+    ];
+    if !valid_backends
+        .iter()
+        .any(|b| b.eq_ignore_ascii_case(backend))
+    {
+        return Err(ForgeError::InvalidParameter(format!(
+            "unknown 'backend' '{backend}' (expected auto, deepfilternet, deepfilternet3, mel-band-roformer, or roformer)"
+        )));
+    }
+    let attenuation_limit_db = match args.get("attenuation_limit_db") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(bounded_f64_arg(
+            args,
+            "attenuation_limit_db",
+            0.0,
+            0.0,
+            100.0,
+        )?),
+    };
+    let timeout = timeout_secs_arg(args)?;
+    let res = external::neural_denoise_checked(
+        sandbox,
+        &input,
+        &output_dir,
+        backend,
+        attenuation_limit_db,
+        timeout,
+    )?;
+    Ok(serde_json::to_value(res)?.into())
+}
+
+fn tool_transcribe_midi(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
+    let input = path_arg(args, "input", sandbox)?;
+    let output_dir = path_arg(args, "output_dir", sandbox)?;
+    let timeout = timeout_secs_arg(args)?;
+    let res = external::transcribe_midi_checked(sandbox, &input, &output_dir, timeout)?;
+    Ok(serde_json::to_value(res)?.into())
 }
 
 fn tool_phase_align(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
@@ -1039,6 +1230,14 @@ mod tests {
                 "forge_ingest_to_reaper",
                 json!({ "input": "in.wav", "output_dir": "../session" }),
             ),
+            (
+                "forge_neural_denoise",
+                json!({ "input": "../in.wav", "output_dir": "out" }),
+            ),
+            (
+                "forge_transcribe_midi",
+                json!({ "input": "in.wav", "output_dir": "../midi_out" }),
+            ),
         ];
         for (tool, args) in cases {
             let result = call_tool(&sb, tool, args);
@@ -1323,5 +1522,108 @@ mod tests {
                 .expect("error")
                 .contains("no REAPER")
         );
+    }
+
+    #[test]
+    fn wave1_dsp_params_accepted_and_validated() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sb = sandbox_in(root.path());
+        write_test_mix(&root.path().join("mix.wav"), 0.08, 48_000);
+
+        // Valid Wave 1 params on forge_deliver
+        let res = call_tool(
+            &sb,
+            "forge_deliver",
+            json!({
+                "input": "mix.wav",
+                "output": "out_punchy_16.wav",
+                "target": "spotify",
+                "limiter_style": "punchy",
+                "channel_link": 0.5,
+                "dither": "noise-shaped",
+                "dither_bits": 16
+            }),
+        );
+        assert!(!is_error(&res), "{}", text(&res));
+        assert!(root.path().join("out_punchy_16.wav").is_file());
+
+        // Invalid limiter_style rejected
+        let bad_style = call_tool(
+            &sb,
+            "forge_deliver",
+            json!({
+                "input": "mix.wav",
+                "output": "bad.wav",
+                "limiter_style": "hyper_extreme"
+            }),
+        );
+        assert!(is_error(&bad_style));
+        assert!(text(&bad_style).contains("limiter_style"));
+
+        // Invalid dither_bits rejected
+        let bad_bits = call_tool(
+            &sb,
+            "forge_deliver",
+            json!({
+                "input": "mix.wav",
+                "output": "bad.wav",
+                "dither_bits": 4
+            }),
+        );
+        assert!(is_error(&bad_bits));
+
+        // Valid Wave 1 params on forge_restore_and_defizz
+        let restored = call_tool(
+            &sb,
+            "forge_restore_and_defizz",
+            json!({
+                "input": "mix.wav",
+                "output": "restored.wav",
+                "tilt": -2.0,
+                "stereo_link": 0.75,
+                "mid_side": 0.5,
+                "delta": true
+            }),
+        );
+        assert!(!is_error(&restored), "{}", text(&restored));
+
+        // Out-of-range tilt rejected
+        let bad_tilt = call_tool(
+            &sb,
+            "forge_restore_and_defizz",
+            json!({
+                "input": "mix.wav",
+                "output": "restored_bad.wav",
+                "tilt": 12.0
+            }),
+        );
+        assert!(is_error(&bad_tilt));
+
+        // Valid Wave 1 params on forge_spectral_unmask
+        let unmasked = call_tool(
+            &sb,
+            "forge_spectral_unmask",
+            json!({
+                "target": "mix.wav",
+                "sidechain": "mix.wav",
+                "output": "unmasked.wav",
+                "mid_side": -0.5,
+                "delta": true
+            }),
+        );
+        assert!(!is_error(&unmasked), "{}", text(&unmasked));
+
+        // Invalid neural denoise backend rejected
+        let bad_backend = call_tool(
+            &sb,
+            "forge_neural_denoise",
+            json!({
+                "input": "mix.wav",
+                "output_dir": "denoised",
+                "backend": "nonexistent"
+            }),
+        );
+        assert!(is_error(&bad_backend));
+        assert!(text(&bad_backend).contains("backend"));
     }
 }

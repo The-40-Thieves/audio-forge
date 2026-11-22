@@ -573,12 +573,12 @@ pub fn shift_vocal_pitch_formant_preserved(
             let w_a = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * phase_a / grain_f).cos());
             let w_b = 1.0 - w_a;
 
-            // 4-point Catmull-Rom cubic interpolation centered at `i` with zero-padded
-            // boundaries so tails never freeze and multi-voice harmony layers stay aligned.
-            let sample_at = |delay: f64| -> f64 {
+            // 4-point Catmull-Rom cubic interpolation centered at `i`; returns `None` when
+            // out of bounds so the crossfade renormalizes onto the valid grain leg at clip edges.
+            let sample_at = |delay: f64| -> Option<f64> {
                 let pos = (i as f64) + half_grain - delay;
                 if pos < 0.0 || pos > ((frames - 1) as f64) {
-                    return 0.0;
+                    return None;
                 }
                 let idx0 = pos.floor() as usize;
                 let frac = pos - (idx0 as f64);
@@ -595,13 +595,20 @@ pub fn shift_vocal_pitch_formant_preserved(
                 let p3 = get(idx0 as isize + 2);
                 let f2 = frac * frac;
                 let f3 = f2 * frac;
-                0.5 * ((2.0 * p1)
-                    + (-p0 + p2) * frac
-                    + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * f2
-                    + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * f3)
+                Some(
+                    0.5 * ((2.0 * p1)
+                        + (-p0 + p2) * frac
+                        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * f2
+                        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * f3),
+                )
             };
 
-            let pitched = w_a * sample_at(phase_a) + w_b * sample_at(phase_b);
+            let pitched = match (sample_at(phase_a), sample_at(phase_b)) {
+                (Some(a), Some(b)) => w_a * a + w_b * b,
+                (Some(a), None) => a,
+                (None, Some(b)) => b,
+                (None, None) => 0.0,
+            };
             // Blend 100% phase-coherent dry sibilant on consonants (`s/sh/t/k`)
             let dry_s = forge_dsp::sanitize_sample_f64(ch[i]);
             *sample_out = pitched * (1.0 - sibilant_env) + dry_s * sibilant_env;
