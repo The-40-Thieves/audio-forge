@@ -298,53 +298,57 @@ impl Plugin for ForgeOpenSoothePlug {
                         &telemetry,
                         slot,
                     );
-                    egui::Grid::new("opensoothe_grid")
-                        .num_columns(2)
-                        .spacing([16.0, 8.0])
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
                         .show(ui, |ui| {
-                            ui.label("Sensitivity (dB)");
-                            ui.add(widgets::ParamSlider::for_param(&params.sensitivity_db, setter));
-                            ui.end_row();
+                            egui::Grid::new("opensoothe_grid")
+                                .num_columns(2)
+                                .spacing([16.0, 8.0])
+                                .show(ui, |ui| {
+                                    ui.label("Sensitivity (dB)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.sensitivity_db, setter));
+                                    ui.end_row();
 
-                            ui.label("Max Suppression (dB)");
-                            ui.add(widgets::ParamSlider::for_param(&params.max_depth_db, setter));
-                            ui.end_row();
+                                    ui.label("Max Suppression (dB)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.max_depth_db, setter));
+                                    ui.end_row();
 
-                            ui.label("Sharpness Radius");
-                            ui.add(widgets::ParamSlider::for_param(&params.sharpness_bins, setter));
-                            ui.end_row();
+                                    ui.label("Sharpness Radius");
+                                    ui.add(widgets::ParamSlider::for_param(&params.sharpness_bins, setter));
+                                    ui.end_row();
 
-                            ui.label("Delta Listen (Fizz Only)");
-                            ui.add(widgets::ParamSlider::for_param(&params.delta_listen, setter));
-                            ui.end_row();
+                                    ui.label("Delta Listen (Fizz Only)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.delta_listen, setter));
+                                    ui.end_row();
 
-                            ui.label("SubMono (<160 Hz) + Tape Bus");
-                            ui.add(widgets::ParamSlider::for_param(&params.enable_sub_tape, setter));
-                            ui.end_row();
+                                    ui.label("SubMono (<160 Hz) + Tape Bus");
+                                    ui.add(widgets::ParamSlider::for_param(&params.enable_sub_tape, setter));
+                                    ui.end_row();
 
-                            ui.label("Console8 / ChowTape Drive");
-                            ui.add(widgets::ParamSlider::for_param(&params.tape_drive, setter));
-                            ui.end_row();
+                                    ui.label("Console8 / ChowTape Drive");
+                                    ui.add(widgets::ParamSlider::for_param(&params.tape_drive, setter));
+                                    ui.end_row();
 
-                            ui.label("True-Peak -1.0 dBTP Brickwall");
-                            ui.add(widgets::ParamSlider::for_param(&params.enable_limiter, setter));
-                            ui.end_row();
+                                    ui.label("True-Peak -1.0 dBTP Brickwall");
+                                    ui.add(widgets::ParamSlider::for_param(&params.enable_limiter, setter));
+                                    ui.end_row();
 
-                            ui.label("Cross-Instance Spectrum Slot");
-                            ui.add(widgets::ParamSlider::for_param(&params.shared_bus_slot, setter));
-                            ui.end_row();
+                                    ui.label("Cross-Instance Spectrum Slot");
+                                    ui.add(widgets::ParamSlider::for_param(&params.shared_bus_slot, setter));
+                                    ui.end_row();
 
-                            ui.label("Spectral Tilt (dB/oct)");
-                            ui.add(widgets::ParamSlider::for_param(&params.tilt_db_per_oct, setter));
-                            ui.end_row();
+                                    ui.label("Spectral Tilt (dB/oct)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.tilt_db_per_oct, setter));
+                                    ui.end_row();
 
-                            ui.label("Stereo Link");
-                            ui.add(widgets::ParamSlider::for_param(&params.stereo_link, setter));
-                            ui.end_row();
+                                    ui.label("Stereo Link");
+                                    ui.add(widgets::ParamSlider::for_param(&params.stereo_link, setter));
+                                    ui.end_row();
 
-                            ui.label("Mid/Side Focus (-1 M .. +1 S)");
-                            ui.add(widgets::ParamSlider::for_param(&params.mid_side_balance, setter));
-                            ui.end_row();
+                                    ui.label("Mid/Side Focus (-1 M .. +1 S)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.mid_side_balance, setter));
+                                    ui.end_row();
+                                });
                         });
                 });
             },

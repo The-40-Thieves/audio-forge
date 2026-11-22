@@ -213,6 +213,22 @@ impl AudioBuffer {
         })?;
         self.save_wav_to_writer(BufWriter::new(file), bits_per_sample, &origin)
     }
+
+    /// Writes an already-dithered `AudioBuffer` to `path` without adding a second TPDF dither stage.
+    pub fn save_wav_no_dither<P: AsRef<Path>>(&self, path: P, bits_per_sample: u16) -> Result<()> {
+        let path_ref = path.as_ref();
+        if let Some(parent) = path_ref.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let origin = path_ref.display().to_string();
+        let file = std::fs::File::create(path_ref).map_err(|e| ForgeError::AudioIo {
+            path: origin.clone(),
+            message: e.to_string(),
+        })?;
+        self.save_wav_no_dither_to_writer(BufWriter::new(file), bits_per_sample, &origin)
+    }
 }
 
 /// Splits interleaved `samples` into `ch_count` planar channels of equal length.

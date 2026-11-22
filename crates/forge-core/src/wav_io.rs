@@ -95,6 +95,35 @@ impl AudioBuffer {
         }
         writer.finalize().map_err(|e| audio_io(origin, e))
     }
+
+    /// Encodes an already-dithered buffer as WAV without adding a second TPDF dither stage.
+    /// Supports 16-bit and 24-bit integer PCM (rounding directly to the nearest code) and
+    /// 32-bit IEEE float.
+    pub fn save_wav_no_dither_to_writer<W: Write + Seek>(
+        &self,
+        writer: W,
+        bits_per_sample: u16,
+        origin: &str,
+    ) -> Result<()> {
+        let (sample_format, bits) = match bits_per_sample {
+            32 => (SampleFormat::Float, 32),
+            16 => (SampleFormat::Int, 16),
+            _ => (SampleFormat::Int, 24),
+        };
+        let spec = WavSpec {
+            channels: self.num_channels() as u16,
+            sample_rate: self.sample_rate,
+            bits_per_sample: bits,
+            sample_format,
+        };
+        let mut writer = WavWriter::new(writer, spec).map_err(|e| audio_io(origin, e))?;
+        match (sample_format, bits) {
+            (SampleFormat::Float, _) => write_float(self, &mut writer, origin)?,
+            (SampleFormat::Int, 16) => write_rounded(self, &mut writer, INT16, origin)?,
+            (SampleFormat::Int, _) => write_rounded(self, &mut writer, INT24, origin)?,
+        }
+        writer.finalize().map_err(|e| audio_io(origin, e))
+    }
 }
 
 fn has_wav_extension(name: &Path) -> bool {
@@ -206,6 +235,31 @@ fn clean_unit(x: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+/// Writes already-dithered/pre-quantized samples without adding another dither pass.
+fn write_rounded<W: Write + Seek>(
+    buf: &AudioBuffer,
+    writer: &mut WavWriter<W>,
+    fmt: IntFormat,
+    origin: &str,
+) -> Result<()> {
+    for f in 0..buf.num_frames() {
+        for ch in 0..buf.num_channels() {
+            let scaled = clean_unit(buf.channels[ch][f]) * fmt.scale;
+            let q = scaled.round().clamp(fmt.min, fmt.max);
+            if fmt.narrow {
+                writer
+                    .write_sample(q as i16)
+                    .map_err(|e| audio_io(origin, e))?;
+            } else {
+                writer
+                    .write_sample(q as i32)
+                    .map_err(|e| audio_io(origin, e))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Writes TPDF-dithered, first-order error-shaped integer samples.

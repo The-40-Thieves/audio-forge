@@ -258,6 +258,12 @@ pub fn deliver(
         None => {}
     }
 
+    if !options.channel_link.is_finite() || !(0.0..=1.0).contains(&options.channel_link) {
+        return Err(ForgeError::InvalidParameter(format!(
+            "channel_link ({}) must be finite and in 0.0..=1.0",
+            options.channel_link
+        )));
+    }
     let mastered = normalize_and_limit_with_config(
         &work,
         &MasteringLimiterConfig {
@@ -269,11 +275,21 @@ pub fn deliver(
             dither_bits: options.dither_bits,
         },
     )?;
-    stages.push(format!(
+    let mut master_stage = format!(
         "master: {:.1} LUFS, {:.1} dBTP true-peak limit",
         target.loudness_lufs(),
         target.ceiling_dbtp()
-    ));
+    );
+    if options.limiter_style != LimiterStyle::Transparent {
+        master_stage.push_str(&format!(" ({:?})", options.limiter_style));
+    }
+    if options.dither != DitherMode::None {
+        master_stage.push_str(&format!(
+            ", {:?} {}-bit dither",
+            options.dither, options.dither_bits
+        ));
+    }
+    stages.push(master_stage);
 
     let after = audit_audio(&mastered);
     let checks = delivery_checks(&after, target);

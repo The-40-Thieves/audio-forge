@@ -66,13 +66,13 @@ enum Commands {
         #[arg(long)]
         delta_listen: bool,
         /// Spectral sensitivity tilt in dB/octave pivoted at 1 kHz (-6.0 to +6.0)
-        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true, value_parser = parse_tilt)]
         tilt: f64,
         /// Stereo gain linking (0.0 = dual-mono, 1.0 = linked stereo)
-        #[arg(long, default_value_t = 1.0)]
+        #[arg(long, default_value_t = 1.0, value_parser = parse_unit_interval)]
         stereo_link: f64,
         /// Mid/Side focus (-1.0 = Mid only, 0.0 = balanced, +1.0 = Side only)
-        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true, value_parser = parse_mid_side)]
         mid_side: f64,
         /// Fundamental hum frequency (50 or 60 Hz) to notch out with 10 harmonics
         #[arg(long, default_value_t = 60.0)]
@@ -96,10 +96,10 @@ enum Commands {
         #[arg(long, default_value = "vocal")]
         mode: String,
         /// Solo only the carved frequencies removed by the sidechain (Delta listen)
-        #[arg(long)]
+        #[arg(long = "delta", alias = "delta-listen")]
         delta_listen: bool,
         /// Mid/Side carving focus (-1.0 = Mid only, 0.0 = balanced, +1.0 = Side only)
-        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true, value_parser = parse_mid_side)]
         mid_side: f64,
     },
 
@@ -602,18 +602,30 @@ async fn main() -> anyhow::Result<()> {
             options.repair = !no_repair;
             options.defizz = !no_defizz;
             options.vocal = vocal;
-            options.limiter_style = match limiter_style.to_ascii_lowercase().as_str() {
+            options.limiter_style = match limiter_style.trim().to_ascii_lowercase().as_str() {
+                "transparent" => LimiterStyle::Transparent,
                 "punchy" => LimiterStyle::Punchy,
                 "dynamic" => LimiterStyle::Dynamic,
                 "aggressive" => LimiterStyle::Aggressive,
-                _ => LimiterStyle::Transparent,
+                other => anyhow::bail!(
+                    "unknown --limiter-style '{other}' (expected transparent, punchy, dynamic, or aggressive)"
+                ),
             };
+            if !channel_link.is_finite() || !(0.0..=1.0).contains(&channel_link) {
+                anyhow::bail!("--channel-link ({channel_link}) must be finite and in 0.0..=1.0");
+            }
             options.channel_link = channel_link;
-            options.dither = match dither.to_ascii_lowercase().as_str() {
+            options.dither = match dither.trim().to_ascii_lowercase().as_str() {
+                "none" => DitherMode::None,
                 "tpdf" => DitherMode::Tpdf,
                 "noise-shaped" | "noise_shaped" | "shaped" => DitherMode::NoiseShapedHighPass,
-                _ => DitherMode::None,
+                other => anyhow::bail!(
+                    "unknown --dither '{other}' (expected none, tpdf, or noise-shaped)"
+                ),
             };
+            if !(8..=24).contains(&dither_bits) {
+                anyhow::bail!("--dither-bits ({dither_bits}) must be in 8..=24");
+            }
             options.dither_bits = dither_bits;
             options.tone_match = match (reference, genre) {
                 (Some(path), _) => Some(ToneMatch::Reference(AudioBuffer::load(&path)?)),
@@ -623,7 +635,12 @@ async fn main() -> anyhow::Result<()> {
 
             let buf = AudioBuffer::load(&input)?;
             let (master, report) = deliver(&buf, &options)?;
-            master.save_wav(&output, 24)?;
+            if options.dither != DitherMode::None {
+                let pcm_bits = if options.dither_bits <= 16 { 16 } else { 24 };
+                master.save_wav_no_dither(&output, pcm_bits)?;
+            } else {
+                master.save_wav(&output, 24)?;
+            }
             let report_path = output.with_extension("delivery.json");
             std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
 
@@ -922,6 +939,33 @@ async fn main() -> anyhow::Result<()> {
 fn parse_bpm(raw: &str) -> Result<f64, String> {
     let bpm: f64 = raw.parse().map_err(|e| format!("{e}"))?;
     validate_bpm(bpm).map_err(|e| e.to_string())
+}
+
+fn parse_tilt(raw: &str) -> Result<f64, String> {
+    let v: f64 = raw.parse().map_err(|e| format!("{e}"))?;
+    if v.is_finite() && (-6.0..=6.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("tilt ({v}) must be finite and in -6.0..=6.0"))
+    }
+}
+
+fn parse_unit_interval(raw: &str) -> Result<f64, String> {
+    let v: f64 = raw.parse().map_err(|e| format!("{e}"))?;
+    if v.is_finite() && (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("value ({v}) must be finite and in 0.0..=1.0"))
+    }
+}
+
+fn parse_mid_side(raw: &str) -> Result<f64, String> {
+    let v: f64 = raw.parse().map_err(|e| format!("{e}"))?;
+    if v.is_finite() && (-1.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("mid-side ({v}) must be finite and in -1.0..=1.0"))
+    }
 }
 
 #[cfg(test)]
