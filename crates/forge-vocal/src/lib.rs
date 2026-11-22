@@ -4,8 +4,11 @@
 //! - Chord-Aware Multi-Part Harmony Stack Generator (3rd above, 5th below, octave double)
 //! - Native REAPER Take Pitch Envelope (`<PITCHENV`) & `ReaPitch` curve compiler
 
+pub mod realtime;
+
 use forge_core::{AudioBuffer, ForgeError, Result};
 use forge_theory::parse_pitch_class;
+pub use realtime::{RealtimeVocalTune, VocalTuneScaleMode};
 use serde::{Deserialize, Serialize};
 
 /// A detected F0 frame at a specific timestamp in seconds.

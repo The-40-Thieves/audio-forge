@@ -20,6 +20,7 @@ members = [
     "plugins/forge-spliteq",
     "plugins/forge-density-clipper",
     "plugins/forge-spaceverb",
+    "plugins/forge-vocal-tune",
     "xtask",
 ]
 # Vendored, patched upstream crates; see `vendor/nih-plug/PATCHES.md`
