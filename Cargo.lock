@@ -1655,11 +1655,13 @@ dependencies = [
 name = "forge-vocal"
 version = "0.1.0"
 dependencies = [
+ "assert_no_alloc",
  "codspeed-divan-compat",
  "forge-core",
  "forge-dsp",
  "forge-theory",
  "proptest",
+ "rustfft",
  "serde",
 ]
 

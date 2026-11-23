@@ -5,6 +5,10 @@
 //! dual-grain Hann-windowed PSOLA ring-buffer pitch shifter.
 
 use std::f64::consts::PI;
+use std::sync::Arc;
+
+use rustfft::num_complex::Complex;
+use rustfft::{Fft, FftPlanner};
 
 /// Musical scale presets for [`RealtimeVocalTune`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -57,7 +61,13 @@ pub struct RealtimeVocalTune {
     yin_hop: usize,
     hop_counter: usize,
     yin_buf: Vec<f64>,
+    yin_prefix_sq: Vec<f64>,
     yin_diff: Vec<f64>,
+    fft_fwd: Arc<dyn Fft<f64>>,
+    fft_inv: Arc<dyn Fft<f64>>,
+    fft_a: Vec<Complex<f64>>,
+    fft_b: Vec<Complex<f64>>,
+    fft_scratch: Vec<Complex<f64>>,
     key_root: u8,
     scale_mode: VocalTuneScaleMode,
     retune_speed_ms: f64,
@@ -76,9 +86,23 @@ pub struct RealtimeVocalTune {
 }
 
 impl RealtimeVocalTune {
-    const RING_LEN: usize = 8192;
-    const YIN_WIN: usize = 2048;
-    const YIN_HOP: usize = 128;
+    /// Computes the power-of-two YIN window size scaled to `sr` so `yin_win / 2` always covers
+    /// vocal fundamentals down to `75 Hz` even at `96 kHz` / `192 kHz` / `384 kHz`.
+    #[inline]
+    fn yin_win_for_sr(sr: f64) -> usize {
+        let min_half = (sr / 75.0).ceil() as usize;
+        (min_half.saturating_mul(2)).max(2048).next_power_of_two()
+    }
+
+    #[inline]
+    fn yin_hop_for_sr(sr: f64) -> usize {
+        ((sr * (128.0 / 48_000.0)).round() as usize).clamp(64, 1024)
+    }
+
+    #[inline]
+    fn grain_len_for_sr(sr: f64) -> usize {
+        ((sr * 0.0213).round() as usize).clamp(256, 4096)
+    }
 
     pub fn new(sample_rate: f64) -> Self {
         let sr = if sample_rate.is_finite() {
@@ -86,25 +110,43 @@ impl RealtimeVocalTune {
         } else {
             48_000.0
         };
-        let yin_min_tau = ((sr / 1050.0).floor() as usize).clamp(8, Self::YIN_WIN / 2 - 2);
-        let yin_max_tau = ((sr / 75.0).ceil() as usize).clamp(yin_min_tau + 1, Self::YIN_WIN / 2);
-        let grain_len = ((sr * 0.0213).round() as usize).clamp(256, 2048);
+        let yin_win = Self::yin_win_for_sr(sr);
+        let grain_len = Self::grain_len_for_sr(sr);
+        let ring_len = (yin_win.max(grain_len).saturating_mul(2))
+            .max(8192)
+            .next_power_of_two();
+        let yin_min_tau = ((sr / 1050.0).floor() as usize).clamp(8, yin_win / 2 - 2);
+        let yin_max_tau = ((sr / 75.0).ceil() as usize).clamp(yin_min_tau + 1, yin_win / 2);
+        let yin_hop = Self::yin_hop_for_sr(sr);
+
+        let mut planner = FftPlanner::<f64>::new();
+        let fft_fwd = planner.plan_fft_forward(yin_win);
+        let fft_inv = planner.plan_fft_inverse(yin_win);
+        let scratch_len = fft_fwd
+            .get_inplace_scratch_len()
+            .max(fft_inv.get_inplace_scratch_len());
 
         Self {
             sample_rate: sr,
-            ring_l: vec![0.0; Self::RING_LEN],
-            ring_r: vec![0.0; Self::RING_LEN],
-            ring_mask: Self::RING_LEN - 1,
+            ring_l: vec![0.0; ring_len],
+            ring_r: vec![0.0; ring_len],
+            ring_mask: ring_len - 1,
             write_pos: 0,
             grain_len,
             grain_phase: 0.0,
-            yin_win: Self::YIN_WIN,
+            yin_win,
             yin_max_tau,
             yin_min_tau,
-            yin_hop: Self::YIN_HOP,
+            yin_hop,
             hop_counter: 0,
-            yin_buf: vec![0.0; Self::YIN_WIN],
-            yin_diff: vec![0.0; Self::YIN_WIN / 2 + 1],
+            yin_buf: vec![0.0; yin_win],
+            yin_prefix_sq: vec![0.0; yin_win + 1],
+            yin_diff: vec![0.0; yin_win / 2 + 1],
+            fft_fwd,
+            fft_inv,
+            fft_a: vec![Complex::new(0.0, 0.0); yin_win],
+            fft_b: vec![Complex::new(0.0, 0.0); yin_win],
+            fft_scratch: vec![Complex::new(0.0, 0.0); scratch_len],
             key_root: 0,
             scale_mode: VocalTuneScaleMode::Chromatic,
             retune_speed_ms: 25.0,
@@ -123,24 +165,43 @@ impl RealtimeVocalTune {
         }
     }
 
-    /// Resets all ring buffers and pitch tracking state in place with zero heap allocations.
+    /// Resets all ring buffers and pitch tracking state in place.
+    ///
+    /// Performs **zero heap allocations** whenever `sample_rate` does not require a larger FFT
+    /// window than already allocated (including all DAW stop/seek resets at the active rate).
     pub fn reset(&mut self, sample_rate: f64) {
         let sr = if sample_rate.is_finite() {
             sample_rate.clamp(8_000.0, 384_000.0)
         } else {
             48_000.0
         };
+        let needed_win = Self::yin_win_for_sr(sr);
+        let grain_len = Self::grain_len_for_sr(sr);
+        if needed_win > self.yin_win || grain_len.saturating_mul(2) > self.ring_l.len() {
+            let mut rebuilt = Self::new(sr);
+            rebuilt.key_root = self.key_root;
+            rebuilt.scale_mode = self.scale_mode;
+            rebuilt.retune_speed_ms = self.retune_speed_ms;
+            rebuilt.retune_amount = self.retune_amount;
+            rebuilt.humanize = self.humanize;
+            rebuilt.wet_mix = self.wet_mix;
+            rebuilt.set_formant_shift_st(self.formant_shift_st);
+            *self = rebuilt;
+            return;
+        }
         self.sample_rate = sr;
         self.yin_min_tau = ((sr / 1050.0).floor() as usize).clamp(8, self.yin_win / 2 - 2);
         self.yin_max_tau =
             ((sr / 75.0).ceil() as usize).clamp(self.yin_min_tau + 1, self.yin_win / 2);
-        self.grain_len = ((sr * 0.0213).round() as usize).clamp(256, 2048);
+        self.yin_hop = Self::yin_hop_for_sr(sr);
+        self.grain_len = grain_len;
         self.ring_l.fill(0.0);
         self.ring_r.fill(0.0);
         self.write_pos = 0;
         self.grain_phase = 0.0;
         self.hop_counter = 0;
         self.yin_buf.fill(0.0);
+        self.yin_prefix_sq.fill(0.0);
         self.yin_diff.fill(0.0);
         self.current_ratio = 1.0;
         self.target_ratio = 1.0;
@@ -272,6 +333,36 @@ impl RealtimeVocalTune {
         }
 
         let half = n / 2;
+        // Build cumulative squared energy prefix sums: O(N).
+        self.yin_prefix_sq[0] = 0.0;
+        for i in 0..n {
+            let x = self.yin_buf[i];
+            self.yin_prefix_sq[i + 1] = self.yin_prefix_sq[i] + x * x;
+        }
+        let e0 = self.yin_prefix_sq[half];
+
+        // Compute exact linear cross-correlation r(tau) = sum_{j=0..half} x[j]*x[j+tau]
+        // via O(N log N) FFT with pre-allocated scratch buffers (zero heap allocations).
+        for j in 0..half {
+            self.fft_a[j] = Complex::new(self.yin_buf[j], 0.0);
+        }
+        for c in &mut self.fft_a[half..n] {
+            *c = Complex::new(0.0, 0.0);
+        }
+        for (dst, &src) in self.fft_b.iter_mut().zip(self.yin_buf.iter()).take(n) {
+            *dst = Complex::new(src, 0.0);
+        }
+        self.fft_fwd
+            .process_with_scratch(&mut self.fft_a[..n], &mut self.fft_scratch);
+        self.fft_fwd
+            .process_with_scratch(&mut self.fft_b[..n], &mut self.fft_scratch);
+        for k in 0..n {
+            self.fft_a[k] = self.fft_b[k] * self.fft_a[k].conj();
+        }
+        self.fft_inv
+            .process_with_scratch(&mut self.fft_a[..n], &mut self.fft_scratch);
+        let inv_n = 1.0 / (n as f64);
+
         self.yin_diff[0] = 1.0;
         let mut running_sum = 0.0_f64;
         let mut best_tau = 0_usize;
@@ -280,11 +371,9 @@ impl RealtimeVocalTune {
         const YIN_THRESH: f64 = 0.18;
 
         for tau in 1..=self.yin_max_tau {
-            let mut sum = 0.0_f64;
-            for j in 0..half {
-                let d = self.yin_buf[j] - self.yin_buf[j + tau];
-                sum += d * d;
-            }
+            let e_tau = self.yin_prefix_sq[tau + half] - self.yin_prefix_sq[tau];
+            let r_tau = self.fft_a[tau].re * inv_n;
+            let sum = (e0 + e_tau - 2.0 * r_tau).max(0.0);
             running_sum += sum;
             let cmnd = if running_sum > 1e-12 {
                 sum * (tau as f64) / running_sum
@@ -482,5 +571,30 @@ mod tests {
         // NaN/Inf self-healing
         let (nl, nr) = tuner.process_stereo_sample(f32::NAN, f32::INFINITY);
         assert!(nl.is_finite() && nr.is_finite());
+    }
+
+    #[test]
+    fn realtime_vocal_tune_detects_low_baritone_at_96k_and_192k() {
+        for &sr in &[96_000.0_f64, 192_000.0_f64] {
+            let mut tuner = RealtimeVocalTune::new(sr);
+            tuner.set_key_and_scale(0, VocalTuneScaleMode::Chromatic);
+            tuner.set_retune_speed_ms(5.0);
+            tuner.set_retune_amount(1.0);
+            tuner.set_humanize(0.0);
+            tuner.set_wet_mix(1.0);
+
+            // 85 Hz (baritone/bass vocal well below the old 93.75 / 187.5 Hz blind spot)
+            let frames = (sr * 0.12) as usize;
+            for i in 0..frames {
+                let s = (0.45 * (2.0 * PI * 85.0 * (i as f64) / sr).sin()) as f32;
+                let (l, r) = tuner.process_stereo_sample(s, s);
+                assert!(l.is_finite() && r.is_finite());
+            }
+            assert!(
+                (tuner.detected_hz() - 85.0).abs() < 2.5,
+                "sr={sr}: expected ~85 Hz, got {}",
+                tuner.detected_hz()
+            );
+        }
     }
 }
