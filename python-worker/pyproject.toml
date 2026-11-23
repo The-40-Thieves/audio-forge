@@ -13,14 +13,21 @@ dependencies = [
 
 [project.optional-dependencies]
 gpu = [
-    "audio-separator[gpu]>=0.47.1",
-]
-denoise = [
-    "deepfilternet>=0.5.6",
+    "audio-separator[gpu]>=0.47.1; sys_platform != 'darwin'",
 ]
 dev = [
     "ruff>=0.17.2",
     "z3-solver>=5.3.1.0",
+]
+# Note: DeepFilterNet3 (`deepfilternet>=0.5.6`) pins `numpy<2.0`, which conflicts
+# with `audio-separator>=0.47.1` (`numpy>=2`). Run DeepFilterNet3 in an isolated venv
+# (`uv run --with deepfilternet`) or rely on the built-in Mel-Band-RoFormer denoise fallback.
+
+[tool.uv]
+environments = [
+    "sys_platform == 'linux'",
+    "sys_platform == 'win32'",
+    "sys_platform == 'darwin'",
 ]
 
 [tool.ruff]

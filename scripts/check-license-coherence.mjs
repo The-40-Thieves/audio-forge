@@ -72,12 +72,29 @@ if (noticeText !== null) {
   );
 }
 
+/**
+ * Return true if any trimmed line in `section` equals `expected` (ignoring spaces around `=`).
+ */
+function hasTomlAssignment(section, key, expectedValue) {
+  for (const rawLine of section.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const eq = line.indexOf("=");
+    if (eq === -1) continue;
+    const lhs = line.slice(0, eq).trim();
+    const rhs = line.slice(eq + 1).trim();
+    if (lhs === key && rhs === expectedValue) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // 3. Root Cargo.toml [workspace.package] + every workspace member [package]
 const rootCargo = readUtf8("Cargo.toml");
 if (rootCargo !== null) {
   const wsPkg = tomlSection(rootCargo, "workspace.package");
   check(
-    wsPkg !== null && /^\s*license\s*=\s*"Apache-2\.0"\s*$/m.test(wsPkg),
+    wsPkg !== null && hasTomlAssignment(wsPkg, "license", '"Apache-2.0"'),
     'Root Cargo.toml [workspace.package] must declare `license = "Apache-2.0"`',
   );
 
@@ -95,8 +112,8 @@ if (rootCargo !== null) {
         const pkg = tomlSection(text, "package");
         const ok =
           pkg !== null &&
-          (/^\s*license\.workspace\s*=\s*true\s*$/m.test(pkg) ||
-            /^\s*license\s*=\s*"Apache-2\.0"\s*$/m.test(pkg));
+          (hasTomlAssignment(pkg, "license.workspace", "true") ||
+            hasTomlAssignment(pkg, "license", '"Apache-2.0"'));
         check(
           ok,
           `${rel} [package] must declare \`license.workspace = true\` or \`license = "Apache-2.0"\``,
@@ -114,8 +131,13 @@ if (pyproject !== null) {
   const project = tomlSection(pyproject, "project");
   const pyOk =
     project !== null &&
-    (/^\s*license\s*=\s*"Apache-2\.0"\s*$/m.test(project) ||
-      /^\s*license\s*=\s*\{\s*text\s*=\s*"Apache-2\.0"\s*\}\s*$/m.test(project));
+    (hasTomlAssignment(project, "license", '"Apache-2.0"') ||
+      project.split(/\r?\n/).some((rawLine) => {
+        const line = rawLine.trim();
+        if (!line.startsWith("license")) return false;
+        const compact = line.replaceAll(" ", "").replaceAll("\t", "");
+        return compact === 'license={text="Apache-2.0"}';
+      }));
   check(
     pyOk,
     'python-worker/pyproject.toml [project] must declare Apache-2.0 license',
@@ -143,10 +165,14 @@ if (!existsSync(jsfxDir)) {
     const rel = join("reaper-jsfx", name);
     const text = readUtf8(rel);
     if (text !== null) {
-      const header = text.split(/\r?\n/).slice(0, 15).join("\n");
+      const headerLines = text.split(/\r?\n/).slice(0, 15);
+      const hasApacheAuthor = headerLines.some((rawLine) => {
+        const line = rawLine.trim();
+        return line.startsWith("//author:") && line.endsWith("(Apache-2.0)");
+      });
+      const hasMit = /\bMIT\b/i.test(headerLines.join("\n"));
       check(
-        /^\s*\/\/author:.*\(Apache-2\.0\)\s*$/m.test(header) &&
-          !/\bMIT\b/i.test(header),
+        hasApacheAuthor && !hasMit,
         `${rel} header must declare '(Apache-2.0)' without conflicting MIT license text`,
       );
     }
@@ -156,9 +182,18 @@ if (!existsSync(jsfxDir)) {
 // 7. Release workflow must explicitly copy NOTICE into dist/$out alongside LICENSE
 const releaseYml = readUtf8(".github/workflows/release.yml");
 if (releaseYml !== null) {
-  const copiesLicense = /^\s*cp\b.*\bLICENSE\b.*dist\/\$out\//m.test(releaseYml);
-  const copiesNotice = /^\s*(?:if\s+\[\s+-f\s+NOTICE\s+\];\s*then\s+)?cp\b.*\bNOTICE\b.*dist\/\$out\//m.test(
-    releaseYml,
+  const lines = releaseYml.split(/\r?\n/).map((l) => l.trim());
+  const copiesLicense = lines.some(
+    (l) =>
+      l.startsWith("cp ") &&
+      l.includes("LICENSE") &&
+      l.includes("dist/$out/"),
+  );
+  const copiesNotice = lines.some(
+    (l) =>
+      (l.startsWith("cp ") || l.startsWith("if [ -f NOTICE ]; then cp ")) &&
+      l.includes("NOTICE") &&
+      l.includes("dist/$out/"),
   );
   check(
     copiesLicense && copiesNotice,
