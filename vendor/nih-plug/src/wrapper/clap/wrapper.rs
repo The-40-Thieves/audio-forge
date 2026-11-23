@@ -126,6 +126,9 @@ pub struct Wrapper<P: ClapPlugin> {
     editor_scaling_factor: AtomicF32,
 
     is_processing: AtomicBool,
+    /// Set while inside `clap_plugin::activate()` so `Task::LatencyChanged` only invokes
+    /// `clap_host_latency::changed()` during activation and uses `request_restart()` otherwise.
+    is_activating: AtomicBool,
     /// The current IO configuration, modified through the `clap_plugin_audio_ports_config`
     /// extension. Initialized to the plugin's first audio IO configuration.
     current_audio_io_layout: AtomicCell<AudioIOLayout>,
@@ -389,22 +392,28 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
                     }
                 }
             }
-            Task::LatencyChanged => match &*self.host_latency.borrow() {
-                Some(host_latency) => {
-                    nih_debug_assert!(is_gui_thread);
+            Task::LatencyChanged => {
+                nih_debug_assert!(is_gui_thread);
 
-                    // XXX: The CLAP docs mention that you should request a restart if this happens
-                    //      while the plugin is activated (which is not entirely the same thing as
-                    //      is processing, but we'll treat it as the same thing). In practice just
-                    //      calling the latency changed function also seems to work just fine.
-                    if self.is_processing.load(Ordering::SeqCst) {
-                        unsafe_clap_call! { &*self.host_callback=>request_restart(&*self.host_callback) };
-                    } else {
-                        unsafe_clap_call! { host_latency=>changed(&*self.host_callback) };
+                // Per the CLAP latency extension, `clap_host_latency::changed` may only be
+                // called within `clap_plugin::activate()`. Outside `activate()`, request a
+                // restart so the host deactivates and reactivates the plugin to pick up the
+                // updated latency.
+                if self.is_activating.load(Ordering::SeqCst) {
+                    match &*self.host_latency.borrow() {
+                        Some(host_latency) => {
+                            unsafe_clap_call! { host_latency=>changed(&*self.host_callback) };
+                        }
+                        None => {
+                            nih_debug_assert_failure!(
+                                "Host does not support the latency extension"
+                            )
+                        }
                     }
+                } else {
+                    unsafe_clap_call! { &*self.host_callback=>request_restart(&*self.host_callback) };
                 }
-                None => nih_debug_assert_failure!("Host does not support the latency extension"),
-            },
+            }
             Task::VoiceInfoChanged => match &*self.host_voice_info.borrow() {
                 Some(host_voice_info) => {
                     nih_debug_assert!(is_gui_thread);
@@ -544,6 +553,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             editor_scaling_factor: AtomicF32::new(1.0),
 
             is_processing: AtomicBool::new(false),
+            is_activating: AtomicBool::new(false),
             current_audio_io_layout: AtomicCell::new(
                 P::AUDIO_IO_LAYOUTS.first().copied().unwrap_or_default(),
             ),
@@ -1888,6 +1898,15 @@ impl<P: ClapPlugin> Wrapper<P> {
         for param in wrapper.param_by_hash.values() {
             param.update_smoother(buffer_config.sample_rate, true);
         }
+
+        struct ActivatingGuard<'a>(&'a AtomicBool);
+        impl Drop for ActivatingGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        wrapper.is_activating.store(true, Ordering::SeqCst);
+        let _activating = ActivatingGuard(&wrapper.is_activating);
 
         // NOTE: This needs to be dropped after the `plugin` lock to avoid deadlocks
         let mut init_context = wrapper.make_init_context();
