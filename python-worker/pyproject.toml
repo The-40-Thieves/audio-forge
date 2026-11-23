@@ -6,13 +6,18 @@ readme = "../README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 dependencies = [
-    "audio-separator[gpu]>=0.47.1",
+    "audio-separator>=0.47.1",
     "basic-pitch>=0.4.0",
     "gradio_client>=2.7.2",
-    "soundfile>=0.14.0",
 ]
 
 [project.optional-dependencies]
+gpu = [
+    "audio-separator[gpu]>=0.47.1",
+]
+denoise = [
+    "deepfilternet>=0.5.6",
+]
 dev = [
     "ruff>=0.17.2",
     "z3-solver>=5.3.1.0",

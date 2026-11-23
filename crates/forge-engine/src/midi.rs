@@ -152,6 +152,11 @@ const MAX_POLY_VOICES: usize = 16;
 pub struct PolySynth {
     sample_rate: f64,
     voices: [SynthVoice; MAX_POLY_VOICES],
+    cached_preset: Option<SynthPreset>,
+    atk_step: f64,
+    rel_mul: f64,
+    lp_alpha: f64,
+    detune_ratio: f64,
 }
 
 impl PolySynth {
@@ -159,12 +164,18 @@ impl PolySynth {
         Self {
             sample_rate: sample_rate.max(8_000.0),
             voices: [SynthVoice::default(); MAX_POLY_VOICES],
+            cached_preset: None,
+            atk_step: 0.001,
+            rel_mul: 0.9999,
+            lp_alpha: 0.25,
+            detune_ratio: 1.0,
         }
     }
 
     pub fn reset(&mut self, sample_rate: f64) {
         self.sample_rate = sample_rate.max(8_000.0);
         self.voices = [SynthVoice::default(); MAX_POLY_VOICES];
+        self.cached_preset = None;
     }
 
     #[inline]
@@ -260,16 +271,28 @@ impl PolySynth {
             }
         }
 
+        if !self.voices.iter().any(|v| v.active) {
+            return (0.0, 0.0);
+        }
+
         let sr = self.sample_rate;
-        let (atk_s, rel_s, cutoff_hz, detune_ratio) = match preset {
-            SynthPreset::WarmSawPad => (0.045, 0.35, 2200.0, 1.0045),
-            SynthPreset::ElectricPiano => (0.004, 0.28, 3400.0, 1.0012),
-            SynthPreset::Sub808Bass => (0.003, 0.18, 420.0, 1.0),
-            SynthPreset::PluckLead => (0.002, 0.14, 4800.0, 1.003),
-        };
-        let atk_step = 1.0 / (atk_s * sr).max(1.0);
-        let rel_mul = (-1.0 / (rel_s * sr).max(1.0)).exp();
-        let lp_alpha = (2.0 * PI * cutoff_hz / sr).clamp(0.002, 0.92);
+        if self.cached_preset != Some(preset) {
+            let (atk_s, rel_s, cutoff_hz, detune_ratio) = match preset {
+                SynthPreset::WarmSawPad => (0.045, 0.35, 2200.0, 1.0045),
+                SynthPreset::ElectricPiano => (0.004, 0.28, 3400.0, 1.0012),
+                SynthPreset::Sub808Bass => (0.003, 0.18, 420.0, 1.0),
+                SynthPreset::PluckLead => (0.002, 0.14, 4800.0, 1.003),
+            };
+            self.atk_step = 1.0 / (atk_s * sr).max(1.0);
+            self.rel_mul = (-1.0 / (rel_s * sr).max(1.0)).exp();
+            self.lp_alpha = (2.0 * PI * cutoff_hz / sr).clamp(0.002, 0.92);
+            self.detune_ratio = detune_ratio;
+            self.cached_preset = Some(preset);
+        }
+        let atk_step = self.atk_step;
+        let rel_mul = self.rel_mul;
+        let lp_alpha = self.lp_alpha;
+        let detune_ratio = self.detune_ratio;
 
         let mut out_l = 0.0_f64;
         let mut out_r = 0.0_f64;

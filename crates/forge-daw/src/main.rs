@@ -173,6 +173,8 @@ struct ForgeDawApp {
     show_mixer: bool,
     pointer_down: bool,
     undo_gesture_active: bool,
+    piano_roll_base_octave: u8,
+    piano_roll_bar: u64,
 }
 
 impl ForgeDawApp {
@@ -219,6 +221,8 @@ impl ForgeDawApp {
             show_mixer: true,
             pointer_down: false,
             undo_gesture_active: false,
+            piano_roll_base_octave: 3,
+            piano_roll_bar: 0,
         }
     }
 
@@ -598,6 +602,35 @@ impl ForgeDawApp {
                     let prev = self.project.clone();
                     self.project.loop_enabled = !self.project.loop_enabled;
                     self.commit_project_change(prev);
+                }
+                if self.project.loop_enabled {
+                    let sr = f64::from(self.project.sample_rate.max(8_000));
+                    let mut start_s = (self.project.loop_start_samples as f64) / sr;
+                    let mut end_s = (self.project.loop_end_samples as f64) / sr;
+                    let s_changed = ui
+                        .add(
+                            egui::DragValue::new(&mut start_s)
+                                .speed(0.1)
+                                .range(0.0..=3600.0)
+                                .suffix("s"),
+                        )
+                        .changed();
+                    ui.label("–");
+                    let e_changed = ui
+                        .add(
+                            egui::DragValue::new(&mut end_s)
+                                .speed(0.1)
+                                .range((start_s + 0.25)..=3600.0)
+                                .suffix("s"),
+                        )
+                        .changed();
+                    if s_changed || e_changed {
+                        let prev = self.project.clone();
+                        self.project.loop_start_samples = (start_s.max(0.0) * sr).round() as u64;
+                        self.project.loop_end_samples =
+                            (end_s.max(start_s + 0.25) * sr).round() as u64;
+                        self.commit_project_change(prev);
+                    }
                 }
                 ui.separator();
                 egui::ComboBox::from_id_salt("snap_grid")
@@ -1055,37 +1088,92 @@ impl ForgeDawApp {
             })
             .unwrap_or(0);
 
-        // Interactive 16-step × 13-note (C4..=C5) Piano Roll Grid
+        // Interactive Multi-Octave (2 octaves visible, C1..C7 scrollable) × Multi-Bar Piano Roll Grid
         let sr = f64::from(self.project.sample_rate.max(8_000));
         let step_smp = (((60.0 / self.project.bpm.max(30.0)) * 0.25) * sr).round() as u64;
+        let bar_steps = u64::from(self.project.time_sig_num.clamp(1, 16)) * 4;
+        let bar_smp = step_smp.saturating_mul(bar_steps).max(1);
+        let total_bars = self.project.tracks[tr_idx].midi_clips[clip_idx]
+            .length_samples
+            .div_ceil(bar_smp)
+            .max(1);
+        if self.piano_roll_bar >= total_bars {
+            self.piano_roll_bar = total_bars - 1;
+        }
+        let bar_offset_smp = self.piano_roll_bar.saturating_mul(bar_smp);
 
-        ui.label(
-            egui::RichText::new(format!(
-                "Editing '{}' — click cells to toggle 16th-note events (C4–C5):",
-                self.project.tracks[tr_idx].midi_clips[clip_idx].name
-            ))
-            .small()
-            .color(egui::Color32::from_rgb(148, 163, 184)),
-        );
+        let mut delete_clip = false;
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "'{}' | Bar {}/{} | Oct C{}–C{}",
+                    self.project.tracks[tr_idx].midi_clips[clip_idx].name,
+                    self.piano_roll_bar + 1,
+                    total_bars,
+                    self.piano_roll_base_octave,
+                    self.piano_roll_base_octave + 2
+                ))
+                .small()
+                .color(egui::Color32::from_rgb(148, 163, 184)),
+            );
+            if ui.small_button("< Bar").clicked() && self.piano_roll_bar > 0 {
+                self.piano_roll_bar -= 1;
+            }
+            if ui.small_button("Bar >").clicked() && self.piano_roll_bar + 1 < total_bars {
+                self.piano_roll_bar += 1;
+            }
+            if ui.small_button("Oct -").clicked() && self.piano_roll_base_octave > 1 {
+                self.piano_roll_base_octave -= 1;
+            }
+            if ui.small_button("Oct +").clicked() && self.piano_roll_base_octave < 5 {
+                self.piano_roll_base_octave += 1;
+            }
+            if ui
+                .small_button(egui::RichText::new("Del Clip").color(egui::Color32::LIGHT_RED))
+                .clicked()
+            {
+                delete_clip = true;
+            }
+        });
 
-        let note_names = [
-            "C5", "B4", "A#4", "A4", "G#4", "G4", "F#4", "F4", "E4", "D#4", "D4", "C#4", "C4",
+        if delete_clip {
+            self.project.tracks[tr_idx].midi_clips.remove(clip_idx);
+            self.selected_midi_clip_id = None;
+            self.commit_project_change(prev);
+            return;
+        }
+
+        const PITCH_CLASSES: [&str; 12] = [
+            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
         ];
+        let low_pitch = (self.piano_roll_base_octave + 1).saturating_mul(12);
+        let high_pitch = low_pitch.saturating_add(24).min(108);
         let mut add_note: Option<(u64, u8)> = None;
         let mut remove_note_idx: Option<usize> = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             let clip = &self.project.tracks[tr_idx].midi_clips[clip_idx];
-            for (row, name) in note_names.iter().enumerate() {
-                let pitch = (72 - row) as u8;
+            for pitch in (low_pitch..=high_pitch).rev() {
+                let pc = PITCH_CLASSES[usize::from(pitch % 12)];
+                let oct = (pitch / 12).saturating_sub(1);
+                let is_black = pc.ends_with('#');
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     ui.add_sized(
-                        [28.0, 16.0],
-                        egui::Label::new(egui::RichText::new(*name).monospace().small()),
+                        [30.0, 15.0],
+                        egui::Label::new(
+                            egui::RichText::new(format!("{pc}{oct}"))
+                                .monospace()
+                                .small()
+                                .color(if is_black {
+                                    egui::Color32::from_rgb(148, 163, 184)
+                                } else {
+                                    egui::Color32::from_rgb(226, 232, 240)
+                                }),
+                        ),
                     );
-                    for step in 0..16_u64 {
-                        let start = step * step_smp;
+                    for step in 0..bar_steps {
+                        let start = bar_offset_smp.saturating_add(step * step_smp);
                         let existing_idx = clip.notes.iter().position(|n| {
                             n.pitch == pitch && n.start_samples.abs_diff(start) < step_smp / 2
                         });
@@ -1094,12 +1182,14 @@ impl ForgeDawApp {
                             egui::Color32::from_rgb(192, 132, 252)
                         } else if step % 4 == 0 {
                             egui::Color32::from_rgb(38, 46, 62)
+                        } else if is_black {
+                            egui::Color32::from_rgb(18, 23, 34)
                         } else {
                             egui::Color32::from_rgb(24, 30, 42)
                         };
                         let btn = egui::Button::new("")
                             .fill(col)
-                            .min_size(egui::vec2(15.0, 15.0));
+                            .min_size(egui::vec2(14.0, 14.0));
                         if ui.add(btn).clicked() {
                             if let Some(idx) = existing_idx {
                                 remove_note_idx = Some(idx);
@@ -2454,6 +2544,8 @@ mod tests {
             show_mixer: true,
             pointer_down: true,
             undo_gesture_active: false,
+            piano_roll_base_octave: 3,
+            piano_roll_bar: 0,
         };
         let initial_gain = app.project.master_gain_db;
         // Simulate 60 frames of continuous slider drag

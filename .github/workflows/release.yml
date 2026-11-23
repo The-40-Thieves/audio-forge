@@ -47,6 +47,13 @@ jobs:
           toolchain: stable
       - name: Verify license coherence
         run: node scripts/check-license-coherence.mjs
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-audit,cargo-deny
+      - name: Security & license dependency audit
+        run: |
+          cargo audit
+          cargo deny -L error check
       - name: Test before packaging
         run: cargo test --workspace --locked
       - name: Bundle VST3 / CLAP plugins
