@@ -231,17 +231,57 @@ pub fn write_distrokid_metadata<P: AsRef<Path>>(
     }
     args.push(out_ref.to_string_lossy().to_string());
 
-    let output = Command::new("ffmpeg")
+    let mut child = Command::new("ffmpeg")
+        .arg("-nostdin")
+        .args(["-protocol_whitelist", "file,pipe"])
         .args(&args)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| ForgeError::ReaperError(format!("FFmpeg metadata tagger failed: {e}")))?;
 
-    if !output.status.success() {
+    let stderr_pipe = child.stderr.take();
+    let stderr_handle = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        if let Some(pipe) = stderr_pipe {
+            let _ = pipe.take(64 * 1024).read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(ForgeError::ReaperError(
+                        "FFmpeg metadata write timed out after 60s".to_string(),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err(ForgeError::ReaperError(format!(
+                    "FFmpeg metadata wait failed: {e}"
+                )));
+            }
+        }
+    };
+
+    if !status.success() {
+        let stderr_buf = stderr_handle.join().unwrap_or_default();
         return Err(ForgeError::ReaperError(format!(
             "FFmpeg metadata write failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            String::from_utf8_lossy(&stderr_buf).trim()
         )));
     }
+    let _ = stderr_handle.join();
     Ok(canonical_isrc)
 }
 

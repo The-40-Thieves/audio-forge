@@ -159,6 +159,8 @@ struct ForgeDawApp {
     selected_midi_clip_id: Option<u64>,
     inspector_tab: InspectorTab,
     active_drag: Option<(usize, u64, DragMode)>,
+    drag_anchor_samples: u64,
+    drag_anchor_x: f32,
     snap_grid: SnapGrid,
     auto_crossfade: bool,
     pixels_per_sec: f32,
@@ -201,6 +203,8 @@ impl ForgeDawApp {
             selected_midi_clip_id: None,
             inspector_tab: InspectorTab::Object,
             active_drag: None,
+            drag_anchor_samples: 0,
+            drag_anchor_x: 0.0,
             snap_grid: SnapGrid::Quarter,
             auto_crossfade: true,
             pixels_per_sec: 120.0,
@@ -237,6 +241,21 @@ impl ForgeDawApp {
         }
     }
 
+    fn project_media_dir(&self) -> PathBuf {
+        let proj = PathBuf::from(self.project_path_buf.trim());
+        let parent = proj
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let stem = proj
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("forgestudio");
+        parent.join(format!("{stem}_media"))
+    }
+
     fn add_demo_clip(&mut self) {
         if self.project.tracks.is_empty() {
             self.project.add_track("01 Audio Track");
@@ -260,7 +279,7 @@ impl ForgeDawApp {
         if let Ok(buf) = AudioBuffer::from_channels(vec![ch_l, ch_r], sr) {
             let prev = self.project.clone();
             let id = self.project.alloc_id();
-            let media_dir = std::env::temp_dir().join("forgestudio_media");
+            let media_dir = self.project_media_dir();
             let _ = std::fs::create_dir_all(&media_dir);
             let path = media_dir.join(format!("demo_am7_{id}.wav"));
             if buf.save_wav(&path, 24).is_ok() {
@@ -332,7 +351,7 @@ impl ForgeDawApp {
                 .min(self.project.tracks.len().saturating_sub(1));
             let start_pos = rec.start_timeline_samples();
             let id = self.project.alloc_id();
-            let media_dir = std::env::temp_dir().join("forgestudio_media");
+            let media_dir = self.project_media_dir();
             let out_wav = media_dir.join(format!("recording_{id}.wav"));
             match rec.stop_and_save(&out_wav, self.project.sample_rate) {
                 Ok(buf) => {
@@ -1140,6 +1159,36 @@ impl ForgeDawApp {
                 ("Forge Master Limiter", FxSlotConfig::default_master_limiter),
             ];
 
+            let mut delete_track = false;
+            ui.horizontal(|ui| {
+                ui.label("Track:");
+                if ui
+                    .text_edit_singleline(&mut self.project.tracks[tr_idx].name)
+                    .changed()
+                {
+                    changed = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .checkbox(
+                        &mut self.project.tracks[tr_idx].phase_invert,
+                        "Phase Invert",
+                    )
+                    .changed();
+                if self.project.tracks.len() > 1 && ui.small_button("Delete Track").clicked() {
+                    delete_track = true;
+                }
+            });
+            if delete_track {
+                self.project.tracks.remove(tr_idx);
+                self.selected_track_idx = tr_idx.min(self.project.tracks.len().saturating_sub(1));
+                self.selected_object_id = None;
+                changed = true;
+                return;
+            }
+            ui.separator();
+
             ui.label(
                 egui::RichText::new(format!(
                     "Track Inserts: {}",
@@ -1172,6 +1221,50 @@ impl ForgeDawApp {
             if let Some(rm) = rm_tr {
                 self.project.tracks[tr_idx].inserts.remove(rm);
                 changed = true;
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Aux Bus Inserts").strong());
+                if ui.small_button("+ Aux Bus").clicked() {
+                    let n = self.project.aux_buses.len() + 1;
+                    self.project.add_aux_bus(format!("Aux {n}: FX Bus"));
+                    changed = true;
+                }
+            });
+            for (bi, bus) in self.project.aux_buses.iter_mut().enumerate() {
+                ui.label(
+                    egui::RichText::new(&bus.name)
+                        .small()
+                        .strong()
+                        .color(egui::Color32::from_rgb(192, 132, 252)),
+                );
+                egui::ComboBox::from_id_salt(("add_aux_fx", bi))
+                    .selected_text("+ Add Aux Insert...")
+                    .show_ui(ui, |ui| {
+                        for (label, make_fn) in presets {
+                            if ui.selectable_label(false, label).clicked() {
+                                bus.inserts.push(make_fn());
+                                changed = true;
+                            }
+                        }
+                    });
+                let mut rm_aux = None;
+                for (idx, fx) in bus.inserts.iter_mut().enumerate() {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.strong(fx.display_name());
+                            if ui.small_button("X").clicked() {
+                                rm_aux = Some(idx);
+                            }
+                        });
+                        changed |= draw_fx_slot_controls(ui, fx);
+                    });
+                }
+                if let Some(rm) = rm_aux {
+                    bus.inserts.remove(rm);
+                    changed = true;
+                }
             }
 
             ui.separator();
@@ -1410,7 +1503,13 @@ impl ForgeDawApp {
                 ui.add(
                     egui::Slider::new(&mut self.pixels_per_sec, 30.0..=400.0).text("Zoom (px/s)"),
                 );
-                ui.add(egui::Slider::new(&mut self.scroll_secs, 0.0..=120.0).text("Scroll (s)"));
+                let sr = f64::from(self.project.sample_rate.max(1));
+                let max_scroll_secs =
+                    ((self.project.total_length_samples() as f64 / sr) as f32 + 30.0).max(120.0);
+                ui.add(
+                    egui::Slider::new(&mut self.scroll_secs, 0.0..=max_scroll_secs)
+                        .text("Scroll (s)"),
+                );
             });
             ui.separator();
 
@@ -1751,6 +1850,9 @@ impl ForgeDawApp {
                                     DragMode::Move
                                 };
                                 self.active_drag = Some((ti, obj_id, mode));
+                                self.drag_anchor_samples =
+                                    self.project.tracks[ti].objects[oi].timeline_start_samples;
+                                self.drag_anchor_x = pt.x;
                             }
                             if lane_resp.clicked()
                                 && !self.project.tracks[ti].show_automation
@@ -1766,23 +1868,32 @@ impl ForgeDawApp {
                                 && lane_resp.dragged()
                             {
                                 let dx = lane_resp.drag_delta().x;
-                                if dx.abs() > 0.1 {
+                                let cum_dx = lane_resp
+                                    .interact_pointer_pos()
+                                    .map_or(dx, |pt| pt.x - self.drag_anchor_x);
+                                if dx.abs() > 0.1 || matches!(drag_mode, DragMode::Move) {
                                     let delta_smp =
                                         (f64::from(dx / self.pixels_per_sec) * sr).round() as i64;
                                     let obj = &mut self.project.tracks[ti].objects[oi];
                                     match drag_mode {
                                         DragMode::Move => {
-                                            let raw = (obj.timeline_start_samples as i64
-                                                + delta_smp)
+                                            let cum_smp = (f64::from(cum_dx / self.pixels_per_sec)
+                                                * sr)
+                                                .round()
+                                                as i64;
+                                            let raw = (self.drag_anchor_samples as i64 + cum_smp)
                                                 .max(0)
                                                 as u64;
-                                            obj.timeline_start_samples =
-                                                self.snap_grid.snap_samples(
-                                                    raw,
-                                                    self.project.sample_rate,
-                                                    self.project.bpm,
-                                                    self.project.time_sig_num,
-                                                );
+                                            let snapped = self.snap_grid.snap_samples(
+                                                raw,
+                                                self.project.sample_rate,
+                                                self.project.bpm,
+                                                self.project.time_sig_num,
+                                            );
+                                            if snapped != obj.timeline_start_samples {
+                                                obj.timeline_start_samples = snapped;
+                                                changed = true;
+                                            }
                                         }
                                         DragMode::TrimLeft => {
                                             let max_shift =
@@ -1807,15 +1918,16 @@ impl ForgeDawApp {
                                                 obj.length_samples =
                                                     obj.length_samples.saturating_add(s);
                                             }
+                                            changed = true;
                                         }
                                         DragMode::TrimRight => {
                                             let new_len = (obj.length_samples as i64 + delta_smp)
                                                 .max(256)
                                                 as u64;
                                             obj.length_samples = new_len;
+                                            changed = true;
                                         }
                                     }
-                                    changed = true;
                                 }
                             }
                         }
@@ -2072,12 +2184,28 @@ fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) -> bool {
             changed |= ui.checkbox(isp_8x, "8x ISP Oversampling").changed();
         }
         FxSlotConfig::SplitEq {
+            tr_low_db,
+            tr_mid_db,
             tr_high_db,
+            tn_low_db,
+            tn_mid_db,
             tn_high_db,
             ..
         } => {
             changed |= ui
+                .add(egui::Slider::new(tr_low_db, -12.0..=12.0).text("Trans Low"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(tr_mid_db, -12.0..=12.0).text("Trans Mid"))
+                .changed();
+            changed |= ui
                 .add(egui::Slider::new(tr_high_db, -12.0..=12.0).text("Trans High"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(tn_low_db, -12.0..=12.0).text("Tonal Low"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(tn_mid_db, -12.0..=12.0).text("Tonal Mid"))
                 .changed();
             changed |= ui
                 .add(egui::Slider::new(tn_high_db, -12.0..=12.0).text("Tonal High"))
@@ -2086,6 +2214,7 @@ fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) -> bool {
         FxSlotConfig::DensityClipper {
             density,
             clip_drive_db,
+            ceiling_db,
             ..
         } => {
             changed |= ui
@@ -2094,9 +2223,15 @@ fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) -> bool {
             changed |= ui
                 .add(egui::Slider::new(clip_drive_db, 0.0..=12.0).text("4x ADAA Clip"))
                 .changed();
+            changed |= ui
+                .add(egui::Slider::new(ceiling_db, -12.0..=0.0).text("Ceil (dB)"))
+                .changed();
         }
         FxSlotConfig::SpaceVerb {
             decay_rt60_secs,
+            damping,
+            shimmer,
+            ducking,
             wet_mix,
             ..
         } => {
@@ -2104,15 +2239,60 @@ fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) -> bool {
                 .add(egui::Slider::new(decay_rt60_secs, 0.2..=12.0).text("Decay (s)"))
                 .changed();
             changed |= ui
+                .add(egui::Slider::new(damping, 0.05..=0.90).text("Damping"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(shimmer, 0.0..=1.0).text("Shimmer"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(ducking, 0.0..=1.0).text("Ducking"))
+                .changed();
+            changed |= ui
                 .add(egui::Slider::new(wet_mix, 0.0..=1.0).text("Wet Mix"))
                 .changed();
         }
         FxSlotConfig::VocalTune {
+            key_root,
+            scale_mode,
             retune_speed_ms,
             retune_amount,
+            humanize,
             formant_shift_st,
+            wet_mix,
             ..
         } => {
+            const ROOTS: [&str; 12] = [
+                "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+            ];
+            const SCALES: [&str; 5] = [
+                "Chromatic",
+                "Major",
+                "Minor",
+                "Pentatonic Maj",
+                "Pentatonic Min",
+            ];
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("vt_root")
+                    .width(46.0)
+                    .selected_text(ROOTS[usize::from(*key_root % 12)])
+                    .show_ui(ui, |ui| {
+                        for (i, name) in ROOTS.iter().enumerate() {
+                            if ui.selectable_value(key_root, i as u8, *name).changed() {
+                                changed = true;
+                            }
+                        }
+                    });
+                egui::ComboBox::from_id_salt("vt_scale")
+                    .width(108.0)
+                    .selected_text(SCALES[usize::from((*scale_mode).min(4))])
+                    .show_ui(ui, |ui| {
+                        for (i, name) in SCALES.iter().enumerate() {
+                            if ui.selectable_value(scale_mode, i as u8, *name).changed() {
+                                changed = true;
+                            }
+                        }
+                    });
+            });
             changed |= ui
                 .add(egui::Slider::new(retune_speed_ms, 0.0..=100.0).text("Speed (ms)"))
                 .changed();
@@ -2120,7 +2300,13 @@ fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) -> bool {
                 .add(egui::Slider::new(retune_amount, 0.0..=1.0).text("Amount"))
                 .changed();
             changed |= ui
+                .add(egui::Slider::new(humanize, 0.0..=1.0).text("Humanize"))
+                .changed();
+            changed |= ui
                 .add(egui::Slider::new(formant_shift_st, -12.0..=12.0).text("Formant (st)"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(wet_mix, 0.0..=1.0).text("Wet Mix"))
                 .changed();
         }
     }
@@ -2129,6 +2315,19 @@ fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) -> bool {
 
 impl eframe::App for ForgeDawApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Drag-and-drop audio file import directly onto the DAW window
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        for path in dropped {
+            self.import_path_buf = path.to_string_lossy().into_owned();
+            self.import_wav_to_selected_track();
+        }
+
         if !ctx.wants_keyboard_input() {
             let (space, split, marker, del, undo, redo, dup) = ctx.input(|i| {
                 (
@@ -2174,5 +2373,37 @@ impl eframe::App for ForgeDawApp {
         if self.audio.as_ref().is_some_and(LiveAudioEngine::is_playing) || self.recorder.is_some() {
             ctx.request_repaint();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snap_grid_quantizes_beats_and_bars_accurately() {
+        // 120 BPM @ 48 kHz -> 1 quarter beat = 24,000 samples, 1 bar (4/4) = 96,000 samples
+        assert_eq!(SnapGrid::Off.snap_samples(13_333, 48_000, 120.0, 4), 13_333);
+        assert_eq!(
+            SnapGrid::Quarter.snap_samples(25_500, 48_000, 120.0, 4),
+            24_000
+        );
+        assert_eq!(
+            SnapGrid::Eighth.snap_samples(35_000, 48_000, 120.0, 4),
+            36_000
+        );
+        assert_eq!(SnapGrid::Bar.snap_samples(90_000, 48_000, 120.0, 4), 96_000);
+    }
+
+    #[test]
+    fn native_gpu_options_enable_wgpu_msaa_and_vsync() {
+        let opts = build_native_options(eframe::Renderer::Wgpu);
+        assert_eq!(opts.renderer, eframe::Renderer::Wgpu);
+        assert_eq!(opts.multisampling, 4);
+        assert!(opts.vsync);
+        assert_eq!(
+            opts.hardware_acceleration,
+            eframe::HardwareAcceleration::Preferred
+        );
     }
 }

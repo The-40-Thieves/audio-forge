@@ -1055,6 +1055,10 @@ impl Plugin for ForgeOpenSpacerPlug {
         true
     }
 
+    fn reset(&mut self) {
+        self.analyzer.clear_state();
+    }
+
     fn process(
         &mut self,
         buffer: &mut Buffer,
@@ -1085,8 +1089,14 @@ impl Plugin for ForgeOpenSpacerPlug {
             let (sc_l, sc_r) = if let Some(sc_buf) = aux.inputs.first_mut() {
                 let sc_slices = sc_buf.as_slice();
                 (
-                    sc_slices.first().map_or(0.0, |c| c[i]),
-                    sc_slices.get(1).map_or(0.0, |c| c[i]),
+                    sc_slices
+                        .first()
+                        .and_then(|c| c.get(i).copied())
+                        .unwrap_or(0.0),
+                    sc_slices
+                        .get(1)
+                        .and_then(|c| c.get(i).copied())
+                        .unwrap_or(0.0),
                 )
             } else {
                 (0.0, 0.0)
@@ -1329,6 +1339,10 @@ impl Plugin for ForgeVocalSurgicalPlug {
         true
     }
 
+    fn reset(&mut self) {
+        self.analyzer.clear_state();
+    }
+
     fn process(
         &mut self,
         buffer: &mut Buffer,
@@ -1542,6 +1556,10 @@ impl Plugin for ForgeSubAndTapePlug {
         self.dsp = RealtimeSubAndTapeBus::new(sr, f64::from(self.params.mono_cutoff_hz.value()));
         self.analyzer.reset(sr);
         true
+    }
+
+    fn reset(&mut self) {
+        self.analyzer.clear_state();
     }
 
     fn process(
@@ -2076,6 +2094,7 @@ impl Plugin for ForgeDrumTriggerPlug {
     /// Notes cannot be sent from here, so held notes are released at the start of the next block.
     fn reset(&mut self) {
         self.release_pending = true;
+        self.analyzer.clear_state();
     }
 
     fn process(
@@ -2537,12 +2556,12 @@ impl Default for SplitEqParams {
         };
         Self {
             editor_state: EguiState::from_size(680, 380),
-            trans_low_db: mk_db("Low Transient (<250 Hz Punch)", 1.5),
-            trans_mid_db: mk_db("Mid Transient (250-3.5kHz Attack)", 0.0),
-            trans_high_db: mk_db("High Transient (>3.5kHz Click/Pick)", -2.0),
-            tonal_low_db: mk_db("Low Tonal (<250 Hz Body)", 0.5),
-            tonal_mid_db: mk_db("Mid Tonal (250-3.5kHz Sustain)", 0.0),
-            tonal_high_db: mk_db("High Tonal (>3.5kHz Shimmer/Air)", 1.5),
+            trans_low_db: mk_db("Low Transient (<180 Hz Punch)", 1.5),
+            trans_mid_db: mk_db("Mid Transient (180-3.2kHz Attack)", 0.0),
+            trans_high_db: mk_db("High Transient (>3.2kHz Click/Pick)", -2.0),
+            tonal_low_db: mk_db("Low Tonal (<180 Hz Body)", 0.5),
+            tonal_mid_db: mk_db("Mid Tonal (180-3.2kHz Sustain)", 0.0),
+            tonal_high_db: mk_db("High Tonal (>3.2kHz Shimmer/Air)", 1.5),
         }
     }
 }
@@ -2660,6 +2679,10 @@ impl Plugin for ForgeSplitEqPlug {
         self.dsp.reset(sr);
         self.analyzer.reset(sr);
         true
+    }
+
+    fn reset(&mut self) {
+        self.analyzer.clear_state();
     }
 
     fn process(
@@ -2883,6 +2906,10 @@ impl Plugin for ForgeDensityClipperPlug {
         self.dsp = RealtimeDensityAndClipper::new(sr);
         self.analyzer.reset(sr);
         true
+    }
+
+    fn reset(&mut self) {
+        self.analyzer.clear_state();
     }
 
     fn process(
@@ -3277,6 +3304,12 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
         self.reverb_dsp.reset(sr);
         self.analyzer.reset(sr);
         true
+    }
+
+    fn reset(&mut self) {
+        let sr = self.reverb_dsp.sample_rate();
+        self.reverb_dsp.reset(sr);
+        self.analyzer.clear_state();
     }
 
     fn process(

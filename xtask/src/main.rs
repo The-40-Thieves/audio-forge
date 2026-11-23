@@ -4,11 +4,11 @@
 //! - `cargo run --package xtask -- bundle <plugin-name> [--release]`
 //!   Bundles any single standalone plugin (e.g. `forge-opensoothe`) or the all-in-one `forge-plug`.
 //! - `cargo run --package xtask -- bundle-all [--release]`
-//!   Bundles all 10 individual standalone VST3 & CLAP plugins into `target/bundled/`.
+//!   Bundles all 11 individual standalone VST3 & CLAP plugins into `target/bundled/`.
 //! - `cargo run --package xtask -- install <plugin-name|--all> [--release] [--dest <folder>]`
-//!   Bundles and installs an individual plugin (or `--all` 10 standalone plugins) into the DAW VST3 & CLAP directories.
+//!   Bundles and installs an individual plugin (or `--all` 11 standalone plugins) into the DAW VST3 & CLAP directories.
 //! - `cargo run --package xtask -- list`
-//!   Lists all 10 standalone VST3/CLAP plugins and their descriptions.
+//!   Lists all 11 standalone VST3/CLAP plugins and their descriptions.
 //! - `cargo run --package xtask -- check`
 //!   Runs the local pre-PR quality gate (`fmt`, `clippy`, `test`, `doc`).
 

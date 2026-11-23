@@ -131,6 +131,15 @@ impl RealtimeSpectrumAnalyzer32 {
         *self = Self::new(sample_rate);
     }
 
+    /// Clears filter and envelope state in place with zero heap allocations.
+    pub fn clear_state(&mut self) {
+        for f in &mut self.filters {
+            f.reset();
+        }
+        self.avg_pow = [0.0; SPECTRUM_BANDS];
+        self.env_pow = [0.0; SPECTRUM_BANDS];
+    }
+
     /// Feeds one stereo frame (analysed as the mid signal `(l + r) / 2`).
     #[inline]
     pub fn push_stereo_sample(&mut self, l: f32, r: f32) {

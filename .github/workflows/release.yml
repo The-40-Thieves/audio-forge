@@ -45,23 +45,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
         with:
           toolchain: stable
+      - name: Verify license coherence
+        run: node scripts/check-license-coherence.mjs
       - name: Test before packaging
         run: cargo test --workspace --locked
       - name: Bundle VST3 / CLAP plugins
         run: cargo xtask bundle-all --release
-      - name: Build forge CLI and MCP server
-        run: cargo build --release --locked -p forge-cli -p forge-mcp
+      - name: Build forge CLI, MCP server, and ForgeStudio DAW
+        run: cargo build --release --locked -p forge-cli -p forge-mcp -p forge-daw
       - name: Package
         shell: bash
         run: |
           set -euo pipefail
           out="audio-forge-${TAG}-${{ matrix.platform }}"
-          mkdir -p "dist/$out/plugins" "dist/$out/bin" "dist/$out/jsfx"
+          mkdir -p "dist/$out/plugins" "dist/$out/bin" "dist/$out/jsfx" "dist/$out/python-worker"
           cp -R target/bundled/*.vst3 target/bundled/*.clap "dist/$out/plugins/"
           cp reaper-jsfx/*.jsfx "dist/$out/jsfx/"
+          cp python-worker/forge_gpu_worker.py python-worker/pyproject.toml "dist/$out/python-worker/"
           cp LICENSE README.md "dist/$out/"
           if [ -f NOTICE ]; then cp NOTICE "dist/$out/"; fi
-          for bin in forge forge-mcp; do
+          for bin in forge forge-mcp forge-daw; do
             for f in "target/release/$bin" "target/release/$bin.exe"; do
               if [ -f "$f" ]; then cp "$f" "dist/$out/bin/"; fi
             done

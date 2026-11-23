@@ -56,12 +56,19 @@ def _normalize(tag: str) -> str:
 def pick_stem(
     files: list[str], wanted: frozenset[str], output_dir: Path
 ) -> Path | None:
-    """Return the first output whose stem tag is in ``wanted``, resolved in output_dir."""
+    """Return the first output whose stem tag is in ``wanted``, verified inside output_dir."""
+    resolved_dir = output_dir.resolve()
     for f in files:
         tag = stem_tag(f)
         if tag is not None and _normalize(tag) in wanted:
             path = Path(f)
-            return path if path.is_absolute() else output_dir / path
+            candidate = path if path.is_absolute() else output_dir / path
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(resolved_dir):
+                raise RuntimeError(
+                    f"Separator wrote stem outside output_dir: {resolved}"
+                )
+            return candidate
     return None
 
 
@@ -364,7 +371,7 @@ def main() -> int:
             )
             print(json.dumps(res))
         return 0
-    except (RuntimeError, ValueError, OSError, ImportError, KeyError) as exc:
+    except Exception as exc:  # noqa: BLE001
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 1
 

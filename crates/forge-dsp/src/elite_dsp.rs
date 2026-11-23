@@ -342,15 +342,28 @@ impl RealtimeDensityAndClipper {
             let xl = bands_l[b] * up_gain;
             let xr = bands_r[b] * up_gain;
 
-            // 2x Oversampled 1st-Order ADAA Soft Clipper per band
-            let adaa_l = &mut self.adaa_l[b];
-            let adaa_r = &mut self.adaa_r[b];
-            bands_l[b] = self.oversampler_l[b].process(xl, |s| adaa_l.process(s, drive_lin));
-            bands_r[b] = self.oversampler_r[b].process(xr, |s| adaa_r.process(s, drive_lin));
+            if clean_drive_db <= 0.01 {
+                bands_l[b] = xl;
+                bands_r[b] = xr;
+            } else {
+                // 4x Oversampled 1st-Order ADAA Soft Clipper per band
+                let adaa_l = &mut self.adaa_l[b];
+                let adaa_r = &mut self.adaa_r[b];
+                bands_l[b] = self.oversampler_l[b].process(xl, |s| adaa_l.process(s, drive_lin));
+                bands_r[b] = self.oversampler_r[b].process(xr, |s| adaa_r.process(s, drive_lin));
+            }
         }
 
-        let sum_l = (bands_l[0] + bands_l[1] + bands_l[2]) * ceiling_lin / drive_lin.powf(0.35);
-        let sum_r = (bands_r[0] + bands_r[1] + bands_r[2]) * ceiling_lin / drive_lin.powf(0.35);
+        let gain_comp = if clean_drive_db <= 0.01 {
+            1.0
+        } else {
+            ceiling_lin / drive_lin.powf(0.35)
+        };
+        // Post-sum brickwall ceiling clamp ensures the 3-band sum never overshoots clip_ceiling_db
+        let sum_l =
+            ((bands_l[0] + bands_l[1] + bands_l[2]) * gain_comp).clamp(-ceiling_lin, ceiling_lin);
+        let sum_r =
+            ((bands_r[0] + bands_r[1] + bands_r[2]) * gain_comp).clamp(-ceiling_lin, ceiling_lin);
 
         (
             flush_denormal_f64(sum_l) as f32,
@@ -540,6 +553,11 @@ impl RealtimeFdnReverb {
         self.mod_depth = sanitize_param_f64(depth, 1.0, 0.0, 2.0);
     }
 
+    #[inline]
+    pub fn sample_rate(&self) -> f64 {
+        self.sample_rate
+    }
+
     /// Resets all reverb state. Clears buffers in place (zero audio-thread allocations) when
     /// `sample_rate` matches the already-configured rate.
     pub fn reset(&mut self, sample_rate: f64) {
@@ -726,7 +744,9 @@ impl RealtimeFdnReverb {
         let rt60 = sanitize_param_f64(decay_rt60_secs, 2.4, 0.2, 20.0);
         let rt60_lo = (rt60 * self.decay_low_mult).clamp(0.15, 24.0);
         let rt60_hi = (rt60 * self.decay_high_mult).clamp(0.15, 24.0);
-        let damp = sanitize_param_f64(damping, 0.35, 0.05, 0.90);
+        let raw_damp = sanitize_param_f64(damping, 0.35, 0.05, 0.90);
+        // Scale 1-pole damping coefficient so HF cutoff is invariant across 44.1 / 48 / 96 / 192 kHz
+        let damp = (1.0 - (1.0 - raw_damp).powf(48_000.0 / self.sample_rate)).clamp(0.01, 0.97);
         let low_alpha = (-2.0 * PI * 350.0 / self.sample_rate).exp();
 
         for (i, &out_val) in outs.iter().enumerate() {
@@ -1509,33 +1529,33 @@ impl GenreTonalTarget {
     }
 
     /// Returns the calibrated 18-band relative spectral target curve (in dB relative to 1 kHz)
-    /// corresponding to `MASTERING_18_BANDS_HZ`.
+    /// aligned 1:1 with `MASTERING_18_BANDS_HZ`:
+    /// `[20, 31.5, 50, 80, 125, 200, 315, 500, 800, 1250, 2k, 3.15k, 4k, 5k, 6.3k, 8k, 10k, 15k]`.
     pub fn target_curve_18_db(self) -> [f64; 18] {
-        // Bands: [31.5, 45, 63, 90, 125, 180, 250, 355, 500, 710, 1k, 1.4k, 2k, 2.8k, 4k, 5.6k, 8k, 12.5k]
         match self {
             Self::ModernPop => [
-                1.5, 3.2, 4.0, 3.0, 1.8, 0.6, -0.4, -0.8, -0.4, 0.0, 0.0, 0.4, 0.8, 0.5, -0.2, 0.6,
-                1.8, 2.5,
+                0.5, 2.2, 3.8, 3.4, 1.8, 0.4, -0.6, -0.4, 0.0, 0.0, 0.6, 0.6, 0.0, 0.2, 0.8, 1.6,
+                2.0, 2.5,
             ],
             Self::HipHopTrap => [
-                4.5, 6.2, 6.5, 4.2, 1.5, -0.5, -1.5, -1.2, -0.5, 0.0, 0.0, 0.2, 0.6, 0.2, -0.5,
-                0.8, 2.2, 3.0,
+                2.5, 5.2, 6.5, 5.0, 1.6, -0.8, -1.4, -0.6, 0.0, 0.0, 0.4, 0.4, -0.4, 0.2, 1.0, 2.0,
+                2.5, 3.0,
             ],
             Self::NeoSoulRnB => [
-                3.0, 4.8, 5.2, 3.8, 2.2, 1.0, 0.2, -0.2, 0.2, 0.2, 0.0, -0.4, -0.8, -1.2, -1.5,
-                -0.4, 1.0, 1.8,
+                1.5, 3.8, 5.2, 4.2, 2.2, 0.8, 0.0, 0.2, 0.1, 0.0, -0.6, -1.0, -1.4, -0.8, -0.2,
+                0.8, 1.4, 1.8,
             ],
             Self::EdmClub => [
-                3.8, 5.8, 6.0, 4.0, 1.8, 0.0, -1.2, -1.0, -0.4, 0.0, 0.0, 0.5, 1.2, 1.0, 0.4, 1.2,
-                2.5, 3.2,
+                2.0, 4.8, 6.0, 4.6, 1.8, -0.4, -1.2, -0.4, 0.0, 0.0, 1.0, 1.0, 0.4, 0.8, 1.4, 2.4,
+                2.8, 3.2,
             ],
             Self::RockMetal => [
-                0.0, 1.8, 3.0, 3.2, 2.4, 1.2, 0.0, -0.6, 0.0, 0.5, 0.0, 1.0, 1.8, 1.5, 0.8, 0.2,
-                0.8, 1.0,
+                -1.0, 0.8, 2.6, 3.2, 2.4, 0.8, -0.4, 0.0, 0.4, 0.0, 1.6, 1.5, 0.8, 0.4, 0.4, 0.8,
+                0.9, 1.0,
             ],
             Self::AcousticJazz => [
-                -1.5, 0.5, 2.0, 2.5, 2.2, 1.5, 0.8, 0.4, 0.2, 0.0, 0.0, -0.2, -0.5, -0.8, -1.0,
-                -0.5, 0.5, 1.2,
+                -2.5, -0.5, 1.5, 2.4, 2.2, 1.4, 0.6, 0.2, 0.0, 0.0, -0.4, -0.8, -1.0, -0.8, -0.4,
+                0.4, 0.8, 1.2,
             ],
         }
     }
@@ -1568,8 +1588,8 @@ pub fn compute_genre_tonal_balance_eq(
         measured_db[b] = 10.0 * (sum_sq / (mono.len() as f64) + 1e-12).log10();
     }
 
-    // Anchor relative to 1 kHz (band index 10)
-    let anchor_db = measured_db[10];
+    // Anchor relative to ~1 kHz (midpoint of 800 Hz [idx 8] and 1250 Hz [idx 9] in MASTERING_18_BANDS_HZ)
+    let anchor_db = 0.5 * (measured_db[8] + measured_db[9]);
     let target = genre.target_curve_18_db();
     let limit = sanitize_param_f64(max_boost_cut_db, 4.5, 0.5, 12.0);
 

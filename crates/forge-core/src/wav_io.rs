@@ -45,7 +45,13 @@ impl AudioBuffer {
     pub fn load_wav_from_reader<R: Read>(reader: R, origin: &str) -> Result<Self> {
         let mut reader = WavReader::new(reader).map_err(|e| audio_io(origin, e))?;
         let spec = reader.spec();
-        let ch_count = usize::from(spec.channels.max(1));
+        if spec.sample_rate == 0 {
+            return Err(audio_io(origin, "WAV header reports 0 Hz sample rate"));
+        }
+        if spec.channels == 0 {
+            return Err(audio_io(origin, "WAV header reports 0 channels"));
+        }
+        let ch_count = usize::from(spec.channels);
 
         let channels = match spec.sample_format {
             SampleFormat::Float => {
@@ -53,7 +59,16 @@ impl AudioBuffer {
                 crate::deinterleave_whole_frames(samples, ch_count, origin)?
             }
             SampleFormat::Int => {
-                let scale = 1.0 / ((1_i64 << (spec.bits_per_sample.saturating_sub(1))) as f64);
+                if spec.bits_per_sample == 0 || spec.bits_per_sample > 32 {
+                    return Err(audio_io(
+                        origin,
+                        format!(
+                            "Unsupported integer WAV bit depth: {}",
+                            spec.bits_per_sample
+                        ),
+                    ));
+                }
+                let scale = 1.0 / ((1_i64 << (spec.bits_per_sample - 1)) as f64);
                 let samples = reader
                     .samples::<i32>()
                     .map(|s| s.map(|v| f64::from(v) * scale));
@@ -76,6 +91,12 @@ impl AudioBuffer {
         bits_per_sample: u16,
         origin: &str,
     ) -> Result<()> {
+        if self.num_channels() == 0 || self.sample_rate == 0 {
+            return Err(audio_io(
+                origin,
+                "Cannot save WAV with 0 channels or 0 Hz sample rate",
+            ));
+        }
         let (sample_format, bits) = match bits_per_sample {
             32 => (SampleFormat::Float, 32),
             16 => (SampleFormat::Int, 16),
@@ -105,6 +126,12 @@ impl AudioBuffer {
         bits_per_sample: u16,
         origin: &str,
     ) -> Result<()> {
+        if self.num_channels() == 0 || self.sample_rate == 0 {
+            return Err(audio_io(
+                origin,
+                "Cannot save WAV with 0 channels or 0 Hz sample rate",
+            ));
+        }
         let (sample_format, bits) = match bits_per_sample {
             32 => (SampleFormat::Float, 32),
             16 => (SampleFormat::Int, 16),
@@ -132,8 +159,12 @@ fn has_wav_extension(name: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
 }
 
+const MAX_FFMPEG_INPUT_BYTES: u64 = 512 * 1024 * 1024;
+const FFMPEG_DECODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Copies `reader` into a temporary file named with `name`'s extension (FFmpeg probes it),
-/// decodes that to 32-bit float WAV with FFmpeg, and loads the result.
+/// decodes that to 32-bit float WAV with FFmpeg (bounded size, protocol whitelist, and timeout),
+/// and loads the result.
 fn decode_with_ffmpeg<R: Read>(reader: &mut R, name: &Path) -> Result<AudioBuffer> {
     let origin = name.display().to_string();
     let suffix = name
@@ -145,17 +176,29 @@ fn decode_with_ffmpeg<R: Read>(reader: &mut R, name: &Path) -> Result<AudioBuffe
         .prefix("forge_source_")
         .suffix(&suffix)
         .tempfile()?;
-    io::copy(reader, source.as_file_mut())?;
+    let copied = io::copy(
+        &mut reader.take(MAX_FFMPEG_INPUT_BYTES + 1),
+        source.as_file_mut(),
+    )?;
+    if copied > MAX_FFMPEG_INPUT_BYTES {
+        return Err(audio_io(
+            &origin,
+            format!("Input audio exceeds {MAX_FFMPEG_INPUT_BYTES} byte safety limit"),
+        ));
+    }
     source.as_file_mut().flush()?;
     let decoded = tempfile::Builder::new()
         .prefix("forge_decode_")
         .suffix(".wav")
         .tempfile()?;
-    let status = Command::new("ffmpeg")
+    let mut child = Command::new("ffmpeg")
         .args([
+            "-nostdin",
             "-hide_banner",
             "-loglevel",
             "error",
+            "-protocol_whitelist",
+            "file,pipe",
             "-y",
             "-i",
             &source.path().to_string_lossy(),
@@ -163,14 +206,54 @@ fn decode_with_ffmpeg<R: Read>(reader: &mut R, name: &Path) -> Result<AudioBuffe
             "pcm_f32le",
             &decoded.path().to_string_lossy(),
         ])
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| audio_io(&origin, format!("Failed to invoke ffmpeg decoder: {e}")))?;
-    if !status.status.success() {
+
+    let stderr_pipe = child.stderr.take();
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stderr_pipe {
+            let _ = pipe.take(64 * 1024).read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = std::time::Instant::now() + FFMPEG_DECODE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(audio_io(
+                        &origin,
+                        format!(
+                            "ffmpeg decoder timed out after {}s",
+                            FFMPEG_DECODE_TIMEOUT.as_secs()
+                        ),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err(audio_io(&origin, format!("ffmpeg wait failed: {e}")));
+            }
+        }
+    };
+
+    if !status.success() {
+        let stderr_buf = stderr_handle.join().unwrap_or_default();
         return Err(audio_io(
             &origin,
-            String::from_utf8_lossy(&status.stderr).trim(),
+            String::from_utf8_lossy(&stderr_buf).trim(),
         ));
     }
+    let _ = stderr_handle.join();
     AudioBuffer::load_wav(decoded.path())
 }
 

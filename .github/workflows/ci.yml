@@ -28,8 +28,11 @@ jobs:
   license:
     name: license coherence
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: node scripts/check-license-coherence.mjs
 
   fmt:
@@ -129,7 +132,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
-      - run: pip install ruff==0.17.2 z3-solver==5.3.1.0
+      - run: "pip install --no-cache-dir --only-binary=:all: ruff==0.17.2 z3-solver==5.3.1.0"
       - run: ruff check python-worker scripts
       - run: ruff format --check python-worker scripts
       # Stem picking and timeouts, with fakes for audio-separator and gradio_client.
