@@ -169,65 +169,126 @@ impl LiveAudioEngine {
             })?;
         let device_sr = supported.sample_rate().0;
         let channels = supported.channels() as usize;
+        let sample_format = supported.sample_format();
 
         let engine = Arc::new(Mutex::new(compiled));
-        let eng_cb = Arc::clone(&engine);
-        let play_cb = Arc::clone(&playing);
-        let pos_cb = Arc::clone(&playhead);
-        let gen_cb = Arc::clone(&seek_gen);
-        let tgt_cb = Arc::clone(&seek_target);
-        let met_cb = Arc::clone(&meters);
-
-        let mut resampler = RealtimeOutputResampler::new(1024);
-        let mut last_seen_gen = 0_u64;
-
         let stream_config: cpal::StreamConfig = supported.into();
-        let stream = device
-            .build_output_stream(
-                &stream_config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let cur_gen = gen_cb.load(Ordering::Acquire);
-                    if !play_cb.load(Ordering::Relaxed) {
-                        data.fill(0.0);
-                        if cur_gen != last_seen_gen {
-                            resampler.reset();
-                            last_seen_gen = cur_gen;
-                        }
-                        return;
+
+        let build_stream = |fmt: cpal::SampleFormat| -> Result<cpal::Stream> {
+            let eng_cb = Arc::clone(&engine);
+            let play_cb = Arc::clone(&playing);
+            let pos_cb = Arc::clone(&playhead);
+            let gen_cb = Arc::clone(&seek_gen);
+            let tgt_cb = Arc::clone(&seek_target);
+            let met_cb = Arc::clone(&meters);
+
+            let mut resampler = RealtimeOutputResampler::new(1024);
+            let mut last_seen_gen = 0_u64;
+            let mut f32_buf = vec![0.0_f32; 8192];
+
+            let mut render_f32 = move |out_f32: &mut [f32]| {
+                let cur_gen = gen_cb.load(Ordering::Acquire);
+                if !play_cb.load(Ordering::Relaxed) {
+                    out_f32.fill(0.0);
+                    if cur_gen != last_seen_gen {
+                        resampler.reset();
+                        last_seen_gen = cur_gen;
                     }
-                    if let Ok(mut guard) = eng_cb.try_lock() {
-                        if cur_gen != last_seen_gen {
-                            let tgt = tgt_cb.load(Ordering::Acquire);
-                            guard.set_playhead_samples(tgt);
-                            resampler.reset();
-                            last_seen_gen = cur_gen;
-                        }
-                        resampler.render_interleaved(
-                            &mut guard,
-                            data,
-                            channels,
-                            f64::from(device_sr),
-                        );
-                        // Only publish playhead if no concurrent seek/stop happened during render
-                        if gen_cb.load(Ordering::Acquire) == cur_gen {
-                            pos_cb.store(guard.playhead_samples(), Ordering::Release);
-                        }
-                        if let Ok(mut m) = met_cb.try_lock() {
-                            m.copy_from_no_alloc(guard.meters());
-                        }
-                    } else {
-                        data.fill(0.0);
+                    return;
+                }
+                if let Ok(mut guard) = eng_cb.try_lock() {
+                    if cur_gen != last_seen_gen {
+                        let tgt = tgt_cb.load(Ordering::Acquire);
+                        guard.set_playhead_samples(tgt);
+                        resampler.reset();
+                        last_seen_gen = cur_gen;
                     }
-                },
-                |err| {
-                    eprintln!("forge-engine audio stream error: {err}");
-                },
-                None,
-            )
-            .map_err(|e| ForgeError::AudioIo {
+                    resampler.render_interleaved(
+                        &mut guard,
+                        out_f32,
+                        channels,
+                        f64::from(device_sr),
+                    );
+                    if gen_cb.load(Ordering::Acquire) == cur_gen {
+                        pos_cb.store(guard.playhead_samples(), Ordering::Release);
+                    }
+                    if let Ok(mut m) = met_cb.try_lock() {
+                        m.copy_from_no_alloc(guard.meters());
+                    }
+                } else {
+                    out_f32.fill(0.0);
+                }
+            };
+
+            let err_cb = |err| {
+                eprintln!("forge-engine audio stream error: {err}");
+            };
+
+            let res = match fmt {
+                cpal::SampleFormat::F32 => device.build_output_stream(
+                    &stream_config,
+                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                        render_f32(data);
+                    },
+                    err_cb,
+                    None,
+                ),
+                cpal::SampleFormat::I16 => device.build_output_stream(
+                    &stream_config,
+                    move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                        let ch = channels.max(1);
+                        let mut offset = 0_usize;
+                        while offset < data.len() {
+                            let max_chunk = (f32_buf.len() / ch) * ch;
+                            let chunk = (data.len() - offset).min(max_chunk.max(ch));
+                            let slice = &mut f32_buf[..chunk];
+                            render_f32(slice);
+                            for (dst, &s) in
+                                data[offset..offset + chunk].iter_mut().zip(slice.iter())
+                            {
+                                *dst = cpal::Sample::from_sample(s.clamp(-1.0, 1.0));
+                            }
+                            offset += chunk;
+                        }
+                    },
+                    err_cb,
+                    None,
+                ),
+                cpal::SampleFormat::U16 => device.build_output_stream(
+                    &stream_config,
+                    move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
+                        let ch = channels.max(1);
+                        let mut offset = 0_usize;
+                        while offset < data.len() {
+                            let max_chunk = (f32_buf.len() / ch) * ch;
+                            let chunk = (data.len() - offset).min(max_chunk.max(ch));
+                            let slice = &mut f32_buf[..chunk];
+                            render_f32(slice);
+                            for (dst, &s) in
+                                data[offset..offset + chunk].iter_mut().zip(slice.iter())
+                            {
+                                *dst = cpal::Sample::from_sample(s.clamp(-1.0, 1.0));
+                            }
+                            offset += chunk;
+                        }
+                    },
+                    err_cb,
+                    None,
+                ),
+                other => {
+                    return Err(ForgeError::AudioIo {
+                        path: device_name.clone(),
+                        message: format!("Unsupported audio output sample format: {other:?}"),
+                    });
+                }
+            };
+            res.map_err(|e| ForgeError::AudioIo {
                 path: device_name.clone(),
                 message: format!("Failed to open audio output stream: {e}"),
-            })?;
+            })
+        };
+
+        let stream = build_stream(sample_format)?;
 
         stream.play().map_err(|e| ForgeError::AudioIo {
             path: device_name.clone(),

@@ -607,8 +607,9 @@ impl ObjectOrientedEngine {
         let is_elastic = (stretch - 1.0).abs() > 1e-4 || pitch_st.abs() > 1e-3;
 
         if !is_elastic {
+            let src_u64 = obj.source_offset_samples.saturating_add(local);
             if (sr_ratio - 1.0).abs() < 1e-6 {
-                let src_idx = (obj.source_offset_samples + local) as usize;
+                let src_idx = usize::try_from(src_u64).unwrap_or(usize::MAX);
                 let clip_frames = clip.num_frames();
                 if src_idx < clip_frames {
                     let c0 = clip.channels[0][src_idx] as f32;
@@ -621,7 +622,7 @@ impl ObjectOrientedEngine {
                 }
                 return (0.0, 0.0, false);
             }
-            let src_pos = ((obj.source_offset_samples + local) as f64) * sr_ratio;
+            let src_pos = (src_u64 as f64) * sr_ratio;
             return Self::sample_clip_interp(clip, src_pos);
         }
 

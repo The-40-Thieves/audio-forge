@@ -117,6 +117,7 @@ impl SynthPreset {
 struct SynthVoice {
     active: bool,
     gate: bool,
+    prev_gate: bool,
     note_id: u64,
     pitch: u8,
     velocity: f32,
@@ -132,6 +133,7 @@ impl Default for SynthVoice {
         Self {
             active: false,
             gate: false,
+            prev_gate: false,
             note_id: 0,
             pitch: 60,
             velocity: 0.0,
@@ -185,10 +187,17 @@ impl PolySynth {
 
     #[inline]
     fn trigger_note(&mut self, note_id: u64, pitch: u8, velocity: f32) {
-        // Already sounding? Keep gate high.
+        // Already sounding? Keep gate high; if it was releasing (e.g. looped note re-entering),
+        // retrigger its attack envelope cleanly.
         for v in &mut self.voices {
             if v.active && v.note_id == note_id {
                 v.gate = true;
+                if !v.prev_gate {
+                    v.velocity = velocity.clamp(0.05, 1.0);
+                    v.phase_a = 0.0;
+                    v.phase_b = 0.25;
+                    v.env = 0.0;
+                }
                 return;
             }
         }
@@ -207,6 +216,7 @@ impl PolySynth {
         self.voices[slot] = SynthVoice {
             active: true,
             gate: true,
+            prev_gate: false,
             note_id,
             pitch,
             velocity: velocity.clamp(0.05, 1.0),
@@ -231,8 +241,9 @@ impl PolySynth {
             return (0.0, 0.0);
         }
 
-        // Clear gates; re-assert for any note currently active at `timeline_pos`
+        // Snapshot previous gate state and clear gates; re-assert for notes active at `timeline_pos`
         for v in &mut self.voices {
+            v.prev_gate = v.gate;
             v.gate = false;
         }
         for clip in clips {
