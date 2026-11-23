@@ -11,6 +11,7 @@ use forge_dsp::{
     clean_vocal_surgical, compute_genre_tonal_balance_eq, compute_reference_match_eq, deliver,
     normalize_and_limit, run_full_restoration_chain,
 };
+use forge_engine::{ClipCache, DawProject, ObjectOrientedEngine};
 use forge_reaper::{
     ReaperProjectBuilder, ReaperTrackSpec, ReleaseMetadata, TempFileGuard, install_jsfx_plugins,
     send_reaper_osc, validate_isrc, write_distrokid_metadata,
@@ -322,6 +323,35 @@ enum Commands {
         /// Worker timeout in seconds (1..=3600)
         #[arg(long, default_value_t = 300)]
         timeout_secs: u64,
+    },
+
+    /// Inspect or headlessly bounce/export stems from a ForgeStudio DAW `.forgeproj` session
+    Daw {
+        #[command(subcommand)]
+        action: DawAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DawAction {
+    /// Validate and print a summary (tracks, objects, aux buses, PDC, BPM) of a `.forgeproj` file
+    Inspect {
+        /// Path to `.forgeproj` project file
+        project: PathBuf,
+        /// Emit raw JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Headless 24-bit WAV mastering bounce (with ITU-R BS.1770-4 audit) and optional stem export
+    Bounce {
+        /// Path to `.forgeproj` project file
+        project: PathBuf,
+        /// Output 24-bit WAV master bounce path
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Optional output directory for batch per-track stem WAV export
+        #[arg(long)]
+        stems_dir: Option<PathBuf>,
     },
 }
 
@@ -1004,6 +1034,82 @@ async fn main() -> anyhow::Result<()> {
             )?;
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
+
+        Commands::Daw { action } => match action {
+            DawAction::Inspect { project, json } => {
+                let proj = DawProject::load_from_file(&project)?;
+                let mut cache = ClipCache::default();
+                let mut missing_clips = Vec::new();
+                for tr in &proj.tracks {
+                    for obj in &tr.objects {
+                        if let Err(e) = cache.load_clip(&obj.source_path) {
+                            missing_clips.push(format!("{}: {e}", obj.source_path.display()));
+                        }
+                    }
+                }
+                let engine = ObjectOrientedEngine::compile(&proj, &cache);
+                let total_objects: usize = proj.tracks.iter().map(|t| t.objects.len()).sum();
+                let total_midi_clips: usize = proj.tracks.iter().map(|t| t.midi_clips.len()).sum();
+                let summary = serde_json::json!({
+                    "name": proj.name,
+                    "sample_rate": proj.sample_rate,
+                    "bpm": proj.bpm,
+                    "time_signature": format!("{}/{}", proj.time_sig_num, proj.time_sig_den),
+                    "tracks": proj.tracks.len(),
+                    "audio_objects": total_objects,
+                    "midi_clips": total_midi_clips,
+                    "aux_buses": proj.aux_buses.len(),
+                    "master_inserts": proj.master_inserts.len(),
+                    "total_pdc_samples": engine.total_pdc_samples(),
+                    "missing_clips": missing_clips,
+                });
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                } else {
+                    println!(
+                        "ForgeStudio Project '{}' | {} Hz | {:.1} BPM ({}/{}) | {} tracks ({} objects, {} MIDI clips) | {} aux buses | PDC: {} spl",
+                        proj.name,
+                        proj.sample_rate,
+                        proj.bpm,
+                        proj.time_sig_num,
+                        proj.time_sig_den,
+                        proj.tracks.len(),
+                        total_objects,
+                        total_midi_clips,
+                        proj.aux_buses.len(),
+                        engine.total_pdc_samples()
+                    );
+                    if !missing_clips.is_empty() {
+                        eprintln!("Warning: {} clip(s) missing on disk", missing_clips.len());
+                    }
+                }
+            }
+            DawAction::Bounce {
+                project,
+                output,
+                stems_dir,
+            } => {
+                let proj = DawProject::load_from_file(&project)?;
+                let mut cache = ClipCache::default();
+                for tr in &proj.tracks {
+                    for obj in &tr.objects {
+                        cache.load_clip(&obj.source_path)?;
+                    }
+                }
+                let report = ObjectOrientedEngine::bounce_to_wav(&proj, &cache, &output)?;
+                let mut exported_stems = Vec::new();
+                if let Some(dir) = stems_dir {
+                    exported_stems = ObjectOrientedEngine::bounce_stems(&proj, &cache, &dir)?;
+                }
+                let result = serde_json::json!({
+                    "output": output.display().to_string(),
+                    "integrated_lufs": report.integrated_lufs,
+                    "true_peak_dbtp": report.true_peak_dbtp,
+                    "stems_exported": exported_stems.len(),
+                });
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+        },
     }
 
     Ok(())
