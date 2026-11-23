@@ -1126,7 +1126,7 @@ impl Plugin for ForgeOpenSpacerPlug {
                 c1[i] = out_r;
             }
         }
-        let carve_db = self.dsp.last_carve_bands_db();
+        let carve_db = self.dsp.last_carve_bands_db().map(|v| -v.abs());
         self.telemetry
             .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &carve_db);
 
