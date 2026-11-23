@@ -437,6 +437,30 @@ fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "forge_daw_inspect",
+            "description": "Validate and inspect a ForgeStudio DAW `.forgeproj` session (BPM, sample rate, tracks, audio objects, MIDI clips, aux buses, total PDC) within the MCP path sandbox.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Path to `.forgeproj` session file" }
+                },
+                "required": ["project"]
+            }
+        }),
+        json!({
+            "name": "forge_daw_bounce",
+            "description": "Headless 24-bit WAV mastering bounce (with ITU-R BS.1770-4 audit) and optional batch stem export from a ForgeStudio DAW `.forgeproj` session within the MCP path sandbox.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Path to `.forgeproj` session file" },
+                    "output": { "type": "string", "description": "Output 24-bit WAV master bounce path" },
+                    "stems_dir": { "type": "string", "description": "Optional directory for batch per-track stem WAV export" }
+                },
+                "required": ["project", "output"]
+            }
+        }),
+        json!({
             "name": "forge_ingest_to_reaper",
             "description": "Full autonomous pipeline: separate stems, clean & de-fizz audio, extract drum MIDI, build voice-led chords, deliver a verified master for the chosen target, install JSFX plugins, and generate a REAPER 7.82 .RPP project.",
             "inputSchema": {
@@ -613,6 +637,8 @@ fn dispatch_tool(
         "forge_ingest_to_reaper" => tool_ingest_to_reaper,
         "forge_neural_denoise" => tool_neural_denoise,
         "forge_transcribe_midi" => tool_transcribe_midi,
+        "forge_daw_inspect" => tool_daw_inspect,
+        "forge_daw_bounce" => tool_daw_bounce,
         _ => {
             return Err(ForgeError::InvalidParameter(format!(
                 "Unknown tool: {name}"
@@ -1234,6 +1260,65 @@ fn build_session(spec: SessionSpec) -> ReaperProjectBuilder {
     rpp
 }
 
+fn tool_daw_inspect(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
+    let project_path = path_arg(args, "project", sandbox)?;
+    let proj = forge_engine::DawProject::load_from_file(&project_path)?;
+    let mut cache = forge_engine::ClipCache::default();
+    let mut missing_clips = Vec::new();
+    for tr in &proj.tracks {
+        for obj in &tr.objects {
+            let safe_clip = sandbox.check(&obj.source_path)?;
+            if let Err(e) = cache.load_clip(&safe_clip) {
+                missing_clips.push(format!("{}: {e}", safe_clip.display()));
+            }
+        }
+    }
+    let engine = forge_engine::ObjectOrientedEngine::compile(&proj, &cache);
+    let total_objects: usize = proj.tracks.iter().map(|t| t.objects.len()).sum();
+    let total_midi_clips: usize = proj.tracks.iter().map(|t| t.midi_clips.len()).sum();
+    let summary = json!({
+        "name": proj.name,
+        "sample_rate": proj.sample_rate,
+        "bpm": proj.bpm,
+        "time_signature": format!("{}/{}", proj.time_sig_num, proj.time_sig_den),
+        "tracks": proj.tracks.len(),
+        "audio_objects": total_objects,
+        "midi_clips": total_midi_clips,
+        "aux_buses": proj.aux_buses.len(),
+        "master_inserts": proj.master_inserts.len(),
+        "total_pdc_samples": engine.total_pdc_samples(),
+        "missing_clips": missing_clips,
+    });
+    Ok(summary.into())
+}
+
+fn tool_daw_bounce(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
+    let project_path = path_arg(args, "project", sandbox)?;
+    let output_path = path_arg(args, "output", sandbox)?;
+    let stems_dir = optional_path_arg(args, "stems_dir", sandbox)?;
+
+    let proj = forge_engine::DawProject::load_from_file(&project_path)?;
+    let mut cache = forge_engine::ClipCache::default();
+    for tr in &proj.tracks {
+        for obj in &tr.objects {
+            let safe_clip = sandbox.check(&obj.source_path)?;
+            cache.load_clip(&safe_clip)?;
+        }
+    }
+    let report = forge_engine::ObjectOrientedEngine::bounce_to_wav(&proj, &cache, &output_path)?;
+    let mut exported_stems = Vec::new();
+    if let Some(dir) = stems_dir {
+        exported_stems = forge_engine::ObjectOrientedEngine::bounce_stems(&proj, &cache, &dir)?;
+    }
+    let payload = json!({
+        "output": output_path.display().to_string(),
+        "integrated_lufs": report.integrated_lufs,
+        "true_peak_dbtp": report.true_peak_dbtp,
+        "stems_exported": exported_stems.len(),
+    });
+    Ok(payload.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1351,6 +1436,14 @@ mod tests {
             (
                 "forge_transcribe_midi",
                 json!({ "input": "in.wav", "output_dir": "../midi_out" }),
+            ),
+            (
+                "forge_daw_inspect",
+                json!({ "project": "../session.forgeproj" }),
+            ),
+            (
+                "forge_daw_bounce",
+                json!({ "project": "session.forgeproj", "output": "../bounce.wav" }),
             ),
         ];
         for (tool, args) in cases {

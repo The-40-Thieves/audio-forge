@@ -681,15 +681,36 @@ impl ForgeDawApp {
                 ui.label(egui::RichText::new("WAV:").small());
                 ui.add(
                     egui::TextEdit::singleline(&mut self.import_path_buf)
-                        .desired_width(210.0)
+                        .desired_width(185.0)
                         .hint_text("path/to/audio.wav"),
                 );
+                if ui
+                    .small_button("…")
+                    .on_hover_text("Browse audio file")
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Audio", &["wav", "flac", "mp3", "ogg", "m4a"])
+                        .pick_file()
+                {
+                    self.import_path_buf = path.display().to_string();
+                    self.import_wav_to_selected_track();
+                }
                 if ui.small_button("Import").clicked() {
                     self.import_wav_to_selected_track();
                 }
                 ui.separator();
                 ui.label(egui::RichText::new("Project:").small());
-                ui.add(egui::TextEdit::singleline(&mut self.project_path_buf).desired_width(150.0));
+                ui.add(egui::TextEdit::singleline(&mut self.project_path_buf).desired_width(135.0));
+                if ui
+                    .small_button("…")
+                    .on_hover_text("Open .forgeproj")
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("ForgeStudio Project", &["forgeproj"])
+                        .pick_file()
+                {
+                    self.project_path_buf = path.display().to_string();
+                }
                 if ui.small_button("Save").clicked() {
                     let p = PathBuf::from(self.project_path_buf.trim());
                     match self.project.save_to_file(&p) {
@@ -718,7 +739,18 @@ impl ForgeDawApp {
                 }
                 ui.separator();
                 ui.label(egui::RichText::new("Out:").small());
-                ui.add(egui::TextEdit::singleline(&mut self.bounce_path_buf).desired_width(140.0));
+                ui.add(egui::TextEdit::singleline(&mut self.bounce_path_buf).desired_width(130.0));
+                if ui
+                    .small_button("…")
+                    .on_hover_text("Choose master bounce WAV")
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("WAV Audio", &["wav"])
+                        .set_file_name("master_bounce.wav")
+                        .save_file()
+                {
+                    self.bounce_path_buf = path.display().to_string();
+                }
                 ui.separator();
                 ui.label(
                     egui::RichText::new(&self.status_line)
