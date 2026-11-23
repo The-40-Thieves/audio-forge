@@ -223,14 +223,13 @@ impl ForgeDawApp {
     }
 
     fn commit_project_change(&mut self, prev: DawProject) {
-        if self.pointer_down {
+        if self.pointer_down || self.undo_gesture_active {
             if !self.undo_gesture_active {
                 self.undo.push(prev);
                 self.undo_gesture_active = true;
             }
         } else {
             self.undo.push(prev);
-            self.undo_gesture_active = false;
         }
         self.sync_audio_engine();
     }
@@ -2328,9 +2327,6 @@ fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) -> bool {
 impl eframe::App for ForgeDawApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pointer_down = ctx.input(|i| i.pointer.primary_down());
-        if !self.pointer_down {
-            self.undo_gesture_active = false;
-        }
         // Drag-and-drop audio file import directly onto the DAW window
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -2370,10 +2366,12 @@ impl eframe::App for ForgeDawApp {
             }
             if undo && let Some(prev) = self.undo.undo(self.project.clone()) {
                 self.project = prev;
+                self.undo_gesture_active = false;
                 self.sync_audio_engine();
             }
             if redo && let Some(next) = self.undo.redo(self.project.clone()) {
                 self.project = next;
+                self.undo_gesture_active = false;
                 self.sync_audio_engine();
             }
             if dup {
@@ -2385,6 +2383,12 @@ impl eframe::App for ForgeDawApp {
         self.draw_object_editor(ctx);
         self.draw_mixer_dock(ctx);
         self.draw_arrange_timeline(ctx);
+
+        // Reset drag-coalescing AFTER widgets finish so a slider release-frame `.changed()`
+        // stays coalesced with the drag gesture instead of pushing a second undo snapshot.
+        if !self.pointer_down {
+            self.undo_gesture_active = false;
+        }
 
         if self.audio.as_ref().is_some_and(LiveAudioEngine::is_playing) || self.recorder.is_some() {
             ctx.request_repaint();

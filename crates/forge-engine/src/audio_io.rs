@@ -5,7 +5,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -212,11 +212,11 @@ impl StereoSpscRingBuffer {
 
 /// Thread-safe handle driving live hardware playback of an [`ObjectOrientedEngine`].
 ///
-/// The audio output callback exclusively owns the active [`ObjectOrientedEngine`] with zero
-/// mutex contention, receiving parameter updates and off-thread recompiles over bounded channels
-/// and retiring replaced heap objects back to the UI thread for deallocation.
+/// The audio output callback exclusively owns `Box<ObjectOrientedEngine>` with zero
+/// mutex contention, receiving parameter updates and off-thread recompiles via a latest-wins
+/// command mailbox and retiring replaced heap objects back to the UI thread for deallocation.
 pub struct LiveAudioEngine {
-    cmd_tx: Option<SyncSender<EngineCommand>>,
+    cmd_mailbox: Option<Arc<Mutex<Option<EngineCommand>>>>,
     retire_rx: Option<Mutex<Receiver<RetiredResource>>>,
     headless_engine: Option<Mutex<ObjectOrientedEngine>>,
     last_project: Mutex<DawProject>,
@@ -249,7 +249,7 @@ impl LiveAudioEngine {
         let host = cpal::default_host();
         let Some(device) = host.default_output_device() else {
             return Ok(Self {
-                cmd_tx: None,
+                cmd_mailbox: None,
                 retire_rx: None,
                 headless_engine: Some(Mutex::new(compiled)),
                 last_project: Mutex::new(project.clone()),
@@ -277,7 +277,8 @@ impl LiveAudioEngine {
         let channels = supported.channels() as usize;
         let sample_format = supported.sample_format();
 
-        let (cmd_tx, cmd_rx) = sync_channel::<EngineCommand>(32);
+        let cmd_mailbox: Arc<Mutex<Option<EngineCommand>>> = Arc::new(Mutex::new(None));
+        let cmd_mailbox_cb = Arc::clone(&cmd_mailbox);
         let (retire_tx, retire_rx) = sync_channel::<RetiredResource>(64);
         let stream_config: cpal::StreamConfig = supported.into();
 
@@ -287,14 +288,17 @@ impl LiveAudioEngine {
         let tgt_cb = Arc::clone(&seek_target);
         let met_cb = Arc::clone(&meters);
 
-        let mut engine = compiled;
+        let mut engine = Box::new(compiled);
         let mut resampler = RealtimeOutputResampler::new(1024);
         let mut last_seen_gen = 0_u64;
         let mut f32_buf = vec![0.0_f32; 8192];
 
         let mut render_f32 = move |out_f32: &mut [f32]| {
-            // Drain pending UI commands lock-free; retire old heap objects back to UI thread.
-            while let Ok(cmd) = cmd_rx.try_recv() {
+            // Pull latest UI command without blocking; pure Box pointer swap avoids RT alloc/drop.
+            if let Ok(mut slot) = cmd_mailbox_cb.try_lock()
+                && let Some(cmd) = slot.take()
+            {
+                drop(slot);
                 match cmd {
                     EngineCommand::SyncMixParams(mut proj) => {
                         let _ = engine.sync_mix_params_swap(&mut proj);
@@ -302,8 +306,8 @@ impl LiveAudioEngine {
                     }
                     EngineCommand::ReplaceEngine(mut next) => {
                         next.set_playhead_samples(engine.playhead_samples());
-                        let old = std::mem::replace(&mut engine, *next);
-                        let _ = retire_tx.try_send(RetiredResource::Engine(Box::new(old)));
+                        let old = std::mem::replace(&mut engine, next);
+                        let _ = retire_tx.try_send(RetiredResource::Engine(old));
                         resampler.reset();
                     }
                 }
@@ -386,7 +390,7 @@ impl LiveAudioEngine {
         })?;
 
         Ok(Self {
-            cmd_tx: Some(cmd_tx),
+            cmd_mailbox: Some(cmd_mailbox),
             retire_rx: Some(Mutex::new(retire_rx)),
             headless_engine: None,
             last_project: Mutex::new(project.clone()),
@@ -490,22 +494,25 @@ impl LiveAudioEngine {
             .map(|prev| ObjectOrientedEngine::topology_compatible(&prev, project))
             .unwrap_or(false);
 
-        let cmd = if topology_same {
-            EngineCommand::SyncMixParams(Box::new(project.clone()))
-        } else {
-            let mut next = ObjectOrientedEngine::compile(project, cache);
-            next.set_playhead_samples(self.playhead_samples());
-            EngineCommand::ReplaceEngine(Box::new(next))
-        };
-
-        if let Some(tx) = &self.cmd_tx {
-            match tx.try_send(cmd) {
-                Ok(()) => {
-                    if let Ok(mut prev) = self.last_project.lock() {
-                        *prev = project.clone();
-                    }
-                }
-                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+        if let Some(mailbox) = &self.cmd_mailbox
+            && let Ok(mut slot) = mailbox.lock()
+        {
+            // If an unconsumed ReplaceEngine is already queued, keep replacing with a fresh
+            // compiled engine so we never overwrite a topology change with SyncMixParams.
+            let must_replace =
+                !topology_same || matches!(*slot, Some(EngineCommand::ReplaceEngine(_)));
+            let cmd = if must_replace {
+                let mut next = ObjectOrientedEngine::compile(project, cache);
+                next.set_playhead_samples(self.playhead_samples());
+                EngineCommand::ReplaceEngine(Box::new(next))
+            } else {
+                EngineCommand::SyncMixParams(Box::new(project.clone()))
+            };
+            // Replacing any unconsumed command drops it safely right here on the UI thread.
+            *slot = Some(cmd);
+            drop(slot);
+            if let Ok(mut prev) = self.last_project.lock() {
+                *prev = project.clone();
             }
         }
     }
@@ -583,7 +590,8 @@ impl LiveRecorder {
         let channels = supported.channels() as usize;
         let sample_format = supported.sample_format();
 
-        // Pre-allocate ~2.7 seconds of lock-free SPSC stereo ring buffer (~1 MiB fixed).
+        // Pre-allocate at least 3 seconds of lock-free SPSC stereo ring buffer (rounded up to a
+        // power of two, ~2 MiB at 48 kHz = 262,144 stereo frames / ~5.46 seconds).
         let ring = Arc::new(StereoSpscRingBuffer::new(
             (input_sr as usize).saturating_mul(3).max(131_072),
         ));
