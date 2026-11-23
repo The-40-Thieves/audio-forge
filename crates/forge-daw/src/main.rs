@@ -1176,6 +1176,9 @@ impl ForgeDawApp {
                     );
                     for step in 0..bar_steps {
                         let start = bar_offset_smp.saturating_add(step * step_smp);
+                        if start >= clip.length_samples {
+                            break;
+                        }
                         let existing_idx = clip.notes.iter().position(|n| {
                             n.pitch == pitch && n.start_samples.abs_diff(start) < step_smp / 2
                         });
