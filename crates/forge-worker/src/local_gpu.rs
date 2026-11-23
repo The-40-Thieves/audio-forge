@@ -72,10 +72,7 @@ pub(crate) fn separate(
     input_path: &Path,
     output_dir: &Path,
     stems: u8,
-    quality: &str,
-    dereverb: bool,
-    drum_sep: bool,
-    timeout: Duration,
+    config: &crate::routing::SeparationConfig,
 ) -> Result<StemBundle> {
     let mut cmd = Command::new(&worker.program);
     cmd.args(&worker.args)
@@ -87,14 +84,20 @@ pub(crate) fn separate(
         .arg("--stems")
         .arg(stems.to_string())
         .arg("--quality")
-        .arg(quality);
-    if !dereverb {
+        .arg(config.quality.as_str());
+    if !config.dereverb {
         cmd.arg("--no-dereverb");
     }
-    if drum_sep {
+    if config.drum_sep {
         cmd.arg("--drum-sep");
     }
-    let out = run_with_timeout(cmd, timeout)?;
+    if config.split_lead_backing {
+        cmd.arg("--split-lead-backing");
+    }
+    if config.restore {
+        cmd.arg("--restore");
+    }
+    let out = run_with_timeout(cmd, config.local_timeout)?;
     if !out.status.success() {
         return Err(ForgeError::WorkerError(format!(
             "GPU worker exited with {}: {}",

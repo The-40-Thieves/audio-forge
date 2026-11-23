@@ -216,6 +216,8 @@ fn commit_bundle(
 ) -> Result<(), ForgeError> {
     let produced = [
         &mut bundle.vocals,
+        &mut bundle.lead_vocals,
+        &mut bundle.backing_vocals,
         &mut bundle.drums,
         &mut bundle.bass,
         &mut bundle.guitar,

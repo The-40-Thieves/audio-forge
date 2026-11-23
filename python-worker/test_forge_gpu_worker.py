@@ -317,10 +317,12 @@ class SixStemAndTranscribeTests(TestCase):
             def separate(self, audio_file: str) -> list[str]:
                 calls.append((self.model, Path(audio_file).name))
                 base = Path(audio_file).stem
-                if self.model == "htdemucs_6s":
+                if self.model in {"BS-Roformer-SW", "htdemucs_6s"}:
                     stems = ("Vocals", "Drums", "Bass", "Guitar", "Piano", "Other")
                 elif self.model == "MDX23C-DrumSep-aufr33-jarredou":
                     stems = ("Kick", "Snare", "Toms", "HH", "Cymbals")
+                elif self.model == "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956":
+                    stems = ("Vocals", "Instrumental")
                 else:
                     stems = ("Instrumental", "Vocals")
                 names = [f"{base}_({stem})_{self.model}.wav" for stem in stems]
@@ -342,15 +344,26 @@ class SixStemAndTranscribeTests(TestCase):
             inp = out / "song.wav"
             inp.write_bytes(b"RIFF")
             res = worker.run_separate(
-                inp, out, dereverb=False, stems=6, quality="studio", drum_sep=True
+                inp,
+                out,
+                dereverb=False,
+                stems=6,
+                quality="studio",
+                drum_sep=True,
+                split_lead_backing=True,
             )
             self.assertEqual(calls[0], (BS_1297, "song.wav"))
             self.assertEqual(
-                calls[1], ("htdemucs_6s", f"song_(Instrumental)_{BS_1297}.wav")
+                calls[1], ("BS-Roformer-SW", f"song_(Instrumental)_{BS_1297}.wav")
             )
-            self.assertEqual(calls[2][0], "MDX23C-DrumSep-aufr33-jarredou")
+            self.assertEqual(
+                calls[2][0], "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956"
+            )
+            self.assertEqual(calls[3][0], "MDX23C-DrumSep-aufr33-jarredou")
             for key in (
                 "vocals",
+                "lead_vocals",
+                "backing_vocals",
                 "drums",
                 "bass",
                 "guitar",
@@ -363,6 +376,67 @@ class SixStemAndTranscribeTests(TestCase):
                 "cymbals",
             ):
                 self.assertIsNotNone(res[key], f"missing cascade slot: {key}")
+
+    def test_scnet_four_stem_falls_back_to_htdemucs_and_spectral_restore_runs(
+        self,
+    ) -> None:
+        import array
+        import wave
+
+        loaded_models: list[str] = []
+
+        def write_pcm(path: Path) -> None:
+            with wave.open(str(path), "wb") as w:
+                w.setnchannels(2)
+                w.setsampwidth(2)
+                w.setframerate(48_000)
+                pcm = [((i % 8) - 4) * 2000 for i in range(64)]
+                w.writeframes(array.array("h", pcm).tobytes())
+
+        class FallbackSeparator(FakeSeparator):
+            def load_model(self, model_filename: str) -> None:
+                loaded_models.append(model_filename)
+                if model_filename in {
+                    worker.SCNET_FOUR_STEM_MODEL,
+                    worker.APOLLO_RESTORE_MODEL,
+                }:
+                    raise FileNotFoundError(f"missing checkpoint: {model_filename}")
+                super().load_model(model_filename)
+
+            def separate(self, audio_file: str) -> list[str]:
+                base = Path(audio_file).stem
+                if self.model == "htdemucs_ft":
+                    stems = ("Vocals", "Drums", "Bass", "Other")
+                else:
+                    stems = ("Instrumental", "Vocals")
+                names = [f"{base}_({stem})_{self.model}.wav" for stem in stems]
+                for name in names:
+                    write_pcm(self.output_dir / name)
+                return names
+
+        modules = {
+            "audio_separator": fake_module("audio_separator"),
+            "audio_separator.separator": fake_module(
+                "audio_separator.separator", Separator=FallbackSeparator
+            ),
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(sys.modules, modules),
+        ):
+            out = Path(tmp)
+            inp = out / "master.wav"
+            write_pcm(inp)
+            res = worker.run_separate(
+                inp, out, dereverb=False, stems=4, quality="studio", restore=True
+            )
+            self.assertIn(worker.SCNET_FOUR_STEM_MODEL, loaded_models)
+            self.assertIn(worker.FOUR_STEM_MODEL, loaded_models)
+            self.assertIn(worker.APOLLO_RESTORE_MODEL, loaded_models)
+            self.assertTrue(
+                Path(res["vocals"]).name.endswith("_restored.wav"), res["vocals"]
+            )
+            self.assertTrue(Path(res["drums"]).is_file())
 
     def test_ultra_ensemble_blends_bs_and_mel_roformer_wavs(self) -> None:
         import array

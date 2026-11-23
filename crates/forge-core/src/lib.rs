@@ -296,6 +296,10 @@ pub struct AuditReport {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StemBundle {
     pub vocals: Option<PathBuf>,
+    #[serde(default)]
+    pub lead_vocals: Option<PathBuf>,
+    #[serde(default)]
+    pub backing_vocals: Option<PathBuf>,
     pub drums: Option<PathBuf>,
     pub bass: Option<PathBuf>,
     pub guitar: Option<PathBuf>,

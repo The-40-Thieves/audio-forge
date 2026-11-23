@@ -324,7 +324,7 @@ enum Commands {
         timeout_secs: u64,
     },
 
-    /// Professional studio neural stem separation (BS-RoFormer 1297 / Mel-Band-RoFormer cascade, 2/4/6 stems + optional 5-piece DrumSep)
+    /// Professional studio neural stem separation (BS-RoFormer 1297 / SCNet XL / BS-RoFormer SW cascade, Karaoke Lead/Backing, DrumSep & Apollo restore)
     Separate {
         /// Input audio file (WAV, FLAC, MP3, OGG, M4A)
         input: PathBuf,
@@ -334,7 +334,7 @@ enum Commands {
         /// Primary stem count: 2 (Vocals/Inst), 4 (Vocals/Drums/Bass/Other), or 6 (+Guitar/Keys)
         #[arg(long, default_value_t = 6)]
         stems: u8,
-        /// Separation quality tier: `fast` (1-pass), `studio` (BS-RoFormer 1297 cascade), or `ultra` (dual-RoFormer ensemble)
+        /// Separation quality tier: `fast` (1-pass), `studio` (BS-RoFormer 1297 + SCNet XL/SW cascade), or `ultra` (dual-RoFormer ensemble)
         #[arg(long, default_value = "studio")]
         quality: String,
         /// Disable BS-RoFormer de-reverb pass on isolated vocals
@@ -343,6 +343,12 @@ enum Commands {
         /// Also split isolated drums into Kick, Snare, Toms, Hi-Hat, and Cymbals (MDX23C DrumSep)
         #[arg(long)]
         drum_sep: bool,
+        /// Also split isolated vocals into Lead Vocals and Backing Vocals / Harmonies (RoFormer Karaoke)
+        #[arg(long)]
+        split_lead_backing: bool,
+        /// Run optional Apollo / spectral bandwidth restoration post-pass on separated stems
+        #[arg(long)]
+        restore: bool,
         /// Backend override: `auto`, `local_gpu`, `colab`, or `dsp`
         #[arg(long)]
         backend: Option<String>,
@@ -1036,6 +1042,8 @@ async fn main() -> anyhow::Result<()> {
             quality,
             no_dereverb,
             drum_sep,
+            split_lead_backing,
+            restore,
             backend,
         } => {
             if !matches!(stems, 2 | 4 | 6) {
@@ -1046,6 +1054,8 @@ async fn main() -> anyhow::Result<()> {
             cfg.quality = parse_quality(&quality)?;
             cfg.dereverb = !no_dereverb;
             cfg.drum_sep = drum_sep;
+            cfg.split_lead_backing = split_lead_backing;
+            cfg.restore = restore;
             if let Some(b) = backend {
                 cfg.backend = parse_backend(&b, cfg.colab_url.as_deref())?;
             }

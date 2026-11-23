@@ -113,6 +113,10 @@ pub struct SeparationConfig {
     pub dereverb: bool,
     /// Also split isolated drums into Kick, Snare, Toms, Hi-Hat, and Cymbals (default `false`).
     pub drum_sep: bool,
+    /// Also split isolated vocals into Lead Vocals and Backing Vocals / Harmonies via RoFormer Karaoke (default `false`).
+    pub split_lead_backing: bool,
+    /// Run optional Apollo / spectral bandwidth restoration post-pass on separated stems (default `false`).
+    pub restore: bool,
 }
 
 impl Default for SeparationConfig {
@@ -128,6 +132,8 @@ impl Default for SeparationConfig {
             quality: SeparationQuality::Studio,
             dereverb: true,
             drum_sep: false,
+            split_lead_backing: false,
+            restore: false,
         }
     }
 }
@@ -160,6 +166,8 @@ impl SeparationConfig {
             quality: SeparationQuality::Studio,
             dereverb: true,
             drum_sep: false,
+            split_lead_backing: false,
+            restore: false,
         }
     }
 }
@@ -266,16 +274,7 @@ impl Attempt<'_> {
             }
         };
         let bundle = match self {
-            Self::Local(worker) => local_gpu::separate(
-                worker,
-                input,
-                output_dir,
-                stems,
-                config.quality.as_str(),
-                config.dereverb,
-                config.drum_sep,
-                config.local_timeout,
-            )?,
+            Self::Local(worker) => local_gpu::separate(worker, input, output_dir, stems, config)?,
             Self::Colab(url) => colab::separate(url, input, output_dir, config.http_timeout)?,
         };
         if bundle.vocals.is_none() && bundle.other.is_none() {

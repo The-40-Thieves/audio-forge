@@ -438,7 +438,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "forge_separate_stems",
-            "description": "Studio-grade neural stem separation (BS-RoFormer 1297 / Mel-Band-RoFormer cascade, 2/4/6 stems + optional BS-RoFormer de-reverb & 5-piece MDX23C DrumSep) with pure-Rust DSP fallback, confined to the MCP path sandbox.",
+            "description": "Studio-grade neural stem separation (BS-RoFormer 1297 / SCNet XL / BS-RoFormer SW cascade, 2/4/6 stems + optional BS-RoFormer de-reverb, RoFormer Karaoke Lead/Backing split, 5-piece MDX23C DrumSep & Apollo spectral restoration) with pure-Rust DSP fallback, confined to the MCP path sandbox.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -447,7 +447,9 @@ fn tool_definitions() -> Vec<Value> {
                     "stems": { "type": "integer", "enum": [2, 4, 6], "default": 6, "description": "Primary stem count (2, 4, or 6)" },
                     "quality": { "type": "string", "enum": ["fast", "studio", "ultra"], "default": "studio", "description": "Separation quality tier" },
                     "dereverb": { "type": "boolean", "default": true, "description": "Run BS-RoFormer de-reverb on isolated vocals" },
-                    "drum_sep": { "type": "boolean", "default": false, "description": "Also split isolated drums into Kick, Snare, Toms, Hi-Hat, and Cymbals" }
+                    "drum_sep": { "type": "boolean", "default": false, "description": "Also split isolated drums into Kick, Snare, Toms, Hi-Hat, and Cymbals" },
+                    "split_lead_backing": { "type": "boolean", "default": false, "description": "Also split isolated vocals into Lead Vocals and Backing Vocals / Harmonies (RoFormer Karaoke)" },
+                    "restore": { "type": "boolean", "default": false, "description": "Run optional Apollo / spectral bandwidth restoration post-pass on separated stems" }
                 },
                 "required": ["input", "output_dir"]
             }
@@ -1276,12 +1278,22 @@ fn tool_separate_stems(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput
         .get("drum_sep")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let split_lead_backing = args
+        .get("split_lead_backing")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let restore = args
+        .get("restore")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let mut cfg = SeparationConfig::from_env();
     cfg.stems = stems;
     cfg.quality = quality;
     cfg.dereverb = dereverb;
     cfg.drum_sep = drum_sep;
+    cfg.split_lead_backing = split_lead_backing;
+    cfg.restore = restore;
 
     let report = external::separate_stems_checked(sandbox, &input, &output_dir, &cfg)?;
     let payload = serde_json::to_value(&report)

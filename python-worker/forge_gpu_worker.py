@@ -36,16 +36,24 @@ SNARE_TAGS = frozenset({"snare", "sd"})
 TOMS_TAGS = frozenset({"toms", "tom"})
 HIHAT_TAGS = frozenset({"hh", "hihat", "hihats", "hats"})
 CYMBALS_TAGS = frozenset({"cymbals", "cymbal", "crash", "ride", "overheads", "oh"})
+LEAD_VOCAL_TAGS = frozenset({"vocals", "vocal", "lead", "leadvocals", "karaoke"})
+BACKING_VOCAL_TAGS = frozenset(
+    {"instrumental", "backing", "backingvocals", "harmonies", "nolead", "other"}
+)
 DRY_TAGS = frozenset({"noreverb", "dry"})
 DENOISED_TAGS = frozenset({"dry", "nonoise", "denoised", "clean"})
 
 BS_ROFORMER_VOCAL_MODEL = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
 MEL_ROFORMER_VOCAL_MODEL = "model_mel_band_roformer_kim_vocals.ckpt"
 DEREVERB_MODEL = "deverb_bs_roformer_8_384dim_10depth.ckpt"
+KARAOKE_MODEL = "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt"
 DENOISE_ROFORMER_MODEL = "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt"
+SCNET_FOUR_STEM_MODEL = "scnet_xl_ihf_sdr_10.08.ckpt"
+BS_ROFORMER_SIX_STEM_MODEL = "BS-Roformer-SW.ckpt"
 FOUR_STEM_MODEL = "htdemucs_ft.yaml"
 SIX_STEM_MODEL = "htdemucs_6s.yaml"
 DRUMSEP_MODEL = "MDX23C-DrumSep-aufr33-jarredou.ckpt"
+APOLLO_RESTORE_MODEL = "apollo_universal_model.ckpt"
 VALID_QUALITIES = frozenset({"fast", "studio", "ultra"})
 
 
@@ -169,6 +177,84 @@ def _run_vocal_stage(
     return bs_vocal, bs_inst
 
 
+def _separate_multistem_with_fallback(
+    sep: object,
+    cascade_input: Path,
+    stems: int,
+) -> list[str]:
+    """Run SOTA multi-stem separation (SCNet XL 4-stem / BS-RoFormer SW 6-stem) with HTDemucs fallback."""
+    primary_model = SCNET_FOUR_STEM_MODEL if stems == 4 else BS_ROFORMER_SIX_STEM_MODEL
+    fallback_model = FOUR_STEM_MODEL if stems == 4 else SIX_STEM_MODEL
+    try:
+        sep.load_model(model_filename=primary_model)  # type: ignore[attr-defined]
+        return sep.separate(str(cascade_input))  # type: ignore[attr-defined]
+    except (RuntimeError, FileNotFoundError, ValueError, OSError):
+        sep.load_model(model_filename=fallback_model)  # type: ignore[attr-defined]
+        return sep.separate(str(cascade_input))  # type: ignore[attr-defined]
+
+
+def _restore_wav_bandwidth(src_path: Path, out_path: Path, drive: float = 0.12) -> Path:
+    """Phase-coherent spectral bandwidth restoration fallback for heavily limited 16-bit PCM WAVs.
+
+    Synthesizes gentle upper-band harmonic air from the first-order high-frequency difference
+    signal and blends it at ``drive`` (~ -18 dB). Falls back to ``src_path`` for non-16-bit/mock files.
+    """
+    try:
+        with wave.open(str(src_path), "rb") as wi:
+            if wi.getsampwidth() != 2:
+                return src_path
+            nch = wi.getnchannels()
+            sr = wi.getframerate()
+            samples = array.array("h")
+            samples.frombytes(wi.readframes(wi.getnframes()))
+        if len(samples) <= nch:
+            return src_path
+        restored = array.array("h", samples)
+        inv_norm = 1.0 / 32768.0
+        for ch in range(nch):
+            prev = samples[ch] * inv_norm
+            for idx in range(ch + nch, len(samples), nch):
+                cur = samples[idx] * inv_norm
+                hp = cur - prev
+                prev = cur
+                # Soft cubic harmonic air excitation strictly on high-frequency transients/air
+                air = hp * (1.0 + 0.5 * hp * hp)
+                y = cur + drive * air
+                restored[idx] = max(-32768, min(32767, round(y * 32767.0)))
+        with wave.open(str(out_path), "wb") as wo:
+            wo.setnchannels(nch)
+            wo.setsampwidth(2)
+            wo.setframerate(sr)
+            wo.writeframes(restored.tobytes())
+        return out_path
+    except (wave.Error, OSError):
+        return src_path
+
+
+def _restore_stem(
+    sep: object,
+    stem_path: Path | None,
+    resolved_output: Path,
+) -> Path | None:
+    """Restore high-frequency bandwidth on a separated stem via Apollo or spectral exciter fallback."""
+    if stem_path is None or not stem_path.exists():
+        return stem_path
+    try:
+        sep.load_model(model_filename=APOLLO_RESTORE_MODEL)  # type: ignore[attr-defined]
+        out_files = sep.separate(str(stem_path))  # type: ignore[attr-defined]
+        if out_files:
+            cand = Path(out_files[0])
+            resolved = (cand if cand.is_absolute() else resolved_output / cand).resolve()
+            if resolved.is_relative_to(resolved_output) and resolved.is_file():
+                return resolved
+    except (RuntimeError, FileNotFoundError, ValueError, OSError):
+        pass
+    out_path = (resolved_output / f"{_safe_stem(stem_path)}_restored.wav").resolve()
+    if not out_path.is_relative_to(resolved_output):
+        return stem_path
+    return _restore_wav_bandwidth(stem_path, out_path)
+
+
 def run_separate(
     input_path: Path,
     output_dir: Path,
@@ -176,6 +262,8 @@ def run_separate(
     stems: int = 2,
     quality: str = "studio",
     drum_sep: bool = False,
+    split_lead_backing: bool = False,
+    restore: bool = False,
 ) -> dict[str, str | None]:
     if stems not in {2, 4, 6}:
         raise ValueError(f"stems must be 2, 4, or 6, got {stems!r}")
@@ -207,6 +295,8 @@ def run_separate(
     toms: Path | None = None
     hihat: Path | None = None
     cymbals: Path | None = None
+    lead_vocals: Path | None = None
+    backing_vocals: Path | None = None
 
     if stems == 2:
         vocal_file, other = _run_vocal_stage(
@@ -230,14 +320,12 @@ def run_separate(
         vocal_file, inst_file = _run_vocal_stage(
             sep, resolved_input, resolved_output, quality
         )
-        # Stage 3: Run 4/6-stem Demucs strictly on the vocal-free Instrumental stem
+        # Stage 3: SOTA SCNet XL (4-stem) / BS-RoFormer SW (6-stem) on vocal-free Instrumental
+        #          with automatic HTDemucs fallback if checkpoint is unavailable.
         cascade_input = (
             inst_file if (inst_file is not None and inst_file.exists()) else resolved_input
         )
-        sep.load_model(
-            model_filename=FOUR_STEM_MODEL if stems == 4 else SIX_STEM_MODEL
-        )
-        files = sep.separate(str(cascade_input))
+        files = _separate_multistem_with_fallback(sep, cascade_input, stems)
         drums = pick_stem(files, DRUMS_TAGS, resolved_output)
         bass = pick_stem(files, BASS_TAGS, resolved_output)
         guitar = pick_stem(files, GUITAR_TAGS, resolved_output) if stems == 6 else None
@@ -250,6 +338,13 @@ def run_separate(
         deverb_files = sep.separate(str(vocal_file))
         vocal_file = pick_stem(deverb_files, DRY_TAGS, resolved_output) or vocal_file
 
+    # Stage 2b: Optional RoFormer Karaoke pass (Lead Vocals vs. Backing Vocals / Harmonies)
+    if split_lead_backing and vocal_file and vocal_file.exists():
+        sep.load_model(model_filename=KARAOKE_MODEL)
+        karaoke_files = sep.separate(str(vocal_file))
+        lead_vocals = pick_stem(karaoke_files, LEAD_VOCAL_TAGS, resolved_output)
+        backing_vocals = pick_stem(karaoke_files, BACKING_VOCAL_TAGS, resolved_output)
+
     # Stage 4: Optional 5-piece DrumSep on isolated drums stem
     if drum_sep and drums and drums.exists():
         sep.load_model(model_filename=DRUMSEP_MODEL)
@@ -260,19 +355,29 @@ def run_separate(
         hihat = pick_stem(drum_files, HIHAT_TAGS, resolved_output)
         cymbals = pick_stem(drum_files, CYMBALS_TAGS, resolved_output)
 
-    return {
-        "vocals": str(vocal_file) if vocal_file else None,
-        "drums": str(drums) if drums else None,
-        "bass": str(bass) if bass else None,
-        "guitar": str(guitar) if guitar else None,
-        "keys": str(keys) if keys else None,
-        "other": str(other) if other else None,
-        "kick": str(kick) if kick else None,
-        "snare": str(snare) if snare else None,
-        "toms": str(toms) if toms else None,
-        "hihat": str(hihat) if hihat else None,
-        "cymbals": str(cymbals) if cymbals else None,
+    stems_map: dict[str, Path | None] = {
+        "vocals": vocal_file,
+        "lead_vocals": lead_vocals,
+        "backing_vocals": backing_vocals,
+        "drums": drums,
+        "bass": bass,
+        "guitar": guitar,
+        "keys": keys,
+        "other": other,
+        "kick": kick,
+        "snare": snare,
+        "toms": toms,
+        "hihat": hihat,
+        "cymbals": cymbals,
     }
+
+    # Stage 5: Optional Apollo / spectral bandwidth restoration post-pass
+    if restore:
+        stems_map = {
+            k: _restore_stem(sep, v, resolved_output) for k, v in stems_map.items()
+        }
+
+    return {k: (str(v) if v else None) for k, v in stems_map.items()}
 
 
 def run_transcribe(input_path: Path, output_dir: Path) -> dict[str, str]:
@@ -447,6 +552,16 @@ def main() -> int:
         action="store_true",
         help="Also split isolated drums into Kick, Snare, Toms, Hi-Hat, and Cymbals (MDX23C DrumSep)",
     )
+    sep_p.add_argument(
+        "--split-lead-backing",
+        action="store_true",
+        help="Also split isolated vocals into Lead Vocals and Backing Vocals / Harmonies (RoFormer Karaoke)",
+    )
+    sep_p.add_argument(
+        "--restore",
+        action="store_true",
+        help="Run optional Apollo / spectral bandwidth restoration post-pass on separated stems",
+    )
 
     tr_p = sub.add_parser(
         "transcribe", help="Run polyphonic audio-to-MIDI transcription via basic-pitch"
@@ -496,6 +611,8 @@ def main() -> int:
                 stems=args.stems,
                 quality=args.quality,
                 drum_sep=args.drum_sep,
+                split_lead_backing=args.split_lead_backing,
+                restore=args.restore,
             )
             print(json.dumps(res))
         elif args.command == "transcribe":
