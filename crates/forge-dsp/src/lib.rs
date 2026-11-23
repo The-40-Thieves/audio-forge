@@ -250,4 +250,23 @@ mod tests {
             assert!(al.is_finite() && ar.is_finite());
         }
     }
+
+    #[test]
+    fn test_adversarial_nam_json_never_panics() {
+        let mut preamp = RealtimeNeuralPreamp::new(AnalogHardwareModel::Neve1073ClassA);
+        let malformed_payloads = [
+            "",
+            "{",
+            "[]",
+            "null",
+            r#"{"weights": [1e309, -1e309]}"#,
+            r#"{"architecture": "WaveNet", "config": {"layers": [{"channels": 99999, "kernel_size": 99, "dilations": [1, 999999]}]}, "weights": []}"#,
+            r#"{"architecture": "WaveNet", "config": {"layers": [{"channels": 0, "kernel_size": 0, "dilations": [0]}]}, "weights": [0.0]}"#,
+        ];
+        for payload in malformed_payloads {
+            let _ = preamp.load_nam_json(payload);
+            let (l, r) = preamp.process_stereo_sample(0.25, -0.25, 6.0, 0.0);
+            assert!(l.is_finite() && r.is_finite());
+        }
+    }
 }

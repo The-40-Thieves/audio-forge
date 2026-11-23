@@ -82,7 +82,9 @@ READY
 | `forge_master_distrokid` | Low-level mastering with an explicit LUFS and ceiling, reference-match EQ and ISRC tagging. |
 | `forge_neural_denoise` | Neural audio denoising via DeepFilterNet3 or Mel-Band-RoFormer on the local Python GPU worker. |
 | `forge_transcribe_midi` | Polyphonic audio-to-MIDI transcription via basic-pitch on the local Python GPU worker. |
-| `forge_separate_stems` | Studio-grade neural stem separation (BS-RoFormer 1297 / Mel-Band-RoFormer cascade, 2/4/6 stems + optional DrumSep) with Rust DSP fallback. |
+| `forge_separate_stems` | Studio-grade neural stem separation (BS-RoFormer 1297 / SCNet XL / BS-RoFormer SW cascade, 23-slot hierarchical sub-splitters + Apollo restore) with Rust DSP fallback. |
+| `forge_daw_inspect` | Validate and inspect a ForgeStudio DAW `.forgeproj` session (BPM, sample rate, tracks, objects, MIDI clips, aux buses, total PDC). |
+| `forge_daw_bounce` | Headless 24-bit WAV mastering bounce (with BS.1770-4 audit) and optional batch per-track stem WAV export from a `.forgeproj` session. |
 
 ### Delivery targets
 
