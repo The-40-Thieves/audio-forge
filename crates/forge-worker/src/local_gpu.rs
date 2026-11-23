@@ -268,13 +268,15 @@ pub(crate) fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<Wo
     }
 }
 
-/// Reads a pipe to its end on a helper thread and sends the bytes back once it closes.
+const MAX_WORKER_PIPE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Reads a pipe to its end (bounded to 16 MiB) on a helper thread and sends the bytes back.
 fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
-        if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut buf);
+        if let Some(pipe) = pipe {
+            let _ = pipe.take(MAX_WORKER_PIPE_BYTES).read_to_end(&mut buf);
         }
         let _ = tx.send(buf);
     });

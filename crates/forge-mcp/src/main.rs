@@ -106,8 +106,10 @@ fn main() {
     }
 }
 
+const MAX_JSONRPC_LINE_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Reads newline-delimited JSON-RPC requests until EOF, answering each on `output`.
-/// A malformed line (bad JSON or invalid UTF-8) gets a -32700 reply; the loop keeps going.
+/// A malformed line (bad JSON, invalid UTF-8, or >4 MiB) gets a -32700 reply; the loop keeps going.
 fn serve<R: BufRead, W: Write>(
     mut input: R,
     output: &mut W,
@@ -116,12 +118,35 @@ fn serve<R: BufRead, W: Write>(
     let mut line = Vec::new();
     loop {
         line.clear();
-        if input.read_until(b'\n', &mut line)? == 0 {
+        let n =
+            io::Read::take(&mut input, MAX_JSONRPC_LINE_BYTES + 1).read_until(b'\n', &mut line)?;
+        if n == 0 {
             return Ok(());
         }
-        let response = match std::str::from_utf8(&line) {
-            Ok(text) => process_line(text, sandbox),
-            Err(e) => Some(parse_error(format!("Parse error: invalid UTF-8: {e}"))),
+        let response = if (n as u64) > MAX_JSONRPC_LINE_BYTES && !line.ends_with(b"\n") {
+            // Drain the remainder of the oversized line safely without buffering it in RAM
+            let mut discard = [0_u8; 4096];
+            loop {
+                let buf = input.fill_buf()?;
+                if buf.is_empty() {
+                    break;
+                }
+                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    input.consume(pos + 1);
+                    break;
+                }
+                let len = buf.len().min(discard.len());
+                discard[..len].copy_from_slice(&buf[..len]);
+                input.consume(len);
+            }
+            Some(parse_error(format!(
+                "Parse error: request line exceeds {MAX_JSONRPC_LINE_BYTES} byte limit"
+            )))
+        } else {
+            match std::str::from_utf8(&line) {
+                Ok(text) => process_line(text, sandbox),
+                Err(e) => Some(parse_error(format!("Parse error: invalid UTF-8: {e}"))),
+            }
         };
         if let Some(resp) = response {
             let serialized = serde_json::to_string(&resp).map_err(io::Error::other)?;
@@ -815,12 +840,13 @@ fn tool_vocal_suite(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, F
         sandbox.check(&output_dir.join("Vocal_Formant_Double.wav"))?,
     ];
     let scale = VocalScale::parse(str_arg_or(args, "scale", "D minor"))?;
-    let retune = f64_arg(args, "retune_strength", 0.85);
+    let retune = f64_arg(args, "retune_strength", 0.85).clamp(0.0, 1.0);
     sandbox.create_dir_all(&output_dir)?;
 
     let raw = sandbox.load_audio(&input)?;
     let clean = clean_vocal_surgical(&raw, true, true, -12.0)?;
     let contour = track_vocal_pitch(&clean, &scale, retune);
+    let pitch_env = forge_vocal::compile_reaper_take_pitch_envelope(&contour);
     let corr_curve: Vec<(f64, f64)> = contour
         .iter()
         .map(|f| (f.time_secs, f.correction_semitones))
@@ -839,7 +865,8 @@ fn tool_vocal_suite(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, F
     Ok(json!({
         "tuned_vocal": tuned_path,
         "harmonies": harmonies,
-        "frames_tracked": contour.len()
+        "frames_tracked": contour.len(),
+        "reaper_pitch_envelope": pitch_env
     })
     .into())
 }
@@ -847,17 +874,21 @@ fn tool_vocal_suite(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, F
 /// Reharmonized chord symbols, then the voiced chord notes and the bass line.
 type VoicedChords = (Vec<String>, Vec<NoteEvent>, Vec<NoteEvent>);
 
-/// Reharmonizes a whitespace-separated chord list and voices it with the neo-soul groove.
-fn voice_chords(chords: &str) -> Result<VoicedChords, ForgeError> {
+fn parse_voicing_style(style: &str) -> VoicingStyle {
+    match style.trim().to_ascii_lowercase().as_str() {
+        "jazz" | "jazz-drop2" | "drop2" => VoicingStyle::Drop2,
+        "pop" | "triad" | "close" => VoicingStyle::Close,
+        "cinematic" => VoicingStyle::CinematicSpread,
+        _ => VoicingStyle::NeoSoulRootless,
+    }
+}
+
+/// Reharmonizes a whitespace-separated chord list and voices it with the selected style.
+fn voice_chords(chords: &str, style: VoicingStyle) -> Result<VoicedChords, ForgeError> {
     let raw_chords: Vec<String> = chords.split_whitespace().map(ToString::to_string).collect();
-    let reharm = reharmonize_progression(&raw_chords, VoicingStyle::NeoSoulRootless);
-    let (chord_notes, bass_notes) = solve_voice_leading(
-        &reharm,
-        VoicingStyle::NeoSoulRootless,
-        GrooveStyle::NeoSoulDilla,
-        480,
-        4,
-    )?;
+    let reharm = reharmonize_progression(&raw_chords, style);
+    let (chord_notes, bass_notes) =
+        solve_voice_leading(&reharm, style, GrooveStyle::NeoSoulDilla, 480, 4)?;
     Ok((reharm, chord_notes, bass_notes))
 }
 
@@ -865,7 +896,8 @@ fn tool_music_theory_midi(args: &Value, sandbox: &PathSandbox) -> Result<ToolOut
     let chords = str_arg(args, "chords")?;
     let output_midi = path_arg(args, "output_midi", sandbox)?;
     let bpm = validate_bpm(f64_arg(args, "bpm", 92.0))?;
-    let (reharm, chord_notes, bass_notes) = voice_chords(chords)?;
+    let style = parse_voicing_style(str_arg_or(args, "style", "neo-soul"));
+    let (reharm, chord_notes, bass_notes) = voice_chords(chords, style)?;
     sandbox.write_midi(
         &output_midi,
         bpm,
@@ -994,8 +1026,12 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
         sample_rate: full_mix.sample_rate,
         duration_secs,
         vocal: bundle.vocals,
+        drums: bundle.drums,
+        bass: bundle.bass,
+        other: bundle.other,
         vocal_pitch_frames,
         chords_midi: paths.chords_midi.clone(),
+        drum_midi: paths.drum_midi.clone(),
     };
     sandbox.save_rpp(&build_session(session), &paths.rpp)?;
 
@@ -1054,7 +1090,7 @@ fn write_ingest_midi(
             ("HiHat_Trigger_F#1", &hat_notes),
         ],
     )?;
-    let (_, chord_notes, bass_notes) = voice_chords(chords)?;
+    let (_, chord_notes, bass_notes) = voice_chords(chords, VoicingStyle::NeoSoulRootless)?;
     sandbox.write_midi(
         &paths.chords_midi,
         bpm,
@@ -1095,8 +1131,12 @@ struct SessionSpec {
     sample_rate: u32,
     duration_secs: f64,
     vocal: Option<PathBuf>,
+    drums: Option<PathBuf>,
+    bass: Option<PathBuf>,
+    other: Option<PathBuf>,
     vocal_pitch_frames: Vec<PitchFrame>,
     chords_midi: PathBuf,
+    drum_midi: PathBuf,
 }
 
 fn build_session(spec: SessionSpec) -> ReaperProjectBuilder {
@@ -1119,14 +1159,72 @@ fn build_session(spec: SessionSpec) -> ReaperProjectBuilder {
         stretch_markers: Vec::new(),
         pitch_envelope: spec.vocal_pitch_frames,
     });
+    if let Some(drums) = spec.drums {
+        rpp.tracks.push(ReaperTrackSpec {
+            name: "02 Drums".to_string(),
+            file_path: Some(drums),
+            is_midi: false,
+            duration_secs: spec.duration_secs,
+            volume_lin: 0.90,
+            pan: 0.0,
+            color: 0x01FF_5555,
+            jsfx_inserts: Vec::new(),
+            sidechain_from_track: None,
+            stretch_markers: Vec::new(),
+            pitch_envelope: Vec::new(),
+        });
+    }
+    if let Some(bass) = spec.bass {
+        rpp.tracks.push(ReaperTrackSpec {
+            name: "03 Bass".to_string(),
+            file_path: Some(bass),
+            is_midi: false,
+            duration_secs: spec.duration_secs,
+            volume_lin: 0.88,
+            pan: 0.0,
+            color: 0x01AA_66FF,
+            jsfx_inserts: vec!["Forge_OpenSpacer_Unmask.jsfx".to_string()],
+            sidechain_from_track: Some(1),
+            stretch_markers: Vec::new(),
+            pitch_envelope: Vec::new(),
+        });
+    }
+    if let Some(other) = spec.other {
+        rpp.tracks.push(ReaperTrackSpec {
+            name: "04 Instruments / Other".to_string(),
+            file_path: Some(other),
+            is_midi: false,
+            duration_secs: spec.duration_secs,
+            volume_lin: 0.82,
+            pan: 0.0,
+            color: 0x0144_DD88,
+            jsfx_inserts: vec!["Forge_OpenSpacer_Unmask.jsfx".to_string()],
+            sidechain_from_track: Some(0),
+            stretch_markers: Vec::new(),
+            pitch_envelope: Vec::new(),
+        });
+    }
     rpp.tracks.push(ReaperTrackSpec {
-        name: "02 MIDI Chords & Triggers".to_string(),
+        name: "05 MIDI Chords & Sub-Bass".to_string(),
         file_path: Some(spec.chords_midi),
         is_midi: true,
         duration_secs: spec.duration_secs,
         volume_lin: 0.85,
         pan: 0.0,
         color: 0x01FF_CC44,
+        jsfx_inserts: Vec::new(),
+        sidechain_from_track: None,
+        stretch_markers: Vec::new(),
+        pitch_envelope: Vec::new(),
+    });
+    rpp.tracks.push(ReaperTrackSpec {
+        name: "06 Drum MIDI Triggers".to_string(),
+        file_path: Some(spec.drum_midi),
+        is_midi: true,
+        duration_secs: spec.duration_secs,
+        volume_lin: 0.85,
+        pan: 0.0,
+        color: 0x01FF_8844,
         jsfx_inserts: Vec::new(),
         sidechain_from_track: None,
         stretch_markers: Vec::new(),
@@ -1510,8 +1608,12 @@ mod tests {
             sample_rate: 48_000,
             duration_secs: 10.0,
             vocal: Some(resource.path().join("vocals.wav")),
+            drums: None,
+            bass: None,
+            other: None,
             vocal_pitch_frames: Vec::new(),
             chords_midi: resource.path().join("chords.mid"),
+            drum_midi: resource.path().join("drums.mid"),
         });
         let effects = resource.path().join("Effects");
         let mut refs = 0;

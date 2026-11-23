@@ -380,15 +380,15 @@ impl LiveAudioEngine {
 /// Real-time stereo audio recorder capturing from the default system input device via `cpal`.
 pub struct LiveRecorder {
     _stream: cpal::Stream,
-    captured_l: Arc<Mutex<Vec<f64>>>,
-    captured_r: Arc<Mutex<Vec<f64>>>,
+    captured: Arc<Mutex<(Vec<f64>, Vec<f64>)>>,
     input_sr: u32,
     start_timeline_samples: u64,
     track_idx: usize,
 }
 
 impl LiveRecorder {
-    /// Starts capturing live audio from the default system input device.
+    /// Starts capturing live audio from the default system input device (supports `F32`, `I16`,
+    /// and `U16` hardware input sample formats).
     pub fn start(track_idx: usize, start_timeline_samples: u64) -> Result<Self> {
         let host = cpal::default_host();
         let device = host
@@ -408,24 +408,27 @@ impl LiveRecorder {
             })?;
         let input_sr = supported.sample_rate().0;
         let channels = supported.channels() as usize;
+        let sample_format = supported.sample_format();
 
-        let captured_l = Arc::new(Mutex::new(Vec::<f64>::with_capacity(
-            (input_sr as usize) * 30,
+        let cap_frames = (input_sr as usize) * 60;
+        let captured = Arc::new(Mutex::new((
+            Vec::<f64>::with_capacity(cap_frames),
+            Vec::<f64>::with_capacity(cap_frames),
         )));
-        let captured_r = Arc::new(Mutex::new(Vec::<f64>::with_capacity(
-            (input_sr as usize) * 30,
-        )));
-        let cap_l_cb = Arc::clone(&captured_l);
-        let cap_r_cb = Arc::clone(&captured_r);
+        let cap_cb = Arc::clone(&captured);
 
         let stream_config: cpal::StreamConfig = supported.into();
-        let stream = device
-            .build_input_stream(
+        let err_cb = |err| {
+            eprintln!("forge-engine input stream error: {err}");
+        };
+
+        let stream = match sample_format {
+            cpal::SampleFormat::F32 => device.build_input_stream(
                 &stream_config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     let ch = channels.max(1);
                     let frames = data.len() / ch;
-                    if let (Ok(mut l), Ok(mut r)) = (cap_l_cb.try_lock(), cap_r_cb.try_lock()) {
+                    if let Ok(mut buf) = cap_cb.try_lock() {
                         for i in 0..frames {
                             let s0 = f64::from(data[i * ch]);
                             let s1 = if ch > 1 {
@@ -433,20 +436,67 @@ impl LiveRecorder {
                             } else {
                                 s0
                             };
-                            l.push(s0);
-                            r.push(s1);
+                            buf.0.push(s0);
+                            buf.1.push(s1);
                         }
                     }
                 },
-                |err| {
-                    eprintln!("forge-engine input stream error: {err}");
-                },
+                err_cb,
                 None,
-            )
-            .map_err(|e| ForgeError::AudioIo {
-                path: device_name.clone(),
-                message: format!("Failed to open audio input stream: {e}"),
-            })?;
+            ),
+            cpal::SampleFormat::I16 => device.build_input_stream(
+                &stream_config,
+                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    let ch = channels.max(1);
+                    let frames = data.len() / ch;
+                    if let Ok(mut buf) = cap_cb.try_lock() {
+                        for i in 0..frames {
+                            let s0 = f64::from(cpal::Sample::to_sample::<f32>(data[i * ch]));
+                            let s1 = if ch > 1 {
+                                f64::from(cpal::Sample::to_sample::<f32>(data[i * ch + 1]))
+                            } else {
+                                s0
+                            };
+                            buf.0.push(s0);
+                            buf.1.push(s1);
+                        }
+                    }
+                },
+                err_cb,
+                None,
+            ),
+            cpal::SampleFormat::U16 => device.build_input_stream(
+                &stream_config,
+                move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                    let ch = channels.max(1);
+                    let frames = data.len() / ch;
+                    if let Ok(mut buf) = cap_cb.try_lock() {
+                        for i in 0..frames {
+                            let s0 = f64::from(cpal::Sample::to_sample::<f32>(data[i * ch]));
+                            let s1 = if ch > 1 {
+                                f64::from(cpal::Sample::to_sample::<f32>(data[i * ch + 1]))
+                            } else {
+                                s0
+                            };
+                            buf.0.push(s0);
+                            buf.1.push(s1);
+                        }
+                    }
+                },
+                err_cb,
+                None,
+            ),
+            other => {
+                return Err(ForgeError::AudioIo {
+                    path: device_name,
+                    message: format!("Unsupported audio input sample format: {other:?}"),
+                });
+            }
+        }
+        .map_err(|e| ForgeError::AudioIo {
+            path: device_name.clone(),
+            message: format!("Failed to open audio input stream: {e}"),
+        })?;
 
         stream.play().map_err(|e| ForgeError::AudioIo {
             path: device_name,
@@ -455,8 +505,7 @@ impl LiveRecorder {
 
         Ok(Self {
             _stream: stream,
-            captured_l,
-            captured_r,
+            captured,
             input_sr,
             start_timeline_samples,
             track_idx,
@@ -475,15 +524,10 @@ impl LiveRecorder {
     /// and returns the resulting [`AudioBuffer`].
     pub fn stop_and_save(self, output_wav: &Path, target_sr: u32) -> Result<AudioBuffer> {
         drop(self._stream);
-        let l = self
-            .captured_l
+        let (l, r) = self
+            .captured
             .lock()
-            .map(|v| v.clone())
-            .unwrap_or_default();
-        let r = self
-            .captured_r
-            .lock()
-            .map(|v| v.clone())
+            .map(|mut v| (std::mem::take(&mut v.0), std::mem::take(&mut v.1)))
             .unwrap_or_default();
         if l.is_empty() {
             return Err(ForgeError::AudioIo {

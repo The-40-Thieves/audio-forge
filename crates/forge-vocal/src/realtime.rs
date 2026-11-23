@@ -437,7 +437,9 @@ impl RealtimeVocalTune {
         let out_l = dry_l * (1.0 - mix) + wet_l * mix;
         let out_r = dry_r * (1.0 - mix) + wet_r * mix;
 
-        (out_l as f32, out_r as f32)
+        let clean_l = if out_l.abs() < 1e-25 { 0.0 } else { out_l };
+        let clean_r = if out_r.abs() < 1e-25 { 0.0 } else { out_r };
+        (clean_l as f32, clean_r as f32)
     }
 }
 

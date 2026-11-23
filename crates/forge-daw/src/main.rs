@@ -159,6 +159,8 @@ struct ForgeDawApp {
     selected_midi_clip_id: Option<u64>,
     inspector_tab: InspectorTab,
     active_drag: Option<(usize, u64, DragMode)>,
+    drag_anchor_samples: u64,
+    drag_anchor_x: f32,
     snap_grid: SnapGrid,
     auto_crossfade: bool,
     pixels_per_sec: f32,
@@ -201,6 +203,8 @@ impl ForgeDawApp {
             selected_midi_clip_id: None,
             inspector_tab: InspectorTab::Object,
             active_drag: None,
+            drag_anchor_samples: 0,
+            drag_anchor_x: 0.0,
             snap_grid: SnapGrid::Quarter,
             auto_crossfade: true,
             pixels_per_sec: 120.0,
@@ -237,6 +241,21 @@ impl ForgeDawApp {
         }
     }
 
+    fn project_media_dir(&self) -> PathBuf {
+        let proj = PathBuf::from(self.project_path_buf.trim());
+        let parent = proj
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let stem = proj
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("forgestudio");
+        parent.join(format!("{stem}_media"))
+    }
+
     fn add_demo_clip(&mut self) {
         if self.project.tracks.is_empty() {
             self.project.add_track("01 Audio Track");
@@ -260,7 +279,7 @@ impl ForgeDawApp {
         if let Ok(buf) = AudioBuffer::from_channels(vec![ch_l, ch_r], sr) {
             let prev = self.project.clone();
             let id = self.project.alloc_id();
-            let media_dir = std::env::temp_dir().join("forgestudio_media");
+            let media_dir = self.project_media_dir();
             let _ = std::fs::create_dir_all(&media_dir);
             let path = media_dir.join(format!("demo_am7_{id}.wav"));
             if buf.save_wav(&path, 24).is_ok() {
@@ -332,7 +351,7 @@ impl ForgeDawApp {
                 .min(self.project.tracks.len().saturating_sub(1));
             let start_pos = rec.start_timeline_samples();
             let id = self.project.alloc_id();
-            let media_dir = std::env::temp_dir().join("forgestudio_media");
+            let media_dir = self.project_media_dir();
             let out_wav = media_dir.join(format!("recording_{id}.wav"));
             match rec.stop_and_save(&out_wav, self.project.sample_rate) {
                 Ok(buf) => {
@@ -1410,7 +1429,13 @@ impl ForgeDawApp {
                 ui.add(
                     egui::Slider::new(&mut self.pixels_per_sec, 30.0..=400.0).text("Zoom (px/s)"),
                 );
-                ui.add(egui::Slider::new(&mut self.scroll_secs, 0.0..=120.0).text("Scroll (s)"));
+                let sr = f64::from(self.project.sample_rate.max(1));
+                let max_scroll_secs =
+                    ((self.project.total_length_samples() as f64 / sr) as f32 + 30.0).max(120.0);
+                ui.add(
+                    egui::Slider::new(&mut self.scroll_secs, 0.0..=max_scroll_secs)
+                        .text("Scroll (s)"),
+                );
             });
             ui.separator();
 
@@ -1751,6 +1776,9 @@ impl ForgeDawApp {
                                     DragMode::Move
                                 };
                                 self.active_drag = Some((ti, obj_id, mode));
+                                self.drag_anchor_samples =
+                                    self.project.tracks[ti].objects[oi].timeline_start_samples;
+                                self.drag_anchor_x = pt.x;
                             }
                             if lane_resp.clicked()
                                 && !self.project.tracks[ti].show_automation
@@ -1766,23 +1794,32 @@ impl ForgeDawApp {
                                 && lane_resp.dragged()
                             {
                                 let dx = lane_resp.drag_delta().x;
-                                if dx.abs() > 0.1 {
+                                let cum_dx = lane_resp
+                                    .interact_pointer_pos()
+                                    .map_or(dx, |pt| pt.x - self.drag_anchor_x);
+                                if dx.abs() > 0.1 || matches!(drag_mode, DragMode::Move) {
                                     let delta_smp =
                                         (f64::from(dx / self.pixels_per_sec) * sr).round() as i64;
                                     let obj = &mut self.project.tracks[ti].objects[oi];
                                     match drag_mode {
                                         DragMode::Move => {
-                                            let raw = (obj.timeline_start_samples as i64
-                                                + delta_smp)
+                                            let cum_smp = (f64::from(cum_dx / self.pixels_per_sec)
+                                                * sr)
+                                                .round()
+                                                as i64;
+                                            let raw = (self.drag_anchor_samples as i64 + cum_smp)
                                                 .max(0)
                                                 as u64;
-                                            obj.timeline_start_samples =
-                                                self.snap_grid.snap_samples(
-                                                    raw,
-                                                    self.project.sample_rate,
-                                                    self.project.bpm,
-                                                    self.project.time_sig_num,
-                                                );
+                                            let snapped = self.snap_grid.snap_samples(
+                                                raw,
+                                                self.project.sample_rate,
+                                                self.project.bpm,
+                                                self.project.time_sig_num,
+                                            );
+                                            if snapped != obj.timeline_start_samples {
+                                                obj.timeline_start_samples = snapped;
+                                                changed = true;
+                                            }
                                         }
                                         DragMode::TrimLeft => {
                                             let max_shift =
@@ -1807,15 +1844,16 @@ impl ForgeDawApp {
                                                 obj.length_samples =
                                                     obj.length_samples.saturating_add(s);
                                             }
+                                            changed = true;
                                         }
                                         DragMode::TrimRight => {
                                             let new_len = (obj.length_samples as i64 + delta_smp)
                                                 .max(256)
                                                 as u64;
                                             obj.length_samples = new_len;
+                                            changed = true;
                                         }
                                     }
-                                    changed = true;
                                 }
                             }
                         }

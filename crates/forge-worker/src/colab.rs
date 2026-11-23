@@ -15,6 +15,23 @@ use serde_json::{Value, json};
 /// Stem keys the worker may return, in `StemBundle` field order.
 const STEM_KEYS: [&str; 6] = ["vocals", "drums", "bass", "guitar", "keys", "other"];
 
+const MAX_COLAB_UPLOAD_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_COLAB_RESPONSE_BYTES: u64 = 512 * 1024 * 1024;
+
+fn validate_colab_url(base_url: &str) -> Result<()> {
+    let trimmed = base_url.trim();
+    if trimmed.starts_with("https://")
+        || trimmed.starts_with("http://localhost")
+        || trimmed.starts_with("http://127.0.0.1")
+        || trimmed.starts_with("http://[::1]")
+    {
+        return Ok(());
+    }
+    Err(ForgeError::WorkerError(format!(
+        "FORGE_COLAB_WORKER_URL must use https:// (or localhost http:// for local testing), got '{trimmed}'"
+    )))
+}
+
 /// Uploads `input_path` to the Colab worker and writes the returned stems into `output_dir`.
 pub(crate) fn separate(
     base_url: &str,
@@ -22,6 +39,14 @@ pub(crate) fn separate(
     output_dir: &Path,
     timeout: Duration,
 ) -> Result<StemBundle> {
+    validate_colab_url(base_url)?;
+    let meta = std::fs::metadata(input_path)?;
+    if meta.len() > MAX_COLAB_UPLOAD_BYTES {
+        return Err(ForgeError::WorkerError(format!(
+            "Input audio ({} bytes) exceeds Colab upload cap ({MAX_COLAB_UPLOAD_BYTES} bytes)",
+            meta.len()
+        )));
+    }
     let audio = std::fs::read(input_path)?;
     let filename = input_path
         .file_name()
@@ -62,7 +87,14 @@ async fn post_json(url: &str, body: &Value, timeout: Duration) -> Result<Value> 
         .connect_timeout(timeout.min(Duration::from_secs(30)))
         .build()
         .map_err(|e| ForgeError::WorkerError(format!("HTTP client init failed: {e}")))?;
-    let resp = client.post(url).json(body).send().await.map_err(|e| {
+    let mut req = client.post(url).json(body);
+    if let Ok(token) = std::env::var("FORGE_COLAB_API_TOKEN") {
+        let t = token.trim();
+        if !t.is_empty() {
+            req = req.bearer_auth(t);
+        }
+    }
+    let resp = req.send().await.map_err(|e| {
         let kind = if e.is_timeout() {
             "timed out"
         } else {
@@ -71,6 +103,13 @@ async fn post_json(url: &str, body: &Value, timeout: Duration) -> Result<Value> 
         ForgeError::WorkerError(format!("Colab request to {url} {kind}: {e}"))
     })?;
     let status = resp.status();
+    if let Some(len) = resp.content_length()
+        && len > MAX_COLAB_RESPONSE_BYTES
+    {
+        return Err(ForgeError::WorkerError(format!(
+            "Colab response ({len} bytes) exceeds safety limit ({MAX_COLAB_RESPONSE_BYTES} bytes)"
+        )));
+    }
     let text = resp.text().await.map_err(|e| {
         ForgeError::WorkerError(format!("Colab response from {url} was cut off: {e}"))
     })?;
