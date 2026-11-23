@@ -834,14 +834,8 @@ impl DawProject {
         let tmp_path = path.with_extension("forgeproj.tmp");
         std::fs::write(&tmp_path, json)?;
         if let Err(err) = std::fs::rename(&tmp_path, path) {
-            // On Windows, `std::fs::rename` fails when the destination file already exists.
-            if path.exists() {
-                std::fs::remove_file(path)?;
-                std::fs::rename(&tmp_path, path)?;
-            } else {
-                let _ = std::fs::remove_file(&tmp_path);
-                return Err(err.into());
-            }
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err.into());
         }
         Ok(())
     }
