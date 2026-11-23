@@ -22,6 +22,7 @@ fn config(backend: WorkerBackend) -> SeparationConfig {
         local_timeout: Duration::from_secs(10),
         http_timeout: Duration::from_secs(10),
         require_neural: false,
+        ..SeparationConfig::default()
     }
 }
 
@@ -253,7 +254,11 @@ fn hung_local_worker_is_killed_at_the_timeout() {
     let dir = tempfile::tempdir().unwrap();
     let worker = sleeping_worker(dir.path());
     let started = Instant::now();
-    let err = local_gpu::separate(&worker, Path::new("in.wav"), dir.path(), SHORT).unwrap_err();
+    let cfg = SeparationConfig {
+        local_timeout: SHORT,
+        ..SeparationConfig::default()
+    };
+    let err = local_gpu::separate(&worker, Path::new("in.wav"), dir.path(), 2, &cfg).unwrap_err();
     let elapsed = started.elapsed();
     assert!(err.to_string().contains("timed out after 0.3 s"), "{err}");
     assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
@@ -340,7 +345,11 @@ fn worker_whose_child_keeps_the_pipes_open_still_times_out() {
         "start /b powershell -NoProfile -Command Start-Sleep -Seconds 5",
     );
     let started = Instant::now();
-    let err = local_gpu::separate(&worker, Path::new("in.wav"), dir.path(), SHORT).unwrap_err();
+    let cfg = SeparationConfig {
+        local_timeout: SHORT,
+        ..SeparationConfig::default()
+    };
+    let err = local_gpu::separate(&worker, Path::new("in.wav"), dir.path(), 2, &cfg).unwrap_err();
     let elapsed = started.elapsed();
     assert!(err.to_string().contains("timed out after 0.3 s"), "{err}");
     assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");

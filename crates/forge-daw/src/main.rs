@@ -127,6 +127,8 @@ struct ForgeDawApp {
     undo_gesture_active: bool,
     piano_roll_base_octave: u8,
     piano_roll_bar: u64,
+    stem_split_rx:
+        Option<std::sync::mpsc::Receiver<Result<(u64, forge_worker::SeparationReport), String>>>,
 }
 
 impl ForgeDawApp {
@@ -175,6 +177,7 @@ impl ForgeDawApp {
             undo_gesture_active: false,
             piano_roll_base_octave: 3,
             piano_roll_bar: 0,
+            stem_split_rx: None,
         }
     }
 
@@ -365,6 +368,96 @@ impl ForgeDawApp {
                 Err(e) => {
                     self.status_line = format!("Cannot start recording: {e}");
                 }
+            }
+        }
+    }
+
+    fn start_stem_split_for_object(&mut self, obj_id: u64) {
+        if self.stem_split_rx.is_some() {
+            self.status_line = "Stem separation already running in background...".to_string();
+            return;
+        }
+        let Some((src_path, start_pos, obj_name)) = self
+            .project
+            .tracks
+            .iter()
+            .flat_map(|t| t.objects.iter())
+            .find(|o| o.id == obj_id)
+            .map(|o| {
+                (
+                    o.source_path.clone(),
+                    o.timeline_start_samples,
+                    o.name.clone(),
+                )
+            })
+        else {
+            return;
+        };
+        let out_dir = self.project_media_dir().join(format!("stems_{obj_id}"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.stem_split_rx = Some(rx);
+        self.status_line = format!("Splitting '{obj_name}' (6-Stem Studio RoFormer cascade)...");
+
+        std::thread::spawn(move || {
+            let mut cfg = forge_worker::SeparationConfig::from_env();
+            cfg.stems = 6;
+            cfg.quality = forge_worker::SeparationQuality::Studio;
+            cfg.dereverb = true;
+            let res = forge_worker::separate_stems(&src_path, &out_dir, &cfg)
+                .map(|report| (start_pos, report))
+                .map_err(|e| e.to_string());
+            let _ = tx.send(res);
+        });
+    }
+
+    fn poll_stem_split_result(&mut self) {
+        let Some(ref rx) = self.stem_split_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok((start_pos, report))) => {
+                self.stem_split_rx = None;
+                let prev = self.project.clone();
+                let target_sr = self.project.sample_rate;
+                let roles: [(&str, &Option<PathBuf>); 6] = [
+                    ("Vocals", &report.bundle.vocals),
+                    ("Drums", &report.bundle.drums),
+                    ("Bass", &report.bundle.bass),
+                    ("Guitar", &report.bundle.guitar),
+                    ("Keys", &report.bundle.keys),
+                    ("Other", &report.bundle.other),
+                ];
+                let mut added = 0_usize;
+                for (label, maybe_path) in roles {
+                    if let Some(stem_path) = maybe_path
+                        && let Ok(buf) = self.cache.load_clip_for_rate(stem_path, target_sr)
+                    {
+                        let len = buf.num_frames() as u64;
+                        let tr_idx = self.project.tracks.len();
+                        self.project.add_track(format!("Stem: {label}"));
+                        let id = self.project.alloc_id();
+                        let mut obj = AudioObject::new(id, label, stem_path.clone(), len);
+                        obj.timeline_start_samples = start_pos;
+                        self.project.tracks[tr_idx].objects.push(obj);
+                        added += 1;
+                    }
+                }
+                if added > 0 {
+                    self.commit_project_change(prev);
+                }
+                self.status_line = format!(
+                    "Stem split complete ({}, {} stems imported)",
+                    report.backend.as_str(),
+                    added
+                );
+            }
+            Ok(Err(err)) => {
+                self.stem_split_rx = None;
+                self.status_line = format!("Stem split failed: {err}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.stem_split_rx = None;
             }
         }
     }
@@ -1390,6 +1483,7 @@ impl ForgeDawApp {
 
 impl eframe::App for ForgeDawApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_stem_split_result();
         self.pointer_down = ctx.input(|i| i.pointer.primary_down());
         // Drag-and-drop audio file import directly onto the DAW window
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -1520,6 +1614,7 @@ mod tests {
             undo_gesture_active: false,
             piano_roll_base_octave: 3,
             piano_roll_bar: 0,
+            stem_split_rx: None,
         };
         let initial_gain = app.project.master_gain_db;
         // Simulate 60 frames of continuous slider drag

@@ -25,9 +25,9 @@ use forge_vocal::{
     track_vocal_pitch,
 };
 use forge_worker::{
-    SeparationConfig, generate_music_lyria, index_drum_sample_library,
-    resolve_default_local_worker, run_local_neural_denoise, run_local_transcribe_midi,
-    separate_stems,
+    SeparationConfig, generate_music_lyria, index_drum_sample_library, parse_backend,
+    parse_quality, resolve_default_local_worker, run_local_neural_denoise,
+    run_local_transcribe_midi, separate_stems,
 };
 
 #[derive(Parser)]
@@ -325,6 +325,51 @@ enum Commands {
         timeout_secs: u64,
     },
 
+    /// Professional studio neural stem separation (BS-RoFormer 1297 / SCNet XL / BS-RoFormer SW cascade, Karaoke Lead/Backing, DrumSep & Apollo restore)
+    Separate {
+        /// Input audio file (WAV, FLAC, MP3, OGG, M4A)
+        input: PathBuf,
+        /// Output directory for separated WAV stems
+        #[arg(short, long)]
+        output_dir: PathBuf,
+        /// Primary stem count: 2 (Vocals/Inst), 4 (Vocals/Drums/Bass/Other), or 6 (+Guitar/Keys)
+        #[arg(long, default_value_t = 6)]
+        stems: u8,
+        /// Separation quality tier: `fast` (1-pass), `studio` (BS-RoFormer 1297 + SCNet XL/SW cascade), or `ultra` (dual-RoFormer ensemble)
+        #[arg(long, default_value = "studio")]
+        quality: String,
+        /// Disable BS-RoFormer de-reverb pass on isolated vocals
+        #[arg(long)]
+        no_dereverb: bool,
+        /// Also split isolated drums into Kick, Snare, Toms, Hi-Hat, and Cymbals (MDX23C DrumSep)
+        #[arg(long)]
+        drum_sep: bool,
+        /// Also split isolated vocals into Lead Vocals and Backing Vocals / Harmonies (RoFormer Karaoke)
+        #[arg(long)]
+        split_lead_backing: bool,
+        /// Also split isolated vocals into Male and Female vocal stems (Mel-Band-RoFormer)
+        #[arg(long)]
+        split_male_female: bool,
+        /// Also split isolated guitar into Electric Guitar and Acoustic Guitar
+        #[arg(long)]
+        split_guitar: bool,
+        /// Also extract Strings, Brass, Woodwinds, and Synth from the residual Other stem
+        #[arg(long)]
+        split_orchestral: bool,
+        /// Also extract live Crowd / Audience / Room Noise from the residual Other stem
+        #[arg(long)]
+        split_crowd: bool,
+        /// Enable full 23-slot hierarchical pro studio cascade (all sub-splitters)
+        #[arg(long)]
+        all_stems: bool,
+        /// Run optional Apollo / spectral bandwidth restoration post-pass on separated stems
+        #[arg(long)]
+        restore: bool,
+        /// Backend override: `auto`, `local_gpu`, `colab`, or `dsp`
+        #[arg(long)]
+        backend: Option<String>,
+    },
+
     /// Inspect or headlessly bounce/export stems from a ForgeStudio DAW `.forgeproj` session
     Daw {
         #[command(subcommand)]
@@ -355,10 +400,18 @@ enum DawAction {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+fn main() -> anyhow::Result<()> {
+    // Windows defaults to a 1 MiB main-thread stack, which unoptimized debug builds
+    // of a multi-subcommand `clap` CLI can exceed during `Cli::parse()`. Run on an 8 MiB stack.
+    std::thread::Builder::new()
+        .name("forge-cli".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| run_cli(Cli::parse()))?
+        .join()
+        .map_err(|_| anyhow::anyhow!("forge-cli worker thread panicked"))?
+}
 
+fn run_cli(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Commands::Audit { input, json } => {
             let buf = AudioBuffer::load(&input)?;
@@ -986,7 +1039,10 @@ async fn main() -> anyhow::Result<()> {
             output,
             model,
         } => {
-            let (saved, lyrics) = generate_music_lyria(&prompt, &model, &output).await?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let (saved, lyrics) = rt.block_on(generate_music_lyria(&prompt, &model, &output))?;
             println!("Lyria audio saved to {}", saved.display());
             if let Some(l) = lyrics {
                 println!("\nGenerated Structure / Lyrics:\n{l}");
@@ -1035,83 +1091,142 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
 
-        Commands::Daw { action } => match action {
-            DawAction::Inspect { project, json } => {
-                let proj = DawProject::load_from_file(&project)?;
-                let mut cache = ClipCache::default();
-                let mut missing_clips = Vec::new();
-                for tr in &proj.tracks {
-                    for obj in &tr.objects {
-                        if let Err(e) = cache.load_clip(&obj.source_path) {
-                            missing_clips.push(format!("{}: {e}", obj.source_path.display()));
-                        }
-                    }
-                }
-                let engine = ObjectOrientedEngine::compile(&proj, &cache);
-                let total_objects: usize = proj.tracks.iter().map(|t| t.objects.len()).sum();
-                let total_midi_clips: usize = proj.tracks.iter().map(|t| t.midi_clips.len()).sum();
-                let summary = serde_json::json!({
-                    "name": proj.name,
-                    "sample_rate": proj.sample_rate,
-                    "bpm": proj.bpm,
-                    "time_signature": format!("{}/{}", proj.time_sig_num, proj.time_sig_den),
-                    "tracks": proj.tracks.len(),
-                    "audio_objects": total_objects,
-                    "midi_clips": total_midi_clips,
-                    "aux_buses": proj.aux_buses.len(),
-                    "master_inserts": proj.master_inserts.len(),
-                    "total_pdc_samples": engine.total_pdc_samples(),
-                    "missing_clips": missing_clips,
-                });
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&summary)?);
-                } else {
-                    println!(
-                        "ForgeStudio Project '{}' | {} Hz | {:.1} BPM ({}/{}) | {} tracks ({} objects, {} MIDI clips) | {} aux buses | PDC: {} spl",
-                        proj.name,
-                        proj.sample_rate,
-                        proj.bpm,
-                        proj.time_sig_num,
-                        proj.time_sig_den,
-                        proj.tracks.len(),
-                        total_objects,
-                        total_midi_clips,
-                        proj.aux_buses.len(),
-                        engine.total_pdc_samples()
-                    );
-                    if !missing_clips.is_empty() {
-                        eprintln!("Warning: {} clip(s) missing on disk", missing_clips.len());
-                    }
+        Commands::Separate {
+            input,
+            output_dir,
+            stems,
+            quality,
+            no_dereverb,
+            drum_sep,
+            split_lead_backing,
+            split_male_female,
+            split_guitar,
+            split_orchestral,
+            split_crowd,
+            all_stems,
+            restore,
+            backend,
+        } => {
+            if !matches!(stems, 2 | 4 | 6) {
+                anyhow::bail!("--stems must be 2, 4, or 6 (got {stems})");
+            }
+            let mut cfg = SeparationConfig::from_env();
+            cfg.stems = stems;
+            cfg.quality = parse_quality(&quality)?;
+            cfg.dereverb = !no_dereverb;
+            cfg.drum_sep = drum_sep;
+            cfg.split_lead_backing = split_lead_backing;
+            cfg.split_male_female = split_male_female;
+            cfg.split_guitar = split_guitar;
+            cfg.split_orchestral = split_orchestral;
+            cfg.split_crowd = split_crowd;
+            if all_stems {
+                cfg.enable_all_stems();
+                if no_dereverb {
+                    cfg.dereverb = false;
                 }
             }
-            DawAction::Bounce {
-                project,
-                output,
-                stems_dir,
-            } => {
-                let proj = DawProject::load_from_file(&project)?;
-                let mut cache = ClipCache::default();
-                for tr in &proj.tracks {
-                    for obj in &tr.objects {
-                        cache.load_clip(&obj.source_path)?;
-                    }
-                }
-                let report = ObjectOrientedEngine::bounce_to_wav(&proj, &cache, &output)?;
-                let mut exported_stems = Vec::new();
-                if let Some(dir) = stems_dir {
-                    exported_stems = ObjectOrientedEngine::bounce_stems(&proj, &cache, &dir)?;
-                }
-                let result = serde_json::json!({
-                    "output": output.display().to_string(),
-                    "integrated_lufs": report.integrated_lufs,
-                    "true_peak_dbtp": report.true_peak_dbtp,
-                    "stems_exported": exported_stems.len(),
-                });
-                println!("{}", serde_json::to_string_pretty(&result)?);
+            cfg.restore = restore;
+            if let Some(b) = backend {
+                cfg.backend = parse_backend(&b, cfg.colab_url.as_deref())?;
             }
-        },
+            run_separate_cli(&input, &output_dir, &cfg)?;
+        }
+
+        Commands::Daw { action } => run_daw_cli(action)?,
     }
 
+    Ok(())
+}
+
+#[inline(never)]
+fn run_daw_cli(action: DawAction) -> anyhow::Result<()> {
+    match action {
+        DawAction::Inspect { project, json } => {
+            let proj = DawProject::load_from_file(&project)?;
+            let mut cache = ClipCache::default();
+            let mut missing_clips = Vec::new();
+            for tr in &proj.tracks {
+                for obj in &tr.objects {
+                    if let Err(e) = cache.load_clip(&obj.source_path) {
+                        missing_clips.push(format!("{}: {e}", obj.source_path.display()));
+                    }
+                }
+            }
+            let engine = ObjectOrientedEngine::compile(&proj, &cache);
+            let total_objects: usize = proj.tracks.iter().map(|t| t.objects.len()).sum();
+            let total_midi_clips: usize = proj.tracks.iter().map(|t| t.midi_clips.len()).sum();
+            let summary = serde_json::json!({
+                "name": proj.name,
+                "sample_rate": proj.sample_rate,
+                "bpm": proj.bpm,
+                "time_signature": format!("{}/{}", proj.time_sig_num, proj.time_sig_den),
+                "tracks": proj.tracks.len(),
+                "audio_objects": total_objects,
+                "midi_clips": total_midi_clips,
+                "aux_buses": proj.aux_buses.len(),
+                "master_inserts": proj.master_inserts.len(),
+                "total_pdc_samples": engine.total_pdc_samples(),
+                "missing_clips": missing_clips,
+            });
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                println!(
+                    "ForgeStudio Project '{}' | {} Hz | {:.1} BPM ({}/{}) | {} tracks ({} objects, {} MIDI clips) | {} aux buses | PDC: {} spl",
+                    proj.name,
+                    proj.sample_rate,
+                    proj.bpm,
+                    proj.time_sig_num,
+                    proj.time_sig_den,
+                    proj.tracks.len(),
+                    total_objects,
+                    total_midi_clips,
+                    proj.aux_buses.len(),
+                    engine.total_pdc_samples()
+                );
+                if !missing_clips.is_empty() {
+                    eprintln!("Warning: {} clip(s) missing on disk", missing_clips.len());
+                }
+            }
+        }
+        DawAction::Bounce {
+            project,
+            output,
+            stems_dir,
+        } => {
+            let proj = DawProject::load_from_file(&project)?;
+            let mut cache = ClipCache::default();
+            for tr in &proj.tracks {
+                for obj in &tr.objects {
+                    cache.load_clip(&obj.source_path)?;
+                }
+            }
+            let report = ObjectOrientedEngine::bounce_to_wav(&proj, &cache, &output)?;
+            let mut exported_stems = Vec::new();
+            if let Some(dir) = stems_dir {
+                exported_stems = ObjectOrientedEngine::bounce_stems(&proj, &cache, &dir)?;
+            }
+            let result = serde_json::json!({
+                "output": output.display().to_string(),
+                "integrated_lufs": report.integrated_lufs,
+                "true_peak_dbtp": report.true_peak_dbtp,
+                "stems_exported": exported_stems.len(),
+            });
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn run_separate_cli(
+    input: &std::path::Path,
+    output_dir: &std::path::Path,
+    cfg: &SeparationConfig,
+) -> anyhow::Result<()> {
+    let report = separate_stems(input, output_dir, cfg)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 

@@ -77,7 +77,35 @@ fn cli_audit_restore_and_phase_align_execute_end_to_end() {
     );
     assert!(aligned_wav.is_file());
 
-    // 4. `forge daw inspect --json` & `forge daw bounce`
+    // 4. `forge separate --backend dsp --stems 6 --quality studio`
+    let sep_stems_dir = dir.path().join("stems_out");
+    let sep_out = Command::new(bin)
+        .args([
+            "separate",
+            "--backend",
+            "dsp",
+            "--stems",
+            "6",
+            "--quality",
+            "studio",
+            "--no-dereverb",
+        ])
+        .arg(&src_wav)
+        .arg("-o")
+        .arg(&sep_stems_dir)
+        .output()
+        .expect("run forge separate");
+    assert!(
+        sep_out.status.success(),
+        "forge separate failed: {}",
+        String::from_utf8_lossy(&sep_out.stderr)
+    );
+    let sep_json: serde_json::Value =
+        serde_json::from_slice(&sep_out.stdout).expect("valid separate JSON");
+    assert_eq!(sep_json["backend"], "pure_rust_dsp");
+    assert!(sep_json["bundle"]["vocals"].is_string());
+
+    // 5. `forge daw inspect --json` & `forge daw bounce`
     let proj_path = dir.path().join("cli_test.forgeproj");
     let bounce_wav = dir.path().join("cli_master_bounce.wav");
     let stems_dir = dir.path().join("stems");

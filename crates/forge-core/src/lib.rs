@@ -296,11 +296,45 @@ pub struct AuditReport {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StemBundle {
     pub vocals: Option<PathBuf>,
+    #[serde(default)]
+    pub lead_vocals: Option<PathBuf>,
+    #[serde(default)]
+    pub backing_vocals: Option<PathBuf>,
+    #[serde(default)]
+    pub male_vocals: Option<PathBuf>,
+    #[serde(default)]
+    pub female_vocals: Option<PathBuf>,
+    #[serde(default)]
+    pub vocal_reverb: Option<PathBuf>,
     pub drums: Option<PathBuf>,
     pub bass: Option<PathBuf>,
     pub guitar: Option<PathBuf>,
+    #[serde(default)]
+    pub electric_guitar: Option<PathBuf>,
+    #[serde(default)]
+    pub acoustic_guitar: Option<PathBuf>,
     pub keys: Option<PathBuf>,
+    #[serde(default)]
+    pub strings: Option<PathBuf>,
+    #[serde(default)]
+    pub brass: Option<PathBuf>,
+    #[serde(default)]
+    pub wind: Option<PathBuf>,
+    #[serde(default)]
+    pub synth: Option<PathBuf>,
+    #[serde(default)]
+    pub crowd: Option<PathBuf>,
     pub other: Option<PathBuf>,
+    #[serde(default)]
+    pub kick: Option<PathBuf>,
+    #[serde(default)]
+    pub snare: Option<PathBuf>,
+    #[serde(default)]
+    pub toms: Option<PathBuf>,
+    #[serde(default)]
+    pub hihat: Option<PathBuf>,
+    #[serde(default)]
+    pub cymbals: Option<PathBuf>,
     pub kick_midi: Option<PathBuf>,
     pub snare_midi: Option<PathBuf>,
     pub hats_midi: Option<PathBuf>,

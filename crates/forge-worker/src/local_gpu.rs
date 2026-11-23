@@ -71,7 +71,8 @@ pub(crate) fn separate(
     worker: &LocalWorkerCommand,
     input_path: &Path,
     output_dir: &Path,
-    timeout: Duration,
+    stems: u8,
+    config: &crate::routing::SeparationConfig,
 ) -> Result<StemBundle> {
     let mut cmd = Command::new(&worker.program);
     cmd.args(&worker.args)
@@ -79,8 +80,36 @@ pub(crate) fn separate(
         .arg("--input")
         .arg(input_path)
         .arg("--output-dir")
-        .arg(output_dir);
-    let out = run_with_timeout(cmd, timeout)?;
+        .arg(output_dir)
+        .arg("--stems")
+        .arg(stems.to_string())
+        .arg("--quality")
+        .arg(config.quality.as_str());
+    if !config.dereverb {
+        cmd.arg("--no-dereverb");
+    }
+    if config.drum_sep {
+        cmd.arg("--drum-sep");
+    }
+    if config.split_lead_backing {
+        cmd.arg("--split-lead-backing");
+    }
+    if config.split_male_female {
+        cmd.arg("--split-male-female");
+    }
+    if config.split_guitar {
+        cmd.arg("--split-guitar");
+    }
+    if config.split_orchestral {
+        cmd.arg("--split-orchestral");
+    }
+    if config.split_crowd {
+        cmd.arg("--split-crowd");
+    }
+    if config.restore {
+        cmd.arg("--restore");
+    }
+    let out = run_with_timeout(cmd, config.local_timeout)?;
     if !out.status.success() {
         return Err(ForgeError::WorkerError(format!(
             "GPU worker exited with {}: {}",

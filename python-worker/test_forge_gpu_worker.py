@@ -17,6 +17,7 @@ from unittest import TestCase, main, mock
 import forge_gpu_worker as worker
 
 KIM = "model_mel_band_roformer_kim_vocals"
+BS_1297 = "model_bs_roformer_ep_317_sdr_12.9755"
 DEVERB = "deverb_bs_roformer_8_384dim_10depth"
 
 
@@ -121,13 +122,15 @@ class RunSeparateTests(TestCase):
 
     def test_vocal_named_input_returns_the_vocal_stem(self) -> None:
         result = self.run_separate("Lead_Vocal_mix.wav", dereverb=False)
-        self.assertEqual(result["vocals"], f"Lead_Vocal_mix_(Vocals)_{KIM}.wav")
-        self.assertEqual(result["other"], f"Lead_Vocal_mix_(Instrumental)_{KIM}.wav")
+        self.assertEqual(result["vocals"], f"Lead_Vocal_mix_(Vocals)_{BS_1297}.wav")
+        self.assertEqual(
+            result["other"], f"Lead_Vocal_mix_(Instrumental)_{BS_1297}.wav"
+        )
 
     def test_dry_named_input_returns_the_dereverbed_vocal(self) -> None:
         result = self.run_separate("dry_take.wav", dereverb=True)
         self.assertEqual(
-            result["vocals"], f"dry_take_(Vocals)_{KIM}_(No Reverb)_{DEVERB}.wav"
+            result["vocals"], f"dry_take_(Vocals)_{BS_1297}_(No Reverb)_{DEVERB}.wav"
         )
 
 
@@ -293,7 +296,7 @@ class SixStemAndTranscribeTests(TestCase):
             out = Path(tmp)
             inp = out / "full_mix.wav"
             inp.write_bytes(b"RIFF")
-            res = worker.run_separate(inp, out, dereverb=False, stems=6)
+            res = worker.run_separate(inp, out, dereverb=False, stems=6, quality="fast")
             expected = {
                 "vocals": "full_mix_(Vocals)_htdemucs_6s.wav",
                 "drums": "full_mix_(Drums)_htdemucs_6s.wav",
@@ -306,6 +309,276 @@ class SixStemAndTranscribeTests(TestCase):
                 self.assertIsNotNone(res[key], f"missing 6-stem slot: {key}")
                 self.assertEqual(Path(res[key]).name, filename)
                 self.assertTrue(Path(res[key]).is_file())
+
+    def test_studio_cascade_and_drumsep_populate_all_eleven_slots(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        class CascadeSeparator(FakeSeparator):
+            def separate(self, audio_file: str) -> list[str]:
+                calls.append((self.model, Path(audio_file).name))
+                base = Path(audio_file).stem
+                if self.model in {"BS-Roformer-SW", "htdemucs_6s"}:
+                    stems = ("Vocals", "Drums", "Bass", "Guitar", "Piano", "Other")
+                elif self.model == "MDX23C-DrumSep-aufr33-jarredou":
+                    stems = ("Kick", "Snare", "Toms", "HH", "Cymbals")
+                elif (
+                    self.model == "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956"
+                ):
+                    stems = ("Vocals", "Instrumental")
+                else:
+                    stems = ("Instrumental", "Vocals")
+                names = [f"{base}_({stem})_{self.model}.wav" for stem in stems]
+                for name in names:
+                    (self.output_dir / name).write_bytes(b"RIFF")
+                return names
+
+        modules = {
+            "audio_separator": fake_module("audio_separator"),
+            "audio_separator.separator": fake_module(
+                "audio_separator.separator", Separator=CascadeSeparator
+            ),
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(sys.modules, modules),
+        ):
+            out = Path(tmp)
+            inp = out / "song.wav"
+            inp.write_bytes(b"RIFF")
+            res = worker.run_separate(
+                inp,
+                out,
+                dereverb=False,
+                stems=6,
+                quality="studio",
+                drum_sep=True,
+                split_lead_backing=True,
+            )
+            self.assertEqual(calls[0], (BS_1297, "song.wav"))
+            self.assertEqual(
+                calls[1], ("BS-Roformer-SW", f"song_(Instrumental)_{BS_1297}.wav")
+            )
+            self.assertEqual(
+                calls[2][0], "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956"
+            )
+            self.assertEqual(calls[3][0], "MDX23C-DrumSep-aufr33-jarredou")
+            for key in (
+                "vocals",
+                "lead_vocals",
+                "backing_vocals",
+                "drums",
+                "bass",
+                "guitar",
+                "keys",
+                "other",
+                "kick",
+                "snare",
+                "toms",
+                "hihat",
+                "cymbals",
+            ):
+                self.assertIsNotNone(res[key], f"missing cascade slot: {key}")
+
+    def test_scnet_four_stem_falls_back_to_htdemucs_and_spectral_restore_runs(
+        self,
+    ) -> None:
+        import array
+        import wave
+
+        loaded_models: list[str] = []
+
+        def write_pcm(path: Path) -> None:
+            with wave.open(str(path), "wb") as w:
+                w.setnchannels(2)
+                w.setsampwidth(2)
+                w.setframerate(48_000)
+                pcm = [((i % 8) - 4) * 2000 for i in range(64)]
+                w.writeframes(array.array("h", pcm).tobytes())
+
+        class FallbackSeparator(FakeSeparator):
+            def load_model(self, model_filename: str) -> None:
+                loaded_models.append(model_filename)
+                if model_filename in {
+                    worker.SCNET_FOUR_STEM_MODEL,
+                    worker.APOLLO_RESTORE_MODEL,
+                }:
+                    raise FileNotFoundError(f"missing checkpoint: {model_filename}")
+                super().load_model(model_filename)
+
+            def separate(self, audio_file: str) -> list[str]:
+                base = Path(audio_file).stem
+                if self.model == "htdemucs_ft":
+                    stems = ("Vocals", "Drums", "Bass", "Other")
+                else:
+                    stems = ("Instrumental", "Vocals")
+                names = [f"{base}_({stem})_{self.model}.wav" for stem in stems]
+                for name in names:
+                    write_pcm(self.output_dir / name)
+                return names
+
+        modules = {
+            "audio_separator": fake_module("audio_separator"),
+            "audio_separator.separator": fake_module(
+                "audio_separator.separator", Separator=FallbackSeparator
+            ),
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(sys.modules, modules),
+        ):
+            out = Path(tmp)
+            inp = out / "master.wav"
+            write_pcm(inp)
+            res = worker.run_separate(
+                inp, out, dereverb=False, stems=4, quality="studio", restore=True
+            )
+            self.assertIn(worker.SCNET_FOUR_STEM_MODEL, loaded_models)
+            self.assertIn(worker.FOUR_STEM_MODEL, loaded_models)
+            self.assertIn(worker.APOLLO_RESTORE_MODEL, loaded_models)
+            self.assertTrue(
+                Path(res["vocals"]).name.endswith("_restored.wav"), res["vocals"]
+            )
+            self.assertTrue(Path(res["drums"]).is_file())
+
+    def test_full_hierarchical_23_slot_cascade_populates_all_sub_stems(self) -> None:
+        model_outputs: dict[str, tuple[str, ...]] = {
+            BS_1297: ("Instrumental", "Vocals"),
+            "BS-Roformer-SW": ("Vocals", "Drums", "Bass", "Guitar", "Piano", "Other"),
+            DEVERB: ("Reverb", "No Reverb"),
+            "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956": (
+                "Vocals",
+                "Instrumental",
+            ),
+            "mel_band_roformer_male_female_aufr33": ("Male", "Female"),
+            "MDX23C-DrumSep-aufr33-jarredou": (
+                "Kick",
+                "Snare",
+                "Toms",
+                "HH",
+                "Cymbals",
+            ),
+            "mel_band_roformer_guitar_elec_acoust": (
+                "Electric Guitar",
+                "Acoustic Guitar",
+            ),
+            "mel_band_roformer_strings": ("Strings", "Other"),
+            "mel_band_roformer_brass": ("Brass", "Other"),
+            "mel_band_roformer_woodwinds": ("Woodwinds", "Other"),
+            "mel_band_roformer_synth": ("Synth", "Other"),
+            "mel_band_roformer_crowd_aufr33_viperx_sdr_8.7144": ("Crowd", "Other"),
+        }
+
+        class FullCascadeSeparator(FakeSeparator):
+            def separate(self, audio_file: str) -> list[str]:
+                base = Path(audio_file).stem
+                stems = model_outputs[self.model]
+                names = [f"{base}_({stem})_{self.model}.wav" for stem in stems]
+                for name in names:
+                    (self.output_dir / name).write_bytes(b"RIFF")
+                return names
+
+        modules = {
+            "audio_separator": fake_module("audio_separator"),
+            "audio_separator.separator": fake_module(
+                "audio_separator.separator", Separator=FullCascadeSeparator
+            ),
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(sys.modules, modules),
+        ):
+            out = Path(tmp)
+            inp = out / "symphony.wav"
+            inp.write_bytes(b"RIFF")
+            res = worker.run_separate(
+                inp,
+                out,
+                dereverb=True,
+                stems=6,
+                quality="studio",
+                drum_sep=True,
+                split_lead_backing=True,
+                split_male_female=True,
+                split_guitar=True,
+                split_orchestral=True,
+                split_crowd=True,
+            )
+            expected_keys = (
+                "vocals",
+                "lead_vocals",
+                "backing_vocals",
+                "male_vocals",
+                "female_vocals",
+                "vocal_reverb",
+                "drums",
+                "bass",
+                "guitar",
+                "electric_guitar",
+                "acoustic_guitar",
+                "keys",
+                "strings",
+                "brass",
+                "wind",
+                "synth",
+                "crowd",
+                "other",
+                "kick",
+                "snare",
+                "toms",
+                "hihat",
+                "cymbals",
+            )
+            self.assertEqual(len(expected_keys), 23)
+            for key in expected_keys:
+                self.assertIsNotNone(res[key], f"missing hierarchical slot: {key}")
+                self.assertTrue(Path(res[key]).is_file())
+
+    def test_ultra_ensemble_blends_bs_and_mel_roformer_wavs(self) -> None:
+        import array
+        import wave
+
+        def write_pcm(path: Path, sample_val: int) -> None:
+            with wave.open(str(path), "wb") as w:
+                w.setnchannels(2)
+                w.setsampwidth(2)
+                w.setframerate(48_000)
+                w.writeframes(array.array("h", [sample_val] * 64).tobytes())
+
+        class EnsembleSeparator(FakeSeparator):
+            def separate(self, audio_file: str) -> list[str]:
+                base = Path(audio_file).stem
+                val = 10_000 if self.model == BS_1297 else 20_000
+                names = [
+                    f"{base}_(Instrumental)_{self.model}.wav",
+                    f"{base}_(Vocals)_{self.model}.wav",
+                ]
+                for name in names:
+                    write_pcm(self.output_dir / name, val)
+                return names
+
+        modules = {
+            "audio_separator": fake_module("audio_separator"),
+            "audio_separator.separator": fake_module(
+                "audio_separator.separator", Separator=EnsembleSeparator
+            ),
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(sys.modules, modules),
+        ):
+            out = Path(tmp)
+            inp = out / "mix.wav"
+            write_pcm(inp, 15_000)
+            res = worker.run_separate(
+                inp, out, dereverb=False, stems=2, quality="ultra"
+            )
+            vocal_path = Path(res["vocals"])
+            self.assertEqual(vocal_path.name, "mix_(Vocals)_roformer_ensemble.wav")
+            with wave.open(str(vocal_path), "rb") as w:
+                samples = array.array("h")
+                samples.frombytes(w.readframes(4))
+            # 0.6 * 10_000 + 0.4 * 20_000 = 14_000
+            self.assertEqual(samples[0], 14_000)
 
     def test_transcribe_writes_midi_file(self) -> None:
         class FakeMidi:

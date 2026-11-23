@@ -59,6 +59,8 @@ impl ForgeDawApp {
                 let mut changed = false;
                 let mut delete_obj = false;
                 let mut split_obj = false;
+                let mut split_stems = false;
+                let splitting_now = self.stem_split_rx.is_some();
                 let prev_snapshot = self.project.clone();
                 let sr = f64::from(self.project.sample_rate.max(1));
 
@@ -73,6 +75,19 @@ impl ForgeDawApp {
                         ui.horizontal(|ui| {
                             if ui.button("Split @ Playhead").clicked() {
                                 split_obj = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    !splitting_now,
+                                    egui::Button::new(if splitting_now {
+                                        "Splitting..."
+                                    } else {
+                                        "Split Stems (Studio)"
+                                    }),
+                                )
+                                .clicked()
+                            {
+                                split_stems = true;
                             }
                             if ui.button("Delete Object").clicked() {
                                 delete_obj = true;
@@ -241,6 +256,8 @@ impl ForgeDawApp {
                         self.status_line =
                             "Move playhead inside the selected object to split".to_string();
                     }
+                } else if split_stems {
+                    self.start_stem_split_for_object(obj_id);
                 } else if delete_obj {
                     if let Some((ti, oi)) = self.project.find_object(obj_id) {
                         self.project.tracks[ti].objects.remove(oi);

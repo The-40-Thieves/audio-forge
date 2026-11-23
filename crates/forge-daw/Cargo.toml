@@ -15,6 +15,7 @@ eframe.workspace = true
 rfd.workspace = true
 forge-core = { path = "../forge-core" }
 forge-engine = { path = "../forge-engine" }
+forge-worker = { path = "../forge-worker" }
 
 [lints]
 workspace = true

@@ -437,6 +437,29 @@ fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "forge_separate_stems",
+            "description": "Studio-grade neural stem separation (BS-RoFormer 1297 / SCNet XL / BS-RoFormer SW cascade, 2/4/6 stems + optional BS-RoFormer de-reverb, RoFormer Karaoke Lead/Backing split, 5-piece MDX23C DrumSep & Apollo spectral restoration) with pure-Rust DSP fallback, confined to the MCP path sandbox.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "input": { "type": "string", "description": "Input audio file" },
+                    "output_dir": { "type": "string", "description": "Output directory for separated WAV stems" },
+                    "stems": { "type": "integer", "enum": [2, 4, 6], "default": 6, "description": "Primary stem count (2, 4, or 6)" },
+                    "quality": { "type": "string", "enum": ["fast", "studio", "ultra"], "default": "studio", "description": "Separation quality tier" },
+                    "dereverb": { "type": "boolean", "default": true, "description": "Run BS-RoFormer de-reverb on isolated vocals" },
+                    "drum_sep": { "type": "boolean", "default": false, "description": "Also split isolated drums into Kick, Snare, Toms, Hi-Hat, and Cymbals" },
+                    "split_lead_backing": { "type": "boolean", "default": false, "description": "Also split isolated vocals into Lead Vocals and Backing Vocals / Harmonies (RoFormer Karaoke)" },
+                    "split_male_female": { "type": "boolean", "default": false, "description": "Also split isolated vocals into Male and Female vocal stems" },
+                    "split_guitar": { "type": "boolean", "default": false, "description": "Also split isolated guitar into Electric Guitar and Acoustic Guitar" },
+                    "split_orchestral": { "type": "boolean", "default": false, "description": "Also extract Strings, Brass, Woodwinds, and Synth from residual Other stem" },
+                    "split_crowd": { "type": "boolean", "default": false, "description": "Also extract live Crowd / Audience / Room Noise from residual Other stem" },
+                    "all_stems": { "type": "boolean", "default": false, "description": "Enable full 23-slot hierarchical pro studio cascade (all sub-splitters)" },
+                    "restore": { "type": "boolean", "default": false, "description": "Run optional Apollo / spectral bandwidth restoration post-pass on separated stems" }
+                },
+                "required": ["input", "output_dir"]
+            }
+        }),
+        json!({
             "name": "forge_daw_inspect",
             "description": "Validate and inspect a ForgeStudio DAW `.forgeproj` session (BPM, sample rate, tracks, audio objects, MIDI clips, aux buses, total PDC) within the MCP path sandbox.",
             "inputSchema": {
@@ -637,6 +660,7 @@ fn dispatch_tool(
         "forge_ingest_to_reaper" => tool_ingest_to_reaper,
         "forge_neural_denoise" => tool_neural_denoise,
         "forge_transcribe_midi" => tool_transcribe_midi,
+        "forge_separate_stems" => tool_separate_stems,
         "forge_daw_inspect" => tool_daw_inspect,
         "forge_daw_bounce" => tool_daw_bounce,
         _ => {
@@ -1260,6 +1284,61 @@ fn build_session(spec: SessionSpec) -> ReaperProjectBuilder {
     rpp
 }
 
+fn tool_separate_stems(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
+    let input = path_arg(args, "input", sandbox)?;
+    let output_dir = path_arg(args, "output_dir", sandbox)?;
+    let stems_raw = args.get("stems").and_then(Value::as_u64).unwrap_or(6);
+    let stems = match stems_raw {
+        2 | 4 | 6 => stems_raw as u8,
+        other => {
+            return Err(ForgeError::InvalidParameter(format!(
+                "stems must be 2, 4, or 6, got {other}"
+            )));
+        }
+    };
+    let quality_str = args
+        .get("quality")
+        .and_then(Value::as_str)
+        .unwrap_or("studio");
+    let quality = forge_worker::parse_quality(quality_str)?;
+    let dereverb = args
+        .get("dereverb")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let drum_sep = args
+        .get("drum_sep")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let split_lead_backing = bool_arg(args, "split_lead_backing", false);
+    let split_male_female = bool_arg(args, "split_male_female", false);
+    let split_guitar = bool_arg(args, "split_guitar", false);
+    let split_orchestral = bool_arg(args, "split_orchestral", false);
+    let split_crowd = bool_arg(args, "split_crowd", false);
+    let all_stems = bool_arg(args, "all_stems", false);
+    let restore = bool_arg(args, "restore", false);
+
+    let mut cfg = SeparationConfig::from_env();
+    cfg.stems = stems;
+    cfg.quality = quality;
+    cfg.dereverb = dereverb;
+    cfg.drum_sep = drum_sep;
+    cfg.split_lead_backing = split_lead_backing;
+    cfg.split_male_female = split_male_female;
+    cfg.split_guitar = split_guitar;
+    cfg.split_orchestral = split_orchestral;
+    cfg.split_crowd = split_crowd;
+    if all_stems {
+        cfg.enable_all_stems();
+        cfg.dereverb = dereverb;
+    }
+    cfg.restore = restore;
+
+    let report = external::separate_stems_checked(sandbox, &input, &output_dir, &cfg)?;
+    let payload = serde_json::to_value(&report)
+        .map_err(|e| ForgeError::InvalidParameter(format!("Failed to serialize report: {e}")))?;
+    Ok(payload.into())
+}
+
 fn load_sandboxed_daw_project(
     project_path: &std::path::Path,
     sandbox: &PathSandbox,
@@ -1492,6 +1571,10 @@ mod tests {
             (
                 "forge_transcribe_midi",
                 json!({ "input": "in.wav", "output_dir": "../midi_out" }),
+            ),
+            (
+                "forge_separate_stems",
+                json!({ "input": "in.wav", "output_dir": "../stems_out" }),
             ),
             (
                 "forge_daw_inspect",
