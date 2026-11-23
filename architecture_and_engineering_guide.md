@@ -204,7 +204,7 @@ flowchart TD
 
 ### 2.8 `forge-cli` & `forge-mcp` — Unified CLI Binary & JSON-RPC 2.0 MCP Agent Server
 - **`crates/forge-cli/src/main.rs` (`forge` binary):** Exposes 9 subcommands (`audit`, `restore`, `unmask`, `phase-align`, `vocal`, `theory`, `master`, `ingest`, `samples`) via `clap` derive macros.
-- **`crates/forge-mcp/src/main.rs` (`forge-mcp` binary):** Implements the Model Context Protocol (`protocolVersion: "2024-11-05"`) over `stdin`/`stdout` JSON-RPC 2.0, exposing 13 structured tools (`forge_deliver`, `forge_audit_audio`, `forge_restore_and_defizz`, `forge_spectral_unmask`, `forge_phase_align`, `forge_vocal_suite`, `forge_music_theory_midi`, `forge_master_distrokid`, `forge_ingest_to_reaper`, `forge_neural_denoise`, `forge_transcribe_midi`, `forge_daw_inspect`, `forge_daw_bounce`) to Claude Code, Antigravity, Cursor, or custom studio agents.
+- **`crates/forge-mcp/src/main.rs` (`forge-mcp` binary):** Implements the Model Context Protocol (`protocolVersion: "2024-11-05"`) over `stdin`/`stdout` JSON-RPC 2.0, exposing 14 structured tools (`forge_deliver`, `forge_audit_audio`, `forge_restore_and_defizz`, `forge_spectral_unmask`, `forge_phase_align`, `forge_vocal_suite`, `forge_music_theory_midi`, `forge_master_distrokid`, `forge_ingest_to_reaper`, `forge_neural_denoise`, `forge_transcribe_midi`, `forge_separate_stems`, `forge_daw_inspect`, `forge_daw_bounce`) to Claude Code, Antigravity, Cursor, or custom studio agents.
 
 ---
 
