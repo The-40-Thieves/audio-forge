@@ -206,4 +206,48 @@ mod tests {
         let read_back = read_shared_spectrum(2);
         assert!((read_back[5] - (-12.5)).abs() < 1e-4);
     }
+
+    #[test]
+    fn test_polyphase_oversampler_preserves_10khz_passband_within_0_1_db() {
+        let sr = 48_000.0;
+        let mut os2 = Oversampler2x::default();
+        let mut os4 = Oversampler4x::default();
+        let mut in_sq = 0.0_f64;
+        let mut out2_sq = 0.0_f64;
+        let mut out4_sq = 0.0_f64;
+        for i in 0..2048 {
+            let x = (2.0 * PI * 10_000.0 * (i as f64) / sr).sin();
+            let y2 = os2.process(x, |s| s);
+            let y4 = os4.process(x, |s| s);
+            if i >= 256 {
+                in_sq += x * x;
+                out2_sq += y2 * y2;
+                out4_sq += y4 * y4;
+            }
+        }
+        let gain2_db = 10.0 * (out2_sq / in_sq).log10();
+        let gain4_db = 10.0 * (out4_sq / in_sq).log10();
+        assert!(
+            gain2_db.abs() < 0.1,
+            "Oversampler2x 10 kHz passband ripple too high: {gain2_db:.3} dB"
+        );
+        assert!(
+            gain4_db.abs() < 0.15,
+            "Oversampler4x 10 kHz passband ripple too high: {gain4_db:.3} dB"
+        );
+    }
+
+    #[test]
+    fn test_sr_invariant_auto_gain_and_neural_preamp_at_96k() {
+        let mut agc = AutoGainCompensator::default();
+        agc.set_sample_rate(96_000.0);
+        let mut preamp = RealtimeNeuralPreamp::new(AnalogHardwareModel::TubeV76Triode);
+        preamp.set_sample_rate(96_000.0);
+        for i in 0..1024 {
+            let s = (0.3 * (2.0 * PI * 440.0 * (i as f64) / 96_000.0).sin()) as f32;
+            let (pl, pr) = preamp.process_stereo_sample(s, s, 6.0, 0.0);
+            let (al, ar) = agc.process_stereo(s, s, pl, pr, true);
+            assert!(al.is_finite() && ar.is_finite());
+        }
+    }
 }

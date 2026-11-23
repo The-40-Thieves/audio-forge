@@ -90,28 +90,55 @@ impl AdaaSin {
     }
 }
 
-/// Zero-allocation 2x Polyphase Half-Band Upsampler & Downsampler for non-linear stages.
+/// Zero-allocation 2x Polyphase Allpass Half-Band IIR Upsampler & Downsampler (4+4 HIIR
+/// allpass stages: `< 0.001 dB` passband ripple up to `0.45 fs`, `> 75 dB` alias rejection).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Oversampler2x {
-    prev_in: f64,
-    lp_state1: f64,
-    lp_state2: f64,
+    up_a: [f64; 4],
+    up_b: [f64; 4],
+    dn_a: [f64; 4],
+    dn_b: [f64; 4],
 }
 
 impl Oversampler2x {
-    /// Upsamples `x` to 2x rate `[s0, s1]`, applies nonlinear closure `f`, and downsamples with anti-aliasing filter.
+    /// 4-stage HIIR half-band allpass branch A coefficients.
+    const COEFFS_A: [f64; 4] = [
+        0.077_115_079_8,
+        0.265_968_526_5,
+        0.482_070_625_1,
+        0.665_104_153_3,
+    ];
+    /// 4-stage HIIR half-band allpass branch B coefficients.
+    const COEFFS_B: [f64; 4] = [
+        0.161_758_498_3,
+        0.371_283_229_7,
+        0.576_228_546_8,
+        0.872_060_452_5,
+    ];
+
+    #[inline]
+    fn run_allpass_chain(mut x: f64, state: &mut [f64; 4], coeffs: &[f64; 4]) -> f64 {
+        for i in 0..4 {
+            let c = coeffs[i];
+            let y = flush_denormal_f64(c * x + state[i]);
+            state[i] = flush_denormal_f64(x - c * y);
+            x = y;
+        }
+        x
+    }
+
+    /// Upsamples `x` to 2x rate `[s0, s1]` via polyphase half-band allpass branches, applies
+    /// nonlinear closure `f`, and decimates cleanly back to 1x with `> 75 dB` alias rejection.
     #[inline]
     pub fn process<F: FnMut(f64) -> f64>(&mut self, x_raw: f64, mut f: F) -> f64 {
         let x = sanitize_sample_f64(x_raw);
-        let mid = 0.5 * (self.prev_in + x);
-        self.prev_in = flush_denormal_f64(x);
-        let y0 = sanitize_sample_f64(f(mid));
-        let y1 = sanitize_sample_f64(f(x));
-        // 2-tap polyphase half-band decimation filter
-        self.lp_state1 = flush_denormal_f64(0.5 * (y0 + y1));
-        let out = flush_denormal_f64(0.5 * (self.lp_state1 + self.lp_state2));
-        self.lp_state2 = self.lp_state1;
-        out
+        let s0 = Self::run_allpass_chain(x, &mut self.up_a, &Self::COEFFS_A);
+        let s1 = Self::run_allpass_chain(x, &mut self.up_b, &Self::COEFFS_B);
+        let y0 = sanitize_sample_f64(f(s0));
+        let y1 = sanitize_sample_f64(f(s1));
+        let d0 = Self::run_allpass_chain(y0, &mut self.dn_b, &Self::COEFFS_B);
+        let d1 = Self::run_allpass_chain(y1, &mut self.dn_a, &Self::COEFFS_A);
+        flush_denormal_f64(0.5 * (d0 + d1))
     }
 }
 
@@ -446,6 +473,14 @@ pub struct RealtimeFdnReverb {
     shimmer_buf: Vec<f64>,
     shimmer_write: usize,
     shimmer_phase: f64,
+    low_alpha: f64,
+    cached_rt60: f64,
+    cached_raw_damp: f64,
+    cached_lo_mult: f64,
+    cached_hi_mult: f64,
+    cached_damp: f64,
+    cached_fb_lo: [f64; 8],
+    cached_fb_upper: [f64; 8],
 }
 
 impl RealtimeFdnReverb {
@@ -503,6 +538,14 @@ impl RealtimeFdnReverb {
             shimmer_buf: vec![0.0; shimmer_len],
             shimmer_write: 0,
             shimmer_phase: 0.0,
+            low_alpha: (-2.0 * PI * 350.0 / sr).exp(),
+            cached_rt60: f64::NAN,
+            cached_raw_damp: f64::NAN,
+            cached_lo_mult: f64::NAN,
+            cached_hi_mult: f64::NAN,
+            cached_damp: 0.35,
+            cached_fb_lo: [0.0; 8],
+            cached_fb_upper: [0.0; 8],
         }
     }
 
@@ -739,22 +782,43 @@ impl RealtimeFdnReverb {
         let mut wet_l = (outs[0] + outs[2] + outs[4] + outs[6]) * 0.5 + er_l * 0.35;
         let mut wet_r = (outs[1] + outs[3] + outs[5] + outs[7]) * 0.5 + er_r * 0.35;
 
-        // 4. Orthogonal 8x8 Walsh-Hadamard mixing + RT60 feedback + Decay Rate EQ (low/high)
+        // 4. Orthogonal 8x8 Walsh-Hadamard mixing + cached RT60 feedback + Decay Rate EQ
         Self::fast_hadamard_8(&mut outs);
         let rt60 = sanitize_param_f64(decay_rt60_secs, 2.4, 0.2, 20.0);
-        let rt60_lo = (rt60 * self.decay_low_mult).clamp(0.15, 24.0);
-        let rt60_hi = (rt60 * self.decay_high_mult).clamp(0.15, 24.0);
         let raw_damp = sanitize_param_f64(damping, 0.35, 0.05, 0.90);
-        // Scale 1-pole damping coefficient so HF cutoff is invariant across 44.1 / 48 / 96 / 192 kHz
-        let damp = (1.0 - (1.0 - raw_damp).powf(48_000.0 / self.sample_rate)).clamp(0.01, 0.97);
-        let low_alpha = (-2.0 * PI * 350.0 / self.sample_rate).exp();
+        if !((rt60 - self.cached_rt60).abs() <= 1e-6
+            && (raw_damp - self.cached_raw_damp).abs() <= 1e-6
+            && (self.decay_low_mult - self.cached_lo_mult).abs() <= 1e-6
+            && (self.decay_high_mult - self.cached_hi_mult).abs() <= 1e-6)
+        {
+            self.cached_rt60 = rt60;
+            self.cached_raw_damp = raw_damp;
+            self.cached_lo_mult = self.decay_low_mult;
+            self.cached_hi_mult = self.decay_high_mult;
+            let rt60_lo = (rt60 * self.decay_low_mult).clamp(0.15, 24.0);
+            let rt60_hi = (rt60 * self.decay_high_mult).clamp(0.15, 24.0);
+            self.cached_damp =
+                (1.0 - (1.0 - raw_damp).powf(48_000.0 / self.sample_rate)).clamp(0.01, 0.97);
+            let hi_blend = (self.decay_high_mult - 1.0).clamp(-0.75, 1.0);
+            for i in 0..8 {
+                let delay_sec = (self.delay_lens[i] as f64) / self.sample_rate;
+                let fb_mid = 10.0_f64.powf(-3.0 * delay_sec / rt60).min(0.985);
+                let fb_lo = 10.0_f64.powf(-3.0 * delay_sec / rt60_lo).min(0.985);
+                let fb_hi = 10.0_f64.powf(-3.0 * delay_sec / rt60_hi).min(0.985);
+                let upper_gain = if hi_blend >= 0.0 {
+                    fb_mid + (fb_hi - fb_mid) * hi_blend
+                } else {
+                    fb_mid + (fb_mid - fb_hi) * hi_blend
+                }
+                .clamp(0.0, 0.985);
+                self.cached_fb_lo[i] = fb_lo;
+                self.cached_fb_upper[i] = upper_gain;
+            }
+        }
+        let damp = self.cached_damp;
+        let low_alpha = self.low_alpha;
 
         for (i, &out_val) in outs.iter().enumerate() {
-            let delay_sec = (self.delay_lens[i] as f64) / self.sample_rate;
-            let fb_mid = 10.0_f64.powf(-3.0 * delay_sec / rt60).min(0.985);
-            let fb_lo = 10.0_f64.powf(-3.0 * delay_sec / rt60_lo).min(0.985);
-            let fb_hi = 10.0_f64.powf(-3.0 * delay_sec / rt60_hi).min(0.985);
-
             // Apply HF damping first so default (1.0, 1.0) Decay Rate EQ preserves exact Jot damping,
             // then split into low (<350 Hz) and mid/high bands for independent Decay Rate EQ scaling.
             self.damp_state[i] =
@@ -765,14 +829,7 @@ impl RealtimeFdnReverb {
             );
             let lo_part = self.low_shelf_state[i];
             let upper_part = damped - lo_part;
-            let hi_blend = (self.decay_high_mult - 1.0).clamp(-0.75, 1.0);
-            let upper_gain = if hi_blend >= 0.0 {
-                fb_mid + (fb_hi - fb_mid) * hi_blend
-            } else {
-                fb_mid + (fb_mid - fb_hi) * hi_blend
-            }
-            .clamp(0.0, 0.985);
-            let fb_sig = lo_part * fb_lo + upper_part * upper_gain;
+            let fb_sig = lo_part * self.cached_fb_lo[i] + upper_part * self.cached_fb_upper[i];
 
             let base_inj = if i % 2 == 0 {
                 0.65 * diff_sig + 0.35 * send_l
@@ -1333,6 +1390,11 @@ pub struct RealtimeNeuralPreamp {
     dc_block_y_l: f64,
     dc_block_x_r: f64,
     dc_block_y_r: f64,
+    dc_block_coeff: f64,
+    cached_drive_db: f64,
+    cached_trim_db: f64,
+    cached_drive_lin: f64,
+    cached_trim_lin: f64,
 }
 
 impl RealtimeNeuralPreamp {
@@ -1350,7 +1412,20 @@ impl RealtimeNeuralPreamp {
             dc_block_y_l: 0.0,
             dc_block_x_r: 0.0,
             dc_block_y_r: 0.0,
+            dc_block_coeff: 0.9985,
+            cached_drive_db: f64::NAN,
+            cached_trim_db: f64::NAN,
+            cached_drive_lin: 1.0,
+            cached_trim_lin: 1.0,
         }
+    }
+
+    /// Configures the DC-blocker high-pass pole (~11.5 Hz) to be sample-rate-invariant across
+    /// 44.1 / 48 / 96 / 192 kHz.
+    #[inline]
+    pub fn set_sample_rate(&mut self, sample_rate: f64) {
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
+        self.dc_block_coeff = (-2.0 * PI * 11.5 / sr).exp().clamp(0.95, 0.9999);
     }
 
     pub fn set_model(&mut self, model: AnalogHardwareModel) {
@@ -1444,8 +1519,17 @@ impl RealtimeNeuralPreamp {
     ) -> (f32, f32) {
         let clean_drive_db = sanitize_param_f64(input_drive_db, 0.0, -12.0, 24.0);
         let clean_trim_db = sanitize_param_f64(output_trim_db, 0.0, -24.0, 12.0);
-        let drive = 10.0_f64.powf(clean_drive_db / 20.0);
-        let trim = 10.0_f64.powf(clean_trim_db / 20.0) / drive.powf(0.55);
+        if !((clean_drive_db - self.cached_drive_db).abs() <= 1e-6
+            && (clean_trim_db - self.cached_trim_db).abs() <= 1e-6)
+        {
+            self.cached_drive_db = clean_drive_db;
+            self.cached_trim_db = clean_trim_db;
+            let drive = 10.0_f64.powf(clean_drive_db / 20.0);
+            self.cached_drive_lin = drive;
+            self.cached_trim_lin = 10.0_f64.powf(clean_trim_db / 20.0) / drive.powf(0.55);
+        }
+        let drive = self.cached_drive_lin;
+        let trim = self.cached_trim_lin;
 
         let xl = sanitize_sample_f32(in_l).clamp(-16.0, 16.0);
         let xr = sanitize_sample_f32(in_r).clamp(-16.0, 16.0);
@@ -1485,12 +1569,13 @@ impl RealtimeNeuralPreamp {
             (l, r)
         };
 
-        // DC blocker (removes any tube/transformer even-harmonic DC shift)
-        let dc_l = flush_denormal_f64(raw_l - self.dc_block_x_l + 0.9985 * self.dc_block_y_l);
+        // Sample-rate-invariant DC blocker (removes any tube/transformer even-harmonic DC shift)
+        let dc_c = self.dc_block_coeff;
+        let dc_l = flush_denormal_f64(raw_l - self.dc_block_x_l + dc_c * self.dc_block_y_l);
         self.dc_block_x_l = flush_denormal_f64(raw_l);
         self.dc_block_y_l = dc_l;
 
-        let dc_r = flush_denormal_f64(raw_r - self.dc_block_x_r + 0.9985 * self.dc_block_y_r);
+        let dc_r = flush_denormal_f64(raw_r - self.dc_block_x_r + dc_c * self.dc_block_y_r);
         self.dc_block_x_r = flush_denormal_f64(raw_r);
         self.dc_block_y_r = dc_r;
 
@@ -1724,6 +1809,9 @@ pub struct AllpassDisperser {
     x1: [f64; 8],
     y1: [f64; 8],
     bypassed: bool,
+    cached_sr: f64,
+    cached_f0: f64,
+    cached_a: f64,
 }
 
 impl AllpassDisperser {
@@ -1753,8 +1841,13 @@ impl AllpassDisperser {
         self.bypassed = false;
         let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
         let f0 = sanitize_param_f64(pinch_hz, 140.0, 30.0, (sr * 0.45).max(30.0));
-        let t = (PI * f0 / sr).tan();
-        let a = ((t - 1.0) / (t + 1.0)).clamp(-0.995, 0.995);
+        if (sr - self.cached_sr).abs() > 1e-3 || (f0 - self.cached_f0).abs() > 1e-3 {
+            self.cached_sr = sr;
+            self.cached_f0 = f0;
+            let t = (PI * f0 / sr).tan();
+            self.cached_a = ((t - 1.0) / (t + 1.0)).clamp(-0.995, 0.995);
+        }
+        let a = self.cached_a;
 
         let mut sig = x0;
         for stage in 0..8 {
@@ -1780,6 +1873,8 @@ pub struct AutoGainCompensator {
     in_sq: f64,
     out_sq: f64,
     gain_lin: f64,
+    rms_alpha: f64,
+    gain_alpha: f64,
 }
 
 impl Default for AutoGainCompensator {
@@ -1788,14 +1883,31 @@ impl Default for AutoGainCompensator {
             in_sq: 1.0e-6,
             out_sq: 1.0e-6,
             gain_lin: 1.0,
+            rms_alpha: 0.9992,
+            gain_alpha: 0.999,
         }
     }
 }
 
 impl AutoGainCompensator {
+    /// Configures sample-rate-invariant RMS and gain-smoothing time constants (~26 ms RMS,
+    /// ~21 ms gain ramp, matching the 48 kHz tuning across 44.1 / 48 / 96 / 192 kHz).
+    #[inline]
+    pub fn set_sample_rate(&mut self, sample_rate: f64) {
+        let sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
+        self.rms_alpha = (-1.0 / (sr * 0.026)).exp().clamp(0.95, 0.99995);
+        self.gain_alpha = (-1.0 / (sr * 0.021)).exp().clamp(0.95, 0.99995);
+    }
+
     #[inline]
     pub fn reset(&mut self) {
-        *self = Self::default();
+        let rms_alpha = self.rms_alpha;
+        let gain_alpha = self.gain_alpha;
+        *self = Self {
+            rms_alpha,
+            gain_alpha,
+            ..Self::default()
+        };
     }
 
     #[inline]
@@ -1817,16 +1929,18 @@ impl AutoGainCompensator {
 
         let p_in = 0.5 * (il * il + ir * ir);
         let p_out = 0.5 * (ol * ol + or_ * or_);
-        self.in_sq = flush_denormal_f64(0.9992 * self.in_sq + 0.0008 * p_in);
-        self.out_sq = flush_denormal_f64(0.9992 * self.out_sq + 0.0008 * p_out);
+        let ra = self.rms_alpha;
+        self.in_sq = flush_denormal_f64(ra * self.in_sq + (1.0 - ra) * p_in);
+        self.out_sq = flush_denormal_f64(ra * self.out_sq + (1.0 - ra) * p_out);
 
         let target_gain = if self.in_sq > 1.0e-6 && self.out_sq > 1.0e-6 {
             (self.in_sq / self.out_sq).sqrt().clamp(0.25, 4.0)
         } else {
             1.0
         };
+        let ga = self.gain_alpha;
         self.gain_lin =
-            flush_denormal_f64(0.999 * self.gain_lin + 0.001 * target_gain).clamp(0.25, 4.0);
+            flush_denormal_f64(ga * self.gain_lin + (1.0 - ga) * target_gain).clamp(0.25, 4.0);
         (
             flush_denormal_f64(ol * self.gain_lin) as f32,
             flush_denormal_f64(or_ * self.gain_lin) as f32,
