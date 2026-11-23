@@ -432,11 +432,13 @@ fn is_unvoiced_sibilant_frame(ch: &[f64], center: usize, half_win: usize, sr: f6
     let mut diff_energy = 0.0_f64;
     let slice = &ch[start..end];
     for w in slice.windows(2) {
-        if (w[0] >= 0.0) != (w[1] >= 0.0) {
+        let a = if w[0].is_finite() { w[0] } else { 0.0 };
+        let b = if w[1].is_finite() { w[1] } else { 0.0 };
+        if (a >= 0.0) != (b >= 0.0) {
             zc += 1;
         }
-        energy += w[0] * w[0];
-        let d = w[1] - w[0];
+        energy += a * a;
+        let d = b - a;
         diff_energy += d * d;
     }
     if energy < 1e-9 {
@@ -559,8 +561,13 @@ pub fn shift_vocal_pitch_formant_preserved(
         for (i, sample_out) in out_ch.iter_mut().enumerate() {
             let t = (i as f64) / sr;
             if i % sib_stride == 0 {
-                let target_sib = is_unvoiced_sibilant_frame(ch, i, sibilant_half_win, sr);
-                sibilant_env = sibilant_env * sib_alpha + target_sib * (1.0 - sib_alpha);
+                let raw_sib = is_unvoiced_sibilant_frame(ch, i, sibilant_half_win, sr);
+                let clean_sib = if raw_sib.is_finite() {
+                    raw_sib.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                sibilant_env = sibilant_env * sib_alpha + clean_sib * (1.0 - sib_alpha);
             }
 
             let raw_semi = forge_dsp::sanitize_param_f64(interp_shift(t), 0.0, -24.0, 24.0);
@@ -1221,5 +1228,29 @@ mod tests {
         .unwrap();
         assert_eq!(mixed.num_frames(), frames);
         assert!(mixed.channels[0].iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn test_nan_sample_does_not_poison_sibilant_envelope_or_rest_of_track() {
+        let sr = 48_000_u32;
+        let frames = 4096_usize;
+        let mut ch: Vec<f64> = (0..frames)
+            .map(|i| 0.35 * (2.0 * PI * 220.0 * (i as f64) / f64::from(sr)).sin())
+            .collect();
+        ch[128] = f64::NAN;
+        let buf = AudioBuffer::from_channels(vec![ch], sr).unwrap();
+        let shifted =
+            shift_vocal_pitch_formant_preserved(&buf, &[(0.0, 3.0), (0.1, 3.0)], 0.5).unwrap();
+        assert!(shifted.channels[0].iter().all(|s| s.is_finite()));
+        let tail_rms = (shifted.channels[0][2048..]
+            .iter()
+            .map(|s| s * s)
+            .sum::<f64>()
+            / 2048.0)
+            .sqrt();
+        assert!(
+            tail_rms > 0.05,
+            "trailing voiced audio was silenced or poisoned after NaN (tail_rms={tail_rms})"
+        );
     }
 }

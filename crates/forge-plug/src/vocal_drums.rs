@@ -10,6 +10,7 @@ pub struct ForgeVocalSurgicalPlug {
     telemetry: Arc<GuiTelemetry>,
     analyzer: RealtimeSpectrumAnalyzer32,
     dsp: RealtimeVocalSurgical,
+    sample_rate: f64,
 }
 
 #[derive(Params)]
@@ -100,6 +101,7 @@ impl Default for ForgeVocalSurgicalPlug {
             telemetry: Arc::new(GuiTelemetry::default()),
             analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
             dsp: RealtimeVocalSurgical::new(48_000.0),
+            sample_rate: 48_000.0,
         }
     }
 }
@@ -183,12 +185,14 @@ impl Plugin for ForgeVocalSurgicalPlug {
         _context: &mut impl InitContext<Self>,
     ) -> bool {
         let sr = f64::from(buffer_config.sample_rate);
+        self.sample_rate = sr;
         self.dsp.reset(sr);
         self.analyzer.reset(sr);
         true
     }
 
     fn reset(&mut self) {
+        self.dsp.reset(self.sample_rate);
         self.analyzer.clear_state();
     }
 
@@ -268,6 +272,7 @@ pub struct ForgeDrumTriggerPlug {
     /// Set by `reset`; the next block starts by releasing every generated note.
     release_pending: bool,
     was_playing: bool,
+    sample_rate: f64,
 }
 
 #[derive(Params)]
@@ -309,6 +314,7 @@ impl Default for ForgeDrumTriggerPlug {
             notes: DrumTriggerNotes::new(48_000.0),
             release_pending: false,
             was_playing: false,
+            sample_rate: 48_000.0,
         }
     }
 }
@@ -386,6 +392,7 @@ impl Plugin for ForgeDrumTriggerPlug {
         _context: &mut impl InitContext<Self>,
     ) -> bool {
         let sr = f64::from(buffer_config.sample_rate);
+        self.sample_rate = sr;
         self.dsp.reset(sr);
         self.analyzer.reset(sr);
         self.notes.set_sample_rate(sr);
@@ -394,6 +401,8 @@ impl Plugin for ForgeDrumTriggerPlug {
 
     /// Notes cannot be sent from here, so held notes are released at the start of the next block.
     fn reset(&mut self) {
+        self.dsp.reset(self.sample_rate);
+        self.notes.set_sample_rate(self.sample_rate);
         self.release_pending = true;
         self.analyzer.clear_state();
     }

@@ -10,6 +10,7 @@ pub struct ForgeSplitEqPlug {
     telemetry: Arc<GuiTelemetry>,
     analyzer: RealtimeSpectrumAnalyzer32,
     dsp: RealtimeTransientTonalSplit,
+    sample_rate: f64,
 }
 
 #[derive(Params)]
@@ -64,6 +65,7 @@ impl Default for ForgeSplitEqPlug {
             telemetry: Arc::new(GuiTelemetry::default()),
             analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
             dsp: RealtimeTransientTonalSplit::new(48_000.0),
+            sample_rate: 48_000.0,
         }
     }
 }
@@ -167,12 +169,14 @@ impl Plugin for ForgeSplitEqPlug {
         _context: &mut impl InitContext<Self>,
     ) -> bool {
         let sr = f64::from(buffer_config.sample_rate);
+        self.sample_rate = sr;
         self.dsp.reset(sr);
         self.analyzer.reset(sr);
         true
     }
 
     fn reset(&mut self) {
+        self.dsp.reset(self.sample_rate);
         self.analyzer.clear_state();
     }
 
@@ -258,6 +262,7 @@ pub struct ForgeDensityClipperPlug {
     telemetry: Arc<GuiTelemetry>,
     analyzer: RealtimeSpectrumAnalyzer32,
     dsp: RealtimeDensityAndClipper,
+    sample_rate: f64,
 }
 
 #[derive(Params)]
@@ -315,6 +320,7 @@ impl Default for ForgeDensityClipperPlug {
             telemetry: Arc::new(GuiTelemetry::default()),
             analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
             dsp: RealtimeDensityAndClipper::new(48_000.0),
+            sample_rate: 48_000.0,
         }
     }
 }
@@ -394,12 +400,14 @@ impl Plugin for ForgeDensityClipperPlug {
         _context: &mut impl InitContext<Self>,
     ) -> bool {
         let sr = f64::from(buffer_config.sample_rate);
+        self.sample_rate = sr;
         self.dsp = RealtimeDensityAndClipper::new(sr);
         self.analyzer.reset(sr);
         true
     }
 
     fn reset(&mut self) {
+        self.dsp.reset(self.sample_rate);
         self.analyzer.clear_state();
     }
 

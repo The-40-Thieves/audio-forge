@@ -21,6 +21,7 @@ import array
 import json
 import sys
 import wave
+from collections.abc import Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 
@@ -367,7 +368,7 @@ def run_separate(
     except ImportError as exc:
         raise RuntimeError(
             "audio-separator is not installed in the worker venv. "
-            "Run: uv pip install 'audio-separator[gpu]'"
+            "Run: uv sync --project python-worker --extra gpu (or omit --extra gpu for CPU)"
         ) from exc
 
     sep = Separator(output_dir=str(resolved_output), output_format="WAV")
@@ -537,7 +538,7 @@ def run_transcribe(input_path: Path, output_dir: Path) -> dict[str, str]:
     except ImportError as exc:
         raise RuntimeError(
             "basic-pitch is not installed in the worker venv. "
-            "Run: uv pip install basic-pitch"
+            "Run: uv sync --project python-worker"
         ) from exc
 
     _model_output, midi_data, _note_events = predict(str(resolved_input))
@@ -625,7 +626,8 @@ def run_denoise(
             if backend == "deepfilternet":
                 raise RuntimeError(
                     "deepfilternet failed or is not installed in the worker venv. "
-                    "Run: uv pip install deepfilternet"
+                    "DeepFilterNet3 pins numpy<2; run it isolated via "
+                    "`uv run --with deepfilternet` or use --backend auto/mel-band-roformer."
                 ) from exc
 
     try:
@@ -773,6 +775,7 @@ def main() -> int:
 
     args = parser.parse_args()
     try:
+        res: Mapping[str, str | None]
         if args.command == "separate":
             all_on = bool(args.all_stems)
             res = run_separate(

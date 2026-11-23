@@ -2,11 +2,23 @@
 **/*.rs.bk
 *.pdb
 .env
+.env.*
+!.env.example
 .venv/
 __pycache__/
 *.pyc
 /outputs/
 /tmp/
+*.pem
+*.key
+*credentials*.json
+*service-account*.json
+.entire/settings.local.json
+.claude/state/
+.claude/settings.local.json
+stems_export/
+.DS_Store
+Thumbs.db
 
 # graphify knowledge-graph output (regenerate with /graphify)
 graphify-out/

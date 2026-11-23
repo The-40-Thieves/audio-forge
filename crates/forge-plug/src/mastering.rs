@@ -10,6 +10,7 @@ pub struct ForgeSubAndTapePlug {
     telemetry: Arc<GuiTelemetry>,
     analyzer: RealtimeSpectrumAnalyzer32,
     dsp: RealtimeSubAndTapeBus,
+    sample_rate: f64,
 }
 
 #[derive(Params)]
@@ -72,6 +73,7 @@ impl Default for ForgeSubAndTapePlug {
             telemetry: Arc::new(GuiTelemetry::default()),
             analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
             dsp: RealtimeSubAndTapeBus::new(48_000.0, 160.0),
+            sample_rate: 48_000.0,
         }
     }
 }
@@ -149,12 +151,14 @@ impl Plugin for ForgeSubAndTapePlug {
         _context: &mut impl InitContext<Self>,
     ) -> bool {
         let sr = f64::from(buffer_config.sample_rate);
+        self.sample_rate = sr;
         self.dsp = RealtimeSubAndTapeBus::new(sr, f64::from(self.params.mono_cutoff_hz.value()));
         self.analyzer.reset(sr);
         true
     }
 
     fn reset(&mut self) {
+        self.dsp.reset(self.sample_rate);
         self.analyzer.clear_state();
     }
 

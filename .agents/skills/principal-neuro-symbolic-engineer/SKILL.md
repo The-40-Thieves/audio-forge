@@ -9,16 +9,16 @@ Activate this skill whenever designing, modifying, or verifying DSP kernels, VST
 
 ## 1. Non-Negotiable Real-Time Audio & Numerical Invariants
 1. **Zero Audio-Thread Heap Allocations:** All `Realtime*` processors in `forge-dsp` and `forge-vocal` must pre-allocate buffers in `new(sample_rate)` and perform zero heap allocations in `process_stereo_sample()`.
-2. **State-Poisoning Immunity (`sanitize_sample` & `flush_denormal`):**
-   - Never allow `f32::NAN`, `f32::INFINITY`, or `f32::NEG_INFINITY` inputs or parameter values to enter recursive filter states (`Biquad::z1/z2`, `AdaaTanh::x_prev/f1_prev`, envelope followers, or FDN delay lines).
+2. **State-Poisoning Immunity (`sanitize_sample_f64`, `sanitize_param_f64` & `flush_denormal_f64`):**
+   - Never allow `f32::NAN`, `f32::INFINITY`, or `f32::NEG_INFINITY` inputs or parameter values to enter recursive filter states (`Biquad::z1/z2`, `AdaaTanh::x_prev/f1_prev`, envelope followers, or FDN delay lines). Use `sanitize_sample_f64` for signal samples and `sanitize_param_f64` for control parameters.
    - Flush subnormal floating-point values (`|x| < 1e-30 -> 0.0`) inside feedback loops to prevent 10x–50x x86/ARM denormal CPU spikes during silence decay.
 3. **Safe Clamping & Overflow Prevention:**
-   - Never call `x.clamp(min, max)` with dynamic bounds unless `min <= max` is guaranteed (use `sanitize_clamp(x, min, max)`).
+   - Never call `x.clamp(min, max)` with dynamic bounds unless `min <= max` is guaranteed (use `sanitize_param_f64` or explicit `min <= max` invariants).
    - Promote `f32` stereo inputs to `f64` *before* summing (`0.5 * (f64::from(l) + f64::from(r))`) to prevent `f32` addition overflow.
 
 ## 2. Mandatory Verification Gate
 ```powershell
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --release
-& "E:\Developer Box\Scripts\gitleaks.exe" detect --source . --no-git
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+gitleaks detect --source . --no-git
 ```

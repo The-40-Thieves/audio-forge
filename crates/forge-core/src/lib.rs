@@ -231,10 +231,17 @@ impl AudioBuffer {
     }
 }
 
+/// Maximum supported WAV channel count for native decoding.
+pub const MAX_WAV_CHANNELS: usize = 64;
+/// Maximum total decoded samples across all channels (~2 GiB as `f64`).
+pub const MAX_AUDIO_SAMPLES: usize = 256 * 1024 * 1024;
+const MAX_INITIAL_FRAME_RESERVE: usize = 65_536;
+
 /// Splits interleaved `samples` into `ch_count` planar channels of equal length.
 ///
-/// Returns [`ForgeError::AudioIo`] for a decode error, or when the sample count is not a whole
-/// number of frames, so a truncated last frame can never produce ragged channels.
+/// Returns [`ForgeError::AudioIo`] for a decode error, invalid/oversized channel counts or sample
+/// totals, or when the sample count is not a whole number of frames, so a truncated last frame can
+/// never produce ragged channels and a crafted header cannot trigger an OOM abort.
 pub(crate) fn deinterleave_whole_frames<I>(
     samples: I,
     ch_count: usize,
@@ -247,11 +254,20 @@ where
         path: origin.to_string(),
         message,
     };
-    let ch_count = ch_count.max(1);
-    let frames_hint = samples.size_hint().0 / ch_count;
+    if ch_count == 0 || ch_count > MAX_WAV_CHANNELS {
+        return Err(io_error(format!(
+            "Unsupported WAV channel count: {ch_count} (supported 1..={MAX_WAV_CHANNELS})"
+        )));
+    }
+    let frames_hint = (samples.size_hint().0 / ch_count).min(MAX_INITIAL_FRAME_RESERVE);
     let mut channels = vec![Vec::with_capacity(frames_hint); ch_count];
     let mut total = 0_usize;
     for (idx, sample) in samples.enumerate() {
+        if idx >= MAX_AUDIO_SAMPLES {
+            return Err(io_error(format!(
+                "WAV exceeds maximum decoded sample limit ({MAX_AUDIO_SAMPLES} samples)"
+            )));
+        }
         let val = sample.map_err(|e| io_error(e.to_string()))?;
         channels[idx % ch_count].push(val);
         total = idx + 1;
@@ -342,6 +358,38 @@ pub struct StemBundle {
     pub bass_midi: Option<PathBuf>,
     pub melody_midi: Option<PathBuf>,
     pub abc_score: Option<String>,
+}
+
+impl StemBundle {
+    /// Returns every audio stem slot paired with its human-readable label.
+    #[must_use]
+    pub const fn audio_stems(&self) -> [(&'static str, &Option<PathBuf>); 23] {
+        [
+            ("Vocals", &self.vocals),
+            ("Lead Vocals", &self.lead_vocals),
+            ("Backing Vocals", &self.backing_vocals),
+            ("Male Vocals", &self.male_vocals),
+            ("Female Vocals", &self.female_vocals),
+            ("Vocal Reverb", &self.vocal_reverb),
+            ("Drums", &self.drums),
+            ("Bass", &self.bass),
+            ("Guitar", &self.guitar),
+            ("Electric Guitar", &self.electric_guitar),
+            ("Acoustic Guitar", &self.acoustic_guitar),
+            ("Keys", &self.keys),
+            ("Strings", &self.strings),
+            ("Brass", &self.brass),
+            ("Wind", &self.wind),
+            ("Synth", &self.synth),
+            ("Crowd", &self.crowd),
+            ("Other", &self.other),
+            ("Kick", &self.kick),
+            ("Snare", &self.snare),
+            ("Toms", &self.toms),
+            ("Hi-Hat", &self.hihat),
+            ("Cymbals", &self.cymbals),
+        ]
+    }
 }
 
 #[cfg(test)]
@@ -501,5 +549,15 @@ mod tests {
             channels,
             vec![vec![0.1, 0.4], vec![0.2, 0.5], vec![0.3, 0.6]]
         );
+    }
+
+    #[test]
+    fn load_wav_rejects_oversized_data_len_header_and_excessive_channels() {
+        // 44-byte WAV claiming ~4 GiB payload must fail cleanly instead of OOM-aborting.
+        let huge = pcm16_wav_bytes(1, 0xFFFF_FFF0, &[]);
+        assert_load_wav_rejects(&huge, "Failed to read enough bytes");
+
+        let many_ch = pcm16_wav_bytes(65, 0, &[]);
+        assert_load_wav_rejects(&many_ch, "Unsupported WAV channel count");
     }
 }

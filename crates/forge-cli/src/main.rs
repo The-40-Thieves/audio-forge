@@ -197,9 +197,9 @@ enum Commands {
         /// Stereo channel link (0.0 = dual-mono, 1.0 = linked stereo)
         #[arg(long, default_value_t = 1.0)]
         channel_link: f64,
-        /// Mastering output dither (`none`, `tpdf`, `noise-shaped`)
-        #[arg(long, default_value = "none")]
-        dither: String,
+        /// Mastering output dither (`none`, `tpdf`, `noise-shaped`); omit for default 24-bit WAV TPDF
+        #[arg(long)]
+        dither: Option<String>,
         /// Bit depth for dithering (8..=24, typically 16 or 24)
         #[arg(long, default_value_t = 24)]
         dither_bits: u16,
@@ -730,7 +730,14 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 anyhow::bail!("--channel-link ({channel_link}) must be finite and in 0.0..=1.0");
             }
             options.channel_link = channel_link;
-            options.dither = match dither.trim().to_ascii_lowercase().as_str() {
+            let explicit_dither = dither.is_some();
+            options.dither = match dither
+                .as_deref()
+                .unwrap_or("none")
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
                 "none" => DitherMode::None,
                 "tpdf" => DitherMode::Tpdf,
                 "noise-shaped" | "noise_shaped" | "shaped" => DitherMode::NoiseShapedHighPass,
@@ -753,6 +760,8 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             if options.dither != DitherMode::None {
                 let pcm_bits = if options.dither_bits <= 16 { 16 } else { 24 };
                 master.save_wav_no_dither(&output, pcm_bits)?;
+            } else if explicit_dither {
+                master.save_wav_no_dither(&output, 24)?;
             } else {
                 master.save_wav(&output, 24)?;
             }

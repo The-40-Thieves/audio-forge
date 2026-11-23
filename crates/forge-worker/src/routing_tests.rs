@@ -188,7 +188,13 @@ fn require_neural_fails_instead_of_falling_back_to_dsp() {
     let msg = err.to_string();
     assert!(msg.contains("local_gpu failed"), "{msg}");
     assert!(msg.contains("remote_colab skipped"), "{msg}");
-    assert!(!stems.join("vocals.wav").exists(), "DSP stems were written");
+    if stems.exists() {
+        assert_eq!(
+            std::fs::read_dir(&stems).unwrap().count(),
+            0,
+            "DSP fallback unexpectedly wrote stem files"
+        );
+    }
 
     let mut dsp_only = config(WorkerBackend::PureRustDsp);
     dsp_only.require_neural = true;

@@ -121,7 +121,8 @@ fn other_realtime_processors_do_not_allocate() {
     let mut eq = RealtimeMasteringEq18::new(48_000.0);
     let mut phase = RealtimePhaseAligner::new(48_000.0);
     let mut drums = RealtimeDrumTrigger::new(48_000.0);
-    assert_no_allocs("vocal/tape/eq/phase/drum processors", || {
+    let mut split = forge_dsp::RealtimeTransientTonalSplit::new(48_000.0);
+    assert_no_allocs("vocal/tape/eq/phase/drum/split processors", || {
         for i in 0..FRAMES {
             let (l, r) = signal(i);
             std::hint::black_box(vocal.process_stereo_sample(l, r, 0.5, 0.5, -24.0, -60.0));
@@ -129,10 +130,19 @@ fn other_realtime_processors_do_not_allocate() {
             std::hint::black_box(eq.process_stereo_sample(l, r));
             std::hint::black_box(phase.process_stereo_sample(l, r));
             std::hint::black_box(drums.process_stereo_sample(l, r, -30.0));
+            std::hint::black_box(split.process_stereo_sample(
+                l,
+                r,
+                [1.5, 0.0, -1.5],
+                [-1.0, 0.5, 1.0],
+                1.5,
+                0,
+            ));
         }
         vocal.reset(96_000.0);
         tape.reset(96_000.0);
         drums.reset(96_000.0);
+        split.reset(96_000.0);
     });
 }
 

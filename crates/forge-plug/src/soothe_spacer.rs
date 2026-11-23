@@ -13,6 +13,8 @@ pub struct ForgeOpenSoothePlug {
     limiter_dsp: RealtimeMasterLimiter,
     /// Host sample rate from the last `initialize`, reused by `reset` (which gets none).
     sample_rate: f64,
+    /// Last latency sample count reported to the host so `process` can update PDC on toggle.
+    last_reported_latency: u32,
     /// Shared-bus slot this instance last published to, cleared when it changes or on drop.
     published_slot: Option<usize>,
     /// This instance's identity on the shared bus, so its clears never empty a slot another
@@ -212,13 +214,17 @@ impl Default for OpenSootheParams {
 
 impl Default for ForgeOpenSoothePlug {
     fn default() -> Self {
+        let dsp = RealtimeOpenSoothe::new(48_000.0);
+        let limiter_dsp = RealtimeMasterLimiter::new(48_000.0);
+        let last_reported_latency = dsp.latency_samples() + limiter_dsp.latency_samples();
         Self {
             params: Arc::new(OpenSootheParams::default()),
             telemetry: Arc::new(GuiTelemetry::default()),
-            dsp: RealtimeOpenSoothe::new(48_000.0),
+            dsp,
             sub_tape_dsp: RealtimeSubAndTapeBus::new(48_000.0, 160.0),
-            limiter_dsp: RealtimeMasterLimiter::new(48_000.0),
+            limiter_dsp,
             sample_rate: 48_000.0,
+            last_reported_latency,
             published_slot: None,
             bus_owner: SpectrumBusOwner::unique(),
         }
@@ -349,7 +355,7 @@ impl Plugin for ForgeOpenSoothePlug {
                         ("bus_slot", ParamRef::Int(&params.shared_bus_slot)),
                         ("tilt", ParamRef::Float(&params.tilt_db_per_oct)),
                         ("slink", ParamRef::Float(&params.stereo_link)),
-                        ("ms", ParamRef::Float(&params.mid_side_balance)),
+                        ("msbal", ParamRef::Float(&params.mid_side_balance)),
                         ("lowlat", ParamRef::Bool(&params.low_latency_mode)),
                         ("atk", ParamRef::Float(&params.attack_ms)),
                         ("rel", ParamRef::Float(&params.release_ms)),
@@ -465,7 +471,9 @@ impl Plugin for ForgeOpenSoothePlug {
         self.dsp
             .set_low_latency(self.params.low_latency_mode.value());
         self.reset();
-        context.set_latency_samples(self.latency_samples());
+        let latency = self.latency_samples();
+        self.last_reported_latency = latency;
+        context.set_latency_samples(latency);
         true
     }
 
@@ -481,10 +489,15 @@ impl Plugin for ForgeOpenSoothePlug {
         &mut self,
         buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
-        _context: &mut impl ProcessContext<Self>,
+        context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         let low_lat = self.params.low_latency_mode.value();
         self.dsp.set_low_latency(low_lat);
+        let latency = self.latency_samples();
+        if latency != self.last_reported_latency {
+            self.last_reported_latency = latency;
+            context.set_latency_samples(latency);
+        }
         let sharp = self.params.sharpness_bins.value() as usize;
         let delta = self.params.delta_listen.value();
         let use_sub_tape = self.params.enable_sub_tape.value();
@@ -591,6 +604,7 @@ pub struct ForgeOpenSpacerPlug {
     telemetry: Arc<GuiTelemetry>,
     analyzer: RealtimeSpectrumAnalyzer32,
     dsp: RealtimeOpenSpacer,
+    sample_rate: f64,
 }
 
 #[derive(Params)]
@@ -678,6 +692,7 @@ impl Default for ForgeOpenSpacerPlug {
             telemetry: Arc::new(GuiTelemetry::default()),
             analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
             dsp: RealtimeOpenSpacer::new(48_000.0),
+            sample_rate: 48_000.0,
         }
     }
 }
@@ -726,6 +741,8 @@ impl Plugin for ForgeOpenSpacerPlug {
                         ("lowhz", ParamRef::Float(&params.low_hz)),
                         ("highhz", ParamRef::Float(&params.high_hz)),
                         ("kickmode", ParamRef::Bool(&params.kick_bass_mode)),
+                        ("delta", ParamRef::Bool(&params.delta_listen)),
+                        ("msbal", ParamRef::Float(&params.mid_side_balance)),
                     ];
                     draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, OPENSPACER_PRESETS);
                     egui::Grid::new("openspacer_grid")
@@ -766,6 +783,7 @@ impl Plugin for ForgeOpenSpacerPlug {
         context: &mut impl InitContext<Self>,
     ) -> bool {
         let sr = f64::from(buffer_config.sample_rate);
+        self.sample_rate = sr;
         self.dsp.reset(sr);
         self.analyzer.reset(sr);
         context.set_latency_samples(self.dsp.latency_samples());
@@ -773,6 +791,7 @@ impl Plugin for ForgeOpenSpacerPlug {
     }
 
     fn reset(&mut self) {
+        self.dsp.reset(self.sample_rate);
         self.analyzer.clear_state();
     }
 

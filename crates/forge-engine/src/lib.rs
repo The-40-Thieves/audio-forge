@@ -237,10 +237,10 @@ mod tests {
         assert!(report.true_peak_dbtp <= -0.9);
         assert!(report.integrated_lufs.is_finite());
 
-        // Verify reverb tail extended the bounced WAV beyond 1 second!
+        // Verify reverb tail extended the bounced WAV more than 1 second beyond clip end.
         let bounced = AudioBuffer::load(&out_wav).unwrap();
         assert!(
-            bounced.num_frames() > frames + (sr as usize / 2),
+            bounced.num_frames() > frames + (sr as usize),
             "bounce_to_wav should preserve reverb decay tail beyond clip end"
         );
     }
@@ -437,20 +437,64 @@ mod tests {
 
     #[test]
     fn adversarial_forgeproj_json_never_panics_and_sanitizes_bounds() {
-        let bad = [
+        for raw in [
             "",
             "{",
             "[]",
             r#"{"schema_version": 999}"#,
-            r#"{"name": "BadSR", "sample_rate": 0, "bpm": 0.0, "time_sig_num": 0, "time_sig_den": 0}"#,
-            r#"{"name": "Inf", "sample_rate": 48000, "bpm": -999.0, "master_gain_db": 99999.0, "tracks": []}"#,
-        ];
-        for raw in bad {
-            if let Ok(proj) = DawProject::from_json(raw) {
-                assert!(proj.sample_rate >= 8_000);
-                assert!(proj.bpm.is_finite() && proj.bpm >= 30.0);
-                assert!(proj.time_sig_num >= 1 && proj.time_sig_den >= 1);
-            }
+            r#"{"name": "MissingSchema", "sample_rate": 0}"#,
+        ] {
+            assert!(
+                DawProject::from_json(raw).is_err(),
+                "malformed/unsupported JSON {raw:?} should fail cleanly"
+            );
         }
+
+        // Case 1: out-of-range sample rate, zero BPM, and zero time signature must clamp safely.
+        let mut case1 = serde_json::to_value(DawProject::new("BadSR", 48_000, 120.0)).unwrap();
+        case1["sample_rate"] = serde_json::json!(0);
+        case1["bpm"] = serde_json::json!(0.0);
+        case1["time_sig_num"] = serde_json::json!(0);
+        case1["time_sig_den"] = serde_json::json!(0);
+        let proj1 = DawProject::from_json(&serde_json::to_string(&case1).unwrap())
+            .expect("sanitized JSON should load");
+        assert!(proj1.sample_rate >= 8_000);
+        assert!(proj1.bpm.is_finite() && proj1.bpm >= 30.0);
+        assert!(proj1.time_sig_num >= 1);
+        assert!(proj1.time_sig_den >= 1);
+
+        // Case 2: negative BPM, extreme master gain, and empty track list must sanitize cleanly.
+        let mut case2 = serde_json::to_value(DawProject::new("Inf", 48_000, 120.0)).unwrap();
+        case2["bpm"] = serde_json::json!(-999.0);
+        case2["master_gain_db"] = serde_json::json!(99999.0);
+        case2["tracks"] = serde_json::json!([]);
+        let proj2 = DawProject::from_json(&serde_json::to_string(&case2).unwrap())
+            .expect("sanitized JSON should load");
+        assert!(proj2.bpm.is_finite() && proj2.bpm >= 30.0);
+        assert!(proj2.master_gain_db.is_finite() && (-60.0..=12.0).contains(&proj2.master_gain_db));
+
+        // Serialized excessive send level must sanitize without panic.
+        let mut p = DawProject::new("RoundTripBounds", 48_000, 120.0);
+        let bus_id = p.add_aux_bus("Plate");
+        p.tracks[0].sends.push(TrackSend {
+            bus_id,
+            gain_db: 120.0,
+            pre_fader: false,
+            mute: false,
+        });
+        let round_trip = DawProject::from_json(&p.to_json().unwrap()).unwrap();
+        assert!(round_trip.tracks[0].sends[0].gain_db <= 12.0);
+
+        // Oversized timeline (> MAX_PROJECT_DURATION_SECS) must return Err.
+        let mut huge = DawProject::new("Huge", 48_000, 120.0);
+        huge.add_track("Long");
+        let mut obj = AudioObject::new(1, "LongClip", PathBuf::from("x.wav"), u64::MAX / 2);
+        obj.timeline_start_samples = 48_000 * 100_000;
+        huge.tracks[0].objects.push(obj);
+        assert!(DawProject::from_json(&huge.to_json().unwrap()).is_err());
+
+        // Oversized JSON payload (> 16 MiB) must fail fast before serde parsing.
+        let oversized = format!(r#"{{"name":"{}"}}"#, "a".repeat(17 * 1024 * 1024));
+        assert!(DawProject::from_json(&oversized).is_err());
     }
 }

@@ -48,8 +48,11 @@ impl AudioBuffer {
         if spec.sample_rate == 0 {
             return Err(audio_io(origin, "WAV header reports 0 Hz sample rate"));
         }
-        if spec.channels == 0 {
-            return Err(audio_io(origin, "WAV header reports 0 channels"));
+        if spec.channels == 0 || usize::from(spec.channels) > crate::MAX_WAV_CHANNELS {
+            return Err(audio_io(
+                origin,
+                format!("Unsupported WAV channel count: {}", spec.channels),
+            ));
         }
         let ch_count = usize::from(spec.channels);
 
@@ -162,19 +165,40 @@ fn has_wav_extension(name: &Path) -> bool {
 const MAX_FFMPEG_INPUT_BYTES: u64 = 512 * 1024 * 1024;
 const FFMPEG_DECODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Copies `reader` into a temporary file named with `name`'s extension (FFmpeg probes it),
-/// decodes that to 32-bit float WAV with FFmpeg (bounded size, protocol whitelist, and timeout),
-/// and loads the result.
+/// Maps a filename extension to a strict non-playlist FFmpeg demuxer name so
+/// auto-probing cannot treat disguised `#EXTM3U` playlists as `hls`/`concat` inputs.
+fn ffmpeg_demuxer_for_extension(name: &Path) -> Option<(&'static str, &'static str)> {
+    let ext = name
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "wav" => Some(("wav", ".wav")),
+        "flac" => Some(("flac", ".flac")),
+        "mp3" => Some(("mp3", ".mp3")),
+        "ogg" | "oga" | "opus" => Some(("ogg", ".ogg")),
+        "m4a" | "mp4" | "mov" => Some(("mov", ".m4a")),
+        "aac" => Some(("aac", ".aac")),
+        "aif" | "aiff" => Some(("aiff", ".aiff")),
+        "webm" | "mka" | "mkv" => Some(("matroska", ".mkv")),
+        _ => None,
+    }
+}
+
+/// Copies `reader` into a temporary file named with `name`'s sanitized extension,
+/// decodes that to 32-bit float WAV with FFmpeg (explicit non-playlist demuxer,
+/// bounded output size/duration, protocol whitelist, and timeout), and loads the result.
 fn decode_with_ffmpeg<R: Read>(reader: &mut R, name: &Path) -> Result<AudioBuffer> {
     let origin = name.display().to_string();
-    let suffix = name
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| format!(".{e}"))
-        .unwrap_or_default();
+    let (demuxer, safe_suffix) = ffmpeg_demuxer_for_extension(name).ok_or_else(|| {
+        audio_io(
+            &origin,
+            "Unsupported audio format extension (playlist and unknown containers are rejected)",
+        )
+    })?;
     let mut source = tempfile::Builder::new()
         .prefix("forge_source_")
-        .suffix(&suffix)
+        .suffix(safe_suffix)
         .tempfile()?;
     let copied = io::copy(
         &mut reader.take(MAX_FFMPEG_INPUT_BYTES + 1),
@@ -199,9 +223,15 @@ fn decode_with_ffmpeg<R: Read>(reader: &mut R, name: &Path) -> Result<AudioBuffe
             "error",
             "-protocol_whitelist",
             "file,pipe",
+            "-f",
+            demuxer,
             "-y",
             "-i",
             &source.path().to_string_lossy(),
+            "-t",
+            "7200",
+            "-fs",
+            "536870912",
             "-c:a",
             "pcm_f32le",
             &decoded.path().to_string_lossy(),
@@ -456,5 +486,17 @@ mod tests {
                 .collect();
             assert_eq!(decoded, codes, "codes changed for {bits}-bit no-dither WAV");
         }
+    }
+
+    #[test]
+    fn load_from_reader_rejects_playlist_extensions_before_ffmpeg() {
+        let playlist = Cursor::new(b"#EXTM3U\n#EXTINF:1,secret\n/etc/passwd\n".to_vec());
+        let err = AudioBuffer::load_from_reader(playlist, Path::new("evil.m3u8"))
+            .expect_err("playlist extension must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Unsupported audio format extension"),
+            "{err}"
+        );
     }
 }

@@ -17,7 +17,7 @@ updates:
       actions:
         patterns: ["*"]
 
-  - package-ecosystem: pip
+  - package-ecosystem: uv
     directory: "/python-worker"
     schedule:
       interval: monthly
