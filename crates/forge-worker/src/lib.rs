@@ -93,9 +93,9 @@ pub async fn generate_music_lyria(
     if let Some(parent) = output_audio_path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)?;
+        tokio::fs::create_dir_all(parent).await?;
     }
-    std::fs::write(output_audio_path, &audio_bytes)?;
+    tokio::fs::write(output_audio_path, &audio_bytes).await?;
 
     let lyrics = body_json
         .pointer("/output_text")
