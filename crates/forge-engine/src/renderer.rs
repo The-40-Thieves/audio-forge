@@ -114,6 +114,7 @@ struct TrackRuntime {
     config: Track,
     objects: Vec<ObjectRuntime>,
     synth: PolySynth,
+    synth_pdc: PdcDelayLine,
     inserts: Vec<FxProcessor>,
     pdc: PdcDelayLine,
     total_latency: usize,
@@ -329,6 +330,7 @@ impl ObjectOrientedEngine {
                 config: track.clone(),
                 objects: obj_runtimes,
                 synth: PolySynth::new(sr),
+                synth_pdc: PdcDelayLine::new(max_obj_latency),
                 inserts,
                 pdc: PdcDelayLine::new(0),
                 total_latency,
@@ -428,11 +430,36 @@ impl ObjectOrientedEngine {
         &self.meters
     }
 
+    fn fx_latency_changed(
+        a: &crate::project::FxSlotConfig,
+        b: &crate::project::FxSlotConfig,
+    ) -> bool {
+        if std::mem::discriminant(a) != std::mem::discriminant(b)
+            || a.is_bypassed() != b.is_bypassed()
+        {
+            return true;
+        }
+        matches!(
+            (a, b),
+            (
+                crate::project::FxSlotConfig::OpenSoothe {
+                    low_latency: la,
+                    ..
+                },
+                crate::project::FxSlotConfig::OpenSoothe {
+                    low_latency: lb,
+                    ..
+                },
+            ) if la != lb
+        )
+    }
+
     /// Attempts to update mix, loop, automation, object EQ/fades, and FX parameters in-place
     /// without resetting DSP state or interrupting live playback.
     ///
     /// Returns `true` if updated in-place, or `false` if the project topology (track count,
-    /// object IDs/sources, FX slot variants, or sample rate) changed and a full recompile is needed.
+    /// object IDs/sources, FX slot variants, latency mode, or sample rate) changed and a full
+    /// recompile is needed.
     pub fn sync_mix_params(&mut self, project: &DawProject) -> bool {
         let target_sr = f64::from(project.sample_rate.max(8_000));
         if (self.sample_rate - target_sr).abs() > 1e-3 {
@@ -449,9 +476,7 @@ impl ObjectOrientedEngine {
                 return false;
             }
             for (a, b) in bus_rt.config.inserts.iter().zip(bus_cfg.inserts.iter()) {
-                if std::mem::discriminant(a) != std::mem::discriminant(b)
-                    || a.is_bypassed() != b.is_bypassed()
-                {
+                if Self::fx_latency_changed(a, b) {
                     return false;
                 }
             }
@@ -461,9 +486,7 @@ impl ObjectOrientedEngine {
             .iter()
             .zip(project.master_inserts.iter())
         {
-            if std::mem::discriminant(a) != std::mem::discriminant(b)
-                || a.is_bypassed() != b.is_bypassed()
-            {
+            if Self::fx_latency_changed(a, b) {
                 return false;
             }
         }
@@ -475,9 +498,7 @@ impl ObjectOrientedEngine {
                 return false;
             }
             for (a, b) in tr_rt.config.inserts.iter().zip(tr_cfg.inserts.iter()) {
-                if std::mem::discriminant(a) != std::mem::discriminant(b)
-                    || a.is_bypassed() != b.is_bypassed()
-                {
+                if Self::fx_latency_changed(a, b) {
                     return false;
                 }
             }
@@ -489,9 +510,7 @@ impl ObjectOrientedEngine {
                     return false;
                 }
                 for (a, b) in obj_rt.config.fx_chain.iter().zip(obj_cfg.fx_chain.iter()) {
-                    if std::mem::discriminant(a) != std::mem::discriminant(b)
-                        || a.is_bypassed() != b.is_bypassed()
-                    {
+                    if Self::fx_latency_changed(a, b) {
                         return false;
                     }
                 }
@@ -525,6 +544,7 @@ impl ObjectOrientedEngine {
         for tr in &mut self.tracks {
             tr.pdc.reset();
             tr.synth.reset(sr);
+            tr.synth_pdc.reset();
             for ins in &mut tr.inserts {
                 ins.reset(sr);
             }
@@ -724,11 +744,13 @@ impl ObjectOrientedEngine {
                     tr_r += or_;
                 }
 
-                // Render built-in zero-alloc 16-voice PolySynth for any MIDI clips on this track
+                // Render built-in zero-alloc 16-voice PolySynth for any MIDI clips on this track,
+                // PDC-aligned to match latency-compensated audio objects on the same track.
                 if !tr.config.midi_clips.is_empty() {
-                    let (ml, mr) =
+                    let (mut ml, mut mr) =
                         tr.synth
                             .render_sample(&tr.config.midi_clips, tr.config.synth_preset, pos);
+                    (ml, mr) = tr.synth_pdc.process(ml, mr);
                     tr_l += ml;
                     tr_r += mr;
                 }
@@ -870,36 +892,32 @@ impl ObjectOrientedEngine {
         AudioBuffer::from_channels(vec![ch_l, ch_r], project.sample_rate)
     }
 
-    /// Bounces the project to a 24-bit WAV file and returns its ITU-R BS.1770-4 [`AuditReport`].
-    ///
-    /// Automatically appends an FX decay tail (up to 3.0 s for active reverb/tail FX) beyond the
-    /// last object boundary so reverb and delay tails are never hard-truncated.
-    pub fn bounce_to_wav(
-        project: &DawProject,
-        cache: &ClipCache,
-        output_wav: &Path,
-    ) -> Result<AuditReport> {
+    fn compute_reverb_tail_frames(project: &DawProject) -> usize {
         let mut tail_secs = 0.0_f32;
         let inspect_fx = |fx: &crate::project::FxSlotConfig, acc: &mut f32| {
-            if !fx.is_bypassed() {
-                if let crate::project::FxSlotConfig::SpaceVerb {
+            if !fx.is_bypassed()
+                && let crate::project::FxSlotConfig::SpaceVerb {
                     decay_rt60_secs, ..
                 } = fx
-                {
-                    *acc = acc.max((*decay_rt60_secs * 1.5).clamp(0.5, 8.0));
-                }
+            {
+                *acc = acc.max((*decay_rt60_secs * 1.5).clamp(0.5, 8.0));
             }
         };
         for fx in &project.master_inserts {
             inspect_fx(fx, &mut tail_secs);
         }
         for tr in &project.tracks {
+            if tr.mute {
+                continue;
+            }
             for fx in &tr.inserts {
                 inspect_fx(fx, &mut tail_secs);
             }
             for obj in &tr.objects {
-                for fx in &obj.fx_chain {
-                    inspect_fx(fx, &mut tail_secs);
+                if !obj.mute {
+                    for fx in &obj.fx_chain {
+                        inspect_fx(fx, &mut tail_secs);
+                    }
                 }
             }
         }
@@ -919,7 +937,19 @@ impl ObjectOrientedEngine {
                 }
             }
         }
-        let tail_frames = (f64::from(tail_secs) * f64::from(project.sample_rate)).round() as usize;
+        (f64::from(tail_secs) * f64::from(project.sample_rate)).round() as usize
+    }
+
+    /// Bounces the project to a 24-bit WAV file and returns its ITU-R BS.1770-4 [`AuditReport`].
+    ///
+    /// Automatically appends an FX decay tail beyond the last object boundary so reverb and delay
+    /// tails are never hard-truncated.
+    pub fn bounce_to_wav(
+        project: &DawProject,
+        cache: &ClipCache,
+        output_wav: &Path,
+    ) -> Result<AuditReport> {
+        let tail_frames = Self::compute_reverb_tail_frames(project);
         let total = (project.total_length_samples() as usize).saturating_add(tail_frames);
         let buf = Self::bounce_offline(project, cache, total)?;
         buf.save_wav(output_wav, 24)?;
@@ -927,14 +957,14 @@ impl ObjectOrientedEngine {
     }
 
     /// Samplitude-style **Batch Multi-Track Stem Export**: renders every unmuted track as its own
-    /// PDC-aligned 24-bit stereo WAV stem inside `output_dir` and returns the written file paths.
+    /// PDC-aligned 24-bit stereo WAV stem (with unique track-index prefix and FX tail preservation)
+    /// inside `output_dir` and returns the written file paths.
     pub fn bounce_stems(
         project: &DawProject,
         cache: &ClipCache,
         output_dir: &Path,
     ) -> Result<Vec<PathBuf>> {
         std::fs::create_dir_all(output_dir)?;
-        let total = project.total_length_samples() as usize;
         let mut written = Vec::new();
 
         for (ti, tr) in project.tracks.iter().enumerate() {
@@ -946,6 +976,8 @@ impl ObjectOrientedEngine {
                 t.solo = j == ti;
                 t.mute = j != ti;
             }
+            let tail_frames = Self::compute_reverb_tail_frames(&stem_proj);
+            let total = (stem_proj.total_length_samples() as usize).saturating_add(tail_frames);
             let safe_name: String = tr
                 .name
                 .chars()
@@ -957,7 +989,7 @@ impl ObjectOrientedEngine {
                     }
                 })
                 .collect();
-            let stem_path = output_dir.join(format!("{safe_name}.wav"));
+            let stem_path = output_dir.join(format!("{:02}_{safe_name}.wav", ti + 1));
             let buf = Self::bounce_offline(&stem_proj, cache, total)?;
             buf.save_wav(&stem_path, 24)?;
             written.push(stem_path);

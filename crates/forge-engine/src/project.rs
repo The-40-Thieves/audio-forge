@@ -390,7 +390,13 @@ impl AudioObject {
         right.id = new_right_id;
         right.name = format!("{} (R)", self.name);
         right.timeline_start_samples = split_timeline_sample;
-        right.source_offset_samples = self.source_offset_samples.saturating_add(left_len);
+        let stretch = f64::from(self.time_stretch.clamp(0.5, 2.0));
+        let src_advance = if (stretch - 1.0).abs() > 1e-4 {
+            ((left_len as f64) * stretch).round().max(0.0) as u64
+        } else {
+            left_len
+        };
+        right.source_offset_samples = self.source_offset_samples.saturating_add(src_advance);
         right.length_samples = right_len;
         let right_in_offset = self.fade_in_offset_samples.saturating_add(left_len);
         if self.fade_in_samples > 0 && right_in_offset < self.fade_in_samples {

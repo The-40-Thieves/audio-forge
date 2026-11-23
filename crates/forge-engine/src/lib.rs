@@ -387,4 +387,51 @@ mod tests {
             assert!(s.is_file(), "expected stem WAV at {}", s.display());
         }
     }
+
+    #[test]
+    fn edge_case_fixes_stretched_split_opensoothe_pdc_and_duplicate_stems() {
+        // 1. Time-stretched split advances source_offset by left_len * time_stretch
+        let mut stretched = AudioObject::new(10, "Loop", PathBuf::from("loop.wav"), 4000);
+        stretched.time_stretch = 0.5;
+        let (_l, r) = stretched.split_at(2000, 11).expect("split");
+        assert_eq!(r.source_offset_samples, 1000);
+
+        // 2. Toggling OpenSoothe low_latency forces sync_mix_params to return false (recompute PDC)
+        let mut proj = DawProject::new("PDC Mode Test", 48_000, 120.0);
+        proj.tracks[0]
+            .inserts
+            .push(FxSlotConfig::default_open_soothe());
+        let cache = ClipCache::default();
+        let mut engine = ObjectOrientedEngine::compile(&proj, &cache);
+        if let FxSlotConfig::OpenSoothe {
+            ref mut low_latency,
+            ..
+        } = proj.tracks[0].inserts[0]
+        {
+            *low_latency = !*low_latency;
+        }
+        assert!(
+            !engine.sync_mix_params(&proj),
+            "toggling OpenSoothe low_latency must trigger recompile for PDC"
+        );
+
+        // 3. Duplicate track names produce distinct indexed stem WAV files
+        let mut dup_proj = DawProject::new("Dup Stem Test", 48_000, 120.0);
+        dup_proj.tracks[0].name = "Vocal".to_string();
+        dup_proj.tracks[1].name = "Vocal".to_string();
+        let mut dup_cache = ClipCache::default();
+        let p = PathBuf::from("mem://dup.wav");
+        dup_cache.insert_memory_clip(p.clone(), sine_clip(48_000, 2048, 330.0, 0.3));
+        dup_proj.tracks[0]
+            .objects
+            .push(AudioObject::new(1, "A", p.clone(), 2048));
+        dup_proj.tracks[1]
+            .objects
+            .push(AudioObject::new(2, "B", p, 2048));
+        let dir = tempfile::tempdir().unwrap();
+        let stems = ObjectOrientedEngine::bounce_stems(&dup_proj, &dup_cache, dir.path()).unwrap();
+        assert_eq!(stems.len(), 2);
+        assert_ne!(stems[0], stems[1]);
+        assert!(stems[0].is_file() && stems[1].is_file());
+    }
 }

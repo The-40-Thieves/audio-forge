@@ -104,6 +104,7 @@ struct ForgeDawApp {
     recorder: Option<LiveRecorder>,
     selected_track_idx: usize,
     selected_object_id: Option<u64>,
+    selected_midi_clip_id: Option<u64>,
     inspector_tab: InspectorTab,
     active_drag: Option<(usize, u64, DragMode)>,
     snap_grid: SnapGrid,
@@ -143,6 +144,7 @@ impl ForgeDawApp {
             recorder: None,
             selected_track_idx: 0,
             selected_object_id: None,
+            selected_midi_clip_id: None,
             inspector_tab: InspectorTab::Object,
             active_drag: None,
             snap_grid: SnapGrid::Quarter,
@@ -181,6 +183,9 @@ impl ForgeDawApp {
     }
 
     fn add_demo_clip(&mut self) {
+        if self.project.tracks.is_empty() {
+            self.project.add_track("01 Audio Track");
+        }
         let sr = self.project.sample_rate;
         let frames = (sr as usize) * 4;
         let mut ch_l = vec![0.0_f64; frames];
@@ -223,6 +228,9 @@ impl ForgeDawApp {
     }
 
     fn import_wav_to_selected_track(&mut self) {
+        if self.project.tracks.is_empty() {
+            self.project.add_track("01 Audio Track");
+        }
         let raw = self.import_path_buf.trim().to_string();
         if raw.is_empty() {
             self.status_line = "Enter a WAV/audio file path to import".to_string();
@@ -393,6 +401,9 @@ impl ForgeDawApp {
 
     fn add_demo_midi_clip(&mut self) {
         let prev = self.project.clone();
+        if self.project.tracks.is_empty() {
+            self.project.add_track("01 Synth Track");
+        }
         let id = self.project.alloc_id();
         let mut clip =
             MidiClip::demo_am7_progression(id, self.project.sample_rate, self.project.bpm);
@@ -401,6 +412,7 @@ impl ForgeDawApp {
             .selected_track_idx
             .min(self.project.tracks.len().saturating_sub(1));
         self.project.tracks[tr_idx].midi_clips.push(clip);
+        self.selected_midi_clip_id = Some(id);
         self.inspector_tab = InspectorTab::PianoRoll;
         self.commit_project_change(prev);
         self.status_line = format!(
@@ -899,6 +911,10 @@ impl ForgeDawApp {
             egui::RichText::new("MIDI PIANO ROLL & SYNTH")
                 .color(egui::Color32::from_rgb(192, 132, 252)),
         );
+        if self.project.tracks.is_empty() {
+            ui.label("No tracks in project. Click '+ Track' to add one.");
+            return;
+        }
         let tr_idx = self
             .selected_track_idx
             .min(self.project.tracks.len().saturating_sub(1));
@@ -943,22 +959,38 @@ impl ForgeDawApp {
             return;
         }
 
-        // Interactive 16-step × 13-note (C4..=C5) Piano Roll Grid for the first MIDI clip on track
+        // Resolve the specifically selected MIDI clip on this track (fallback to first clip)
+        let clip_idx = self
+            .selected_midi_clip_id
+            .and_then(|cid| {
+                self.project.tracks[tr_idx]
+                    .midi_clips
+                    .iter()
+                    .position(|c| c.id == cid)
+            })
+            .unwrap_or(0);
+
+        // Interactive 16-step × 13-note (C4..=C5) Piano Roll Grid
         let sr = f64::from(self.project.sample_rate.max(8_000));
         let step_smp = (((60.0 / self.project.bpm.max(30.0)) * 0.25) * sr).round() as u64;
-        let next_note_id = self.project.alloc_id();
 
         ui.label(
-            egui::RichText::new("Click cells to toggle 16th-note MIDI events (C4–C5):")
-                .small()
-                .color(egui::Color32::from_rgb(148, 163, 184)),
+            egui::RichText::new(format!(
+                "Editing '{}' — click cells to toggle 16th-note events (C4–C5):",
+                self.project.tracks[tr_idx].midi_clips[clip_idx].name
+            ))
+            .small()
+            .color(egui::Color32::from_rgb(148, 163, 184)),
         );
 
         let note_names = [
             "C5", "B4", "A#4", "A4", "G#4", "G4", "F#4", "F4", "E4", "D#4", "D4", "C#4", "C4",
         ];
+        let mut add_note: Option<(u64, u8)> = None;
+        let mut remove_note_idx: Option<usize> = None;
+
         egui::ScrollArea::vertical().show(ui, |ui| {
-            let clip = &mut self.project.tracks[tr_idx].midi_clips[0];
+            let clip = &self.project.tracks[tr_idx].midi_clips[clip_idx];
             for (row, name) in note_names.iter().enumerate() {
                 let pitch = (72 - row) as u8;
                 ui.horizontal(|ui| {
@@ -985,22 +1017,34 @@ impl ForgeDawApp {
                             .min_size(egui::vec2(15.0, 15.0));
                         if ui.add(btn).clicked() {
                             if let Some(idx) = existing_idx {
-                                clip.notes.remove(idx);
+                                remove_note_idx = Some(idx);
                             } else {
-                                clip.notes.push(MidiNote {
-                                    id: next_note_id + step * 16 + row as u64,
-                                    start_samples: start,
-                                    length_samples: step_smp.saturating_mul(9) / 10,
-                                    pitch,
-                                    velocity: 0.82,
-                                });
+                                add_note = Some((start, pitch));
                             }
-                            changed = true;
                         }
                     }
                 });
             }
         });
+
+        if let Some(idx) = remove_note_idx {
+            self.project.tracks[tr_idx].midi_clips[clip_idx]
+                .notes
+                .remove(idx);
+            changed = true;
+        } else if let Some((start, pitch)) = add_note {
+            let unique_id = self.project.alloc_id();
+            self.project.tracks[tr_idx].midi_clips[clip_idx]
+                .notes
+                .push(MidiNote {
+                    id: unique_id,
+                    start_samples: start,
+                    length_samples: step_smp.saturating_mul(9) / 10,
+                    pitch,
+                    velocity: 0.82,
+                });
+            changed = true;
+        }
 
         if changed {
             self.commit_project_change(prev);
@@ -1012,6 +1056,10 @@ impl ForgeDawApp {
             egui::RichText::new("TRACK, AUX & MASTER FX")
                 .color(egui::Color32::from_rgb(56, 189, 248)),
         );
+        if self.project.tracks.is_empty() {
+            ui.label("No tracks in project. Click '+ Track' to add one.");
+            return;
+        }
         let tr_idx = self
             .selected_track_idx
             .min(self.project.tracks.len().saturating_sub(1));
@@ -1767,6 +1815,7 @@ impl ForgeDawApp {
                                 && mrect.contains(pt)
                             {
                                 self.selected_track_idx = ti;
+                                self.selected_midi_clip_id = Some(mc.id);
                                 self.inspector_tab = InspectorTab::PianoRoll;
                             }
                         }
