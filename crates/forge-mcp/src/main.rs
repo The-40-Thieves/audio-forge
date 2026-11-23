@@ -1159,6 +1159,7 @@ fn build_session(spec: SessionSpec) -> ReaperProjectBuilder {
         stretch_markers: Vec::new(),
         pitch_envelope: spec.vocal_pitch_frames,
     });
+    let has_drums = spec.drums.is_some();
     if let Some(drums) = spec.drums {
         rpp.tracks.push(ReaperTrackSpec {
             name: "02 Drums".to_string(),
@@ -1184,7 +1185,7 @@ fn build_session(spec: SessionSpec) -> ReaperProjectBuilder {
             pan: 0.0,
             color: 0x01AA_66FF,
             jsfx_inserts: vec!["Forge_OpenSpacer_Unmask.jsfx".to_string()],
-            sidechain_from_track: Some(1),
+            sidechain_from_track: if has_drums { Some(1) } else { None },
             stretch_markers: Vec::new(),
             pitch_envelope: Vec::new(),
         });

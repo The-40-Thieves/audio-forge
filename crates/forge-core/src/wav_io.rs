@@ -212,6 +212,15 @@ fn decode_with_ffmpeg<R: Read>(reader: &mut R, name: &Path) -> Result<AudioBuffe
         .spawn()
         .map_err(|e| audio_io(&origin, format!("Failed to invoke ffmpeg decoder: {e}")))?;
 
+    let stderr_pipe = child.stderr.take();
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stderr_pipe {
+            let _ = pipe.take(64 * 1024).read_to_end(&mut buf);
+        }
+        buf
+    });
+
     let deadline = std::time::Instant::now() + FFMPEG_DECODE_TIMEOUT;
     let status = loop {
         match child.try_wait() {
@@ -238,15 +247,13 @@ fn decode_with_ffmpeg<R: Read>(reader: &mut R, name: &Path) -> Result<AudioBuffe
     };
 
     if !status.success() {
-        let mut stderr_buf = Vec::new();
-        if let Some(err_pipe) = child.stderr.take() {
-            let _ = err_pipe.take(64 * 1024).read_to_end(&mut stderr_buf);
-        }
+        let stderr_buf = stderr_handle.join().unwrap_or_default();
         return Err(audio_io(
             &origin,
             String::from_utf8_lossy(&stderr_buf).trim(),
         ));
     }
+    let _ = stderr_handle.join();
     AudioBuffer::load_wav(decoded.path())
 }
 

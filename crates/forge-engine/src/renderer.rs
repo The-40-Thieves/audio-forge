@@ -721,7 +721,18 @@ impl ObjectOrientedEngine {
                     let tail_pad = if obj.fx.is_empty() {
                         (obj.pdc.delay_samples as u64).saturating_add(64)
                     } else {
-                        (self.sample_rate as u64).saturating_mul(4)
+                        let mut tail_secs = 4.0_f64;
+                        for fx in &obj.config.fx_chain {
+                            if !fx.is_bypassed()
+                                && let crate::project::FxSlotConfig::SpaceVerb {
+                                    decay_rt60_secs,
+                                    ..
+                                } = fx
+                            {
+                                tail_secs = tail_secs.max(f64::from(*decay_rt60_secs) * 1.5);
+                            }
+                        }
+                        (tail_secs.clamp(4.0, 20.0) * self.sample_rate).round() as u64
                     };
                     if pos < start || pos >= end.saturating_add(tail_pad) {
                         continue;

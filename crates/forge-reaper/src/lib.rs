@@ -241,6 +241,16 @@ pub fn write_distrokid_metadata<P: AsRef<Path>>(
         .spawn()
         .map_err(|e| ForgeError::ReaperError(format!("FFmpeg metadata tagger failed: {e}")))?;
 
+    let stderr_pipe = child.stderr.take();
+    let stderr_handle = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        if let Some(pipe) = stderr_pipe {
+            let _ = pipe.take(64 * 1024).read_to_end(&mut buf);
+        }
+        buf
+    });
+
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let status = loop {
         match child.try_wait() {
@@ -265,16 +275,13 @@ pub fn write_distrokid_metadata<P: AsRef<Path>>(
     };
 
     if !status.success() {
-        use std::io::Read;
-        let mut stderr_buf = Vec::new();
-        if let Some(pipe) = child.stderr.take() {
-            let _ = pipe.take(64 * 1024).read_to_end(&mut stderr_buf);
-        }
+        let stderr_buf = stderr_handle.join().unwrap_or_default();
         return Err(ForgeError::ReaperError(format!(
             "FFmpeg metadata write failed: {}",
             String::from_utf8_lossy(&stderr_buf).trim()
         )));
     }
+    let _ = stderr_handle.join();
     Ok(canonical_isrc)
 }
 
