@@ -75,9 +75,7 @@ class StemTagTests(TestCase):
     def test_pick_stem_rejects_path_traversal(self) -> None:
         out = Path("out")
         with self.assertRaises(RuntimeError):
-            worker.pick_stem(
-                [f"../escape_(Vocals)_{KIM}.wav"], worker.VOCAL_TAGS, out
-            )
+            worker.pick_stem([f"../escape_(Vocals)_{KIM}.wav"], worker.VOCAL_TAGS, out)
 
 
 class RunSeparateTests(TestCase):
