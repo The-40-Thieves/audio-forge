@@ -1260,19 +1260,51 @@ fn build_session(spec: SessionSpec) -> ReaperProjectBuilder {
     rpp
 }
 
-fn tool_daw_inspect(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
-    let project_path = path_arg(args, "project", sandbox)?;
-    let proj = forge_engine::DawProject::load_from_file(&project_path)?;
+fn load_sandboxed_daw_project(
+    project_path: &std::path::Path,
+    sandbox: &PathSandbox,
+    require_all_clips: bool,
+) -> Result<
+    (
+        forge_engine::DawProject,
+        forge_engine::ClipCache,
+        Vec<String>,
+    ),
+    ForgeError,
+> {
+    const MAX_PROJ_BYTES: u64 = 16 * 1024 * 1024;
+    let file = sandbox.open_read(project_path)?;
+    let mut raw = String::new();
+    std::io::Read::read_to_string(&mut std::io::Read::take(file, MAX_PROJ_BYTES + 1), &mut raw)
+        .map_err(ForgeError::Io)?;
+    if (raw.len() as u64) > MAX_PROJ_BYTES {
+        return Err(ForgeError::InvalidParameter(
+            "Project file exceeds 16 MiB maximum size".to_string(),
+        ));
+    }
+    let proj = forge_engine::DawProject::from_json(&raw)?;
     let mut cache = forge_engine::ClipCache::default();
     let mut missing_clips = Vec::new();
     for tr in &proj.tracks {
         for obj in &tr.objects {
             let safe_clip = sandbox.check(&obj.source_path)?;
-            if let Err(e) = cache.load_clip(&safe_clip) {
-                missing_clips.push(format!("{}: {e}", safe_clip.display()));
+            match sandbox.load_audio(&safe_clip) {
+                Ok(buf) => {
+                    cache.insert_memory_clip(obj.source_path.clone(), buf);
+                }
+                Err(e) if !require_all_clips => {
+                    missing_clips.push(format!("{}: {e}", safe_clip.display()));
+                }
+                Err(e) => return Err(e),
             }
         }
     }
+    Ok((proj, cache, missing_clips))
+}
+
+fn tool_daw_inspect(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
+    let project_path = path_arg(args, "project", sandbox)?;
+    let (proj, cache, missing_clips) = load_sandboxed_daw_project(&project_path, sandbox, false)?;
     let engine = forge_engine::ObjectOrientedEngine::compile(&proj, &cache);
     let total_objects: usize = proj.tracks.iter().map(|t| t.objects.len()).sum();
     let total_midi_clips: usize = proj.tracks.iter().map(|t| t.midi_clips.len()).sum();
@@ -1297,24 +1329,48 @@ fn tool_daw_bounce(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, Fo
     let output_path = path_arg(args, "output", sandbox)?;
     let stems_dir = optional_path_arg(args, "stems_dir", sandbox)?;
 
-    let proj = forge_engine::DawProject::load_from_file(&project_path)?;
-    let mut cache = forge_engine::ClipCache::default();
-    for tr in &proj.tracks {
-        for obj in &tr.objects {
-            let safe_clip = sandbox.check(&obj.source_path)?;
-            cache.load_clip(&safe_clip)?;
-        }
-    }
-    let report = forge_engine::ObjectOrientedEngine::bounce_to_wav(&proj, &cache, &output_path)?;
-    let mut exported_stems = Vec::new();
+    let (proj, cache, _) = load_sandboxed_daw_project(&project_path, sandbox, true)?;
+    let tail_frames = (proj.sample_rate as usize).saturating_mul(2);
+    let total = (proj.total_length_samples() as usize).saturating_add(tail_frames);
+    let master_buf = forge_engine::ObjectOrientedEngine::bounce_offline(&proj, &cache, total)?;
+    sandbox.save_wav(&master_buf, &output_path, 24)?;
+    let report = audit_audio(&master_buf);
+
+    let mut stems_exported = 0_usize;
     if let Some(dir) = stems_dir {
-        exported_stems = forge_engine::ObjectOrientedEngine::bounce_stems(&proj, &cache, &dir)?;
+        sandbox.create_dir_all(&dir)?;
+        for (ti, tr) in proj.tracks.iter().enumerate() {
+            if tr.mute || (tr.objects.is_empty() && tr.midi_clips.is_empty()) {
+                continue;
+            }
+            let mut stem_proj = proj.clone();
+            for (j, t) in stem_proj.tracks.iter_mut().enumerate() {
+                t.solo = j == ti;
+                t.mute = j != ti;
+            }
+            let safe_name: String = tr
+                .name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            let stem_path = sandbox.check(&dir.join(format!("{:02}_{safe_name}.wav", ti + 1)))?;
+            let stem_buf =
+                forge_engine::ObjectOrientedEngine::bounce_offline(&stem_proj, &cache, total)?;
+            sandbox.save_wav(&stem_buf, &stem_path, 24)?;
+            stems_exported += 1;
+        }
     }
     let payload = json!({
         "output": output_path.display().to_string(),
         "integrated_lufs": report.integrated_lufs,
         "true_peak_dbtp": report.true_peak_dbtp,
-        "stems_exported": exported_stems.len(),
+        "stems_exported": stems_exported,
     });
     Ok(payload.into())
 }
