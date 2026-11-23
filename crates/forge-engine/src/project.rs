@@ -775,9 +775,55 @@ impl DawProject {
             proj.bpm = 120.0;
         }
         proj.bpm = proj.bpm.clamp(30.0, 300.0);
+        proj.time_sig_num = proj.time_sig_num.clamp(1, 32);
+        proj.time_sig_den = match proj.time_sig_den {
+            2 | 4 | 8 | 16 => proj.time_sig_den,
+            _ => 4,
+        };
+        if !proj.master_gain_db.is_finite() {
+            proj.master_gain_db = 0.0;
+        }
+        proj.master_gain_db = proj.master_gain_db.clamp(-48.0, 12.0);
+        if proj.loop_end_samples < proj.loop_start_samples {
+            std::mem::swap(&mut proj.loop_start_samples, &mut proj.loop_end_samples);
+        }
+
+        let mut max_id = proj.next_id;
+        let clean_f32 = |v: &mut f32, def: f32, lo: f32, hi: f32| {
+            *v = if v.is_finite() { v.clamp(lo, hi) } else { def };
+        };
+        for bus in &mut proj.aux_buses {
+            max_id = max_id.max(bus.id.saturating_add(1));
+            clean_f32(&mut bus.gain_db, 0.0, -60.0, 12.0);
+            clean_f32(&mut bus.pan, 0.0, -1.0, 1.0);
+        }
+        for tr in &mut proj.tracks {
+            max_id = max_id.max(tr.id.saturating_add(1));
+            clean_f32(&mut tr.gain_db, 0.0, -60.0, 12.0);
+            clean_f32(&mut tr.pan, 0.0, -1.0, 1.0);
+            tr.volume_auto.points.retain(|p| p.value.is_finite());
+            tr.pan_auto.points.retain(|p| p.value.is_finite());
+            for obj in &mut tr.objects {
+                max_id = max_id.max(obj.id.saturating_add(1));
+                clean_f32(&mut obj.gain_db, 0.0, -48.0, 24.0);
+                clean_f32(&mut obj.pan, 0.0, -1.0, 1.0);
+                clean_f32(&mut obj.time_stretch, 1.0, 0.5, 2.0);
+                clean_f32(&mut obj.pitch_semitones, 0.0, -12.0, 12.0);
+            }
+            for mc in &mut tr.midi_clips {
+                max_id = max_id.max(mc.id.saturating_add(1));
+                for n in &mut mc.notes {
+                    max_id = max_id.max(n.id.saturating_add(1));
+                    clean_f32(&mut n.velocity, 0.8, 0.05, 1.0);
+                }
+            }
+        }
+        proj.next_id = max_id;
         Ok(proj)
     }
 
+    /// Saves the project atomically via a sibling temporary file + rename so crashes never
+    /// corrupt an existing `.forgeproj` file.
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
         let json = self.to_json()?;
         if let Some(parent) = path.parent()
@@ -785,7 +831,9 @@ impl DawProject {
         {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, json)?;
+        let tmp_path = path.with_extension("forgeproj.tmp");
+        std::fs::write(&tmp_path, json)?;
+        std::fs::rename(&tmp_path, path)?;
         Ok(())
     }
 

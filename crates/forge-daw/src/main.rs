@@ -1159,6 +1159,36 @@ impl ForgeDawApp {
                 ("Forge Master Limiter", FxSlotConfig::default_master_limiter),
             ];
 
+            let mut delete_track = false;
+            ui.horizontal(|ui| {
+                ui.label("Track:");
+                if ui
+                    .text_edit_singleline(&mut self.project.tracks[tr_idx].name)
+                    .changed()
+                {
+                    changed = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .checkbox(
+                        &mut self.project.tracks[tr_idx].phase_invert,
+                        "Phase Invert",
+                    )
+                    .changed();
+                if self.project.tracks.len() > 1 && ui.small_button("Delete Track").clicked() {
+                    delete_track = true;
+                }
+            });
+            if delete_track {
+                self.project.tracks.remove(tr_idx);
+                self.selected_track_idx = tr_idx.min(self.project.tracks.len().saturating_sub(1));
+                self.selected_object_id = None;
+                changed = true;
+                return;
+            }
+            ui.separator();
+
             ui.label(
                 egui::RichText::new(format!(
                     "Track Inserts: {}",
@@ -1191,6 +1221,50 @@ impl ForgeDawApp {
             if let Some(rm) = rm_tr {
                 self.project.tracks[tr_idx].inserts.remove(rm);
                 changed = true;
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Aux Bus Inserts").strong());
+                if ui.small_button("+ Aux Bus").clicked() {
+                    let n = self.project.aux_buses.len() + 1;
+                    self.project.add_aux_bus(format!("Aux {n}: FX Bus"));
+                    changed = true;
+                }
+            });
+            for (bi, bus) in self.project.aux_buses.iter_mut().enumerate() {
+                ui.label(
+                    egui::RichText::new(&bus.name)
+                        .small()
+                        .strong()
+                        .color(egui::Color32::from_rgb(192, 132, 252)),
+                );
+                egui::ComboBox::from_id_salt(("add_aux_fx", bi))
+                    .selected_text("+ Add Aux Insert...")
+                    .show_ui(ui, |ui| {
+                        for (label, make_fn) in presets {
+                            if ui.selectable_label(false, label).clicked() {
+                                bus.inserts.push(make_fn());
+                                changed = true;
+                            }
+                        }
+                    });
+                let mut rm_aux = None;
+                for (idx, fx) in bus.inserts.iter_mut().enumerate() {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.strong(fx.display_name());
+                            if ui.small_button("X").clicked() {
+                                rm_aux = Some(idx);
+                            }
+                        });
+                        changed |= draw_fx_slot_controls(ui, fx);
+                    });
+                }
+                if let Some(rm) = rm_aux {
+                    bus.inserts.remove(rm);
+                    changed = true;
+                }
             }
 
             ui.separator();
@@ -2110,12 +2184,28 @@ fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) -> bool {
             changed |= ui.checkbox(isp_8x, "8x ISP Oversampling").changed();
         }
         FxSlotConfig::SplitEq {
+            tr_low_db,
+            tr_mid_db,
             tr_high_db,
+            tn_low_db,
+            tn_mid_db,
             tn_high_db,
             ..
         } => {
             changed |= ui
+                .add(egui::Slider::new(tr_low_db, -12.0..=12.0).text("Trans Low"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(tr_mid_db, -12.0..=12.0).text("Trans Mid"))
+                .changed();
+            changed |= ui
                 .add(egui::Slider::new(tr_high_db, -12.0..=12.0).text("Trans High"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(tn_low_db, -12.0..=12.0).text("Tonal Low"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(tn_mid_db, -12.0..=12.0).text("Tonal Mid"))
                 .changed();
             changed |= ui
                 .add(egui::Slider::new(tn_high_db, -12.0..=12.0).text("Tonal High"))
@@ -2124,6 +2214,7 @@ fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) -> bool {
         FxSlotConfig::DensityClipper {
             density,
             clip_drive_db,
+            ceiling_db,
             ..
         } => {
             changed |= ui
@@ -2132,9 +2223,15 @@ fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) -> bool {
             changed |= ui
                 .add(egui::Slider::new(clip_drive_db, 0.0..=12.0).text("4x ADAA Clip"))
                 .changed();
+            changed |= ui
+                .add(egui::Slider::new(ceiling_db, -12.0..=0.0).text("Ceil (dB)"))
+                .changed();
         }
         FxSlotConfig::SpaceVerb {
             decay_rt60_secs,
+            damping,
+            shimmer,
+            ducking,
             wet_mix,
             ..
         } => {
@@ -2142,15 +2239,60 @@ fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) -> bool {
                 .add(egui::Slider::new(decay_rt60_secs, 0.2..=12.0).text("Decay (s)"))
                 .changed();
             changed |= ui
+                .add(egui::Slider::new(damping, 0.05..=0.90).text("Damping"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(shimmer, 0.0..=1.0).text("Shimmer"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(ducking, 0.0..=1.0).text("Ducking"))
+                .changed();
+            changed |= ui
                 .add(egui::Slider::new(wet_mix, 0.0..=1.0).text("Wet Mix"))
                 .changed();
         }
         FxSlotConfig::VocalTune {
+            key_root,
+            scale_mode,
             retune_speed_ms,
             retune_amount,
+            humanize,
             formant_shift_st,
+            wet_mix,
             ..
         } => {
+            const ROOTS: [&str; 12] = [
+                "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+            ];
+            const SCALES: [&str; 5] = [
+                "Chromatic",
+                "Major",
+                "Minor",
+                "Pentatonic Maj",
+                "Pentatonic Min",
+            ];
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("vt_root")
+                    .width(46.0)
+                    .selected_text(ROOTS[usize::from(*key_root % 12)])
+                    .show_ui(ui, |ui| {
+                        for (i, name) in ROOTS.iter().enumerate() {
+                            if ui.selectable_value(key_root, i as u8, *name).changed() {
+                                changed = true;
+                            }
+                        }
+                    });
+                egui::ComboBox::from_id_salt("vt_scale")
+                    .width(108.0)
+                    .selected_text(SCALES[usize::from((*scale_mode).min(4))])
+                    .show_ui(ui, |ui| {
+                        for (i, name) in SCALES.iter().enumerate() {
+                            if ui.selectable_value(scale_mode, i as u8, *name).changed() {
+                                changed = true;
+                            }
+                        }
+                    });
+            });
             changed |= ui
                 .add(egui::Slider::new(retune_speed_ms, 0.0..=100.0).text("Speed (ms)"))
                 .changed();
@@ -2158,7 +2300,13 @@ fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) -> bool {
                 .add(egui::Slider::new(retune_amount, 0.0..=1.0).text("Amount"))
                 .changed();
             changed |= ui
+                .add(egui::Slider::new(humanize, 0.0..=1.0).text("Humanize"))
+                .changed();
+            changed |= ui
                 .add(egui::Slider::new(formant_shift_st, -12.0..=12.0).text("Formant (st)"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(wet_mix, 0.0..=1.0).text("Wet Mix"))
                 .changed();
         }
     }
@@ -2167,6 +2315,19 @@ fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) -> bool {
 
 impl eframe::App for ForgeDawApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Drag-and-drop audio file import directly onto the DAW window
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        for path in dropped {
+            self.import_path_buf = path.to_string_lossy().into_owned();
+            self.import_wav_to_selected_track();
+        }
+
         if !ctx.wants_keyboard_input() {
             let (space, split, marker, del, undo, redo, dup) = ctx.input(|i| {
                 (
@@ -2212,5 +2373,37 @@ impl eframe::App for ForgeDawApp {
         if self.audio.as_ref().is_some_and(LiveAudioEngine::is_playing) || self.recorder.is_some() {
             ctx.request_repaint();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snap_grid_quantizes_beats_and_bars_accurately() {
+        // 120 BPM @ 48 kHz -> 1 quarter beat = 24,000 samples, 1 bar (4/4) = 96,000 samples
+        assert_eq!(SnapGrid::Off.snap_samples(13_333, 48_000, 120.0, 4), 13_333);
+        assert_eq!(
+            SnapGrid::Quarter.snap_samples(25_500, 48_000, 120.0, 4),
+            24_000
+        );
+        assert_eq!(
+            SnapGrid::Eighth.snap_samples(35_000, 48_000, 120.0, 4),
+            36_000
+        );
+        assert_eq!(SnapGrid::Bar.snap_samples(90_000, 48_000, 120.0, 4), 96_000);
+    }
+
+    #[test]
+    fn native_gpu_options_enable_wgpu_msaa_and_vsync() {
+        let opts = build_native_options(eframe::Renderer::Wgpu);
+        assert_eq!(opts.renderer, eframe::Renderer::Wgpu);
+        assert_eq!(opts.multisampling, 4);
+        assert!(opts.vsync);
+        assert_eq!(
+            opts.hardware_acceleration,
+            eframe::HardwareAcceleration::Preferred
+        );
     }
 }

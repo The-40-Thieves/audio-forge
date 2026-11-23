@@ -451,6 +451,12 @@ impl ObjectOrientedEngine {
                     ..
                 },
             ) if la != lb
+        ) || matches!(
+            (a, b),
+            (
+                crate::project::FxSlotConfig::MasterLimiter { isp_8x: ia, .. },
+                crate::project::FxSlotConfig::MasterLimiter { isp_8x: ib, .. },
+            ) if ia != ib
         )
     }
 
@@ -627,8 +633,11 @@ impl ObjectOrientedEngine {
         }
 
         // Zero-alloc Dual-Grain Hann Overlap-Add Elastic Time-Stretch & Pitch-Shift
-        const GRAIN_LEN: f64 = 2048.0;
-        const HALF_GRAIN: f64 = 1024.0;
+        // Scale grain duration (~42 ms) with sample rate so 96/192 kHz sessions stay smooth.
+        let grain_len = (0.04266 * engine_sr.max(8_000.0))
+            .round()
+            .clamp(512.0, 8192.0);
+        let half_grain = grain_len * 0.5;
         let pitch_ratio = 2.0_f64.powf(pitch_st / 12.0);
         let local_f = local as f64;
         let src_off_f = (obj.source_offset_samples as f64) * sr_ratio;
@@ -638,15 +647,15 @@ impl ObjectOrientedEngine {
         let mut any_in = false;
 
         for g in 0..2 {
-            let shifted = local_f + (g as f64) * HALF_GRAIN;
-            let phase = shifted.rem_euclid(GRAIN_LEN);
+            let shifted = local_f + (g as f64) * half_grain;
+            let phase = shifted.rem_euclid(grain_len);
             let anchor = shifted - phase;
-            let u = phase / GRAIN_LEN;
+            let u = phase / grain_len;
             let win = (std::f64::consts::PI * u).sin();
             let w = (win * win) as f32;
             let src_pos = src_off_f
                 + anchor * stretch * sr_ratio
-                + (phase - HALF_GRAIN) * pitch_ratio * sr_ratio;
+                + (phase - half_grain) * pitch_ratio * sr_ratio;
             let (gl, gr, ok) = Self::sample_clip_interp(clip, src_pos);
             if ok {
                 out_l += gl * w;
@@ -708,6 +717,15 @@ impl ObjectOrientedEngine {
                     }
                     let start = obj.config.timeline_start_samples;
                     let end = obj.config.timeline_end_samples();
+                    // Fast-skip idle objects far outside their clip + FX/PDC tail window
+                    let tail_pad = if obj.fx.is_empty() {
+                        (obj.pdc.delay_samples as u64).saturating_add(64)
+                    } else {
+                        (self.sample_rate as u64).saturating_mul(4)
+                    };
+                    if pos < start || pos >= end.saturating_add(tail_pad) {
+                        continue;
+                    }
                     let (mut ol, mut or_) = if pos >= start && pos < end {
                         let local = pos - start;
                         if let Some(ref clip) = obj.clip {

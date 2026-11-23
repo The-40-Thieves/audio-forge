@@ -9,11 +9,12 @@
 [![VST3 / CLAP](https://img.shields.io/badge/Plugins-VST3%20%7C%20CLAP%20%7C%20JSFX-purple.svg)](crates/forge-plug/)
 [![REAPER](https://img.shields.io/badge/REAPER-7.82%2B%20Native%20JSFX%20%26%20RPP-green.svg)](reaper-jsfx/)
 
-The same Rust DSP engine ships in four forms:
+The same Rust DSP engine ships in five forms:
 
+- **`forge-daw`** (+ `forge-engine`), a native GPU-accelerated (`wgpu` DX12/Metal/Vulkan) Samplitude-style Object-Oriented Mixing, MIDI & Mastering DAW.
 - **`forge-mcp`**, a Model Context Protocol server for agents.
 - **`forge`**, a command-line tool.
-- **`forge-plug`**, ten VST3 and CLAP plugins.
+- **`forge-plug`**, eleven VST3 and CLAP plugins.
 - **Native REAPER JSFX** effects.
 
 ---
@@ -201,10 +202,18 @@ cargo run --release --bin forge -- theory --chords "Dm9 G13 Cmaj9 A7" -o chords.
 cargo run --release --bin forge -- master mix.wav -o master.wav --target-lufs -14 --ceiling-dbtp -1 --isrc USABC2600001
 ```
 
+### ForgeStudio DAW
+
+```bash
+cargo run --release -p forge-daw
+```
+
+Native GPU-accelerated (`wgpu` DX12/Metal/Vulkan with OpenGL fallback) Object-Oriented Mixing, MIDI & Mastering DAW with per-object EQ/fades/FX chains, Elastic Time-Stretch & Pitch-Shift, 16-voice PolySynth + Piano Roll, Automation Lanes, Aux/Send buses with automatic PDC, live `cpal` playback & recording, 24-bit WAV bounce with BS.1770-4 audit, and batch stem export.
+
 ### Plugins
 
 ```bash
-cargo run --package xtask -- list                            # list the 10 plugins
+cargo run --package xtask -- list                            # list the 11 plugins
 cargo run --package xtask -- bundle forge-opensoothe --release
 cargo run --package xtask -- bundle-all --release            # everything into target/bundled/
 cargo run --package xtask -- install --all --release         # copy into system VST3 and CLAP folders
@@ -212,16 +221,17 @@ cargo run --package xtask -- install --all --release         # copy into system 
 
 | Package | What it does |
 | :--- | :--- |
-| `forge-opensoothe` | Dynamic spectral resonance suppressor (STFT, 2048-sample latency plus the 3 ms limiter lookahead, egui GUI) |
+| `forge-opensoothe` | Dynamic spectral resonance suppressor (STFT, 2048-sample / 256-sample low-latency modes, egui GUI) |
 | `forge-openspacer` | Sidechain spectral unmasker (vocal over music, kick over bass) |
 | `forge-vocal-surgical` | Zero-latency de-click, plosive suppression below 115 Hz, split-band de-esser and breath gate |
+| `forge-vocal-tune` | Real-time low-latency YIN + scale-locked dual-grain pitch corrector with formant shift |
 | `forge-submono-tape` | Linkwitz-Riley sub mono below 160 Hz, harmonic bass reinforcement, console and tape saturation |
-| `forge-master-limiter` | Lookahead 4x true-peak limiter with a BS.1770-4 meter |
+| `forge-master-limiter` | Lookahead 4x/8x true-peak limiter with a BS.1770-4 meter & unity audition |
 | `forge-drum-trigger` | Real-time 3-band drum-to-MIDI triggers and a one-finger chord voicer |
 | `forge-phase-eq` | Phase and polarity aligner with an 18-band EQ and genre tonal-balance targets |
 | `forge-spliteq` | 3-band transient/tonal split equalizer and shaper |
-| `forge-density-clipper` | Upward density compressor and a 3-band ADAA soft clipper |
-| `forge-spaceverb` | FDN reverb with ducking and shimmer, plus a WaveNet preamp model |
+| `forge-density-clipper` | Upward density compressor and a 3-band 4x ADAA soft clipper |
+| `forge-spaceverb` | FDN reverb with ducking, shimmer, decay-rate EQ, and a WaveNet `.nam` preamp engine |
 
 ---
 

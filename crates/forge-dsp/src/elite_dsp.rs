@@ -744,7 +744,9 @@ impl RealtimeFdnReverb {
         let rt60 = sanitize_param_f64(decay_rt60_secs, 2.4, 0.2, 20.0);
         let rt60_lo = (rt60 * self.decay_low_mult).clamp(0.15, 24.0);
         let rt60_hi = (rt60 * self.decay_high_mult).clamp(0.15, 24.0);
-        let damp = sanitize_param_f64(damping, 0.35, 0.05, 0.90);
+        let raw_damp = sanitize_param_f64(damping, 0.35, 0.05, 0.90);
+        // Scale 1-pole damping coefficient so HF cutoff is invariant across 44.1 / 48 / 96 / 192 kHz
+        let damp = (1.0 - (1.0 - raw_damp).powf(48_000.0 / self.sample_rate)).clamp(0.01, 0.97);
         let low_alpha = (-2.0 * PI * 350.0 / self.sample_rate).exp();
 
         for (i, &out_val) in outs.iter().enumerate() {

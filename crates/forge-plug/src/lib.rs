@@ -1055,6 +1055,10 @@ impl Plugin for ForgeOpenSpacerPlug {
         true
     }
 
+    fn reset(&mut self) {
+        self.analyzer.clear_state();
+    }
+
     fn process(
         &mut self,
         buffer: &mut Buffer,
@@ -1335,6 +1339,10 @@ impl Plugin for ForgeVocalSurgicalPlug {
         true
     }
 
+    fn reset(&mut self) {
+        self.analyzer.clear_state();
+    }
+
     fn process(
         &mut self,
         buffer: &mut Buffer,
@@ -1548,6 +1556,10 @@ impl Plugin for ForgeSubAndTapePlug {
         self.dsp = RealtimeSubAndTapeBus::new(sr, f64::from(self.params.mono_cutoff_hz.value()));
         self.analyzer.reset(sr);
         true
+    }
+
+    fn reset(&mut self) {
+        self.analyzer.clear_state();
     }
 
     fn process(
@@ -2669,6 +2681,10 @@ impl Plugin for ForgeSplitEqPlug {
         true
     }
 
+    fn reset(&mut self) {
+        self.analyzer.clear_state();
+    }
+
     fn process(
         &mut self,
         buffer: &mut Buffer,
@@ -2890,6 +2906,10 @@ impl Plugin for ForgeDensityClipperPlug {
         self.dsp = RealtimeDensityAndClipper::new(sr);
         self.analyzer.reset(sr);
         true
+    }
+
+    fn reset(&mut self) {
+        self.analyzer.clear_state();
     }
 
     fn process(
