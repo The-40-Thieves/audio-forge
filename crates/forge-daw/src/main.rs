@@ -1091,7 +1091,9 @@ impl ForgeDawApp {
         // Interactive Multi-Octave (2 octaves visible, C1..C7 scrollable) × Multi-Bar Piano Roll Grid
         let sr = f64::from(self.project.sample_rate.max(8_000));
         let step_smp = (((60.0 / self.project.bpm.max(30.0)) * 0.25) * sr).round() as u64;
-        let bar_steps = u64::from(self.project.time_sig_num.clamp(1, 16)) * 4;
+        let bar_steps = (u64::from(self.project.time_sig_num.clamp(1, 16)) * 16
+            / u64::from(self.project.time_sig_den.clamp(1, 16)))
+        .max(1);
         let bar_smp = step_smp.saturating_mul(bar_steps).max(1);
         let total_bars = self.project.tracks[tr_idx].midi_clips[clip_idx]
             .length_samples
