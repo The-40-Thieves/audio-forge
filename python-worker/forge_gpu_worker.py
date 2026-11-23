@@ -182,7 +182,9 @@ def _run_vocal_stage(
 
     base = _safe_stem(resolved_input)
     if bs_vocal and mel_vocal and bs_vocal.exists() and mel_vocal.exists():
-        vocal_out = (resolved_output / f"{base}_(Vocals)_roformer_ensemble.wav").resolve()
+        vocal_out = (
+            resolved_output / f"{base}_(Vocals)_roformer_ensemble.wav"
+        ).resolve()
         if vocal_out.is_relative_to(resolved_output):
             bs_vocal = _blend_wav_pair(bs_vocal, mel_vocal, vocal_out, weight_a=0.6)
     if bs_inst and mel_inst and bs_inst.exists() and mel_inst.exists():
@@ -261,7 +263,9 @@ def _restore_stem(
         out_files = sep.separate(str(stem_path))  # type: ignore[attr-defined]
         if out_files:
             cand = Path(out_files[0])
-            resolved = (cand if cand.is_absolute() else resolved_output / cand).resolve()
+            resolved = (
+                cand if cand.is_absolute() else resolved_output / cand
+            ).resolve()
             if resolved.is_relative_to(resolved_output) and resolved.is_file():
                 return resolved
     except (RuntimeError, FileNotFoundError, ValueError, OSError):
@@ -323,7 +327,9 @@ def _run_orchestral_sub_splitters(
             and next_residual != residual
             and next_residual.exists()
         ):
-            short_res = (resolved_output / f"{base_stem}_(Residual_{key}).wav").resolve()
+            short_res = (
+                resolved_output / f"{base_stem}_(Residual_{key}).wav"
+            ).resolve()
             if short_res.is_relative_to(resolved_output):
                 next_residual.replace(short_res)
                 next_residual = short_res
@@ -396,9 +402,7 @@ def run_separate(
         )
     elif quality == "fast":
         # Fast single-pass 4-stem or 6-stem Demucs
-        sep.load_model(
-            model_filename=FOUR_STEM_MODEL if stems == 4 else SIX_STEM_MODEL
-        )
+        sep.load_model(model_filename=FOUR_STEM_MODEL if stems == 4 else SIX_STEM_MODEL)
         files = sep.separate(str(resolved_input))
         vocal_file = pick_stem(files, VOCAL_TAGS, resolved_output)
         drums = pick_stem(files, DRUMS_TAGS, resolved_output)
@@ -415,7 +419,9 @@ def run_separate(
         # Stage 3: SOTA SCNet XL (4-stem) / BS-RoFormer SW (6-stem) on vocal-free Instrumental
         #          with automatic HTDemucs fallback if checkpoint is unavailable.
         cascade_input = (
-            inst_file if (inst_file is not None and inst_file.exists()) else resolved_input
+            inst_file
+            if (inst_file is not None and inst_file.exists())
+            else resolved_input
         )
         files = _separate_multistem_with_fallback(sep, cascade_input, stems)
         drums = pick_stem(files, DRUMS_TAGS, resolved_output)

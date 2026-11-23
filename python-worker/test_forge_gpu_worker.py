@@ -123,7 +123,9 @@ class RunSeparateTests(TestCase):
     def test_vocal_named_input_returns_the_vocal_stem(self) -> None:
         result = self.run_separate("Lead_Vocal_mix.wav", dereverb=False)
         self.assertEqual(result["vocals"], f"Lead_Vocal_mix_(Vocals)_{BS_1297}.wav")
-        self.assertEqual(result["other"], f"Lead_Vocal_mix_(Instrumental)_{BS_1297}.wav")
+        self.assertEqual(
+            result["other"], f"Lead_Vocal_mix_(Instrumental)_{BS_1297}.wav"
+        )
 
     def test_dry_named_input_returns_the_dereverbed_vocal(self) -> None:
         result = self.run_separate("dry_take.wav", dereverb=True)
@@ -294,9 +296,7 @@ class SixStemAndTranscribeTests(TestCase):
             out = Path(tmp)
             inp = out / "full_mix.wav"
             inp.write_bytes(b"RIFF")
-            res = worker.run_separate(
-                inp, out, dereverb=False, stems=6, quality="fast"
-            )
+            res = worker.run_separate(inp, out, dereverb=False, stems=6, quality="fast")
             expected = {
                 "vocals": "full_mix_(Vocals)_htdemucs_6s.wav",
                 "drums": "full_mix_(Drums)_htdemucs_6s.wav",
@@ -321,7 +321,9 @@ class SixStemAndTranscribeTests(TestCase):
                     stems = ("Vocals", "Drums", "Bass", "Guitar", "Piano", "Other")
                 elif self.model == "MDX23C-DrumSep-aufr33-jarredou":
                     stems = ("Kick", "Snare", "Toms", "HH", "Cymbals")
-                elif self.model == "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956":
+                elif (
+                    self.model == "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956"
+                ):
                     stems = ("Vocals", "Instrumental")
                 else:
                     stems = ("Instrumental", "Vocals")
@@ -448,8 +450,17 @@ class SixStemAndTranscribeTests(TestCase):
                 "Instrumental",
             ),
             "mel_band_roformer_male_female_aufr33": ("Male", "Female"),
-            "MDX23C-DrumSep-aufr33-jarredou": ("Kick", "Snare", "Toms", "HH", "Cymbals"),
-            "mel_band_roformer_guitar_elec_acoust": ("Electric Guitar", "Acoustic Guitar"),
+            "MDX23C-DrumSep-aufr33-jarredou": (
+                "Kick",
+                "Snare",
+                "Toms",
+                "HH",
+                "Cymbals",
+            ),
+            "mel_band_roformer_guitar_elec_acoust": (
+                "Electric Guitar",
+                "Acoustic Guitar",
+            ),
             "mel_band_roformer_strings": ("Strings", "Other"),
             "mel_band_roformer_brass": ("Brass", "Other"),
             "mel_band_roformer_woodwinds": ("Woodwinds", "Other"),
