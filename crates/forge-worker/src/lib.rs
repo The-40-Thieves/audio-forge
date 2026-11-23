@@ -65,6 +65,32 @@ pub async fn generate_music_lyria(
         .await
         .map_err(|e| ForgeError::WorkerError(format!("Lyria API request failed: {e}")))?;
 
+    let status = resp.status();
+    if !status.is_success() {
+        const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+        let mut err_raw = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| ForgeError::WorkerError(format!("Lyria response stream failed: {e}")))?
+        {
+            let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(err_raw.len());
+            if remaining == 0 {
+                break;
+            }
+            let take = chunk.len().min(remaining);
+            err_raw.extend_from_slice(&chunk[..take]);
+            if err_raw.len() >= MAX_ERROR_BODY_BYTES {
+                break;
+            }
+        }
+        let body = String::from_utf8_lossy(&err_raw);
+        return Err(ForgeError::WorkerError(format!(
+            "Lyria API returned HTTP {status}: {}",
+            body.chars().take(1024).collect::<String>()
+        )));
+    }
+
     const MAX_LYRIA_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
     if let Some(len) = resp.content_length()
         && len > MAX_LYRIA_RESPONSE_BYTES as u64
@@ -73,7 +99,6 @@ pub async fn generate_music_lyria(
             "Lyria response ({len} bytes) exceeds safety limit ({MAX_LYRIA_RESPONSE_BYTES} bytes)"
         )));
     }
-    let status = resp.status();
     let mut raw = Vec::new();
     while let Some(chunk) = resp
         .chunk()
@@ -86,14 +111,6 @@ pub async fn generate_music_lyria(
             )));
         }
         raw.extend_from_slice(&chunk);
-    }
-
-    if !status.is_success() {
-        let body = String::from_utf8_lossy(&raw);
-        return Err(ForgeError::WorkerError(format!(
-            "Lyria API returned HTTP {status}: {}",
-            body.chars().take(1024).collect::<String>()
-        )));
     }
 
     let body_json: serde_json::Value = serde_json::from_slice(&raw)

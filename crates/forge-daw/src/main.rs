@@ -316,12 +316,7 @@ impl ForgeDawApp {
 
     fn toggle_record(&mut self) {
         if let Some(rec) = self.recorder.take() {
-            if self.project.tracks.is_empty() {
-                self.project.add_track("Recorded Track");
-            }
-            let tr_idx = rec
-                .track_idx()
-                .min(self.project.tracks.len().saturating_sub(1));
+            let rec_track_idx = rec.track_idx();
             let start_pos = rec.start_timeline_samples();
             let id = self.project.alloc_id();
             let media_dir = self.project_media_dir();
@@ -329,6 +324,10 @@ impl ForgeDawApp {
             match rec.stop_and_save(&out_wav, self.project.sample_rate) {
                 Ok(buf) => {
                     let prev = self.project.clone();
+                    if self.project.tracks.is_empty() {
+                        self.project.add_track("Recorded Track");
+                    }
+                    let tr_idx = rec_track_idx.min(self.project.tracks.len().saturating_sub(1));
                     let len = buf.num_frames() as u64;
                     self.cache.insert_memory_clip(out_wav.clone(), buf);
                     let mut obj = AudioObject::new(id, format!("Take {id}"), out_wav, len);
