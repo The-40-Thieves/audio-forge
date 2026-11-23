@@ -368,7 +368,7 @@ def run_separate(
     except ImportError as exc:
         raise RuntimeError(
             "audio-separator is not installed in the worker venv. "
-            "Run: uv sync --project python-worker --extra gpu (or omit --extra gpu for CPU)"
+            "Run: uv sync --project python-worker --extra gpu (or --extra cpu for CPU)"
         ) from exc
 
     sep = Separator(output_dir=str(resolved_output), output_format="WAV")

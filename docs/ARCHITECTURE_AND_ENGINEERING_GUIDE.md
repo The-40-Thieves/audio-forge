@@ -357,6 +357,6 @@ External steps that invoke path-based tools — ISRC tagging in `forge_master_di
 ```bash
 uv sync --project python-worker --extra gpu
 ```
-(Or omit `--extra gpu` for CPU-only execution, and use `uv run --with deepfilternet ...` when running DeepFilterNet3 in isolation due to its `numpy<2` pin.)
+(Or use `--extra cpu` for CPU-only ONNX execution, and use `uv run --with deepfilternet ...` when running DeepFilterNet3 in isolation due to its `numpy<2` pin.)
 
 Or open `notebooks/ForgeAudio_Colab_A100_Worker.ipynb` in Google Colab (A100/L4) for cloud-accelerated separation (`FORGE_COLAB_WORKER_URL` + `FORGE_COLAB_API_TOKEN`). Depending on flags (`--stems`, `--quality`, `--drum-sep`, `--split-lead-backing`, `--split-male-female`, `--split-guitar`, `--split-orchestral`, `--split-crowd`, `--all-stems`), the neural worker populates up to **23 audio stem slots** (`StemBundle`), while the offline Rust DSP splitter returns four (`Vocals`, `Drums`, `Bass`, `Other`).

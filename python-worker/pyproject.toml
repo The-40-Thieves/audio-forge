@@ -3,7 +3,7 @@ name = "forge-gpu-worker"
 version = "0.1.0"
 description = "Ephemeral PyTorch/ONNX GPU worker for ForgeAudio (Mel-Band-RoFormer vocal separation, BS-RoFormer de-reverb, remote YuE2-3B)"
 readme = "../README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 dependencies = [
     "audio-separator>=0.47.1",
@@ -12,6 +12,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+cpu = [
+    "audio-separator[cpu]>=0.47.1",
+]
 gpu = [
     "audio-separator[gpu]>=0.47.1; sys_platform != 'darwin'",
 ]
@@ -24,6 +27,16 @@ dev = [
 # (`uv run --with deepfilternet`) or rely on the built-in Mel-Band-RoFormer denoise fallback.
 
 [tool.uv]
+# Exclude legacy TensorFlow/Keras/TFLite/CoreML backends pulled transitively by
+# `basic-pitch 0.4.0` (which resolve vulnerable `tensorflow==2.9.0` and `keras==2.9.0`);
+# `basic-pitch` runs on the worker's `onnxruntime` / `onnxruntime-gpu` backend instead.
+exclude-dependencies = [
+    "tensorflow",
+    "tensorflow-macos",
+    "tflite-runtime",
+    "keras",
+    "coremltools",
+]
 environments = [
     "sys_platform == 'linux'",
     "sys_platform == 'win32'",
@@ -31,7 +44,7 @@ environments = [
 ]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 88
 
 [tool.ruff.lint]
