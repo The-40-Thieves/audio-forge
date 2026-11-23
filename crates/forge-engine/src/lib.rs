@@ -434,4 +434,23 @@ mod tests {
         assert_ne!(stems[0], stems[1]);
         assert!(stems[0].is_file() && stems[1].is_file());
     }
+
+    #[test]
+    fn adversarial_forgeproj_json_never_panics_and_sanitizes_bounds() {
+        let bad = [
+            "",
+            "{",
+            "[]",
+            r#"{"schema_version": 999}"#,
+            r#"{"name": "BadSR", "sample_rate": 0, "bpm": 0.0, "time_sig_num": 0, "time_sig_den": 0}"#,
+            r#"{"name": "Inf", "sample_rate": 48000, "bpm": -999.0, "master_gain_db": 99999.0, "tracks": []}"#,
+        ];
+        for raw in bad {
+            if let Ok(proj) = DawProject::from_json(raw) {
+                assert!(proj.sample_rate >= 8_000);
+                assert!(proj.bpm.is_finite() && proj.bpm >= 30.0);
+                assert!(proj.time_sig_num >= 1 && proj.time_sig_den >= 1);
+            }
+        }
+    }
 }
