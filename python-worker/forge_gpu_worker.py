@@ -62,10 +62,11 @@ def pick_stem(
         tag = stem_tag(f)
         if tag is not None and _normalize(tag) in wanted:
             path = Path(f)
-            candidate = (path if path.is_absolute() else resolved_dir / path).resolve()
-            if not candidate.is_relative_to(resolved_dir):
+            candidate = path if path.is_absolute() else output_dir / path
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(resolved_dir):
                 raise RuntimeError(
-                    f"Separator wrote stem outside output_dir: {candidate}"
+                    f"Separator wrote stem outside output_dir: {resolved}"
                 )
             return candidate
     return None

@@ -426,20 +426,7 @@ impl LiveRecorder {
             cpal::SampleFormat::F32 => device.build_input_stream(
                 &stream_config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    let ch = channels.max(1);
-                    let frames = data.len() / ch;
-                    if let Ok(mut buf) = cap_cb.try_lock() {
-                        for i in 0..frames {
-                            let s0 = f64::from(data[i * ch]);
-                            let s1 = if ch > 1 {
-                                f64::from(data[i * ch + 1])
-                            } else {
-                                s0
-                            };
-                            buf.0.push(s0);
-                            buf.1.push(s1);
-                        }
-                    }
+                    capture_input_frames(data, channels, &cap_cb);
                 },
                 err_cb,
                 None,
@@ -447,20 +434,7 @@ impl LiveRecorder {
             cpal::SampleFormat::I16 => device.build_input_stream(
                 &stream_config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    let ch = channels.max(1);
-                    let frames = data.len() / ch;
-                    if let Ok(mut buf) = cap_cb.try_lock() {
-                        for i in 0..frames {
-                            let s0 = f64::from(cpal::Sample::to_sample::<f32>(data[i * ch]));
-                            let s1 = if ch > 1 {
-                                f64::from(cpal::Sample::to_sample::<f32>(data[i * ch + 1]))
-                            } else {
-                                s0
-                            };
-                            buf.0.push(s0);
-                            buf.1.push(s1);
-                        }
-                    }
+                    capture_input_frames(data, channels, &cap_cb);
                 },
                 err_cb,
                 None,
@@ -468,20 +442,7 @@ impl LiveRecorder {
             cpal::SampleFormat::U16 => device.build_input_stream(
                 &stream_config,
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                    let ch = channels.max(1);
-                    let frames = data.len() / ch;
-                    if let Ok(mut buf) = cap_cb.try_lock() {
-                        for i in 0..frames {
-                            let s0 = f64::from(cpal::Sample::to_sample::<f32>(data[i * ch]));
-                            let s1 = if ch > 1 {
-                                f64::from(cpal::Sample::to_sample::<f32>(data[i * ch + 1]))
-                            } else {
-                                s0
-                            };
-                            buf.0.push(s0);
-                            buf.1.push(s1);
-                        }
-                    }
+                    capture_input_frames(data, channels, &cap_cb);
                 },
                 err_cb,
                 None,
@@ -542,5 +503,26 @@ impl LiveRecorder {
         }
         converted.save_wav(output_wav, 24)?;
         Ok(converted)
+    }
+}
+
+fn capture_input_frames<T>(data: &[T], channels: usize, captured: &Mutex<(Vec<f64>, Vec<f64>)>)
+where
+    T: cpal::Sample,
+    f32: cpal::FromSample<T>,
+{
+    let ch = channels.max(1);
+    let frames = data.len() / ch;
+    if let Ok(mut buf) = captured.try_lock() {
+        for i in 0..frames {
+            let s0 = f64::from(cpal::Sample::to_sample::<f32>(data[i * ch]));
+            let s1 = if ch > 1 {
+                f64::from(cpal::Sample::to_sample::<f32>(data[i * ch + 1]))
+            } else {
+                s0
+            };
+            buf.0.push(s0);
+            buf.1.push(s1);
+        }
     }
 }
