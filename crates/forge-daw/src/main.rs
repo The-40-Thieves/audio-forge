@@ -18,22 +18,74 @@ use forge_engine::{
     MidiClip, MidiNote, ObjectOrientedEngine, SynthPreset, TimelineMarker, TrackSend, UndoStack,
 };
 
-fn main() -> eframe::Result {
-    let options = eframe::NativeOptions {
+fn build_native_options(renderer: eframe::Renderer) -> eframe::NativeOptions {
+    let wgpu_setup = eframe::egui_wgpu::WgpuSetupCreateNew {
+        power_preference: eframe::wgpu::PowerPreference::HighPerformance,
+        instance_descriptor: eframe::wgpu::InstanceDescriptor {
+            backends: eframe::wgpu::Backends::PRIMARY,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let wgpu_options = eframe::egui_wgpu::WgpuConfiguration {
+        present_mode: eframe::wgpu::PresentMode::AutoVsync,
+        desired_maximum_frame_latency: Some(2),
+        wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(wgpu_setup),
+        ..Default::default()
+    };
+
+    eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1360.0, 840.0])
             .with_min_inner_size([960.0, 600.0])
             .with_title("ForgeStudio DAW — Object-Oriented Audio & Mastering"),
+        renderer,
+        hardware_acceleration: eframe::HardwareAcceleration::Preferred,
+        vsync: true,
+        multisampling: 4,
+        wgpu_options,
         ..Default::default()
-    };
-    eframe::run_native(
+    }
+}
+
+fn detect_gpu_label(cc: &eframe::CreationContext<'_>) -> String {
+    if let Some(ref rs) = cc.wgpu_render_state {
+        let info = rs.adapter.get_info();
+        return format!(
+            "{} [{:?} | {:?}]",
+            info.name, info.backend, info.device_type
+        );
+    }
+    "OpenGL (glow fallback)".to_string()
+}
+
+fn main() -> eframe::Result {
+    let primary = build_native_options(eframe::Renderer::Wgpu);
+    match eframe::run_native(
         "ForgeStudio DAW",
-        options,
+        primary,
         Box::new(|cc| {
             configure_studio_theme(&cc.egui_ctx);
-            Ok(Box::new(ForgeDawApp::new()))
+            let gpu_label = detect_gpu_label(cc);
+            Ok(Box::new(ForgeDawApp::new(gpu_label)))
         }),
-    )
+    ) {
+        Ok(()) => Ok(()),
+        Err(wgpu_err) => {
+            eprintln!("wgpu init failed ({wgpu_err}), falling back to OpenGL (glow)");
+            let fallback = build_native_options(eframe::Renderer::Glow);
+            eframe::run_native(
+                "ForgeStudio DAW",
+                fallback,
+                Box::new(|cc| {
+                    configure_studio_theme(&cc.egui_ctx);
+                    let gpu_label = detect_gpu_label(cc);
+                    Ok(Box::new(ForgeDawApp::new(gpu_label)))
+                }),
+            )
+        }
+    }
 }
 
 fn configure_studio_theme(ctx: &egui::Context) {
@@ -114,26 +166,28 @@ struct ForgeDawApp {
     import_path_buf: String,
     project_path_buf: String,
     bounce_path_buf: String,
+    gpu_backend_label: String,
     status_line: String,
     show_mixer: bool,
 }
 
 impl ForgeDawApp {
-    fn new() -> Self {
+    fn new(gpu_backend_label: String) -> Self {
         let project = DawProject::default();
         let cache = ClipCache::default();
         let (audio, status_line) = match LiveAudioEngine::start(&project, &cache) {
             Ok(eng) => {
                 let msg = format!(
-                    "Ready — Audio: {} ({} Hz)",
+                    "Ready — Audio: {} ({} Hz) | GPU: {}",
                     eng.device_name(),
-                    eng.sample_rate()
+                    eng.sample_rate(),
+                    gpu_backend_label
                 );
                 (Some(eng), msg)
             }
             Err(e) => (
                 None,
-                format!("Audio output unavailable ({e}) — Offline mode"),
+                format!("Audio output unavailable ({e}) — Offline mode | GPU: {gpu_backend_label}"),
             ),
         };
         Self {
@@ -154,6 +208,7 @@ impl ForgeDawApp {
             import_path_buf: String::new(),
             project_path_buf: "session.forgeproj".to_string(),
             bounce_path_buf: "master_bounce.wav".to_string(),
+            gpu_backend_label,
             status_line,
             show_mixer: true,
         }
@@ -1177,10 +1232,11 @@ impl ForgeDawApp {
                     ui.separator();
                     ui.label(
                         egui::RichText::new(format!(
-                            "Master L {:+5.1} dB | R {:+5.1} dB | PDC: {} smp",
+                            "Master L {:+5.1} dB | R {:+5.1} dB | PDC: {} smp | GPU: {}",
                             meters.master_peak_l_db,
                             meters.master_peak_r_db,
-                            meters.total_pdc_samples
+                            meters.total_pdc_samples,
+                            self.gpu_backend_label
                         ))
                         .monospace()
                         .small()
@@ -1586,7 +1642,7 @@ impl ForgeDawApp {
                                 egui::StrokeKind::Inside,
                             );
 
-                            // Waveform peaks inside the object
+                            // Viewport-culled waveform peaks inside the object (O(visible width))
                             if let Some(peaks) = self
                                 .cache
                                 .get_peaks(&self.project.tracks[ti].objects[oi].source_path)
@@ -1595,25 +1651,34 @@ impl ForgeDawApp {
                                 let half_h = (obj_rect.height() * 0.42).max(4.0);
                                 let step_px = 2.0_f32;
                                 let n_cols = ((obj_rect.width() / step_px) as usize).max(1);
+                                let c_start = (((lane_rect.left() - obj_rect.left()) / step_px)
+                                    .floor()
+                                    .max(0.0)
+                                    as usize)
+                                    .min(n_cols);
+                                let c_end = (((lane_rect.right() - obj_rect.left()) / step_px)
+                                    .ceil()
+                                    .max(0.0)
+                                    as usize)
+                                    .min(n_cols);
                                 let obj_len =
                                     self.project.tracks[ti].objects[oi].length_samples.max(1);
                                 let src_off =
                                     self.project.tracks[ti].objects[oi].source_offset_samples;
-                                for c in 0..n_cols {
+                                for c in c_start..c_end {
                                     let frac = (c as f64) / (n_cols as f64);
-                                    let smp = src_off + ((frac * (obj_len as f64)) as u64);
+                                    let smp =
+                                        src_off.saturating_add((frac * (obj_len as f64)) as u64);
                                     let bucket = (smp as usize) / peaks.samples_per_bucket;
                                     if let Some(&(mn, mx)) = peaks.min_max.get(bucket) {
                                         let cx = obj_rect.left() + (c as f32) * step_px;
-                                        if cx >= lane_rect.left() && cx <= lane_rect.right() {
-                                            p.line_segment(
-                                                [
-                                                    egui::pos2(cx, mid_y - mx * half_h),
-                                                    egui::pos2(cx, mid_y - mn * half_h),
-                                                ],
-                                                egui::Stroke::new(1.0_f32, tr_color),
-                                            );
-                                        }
+                                        p.line_segment(
+                                            [
+                                                egui::pos2(cx, mid_y - mx * half_h),
+                                                egui::pos2(cx, mid_y - mn * half_h),
+                                            ],
+                                            egui::Stroke::new(1.0_f32, tr_color),
+                                        );
                                     }
                                 }
                             }
