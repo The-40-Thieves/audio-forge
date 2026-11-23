@@ -10,9 +10,11 @@ description = "Vocal F0 pitch tracker, formant-preserving scale pitch correction
 forge-core = { path = "../forge-core" }
 forge-dsp = { path = "../forge-dsp" }
 forge-theory = { path = "../forge-theory" }
+rustfft.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+assert_no_alloc = { git = "https://github.com/robbert-vdh/rust-assert-no-alloc.git", branch = "feature/nested-permit-forbid", features = ["warn_debug"] }
 divan = { version = "6.0.0", package = "codspeed-divan-compat" }
 proptest.workspace = true
 

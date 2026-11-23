@@ -76,8 +76,14 @@ fn object_oriented_engine_render_block_is_zero_alloc() {
     let mut out_l = vec![0.0_f32; 512];
     let mut out_r = vec![0.0_f32; 512];
 
+    let mut updated = project.clone();
+    updated.master_gain_db = -3.0;
+    updated.tracks[0].gain_db = -2.0;
+    updated.tracks[0].objects[0].eq.low_db = 3.0;
+
     let before = violation_count();
     assert_no_alloc(|| {
+        assert!(engine.sync_mix_params_swap(&mut updated));
         for _ in 0..16 {
             engine.render_block(&mut out_l, &mut out_r);
         }
@@ -86,8 +92,9 @@ fn object_oriented_engine_render_block_is_zero_alloc() {
     assert_eq!(
         after - before,
         0,
-        "ObjectOrientedEngine::render_block must perform zero heap allocations on the audio thread"
+        "ObjectOrientedEngine::sync_mix_params_swap and render_block must perform zero heap allocations on the audio thread"
     );
+    drop(updated);
     assert!(out_l.iter().all(|s| s.is_finite()));
     assert!(out_r.iter().all(|s| s.is_finite()));
 }

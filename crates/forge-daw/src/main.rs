@@ -171,6 +171,8 @@ struct ForgeDawApp {
     gpu_backend_label: String,
     status_line: String,
     show_mixer: bool,
+    pointer_down: bool,
+    undo_gesture_active: bool,
 }
 
 impl ForgeDawApp {
@@ -215,11 +217,20 @@ impl ForgeDawApp {
             gpu_backend_label,
             status_line,
             show_mixer: true,
+            pointer_down: false,
+            undo_gesture_active: false,
         }
     }
 
     fn commit_project_change(&mut self, prev: DawProject) {
-        self.undo.push(prev);
+        if self.pointer_down || self.undo_gesture_active {
+            if !self.undo_gesture_active {
+                self.undo.push(prev);
+                self.undo_gesture_active = true;
+            }
+        } else {
+            self.undo.push(prev);
+        }
         self.sync_audio_engine();
     }
 
@@ -2315,6 +2326,7 @@ fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) -> bool {
 
 impl eframe::App for ForgeDawApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.pointer_down = ctx.input(|i| i.pointer.primary_down());
         // Drag-and-drop audio file import directly onto the DAW window
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -2354,10 +2366,12 @@ impl eframe::App for ForgeDawApp {
             }
             if undo && let Some(prev) = self.undo.undo(self.project.clone()) {
                 self.project = prev;
+                self.undo_gesture_active = false;
                 self.sync_audio_engine();
             }
             if redo && let Some(next) = self.undo.redo(self.project.clone()) {
                 self.project = next;
+                self.undo_gesture_active = false;
                 self.sync_audio_engine();
             }
             if dup {
@@ -2369,6 +2383,12 @@ impl eframe::App for ForgeDawApp {
         self.draw_object_editor(ctx);
         self.draw_mixer_dock(ctx);
         self.draw_arrange_timeline(ctx);
+
+        // Reset drag-coalescing AFTER widgets finish so a slider release-frame `.changed()`
+        // stays coalesced with the drag gesture instead of pushing a second undo snapshot.
+        if !self.pointer_down {
+            self.undo_gesture_active = false;
+        }
 
         if self.audio.as_ref().is_some_and(LiveAudioEngine::is_playing) || self.recorder.is_some() {
             ctx.request_repaint();
@@ -2405,5 +2425,53 @@ mod tests {
             opts.hardware_acceleration,
             eframe::HardwareAcceleration::Preferred
         );
+    }
+
+    #[test]
+    fn gesture_coalesced_undo_records_single_snapshot_per_drag() {
+        let mut app = ForgeDawApp {
+            project: DawProject::default(),
+            undo: UndoStack::default(),
+            cache: ClipCache::default(),
+            audio: None,
+            recorder: None,
+            selected_track_idx: 0,
+            selected_object_id: None,
+            selected_midi_clip_id: None,
+            inspector_tab: InspectorTab::Object,
+            active_drag: None,
+            drag_anchor_samples: 0,
+            drag_anchor_x: 0.0,
+            snap_grid: SnapGrid::Quarter,
+            auto_crossfade: true,
+            pixels_per_sec: 120.0,
+            scroll_secs: 0.0,
+            import_path_buf: String::new(),
+            project_path_buf: "session.forgeproj".to_string(),
+            bounce_path_buf: "master_bounce.wav".to_string(),
+            gpu_backend_label: "Test".to_string(),
+            status_line: String::new(),
+            show_mixer: true,
+            pointer_down: true,
+            undo_gesture_active: false,
+        };
+        let initial_gain = app.project.master_gain_db;
+        // Simulate 60 frames of continuous slider drag
+        for step in 1..=60 {
+            let prev = app.project.clone();
+            app.project.master_gain_db = initial_gain - (step as f32) * 0.1;
+            app.commit_project_change(prev);
+        }
+        // Release pointer
+        app.pointer_down = false;
+        app.undo_gesture_active = false;
+
+        // Single undo restores the exact pre-drag gain, and stack is now empty
+        let restored = app
+            .undo
+            .undo(app.project.clone())
+            .expect("should have 1 undo snapshot");
+        assert!((restored.master_gain_db - initial_gain).abs() < 1e-6);
+        assert!(app.undo.undo(restored).is_none());
     }
 }

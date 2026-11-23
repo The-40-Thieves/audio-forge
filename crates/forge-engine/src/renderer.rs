@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use forge_core::{AudioBuffer, AuditReport, Result};
-use forge_dsp::{Biquad, RealtimeSpectrumAnalyzer32, audit_audio, flush_denormal_f64};
+use forge_dsp::{
+    Biquad, ParamSmoother, RealtimeSpectrumAnalyzer32, audit_audio, flush_denormal_f64,
+};
 
 use crate::fx::FxProcessor;
 use crate::midi::PolySynth;
@@ -91,6 +93,26 @@ impl ObjectEqRuntime {
         (flush_denormal_f64(xl) as f32, flush_denormal_f64(xr) as f32)
     }
 
+    fn update_coeffs(&mut self, sr: f64, eq: ObjectEq3) {
+        let copy = |dst: &mut Biquad, src: Biquad| {
+            dst.b0 = src.b0;
+            dst.b1 = src.b1;
+            dst.b2 = src.b2;
+            dst.a1 = src.a1;
+            dst.a2 = src.a2;
+        };
+        let low = Biquad::peaking_eq(sr, 120.0, 0.7, f64::from(eq.low_db.clamp(-18.0, 18.0)));
+        let mid = Biquad::peaking_eq(sr, 1200.0, 0.9, f64::from(eq.mid_db.clamp(-18.0, 18.0)));
+        let high = Biquad::peaking_eq(sr, 6500.0, 0.7, f64::from(eq.high_db.clamp(-18.0, 18.0)));
+        copy(&mut self.low_l, low);
+        copy(&mut self.low_r, low);
+        copy(&mut self.mid_l, mid);
+        copy(&mut self.mid_r, mid);
+        copy(&mut self.high_l, high);
+        copy(&mut self.high_r, high);
+        self.flat = eq.is_flat();
+    }
+
     fn reset(&mut self) {
         self.low_l.reset();
         self.low_r.reset();
@@ -119,6 +141,8 @@ struct TrackRuntime {
     pdc: PdcDelayLine,
     total_latency: usize,
     peak_db: f32,
+    gain_l_smooth: ParamSmoother,
+    gain_r_smooth: ParamSmoother,
 }
 
 struct AuxBusRuntime {
@@ -264,6 +288,7 @@ pub struct ObjectOrientedEngine {
     loop_start: u64,
     loop_end: u64,
     master_gain_lin: f32,
+    master_gain_smooth: ParamSmoother,
     master_insert_cfgs: Vec<crate::project::FxSlotConfig>,
     master_inserts: Vec<FxProcessor>,
     tracks: Vec<TrackRuntime>,
@@ -326,6 +351,11 @@ impl ObjectOrientedEngine {
             let total_latency = max_obj_latency + track_fx_lat;
             max_track_latency = max_track_latency.max(total_latency);
 
+            let init_gain_db = track.volume_auto.evaluate(0, track.gain_db);
+            let init_pan = track.pan_auto.evaluate(0, track.pan);
+            let init_tg = 10.0_f32.powf(init_gain_db.clamp(-60.0, 12.0) / 20.0)
+                * if track.phase_invert { -1.0 } else { 1.0 };
+            let (init_pl, init_pr) = Self::equal_power_pan(init_pan);
             tracks.push(TrackRuntime {
                 config: track.clone(),
                 objects: obj_runtimes,
@@ -335,6 +365,8 @@ impl ObjectOrientedEngine {
                 pdc: PdcDelayLine::new(0),
                 total_latency,
                 peak_db: -90.0,
+                gain_l_smooth: ParamSmoother::new(f64::from(init_tg * init_pl), sr, 5.0),
+                gain_r_smooth: ParamSmoother::new(f64::from(init_tg * init_pr), sr, 5.0),
             });
         }
 
@@ -387,13 +419,15 @@ impl ObjectOrientedEngine {
         let total_pdc_samples = max_track_latency + max_aux_latency + master_lat;
 
         let track_peaks_db = vec![-90.0; tracks.len()];
+        let master_gain_lin = 10.0_f32.powf(project.master_gain_db.clamp(-48.0, 12.0) / 20.0);
         Self {
             sample_rate: sr,
             playhead_samples: 0,
             loop_enabled: project.loop_enabled,
             loop_start: project.loop_start_samples,
             loop_end: project.loop_end_samples,
-            master_gain_lin: 10.0_f32.powf(project.master_gain_db.clamp(-48.0, 12.0) / 20.0),
+            master_gain_lin,
+            master_gain_smooth: ParamSmoother::new(f64::from(master_gain_lin), sr, 5.0),
             master_insert_cfgs: project.master_inserts.clone(),
             master_inserts,
             tracks,
@@ -460,13 +494,71 @@ impl ObjectOrientedEngine {
         )
     }
 
-    /// Attempts to update mix, loop, automation, object EQ/fades, and FX parameters in-place
-    /// without resetting DSP state or interrupting live playback.
-    ///
-    /// Returns `true` if updated in-place, or `false` if the project topology (track count,
-    /// object IDs/sources, FX slot variants, latency mode, or sample rate) changed and a full
-    /// recompile is needed.
-    pub fn sync_mix_params(&mut self, project: &DawProject) -> bool {
+    /// Checks off-audio-thread whether `next` has the exact same track, object, aux, and FX-latency
+    /// topology as `prev` so it can be applied via [`Self::sync_mix_params_swap`] without recompiling.
+    pub fn topology_compatible(prev: &DawProject, next: &DawProject) -> bool {
+        if prev.sample_rate != next.sample_rate
+            || prev.tracks.len() != next.tracks.len()
+            || prev.aux_buses.len() != next.aux_buses.len()
+            || prev.master_inserts.len() != next.master_inserts.len()
+        {
+            return false;
+        }
+        for (a, b) in prev.aux_buses.iter().zip(next.aux_buses.iter()) {
+            if a.id != b.id || a.inserts.len() != b.inserts.len() {
+                return false;
+            }
+            if a.inserts
+                .iter()
+                .zip(b.inserts.iter())
+                .any(|(x, y)| Self::fx_latency_changed(x, y))
+            {
+                return false;
+            }
+        }
+        if prev
+            .master_inserts
+            .iter()
+            .zip(next.master_inserts.iter())
+            .any(|(x, y)| Self::fx_latency_changed(x, y))
+        {
+            return false;
+        }
+        for (a, b) in prev.tracks.iter().zip(next.tracks.iter()) {
+            if a.id != b.id
+                || a.objects.len() != b.objects.len()
+                || a.inserts.len() != b.inserts.len()
+            {
+                return false;
+            }
+            if a.inserts
+                .iter()
+                .zip(b.inserts.iter())
+                .any(|(x, y)| Self::fx_latency_changed(x, y))
+            {
+                return false;
+            }
+            for (oa, ob) in a.objects.iter().zip(b.objects.iter()) {
+                if oa.id != ob.id
+                    || oa.source_path != ob.source_path
+                    || oa.fx_chain.len() != ob.fx_chain.len()
+                    || oa
+                        .fx_chain
+                        .iter()
+                        .zip(ob.fx_chain.iter())
+                        .any(|(x, y)| Self::fx_latency_changed(x, y))
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Zero-allocation, zero-deallocation in-place parameter swap for real-time audio callbacks.
+    /// Swaps owned config containers out of `project` so the caller can retire and drop the
+    /// previous containers off the audio thread.
+    pub fn sync_mix_params_swap(&mut self, project: &mut DawProject) -> bool {
         let target_sr = f64::from(project.sample_rate.max(8_000));
         if (self.sample_rate - target_sr).abs() > 1e-3 {
             return false;
@@ -478,47 +570,51 @@ impl ObjectOrientedEngine {
             return false;
         }
         for (bus_rt, bus_cfg) in self.aux_buses.iter().zip(project.aux_buses.iter()) {
-            if bus_rt.config.id != bus_cfg.id || bus_rt.inserts.len() != bus_cfg.inserts.len() {
+            if bus_rt.config.id != bus_cfg.id
+                || bus_rt.inserts.len() != bus_cfg.inserts.len()
+                || bus_rt
+                    .config
+                    .inserts
+                    .iter()
+                    .zip(bus_cfg.inserts.iter())
+                    .any(|(a, b)| Self::fx_latency_changed(a, b))
+            {
                 return false;
             }
-            for (a, b) in bus_rt.config.inserts.iter().zip(bus_cfg.inserts.iter()) {
-                if Self::fx_latency_changed(a, b) {
-                    return false;
-                }
-            }
         }
-        for (a, b) in self
+        if self
             .master_insert_cfgs
             .iter()
             .zip(project.master_inserts.iter())
+            .any(|(a, b)| Self::fx_latency_changed(a, b))
         {
-            if Self::fx_latency_changed(a, b) {
-                return false;
-            }
+            return false;
         }
         for (tr_rt, tr_cfg) in self.tracks.iter().zip(project.tracks.iter()) {
             if tr_rt.config.id != tr_cfg.id
                 || tr_rt.objects.len() != tr_cfg.objects.len()
                 || tr_rt.inserts.len() != tr_cfg.inserts.len()
+                || tr_rt
+                    .config
+                    .inserts
+                    .iter()
+                    .zip(tr_cfg.inserts.iter())
+                    .any(|(a, b)| Self::fx_latency_changed(a, b))
             {
                 return false;
-            }
-            for (a, b) in tr_rt.config.inserts.iter().zip(tr_cfg.inserts.iter()) {
-                if Self::fx_latency_changed(a, b) {
-                    return false;
-                }
             }
             for (obj_rt, obj_cfg) in tr_rt.objects.iter().zip(tr_cfg.objects.iter()) {
                 if obj_rt.config.id != obj_cfg.id
                     || obj_rt.config.source_path != obj_cfg.source_path
                     || obj_rt.fx.len() != obj_cfg.fx_chain.len()
+                    || obj_rt
+                        .config
+                        .fx_chain
+                        .iter()
+                        .zip(obj_cfg.fx_chain.iter())
+                        .any(|(a, b)| Self::fx_latency_changed(a, b))
                 {
                     return false;
-                }
-                for (a, b) in obj_rt.config.fx_chain.iter().zip(obj_cfg.fx_chain.iter()) {
-                    if Self::fx_latency_changed(a, b) {
-                        return false;
-                    }
                 }
             }
         }
@@ -528,21 +624,34 @@ impl ObjectOrientedEngine {
         self.loop_start = project.loop_start_samples;
         self.loop_end = project.loop_end_samples;
         self.master_gain_lin = 10.0_f32.powf(project.master_gain_db.clamp(-48.0, 12.0) / 20.0);
-        self.master_insert_cfgs = project.master_inserts.clone();
+        self.master_gain_smooth
+            .set_target(f64::from(self.master_gain_lin));
+        std::mem::swap(&mut self.master_insert_cfgs, &mut project.master_inserts);
 
-        for (tr_rt, tr_cfg) in self.tracks.iter_mut().zip(project.tracks.iter()) {
-            tr_rt.config = tr_cfg.clone();
-            for (obj_rt, obj_cfg) in tr_rt.objects.iter_mut().zip(tr_cfg.objects.iter()) {
+        for (tr_rt, tr_cfg) in self.tracks.iter_mut().zip(project.tracks.iter_mut()) {
+            for (obj_rt, obj_cfg) in tr_rt.objects.iter_mut().zip(tr_cfg.objects.iter_mut()) {
                 if obj_rt.config.eq != obj_cfg.eq {
-                    obj_rt.eq = ObjectEqRuntime::new(self.sample_rate, obj_cfg.eq);
+                    obj_rt.eq.update_coeffs(self.sample_rate, obj_cfg.eq);
                 }
-                obj_rt.config = obj_cfg.clone();
+                std::mem::swap(&mut obj_rt.config, obj_cfg);
             }
+            std::mem::swap(&mut tr_rt.config, tr_cfg);
         }
-        for (bus_rt, bus_cfg) in self.aux_buses.iter_mut().zip(project.aux_buses.iter()) {
-            bus_rt.config = bus_cfg.clone();
+        for (bus_rt, bus_cfg) in self.aux_buses.iter_mut().zip(project.aux_buses.iter_mut()) {
+            std::mem::swap(&mut bus_rt.config, bus_cfg);
         }
         true
+    }
+
+    /// Attempts to update mix, loop, automation, object EQ/fades, and FX parameters in-place
+    /// without resetting DSP state or interrupting live playback.
+    ///
+    /// Returns `true` if updated in-place, or `false` if the project topology (track count,
+    /// object IDs/sources, FX slot variants, latency mode, or sample rate) changed and a full
+    /// recompile is needed.
+    pub fn sync_mix_params(&mut self, project: &DawProject) -> bool {
+        let mut owned = project.clone();
+        self.sync_mix_params_swap(&mut owned)
     }
 
     pub fn reset_dsp_state(&mut self) {
@@ -799,8 +908,10 @@ impl ObjectOrientedEngine {
                 let tg = 10.0_f32.powf(gain_db.clamp(-60.0, 12.0) / 20.0)
                     * if tr.config.phase_invert { -1.0 } else { 1.0 };
                 let (tpl, tpr) = Self::equal_power_pan(pan);
-                tr_l *= tg * tpl;
-                tr_r *= tg * tpr;
+                tr.gain_l_smooth.set_target(f64::from(tg * tpl));
+                tr.gain_r_smooth.set_target(f64::from(tg * tpr));
+                tr_l *= tr.gain_l_smooth.next_val() as f32;
+                tr_r *= tr.gain_r_smooth.next_val() as f32;
 
                 // Route pre-fader and post-fader track sends to Aux Buses (zero alloc)
                 for send in &tr.config.sends {
@@ -850,12 +961,13 @@ impl ObjectOrientedEngine {
                 mix_r += br * bg * bpr;
             }
 
-            // Master bus inserts & gain
+            // Master bus inserts & smoothed gain
             for (proc_fx, cfg) in self.master_inserts.iter_mut().zip(&self.master_insert_cfgs) {
                 (mix_l, mix_r) = proc_fx.process_stereo(cfg, mix_l, mix_r);
             }
-            mix_l *= self.master_gain_lin;
-            mix_r *= self.master_gain_lin;
+            let mg = self.master_gain_smooth.next_val() as f32;
+            mix_l *= mg;
+            mix_r *= mg;
 
             if !mix_l.is_finite() {
                 mix_l = 0.0;
