@@ -40,6 +40,16 @@ LEAD_VOCAL_TAGS = frozenset({"vocals", "vocal", "lead", "leadvocals", "karaoke"}
 BACKING_VOCAL_TAGS = frozenset(
     {"instrumental", "backing", "backingvocals", "harmonies", "nolead", "other"}
 )
+MALE_VOCAL_TAGS = frozenset({"male", "malevocal", "malevocals"})
+FEMALE_VOCAL_TAGS = frozenset({"female", "femalevocal", "femalevocals"})
+ELECTRIC_GUITAR_TAGS = frozenset({"electric", "electricguitar", "eguitar"})
+ACOUSTIC_GUITAR_TAGS = frozenset({"acoustic", "acousticguitar", "aguitar", "other"})
+STRINGS_TAGS = frozenset({"strings", "bowedstrings", "violin", "cello"})
+BRASS_TAGS = frozenset({"brass", "horns", "trumpet", "trombone"})
+WIND_TAGS = frozenset({"wind", "winds", "woodwinds", "reeds", "flute", "sax"})
+SYNTH_TAGS = frozenset({"synth", "synthesizer", "pad", "lead"})
+CROWD_TAGS = frozenset({"crowd", "applause", "audience", "noise"})
+REVERB_TAGS = frozenset({"reverb", "wet", "echo", "ambience"})
 DRY_TAGS = frozenset({"noreverb", "dry"})
 DENOISED_TAGS = frozenset({"dry", "nonoise", "denoised", "clean"})
 
@@ -47,6 +57,13 @@ BS_ROFORMER_VOCAL_MODEL = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
 MEL_ROFORMER_VOCAL_MODEL = "model_mel_band_roformer_kim_vocals.ckpt"
 DEREVERB_MODEL = "deverb_bs_roformer_8_384dim_10depth.ckpt"
 KARAOKE_MODEL = "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt"
+MALE_FEMALE_MODEL = "mel_band_roformer_male_female_aufr33.ckpt"
+GUITAR_SUB_MODEL = "mel_band_roformer_guitar_elec_acoust.ckpt"
+STRINGS_MODEL = "mel_band_roformer_strings.ckpt"
+BRASS_MODEL = "mel_band_roformer_brass.ckpt"
+WIND_MODEL = "mel_band_roformer_woodwinds.ckpt"
+SYNTH_MODEL = "mel_band_roformer_synth.ckpt"
+CROWD_MODEL = "mel_band_roformer_crowd_aufr33_viperx_sdr_8.7144.ckpt"
 DENOISE_ROFORMER_MODEL = "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt"
 SCNET_FOUR_STEM_MODEL = "scnet_xl_ihf_sdr_10.08.ckpt"
 BS_ROFORMER_SIX_STEM_MODEL = "BS-Roformer-SW.ckpt"
@@ -255,6 +272,65 @@ def _restore_stem(
     return _restore_wav_bandwidth(stem_path, out_path)
 
 
+def _try_optional_split(
+    sep: object,
+    src_path: Path | None,
+    model_filename: str,
+    primary_tags: frozenset[str],
+    residual_tags: frozenset[str],
+    resolved_output: Path,
+) -> tuple[Path | None, Path | None]:
+    """Run an optional binary RoFormer sub-splitter; returns ``(None, src_path)`` if unavailable."""
+    if src_path is None or not src_path.exists():
+        return None, src_path
+    try:
+        sep.load_model(model_filename=model_filename)  # type: ignore[attr-defined]
+        out_files = sep.separate(str(src_path))  # type: ignore[attr-defined]
+    except (RuntimeError, FileNotFoundError, ValueError, OSError):
+        return None, src_path
+    primary = pick_stem(out_files, primary_tags, resolved_output)
+    residual = pick_stem(out_files, residual_tags, resolved_output) or src_path
+    return primary, residual
+
+
+def _run_orchestral_sub_splitters(
+    sep: object,
+    residual: Path | None,
+    resolved_output: Path,
+    base_stem: str,
+) -> tuple[dict[str, Path | None], Path | None]:
+    """Cascade Strings, Brass, Woodwinds, and Synth RoFormer sub-splitters on residual ``other``."""
+    extracted: dict[str, Path | None] = {
+        "strings": None,
+        "brass": None,
+        "wind": None,
+        "synth": None,
+    }
+    specs = (
+        ("strings", STRINGS_MODEL, STRINGS_TAGS),
+        ("brass", BRASS_MODEL, BRASS_TAGS),
+        ("wind", WIND_MODEL, WIND_TAGS),
+        ("synth", SYNTH_MODEL, SYNTH_TAGS),
+    )
+    for key, model_name, tags in specs:
+        stem, next_residual = _try_optional_split(
+            sep, residual, model_name, tags, INSTRUMENTAL_TAGS, resolved_output
+        )
+        extracted[key] = stem
+        # Keep cascaded residual filenames short so multi-stage runs never exceed OS NAME_MAX (255 B).
+        if (
+            next_residual is not None
+            and next_residual != residual
+            and next_residual.exists()
+        ):
+            short_res = (resolved_output / f"{base_stem}_(Residual_{key}).wav").resolve()
+            if short_res.is_relative_to(resolved_output):
+                next_residual.replace(short_res)
+                next_residual = short_res
+        residual = next_residual
+    return extracted, residual
+
+
 def run_separate(
     input_path: Path,
     output_dir: Path,
@@ -263,6 +339,10 @@ def run_separate(
     quality: str = "studio",
     drum_sep: bool = False,
     split_lead_backing: bool = False,
+    split_male_female: bool = False,
+    split_guitar: bool = False,
+    split_orchestral: bool = False,
+    split_crowd: bool = False,
     restore: bool = False,
 ) -> dict[str, str | None]:
     if stems not in {2, 4, 6}:
@@ -297,6 +377,18 @@ def run_separate(
     cymbals: Path | None = None
     lead_vocals: Path | None = None
     backing_vocals: Path | None = None
+    male_vocals: Path | None = None
+    female_vocals: Path | None = None
+    vocal_reverb: Path | None = None
+    electric_guitar: Path | None = None
+    acoustic_guitar: Path | None = None
+    crowd: Path | None = None
+    orch_stems: dict[str, Path | None] = {
+        "strings": None,
+        "brass": None,
+        "wind": None,
+        "synth": None,
+    }
 
     if stems == 2:
         vocal_file, other = _run_vocal_stage(
@@ -332,10 +424,11 @@ def run_separate(
         keys = pick_stem(files, KEYS_TAGS, resolved_output) if stems == 6 else None
         other = pick_stem(files, INSTRUMENTAL_TAGS, resolved_output) or inst_file
 
-    # Stage 2: Optional BS-RoFormer De-Reverb on isolated vocal stem
+    # Stage 2a: Optional BS-RoFormer De-Reverb on isolated vocal stem (exposes both dry & wet tail)
     if dereverb and vocal_file and vocal_file.exists():
         sep.load_model(model_filename=DEREVERB_MODEL)
         deverb_files = sep.separate(str(vocal_file))
+        vocal_reverb = pick_stem(deverb_files, REVERB_TAGS, resolved_output)
         vocal_file = pick_stem(deverb_files, DRY_TAGS, resolved_output) or vocal_file
 
     # Stage 2b: Optional RoFormer Karaoke pass (Lead Vocals vs. Backing Vocals / Harmonies)
@@ -344,6 +437,18 @@ def run_separate(
         karaoke_files = sep.separate(str(vocal_file))
         lead_vocals = pick_stem(karaoke_files, LEAD_VOCAL_TAGS, resolved_output)
         backing_vocals = pick_stem(karaoke_files, BACKING_VOCAL_TAGS, resolved_output)
+
+    # Stage 2c: Optional Male vs. Female Vocal split
+    if split_male_female:
+        male_vocals, female_cand = _try_optional_split(
+            sep,
+            vocal_file,
+            MALE_FEMALE_MODEL,
+            MALE_VOCAL_TAGS,
+            FEMALE_VOCAL_TAGS,
+            resolved_output,
+        )
+        female_vocals = female_cand if male_vocals is not None else None
 
     # Stage 4: Optional 5-piece DrumSep on isolated drums stem
     if drum_sep and drums and drums.exists():
@@ -355,14 +460,48 @@ def run_separate(
         hihat = pick_stem(drum_files, HIHAT_TAGS, resolved_output)
         cymbals = pick_stem(drum_files, CYMBALS_TAGS, resolved_output)
 
+    # Stage 5: Optional Electric vs. Acoustic Guitar sub-split
+    if split_guitar and guitar and guitar.exists():
+        electric_guitar, acoustic_cand = _try_optional_split(
+            sep,
+            guitar,
+            GUITAR_SUB_MODEL,
+            ELECTRIC_GUITAR_TAGS,
+            ACOUSTIC_GUITAR_TAGS,
+            resolved_output,
+        )
+        acoustic_guitar = acoustic_cand if electric_guitar is not None else None
+
+    # Stage 6: Optional Orchestral & Synth sub-splitters on residual `other`
+    if split_orchestral and other and other.exists():
+        orch_stems, other = _run_orchestral_sub_splitters(
+            sep, other, resolved_output, _safe_stem(resolved_input)
+        )
+
+    # Stage 7: Optional Crowd / Audience / Live Room extraction
+    if split_crowd:
+        crowd, other = _try_optional_split(
+            sep, other, CROWD_MODEL, CROWD_TAGS, INSTRUMENTAL_TAGS, resolved_output
+        )
+
     stems_map: dict[str, Path | None] = {
         "vocals": vocal_file,
         "lead_vocals": lead_vocals,
         "backing_vocals": backing_vocals,
+        "male_vocals": male_vocals,
+        "female_vocals": female_vocals,
+        "vocal_reverb": vocal_reverb,
         "drums": drums,
         "bass": bass,
         "guitar": guitar,
+        "electric_guitar": electric_guitar,
+        "acoustic_guitar": acoustic_guitar,
         "keys": keys,
+        "strings": orch_stems["strings"],
+        "brass": orch_stems["brass"],
+        "wind": orch_stems["wind"],
+        "synth": orch_stems["synth"],
+        "crowd": crowd,
         "other": other,
         "kick": kick,
         "snare": snare,
@@ -371,7 +510,7 @@ def run_separate(
         "cymbals": cymbals,
     }
 
-    # Stage 5: Optional Apollo / spectral bandwidth restoration post-pass
+    # Stage 8: Optional Apollo / spectral bandwidth restoration post-pass
     if restore:
         stems_map = {
             k: _restore_stem(sep, v, resolved_output) for k, v in stems_map.items()
@@ -558,6 +697,31 @@ def main() -> int:
         help="Also split isolated vocals into Lead Vocals and Backing Vocals / Harmonies (RoFormer Karaoke)",
     )
     sep_p.add_argument(
+        "--split-male-female",
+        action="store_true",
+        help="Also split isolated vocals into Male and Female vocal stems (Mel-Band-RoFormer)",
+    )
+    sep_p.add_argument(
+        "--split-guitar",
+        action="store_true",
+        help="Also split isolated guitar into Electric Guitar and Acoustic Guitar",
+    )
+    sep_p.add_argument(
+        "--split-orchestral",
+        action="store_true",
+        help="Also extract Strings, Brass, Woodwinds, and Synth from residual Other stem",
+    )
+    sep_p.add_argument(
+        "--split-crowd",
+        action="store_true",
+        help="Also extract live Crowd / Audience / Room Noise from residual Other stem",
+    )
+    sep_p.add_argument(
+        "--all-stems",
+        action="store_true",
+        help="Enable full 23-slot hierarchical pro cascade (6-stem + DrumSep + Karaoke + Male/Female + Guitar + Orchestral/Synth + Crowd)",
+    )
+    sep_p.add_argument(
         "--restore",
         action="store_true",
         help="Run optional Apollo / spectral bandwidth restoration post-pass on separated stems",
@@ -604,14 +768,19 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command == "separate":
+            all_on = bool(args.all_stems)
             res = run_separate(
                 args.input,
                 args.output_dir,
                 dereverb=not args.no_dereverb,
-                stems=args.stems,
+                stems=6 if all_on else args.stems,
                 quality=args.quality,
-                drum_sep=args.drum_sep,
-                split_lead_backing=args.split_lead_backing,
+                drum_sep=all_on or args.drum_sep,
+                split_lead_backing=all_on or args.split_lead_backing,
+                split_male_female=all_on or args.split_male_female,
+                split_guitar=all_on or args.split_guitar,
+                split_orchestral=all_on or args.split_orchestral,
+                split_crowd=all_on or args.split_crowd,
                 restore=args.restore,
             )
             print(json.dumps(res))

@@ -115,6 +115,14 @@ pub struct SeparationConfig {
     pub drum_sep: bool,
     /// Also split isolated vocals into Lead Vocals and Backing Vocals / Harmonies via RoFormer Karaoke (default `false`).
     pub split_lead_backing: bool,
+    /// Also split isolated vocals into Male and Female vocal stems (default `false`).
+    pub split_male_female: bool,
+    /// Also split isolated guitar into Electric Guitar and Acoustic Guitar (default `false`).
+    pub split_guitar: bool,
+    /// Also extract Strings, Brass, Woodwinds, and Synth from the residual Other stem (default `false`).
+    pub split_orchestral: bool,
+    /// Also extract live Crowd / Audience / Room Noise from the residual Other stem (default `false`).
+    pub split_crowd: bool,
     /// Run optional Apollo / spectral bandwidth restoration post-pass on separated stems (default `false`).
     pub restore: bool,
 }
@@ -133,6 +141,10 @@ impl Default for SeparationConfig {
             dereverb: true,
             drum_sep: false,
             split_lead_backing: false,
+            split_male_female: false,
+            split_guitar: false,
+            split_orchestral: false,
+            split_crowd: false,
             restore: false,
         }
     }
@@ -167,8 +179,24 @@ impl SeparationConfig {
             dereverb: true,
             drum_sep: false,
             split_lead_backing: false,
+            split_male_female: false,
+            split_guitar: false,
+            split_orchestral: false,
+            split_crowd: false,
             restore: false,
         }
+    }
+
+    /// Enables the full 23-slot hierarchical pro studio cascade in one call.
+    pub fn enable_all_stems(&mut self) {
+        self.stems = 6;
+        self.dereverb = true;
+        self.drum_sep = true;
+        self.split_lead_backing = true;
+        self.split_male_female = true;
+        self.split_guitar = true;
+        self.split_orchestral = true;
+        self.split_crowd = true;
     }
 }
 

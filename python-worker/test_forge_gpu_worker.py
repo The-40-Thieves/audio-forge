@@ -438,6 +438,90 @@ class SixStemAndTranscribeTests(TestCase):
             )
             self.assertTrue(Path(res["drums"]).is_file())
 
+    def test_full_hierarchical_23_slot_cascade_populates_all_sub_stems(self) -> None:
+        model_outputs: dict[str, tuple[str, ...]] = {
+            BS_1297: ("Instrumental", "Vocals"),
+            "BS-Roformer-SW": ("Vocals", "Drums", "Bass", "Guitar", "Piano", "Other"),
+            DEVERB: ("Reverb", "No Reverb"),
+            "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956": (
+                "Vocals",
+                "Instrumental",
+            ),
+            "mel_band_roformer_male_female_aufr33": ("Male", "Female"),
+            "MDX23C-DrumSep-aufr33-jarredou": ("Kick", "Snare", "Toms", "HH", "Cymbals"),
+            "mel_band_roformer_guitar_elec_acoust": ("Electric Guitar", "Acoustic Guitar"),
+            "mel_band_roformer_strings": ("Strings", "Other"),
+            "mel_band_roformer_brass": ("Brass", "Other"),
+            "mel_band_roformer_woodwinds": ("Woodwinds", "Other"),
+            "mel_band_roformer_synth": ("Synth", "Other"),
+            "mel_band_roformer_crowd_aufr33_viperx_sdr_8.7144": ("Crowd", "Other"),
+        }
+
+        class FullCascadeSeparator(FakeSeparator):
+            def separate(self, audio_file: str) -> list[str]:
+                base = Path(audio_file).stem
+                stems = model_outputs[self.model]
+                names = [f"{base}_({stem})_{self.model}.wav" for stem in stems]
+                for name in names:
+                    (self.output_dir / name).write_bytes(b"RIFF")
+                return names
+
+        modules = {
+            "audio_separator": fake_module("audio_separator"),
+            "audio_separator.separator": fake_module(
+                "audio_separator.separator", Separator=FullCascadeSeparator
+            ),
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(sys.modules, modules),
+        ):
+            out = Path(tmp)
+            inp = out / "symphony.wav"
+            inp.write_bytes(b"RIFF")
+            res = worker.run_separate(
+                inp,
+                out,
+                dereverb=True,
+                stems=6,
+                quality="studio",
+                drum_sep=True,
+                split_lead_backing=True,
+                split_male_female=True,
+                split_guitar=True,
+                split_orchestral=True,
+                split_crowd=True,
+            )
+            expected_keys = (
+                "vocals",
+                "lead_vocals",
+                "backing_vocals",
+                "male_vocals",
+                "female_vocals",
+                "vocal_reverb",
+                "drums",
+                "bass",
+                "guitar",
+                "electric_guitar",
+                "acoustic_guitar",
+                "keys",
+                "strings",
+                "brass",
+                "wind",
+                "synth",
+                "crowd",
+                "other",
+                "kick",
+                "snare",
+                "toms",
+                "hihat",
+                "cymbals",
+            )
+            self.assertEqual(len(expected_keys), 23)
+            for key in expected_keys:
+                self.assertIsNotNone(res[key], f"missing hierarchical slot: {key}")
+                self.assertTrue(Path(res[key]).is_file())
+
     def test_ultra_ensemble_blends_bs_and_mel_roformer_wavs(self) -> None:
         import array
         import wave

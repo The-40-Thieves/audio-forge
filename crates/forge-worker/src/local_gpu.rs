@@ -94,6 +94,18 @@ pub(crate) fn separate(
     if config.split_lead_backing {
         cmd.arg("--split-lead-backing");
     }
+    if config.split_male_female {
+        cmd.arg("--split-male-female");
+    }
+    if config.split_guitar {
+        cmd.arg("--split-guitar");
+    }
+    if config.split_orchestral {
+        cmd.arg("--split-orchestral");
+    }
+    if config.split_crowd {
+        cmd.arg("--split-crowd");
+    }
     if config.restore {
         cmd.arg("--restore");
     }

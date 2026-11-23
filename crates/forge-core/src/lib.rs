@@ -300,10 +300,30 @@ pub struct StemBundle {
     pub lead_vocals: Option<PathBuf>,
     #[serde(default)]
     pub backing_vocals: Option<PathBuf>,
+    #[serde(default)]
+    pub male_vocals: Option<PathBuf>,
+    #[serde(default)]
+    pub female_vocals: Option<PathBuf>,
+    #[serde(default)]
+    pub vocal_reverb: Option<PathBuf>,
     pub drums: Option<PathBuf>,
     pub bass: Option<PathBuf>,
     pub guitar: Option<PathBuf>,
+    #[serde(default)]
+    pub electric_guitar: Option<PathBuf>,
+    #[serde(default)]
+    pub acoustic_guitar: Option<PathBuf>,
     pub keys: Option<PathBuf>,
+    #[serde(default)]
+    pub strings: Option<PathBuf>,
+    #[serde(default)]
+    pub brass: Option<PathBuf>,
+    #[serde(default)]
+    pub wind: Option<PathBuf>,
+    #[serde(default)]
+    pub synth: Option<PathBuf>,
+    #[serde(default)]
+    pub crowd: Option<PathBuf>,
     pub other: Option<PathBuf>,
     #[serde(default)]
     pub kick: Option<PathBuf>,

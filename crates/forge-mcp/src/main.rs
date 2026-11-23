@@ -449,6 +449,11 @@ fn tool_definitions() -> Vec<Value> {
                     "dereverb": { "type": "boolean", "default": true, "description": "Run BS-RoFormer de-reverb on isolated vocals" },
                     "drum_sep": { "type": "boolean", "default": false, "description": "Also split isolated drums into Kick, Snare, Toms, Hi-Hat, and Cymbals" },
                     "split_lead_backing": { "type": "boolean", "default": false, "description": "Also split isolated vocals into Lead Vocals and Backing Vocals / Harmonies (RoFormer Karaoke)" },
+                    "split_male_female": { "type": "boolean", "default": false, "description": "Also split isolated vocals into Male and Female vocal stems" },
+                    "split_guitar": { "type": "boolean", "default": false, "description": "Also split isolated guitar into Electric Guitar and Acoustic Guitar" },
+                    "split_orchestral": { "type": "boolean", "default": false, "description": "Also extract Strings, Brass, Woodwinds, and Synth from residual Other stem" },
+                    "split_crowd": { "type": "boolean", "default": false, "description": "Also extract live Crowd / Audience / Room Noise from residual Other stem" },
+                    "all_stems": { "type": "boolean", "default": false, "description": "Enable full 23-slot hierarchical pro studio cascade (all sub-splitters)" },
                     "restore": { "type": "boolean", "default": false, "description": "Run optional Apollo / spectral bandwidth restoration post-pass on separated stems" }
                 },
                 "required": ["input", "output_dir"]
@@ -1278,14 +1283,13 @@ fn tool_separate_stems(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput
         .get("drum_sep")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let split_lead_backing = args
-        .get("split_lead_backing")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let restore = args
-        .get("restore")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let split_lead_backing = bool_arg(args, "split_lead_backing", false);
+    let split_male_female = bool_arg(args, "split_male_female", false);
+    let split_guitar = bool_arg(args, "split_guitar", false);
+    let split_orchestral = bool_arg(args, "split_orchestral", false);
+    let split_crowd = bool_arg(args, "split_crowd", false);
+    let all_stems = bool_arg(args, "all_stems", false);
+    let restore = bool_arg(args, "restore", false);
 
     let mut cfg = SeparationConfig::from_env();
     cfg.stems = stems;
@@ -1293,6 +1297,14 @@ fn tool_separate_stems(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput
     cfg.dereverb = dereverb;
     cfg.drum_sep = drum_sep;
     cfg.split_lead_backing = split_lead_backing;
+    cfg.split_male_female = split_male_female;
+    cfg.split_guitar = split_guitar;
+    cfg.split_orchestral = split_orchestral;
+    cfg.split_crowd = split_crowd;
+    if all_stems {
+        cfg.enable_all_stems();
+        cfg.dereverb = dereverb;
+    }
     cfg.restore = restore;
 
     let report = external::separate_stems_checked(sandbox, &input, &output_dir, &cfg)?;

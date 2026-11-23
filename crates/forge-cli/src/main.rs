@@ -346,6 +346,21 @@ enum Commands {
         /// Also split isolated vocals into Lead Vocals and Backing Vocals / Harmonies (RoFormer Karaoke)
         #[arg(long)]
         split_lead_backing: bool,
+        /// Also split isolated vocals into Male and Female vocal stems (Mel-Band-RoFormer)
+        #[arg(long)]
+        split_male_female: bool,
+        /// Also split isolated guitar into Electric Guitar and Acoustic Guitar
+        #[arg(long)]
+        split_guitar: bool,
+        /// Also extract Strings, Brass, Woodwinds, and Synth from the residual Other stem
+        #[arg(long)]
+        split_orchestral: bool,
+        /// Also extract live Crowd / Audience / Room Noise from the residual Other stem
+        #[arg(long)]
+        split_crowd: bool,
+        /// Enable full 23-slot hierarchical pro studio cascade (all sub-splitters)
+        #[arg(long)]
+        all_stems: bool,
         /// Run optional Apollo / spectral bandwidth restoration post-pass on separated stems
         #[arg(long)]
         restore: bool,
@@ -355,8 +370,7 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -986,7 +1000,10 @@ async fn main() -> anyhow::Result<()> {
             output,
             model,
         } => {
-            let (saved, lyrics) = generate_music_lyria(&prompt, &model, &output).await?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let (saved, lyrics) = rt.block_on(generate_music_lyria(&prompt, &model, &output))?;
             println!("Lyria audio saved to {}", saved.display());
             if let Some(l) = lyrics {
                 println!("\nGenerated Structure / Lyrics:\n{l}");
@@ -1043,6 +1060,11 @@ async fn main() -> anyhow::Result<()> {
             no_dereverb,
             drum_sep,
             split_lead_backing,
+            split_male_female,
+            split_guitar,
+            split_orchestral,
+            split_crowd,
+            all_stems,
             restore,
             backend,
         } => {
@@ -1055,15 +1077,35 @@ async fn main() -> anyhow::Result<()> {
             cfg.dereverb = !no_dereverb;
             cfg.drum_sep = drum_sep;
             cfg.split_lead_backing = split_lead_backing;
+            cfg.split_male_female = split_male_female;
+            cfg.split_guitar = split_guitar;
+            cfg.split_orchestral = split_orchestral;
+            cfg.split_crowd = split_crowd;
+            if all_stems {
+                cfg.enable_all_stems();
+                if no_dereverb {
+                    cfg.dereverb = false;
+                }
+            }
             cfg.restore = restore;
             if let Some(b) = backend {
                 cfg.backend = parse_backend(&b, cfg.colab_url.as_deref())?;
             }
-            let report = separate_stems(&input, &output_dir, &cfg)?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            run_separate_cli(&input, &output_dir, &cfg)?;
         }
     }
 
+    Ok(())
+}
+
+#[inline(never)]
+fn run_separate_cli(
+    input: &std::path::Path,
+    output_dir: &std::path::Path,
+    cfg: &SeparationConfig,
+) -> anyhow::Result<()> {
+    let report = separate_stems(input, output_dir, cfg)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
