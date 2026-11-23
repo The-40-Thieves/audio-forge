@@ -1941,6 +1941,15 @@ impl RealtimeMasteringEq18 {
         }
     }
 
+    /// Clears all 18 stereo biquad filter delay registers in place with zero heap allocations.
+    pub fn reset(&mut self) {
+        for i in 0..18 {
+            self.bands_l[i].reset();
+            self.bands_r[i].reset();
+        }
+        self.control_count = 0;
+    }
+
     /// Sets each band's target gain to `gains_db[i] * amount`, clamped to +/-15 dB.
     pub fn set_gains(&mut self, gains_db: &[f64; 18], amount: f64) {
         let amt = sanitize_param_f64(amount, 1.0, 0.0, 2.0);
@@ -2017,6 +2026,13 @@ impl RealtimePhaseAligner {
             current_delay_samples: 0,
             invert_polarity: false,
         }
+    }
+
+    /// Clears the stereo delay lines in place with zero heap allocations.
+    pub fn reset(&mut self) {
+        self.delay_line_l.fill(0.0);
+        self.delay_line_r.fill(0.0);
+        self.write_pos = 0;
     }
 
     pub fn set_alignment(&mut self, delay_samples: usize, invert_polarity: bool) {

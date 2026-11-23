@@ -688,6 +688,10 @@ impl Plugin for ForgeOpenSoothePlug {
                                     ui.add(widgets::ParamSlider::for_param(&params.enable_limiter, setter));
                                     ui.end_row();
 
+                                    ui.label("Limiter Ceiling (dBTP)");
+                                    ui.add(widgets::ParamSlider::for_param(&params.ceiling_dbtp, setter));
+                                    ui.end_row();
+
                                     ui.label("Cross-Instance Spectrum Slot");
                                     ui.add(widgets::ParamSlider::for_param(&params.shared_bus_slot, setter));
                                     ui.end_row();
@@ -1122,8 +1126,9 @@ impl Plugin for ForgeOpenSpacerPlug {
                 c1[i] = out_r;
             }
         }
+        let carve_db = self.dsp.last_carve_bands_db().map(|v| -v.abs());
         self.telemetry
-            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &[0.0; 32]);
+            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &carve_db);
 
         ProcessStatus::Normal
     }
@@ -2418,8 +2423,16 @@ impl Plugin for ForgePhaseAndMatchPlug {
         self.phase_dsp = RealtimePhaseAligner::new(sr);
         self.eq_dsp = RealtimeMasteringEq18::new(sr);
         self.analyzer.reset(sr);
+        self.auto_gain.set_sample_rate(sr);
         self.auto_gain.reset();
         true
+    }
+
+    fn reset(&mut self) {
+        self.phase_dsp.reset();
+        self.eq_dsp.reset();
+        self.auto_gain.reset();
+        self.analyzer.clear_state();
     }
 
     fn process(
@@ -3301,6 +3314,7 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
     ) -> bool {
         let sr = f64::from(buffer_config.sample_rate);
         self.preamp_dsp = RealtimeNeuralPreamp::new(AnalogHardwareModel::Neve1073ClassA);
+        self.preamp_dsp.set_sample_rate(sr);
         self.reverb_dsp.reset(sr);
         self.analyzer.reset(sr);
         true
@@ -3308,6 +3322,7 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
 
     fn reset(&mut self) {
         let sr = self.reverb_dsp.sample_rate();
+        self.preamp_dsp.reset();
         self.reverb_dsp.reset(sr);
         self.analyzer.clear_state();
     }
@@ -3555,11 +3570,18 @@ impl Plugin for ForgeVocalTunePlug {
     const EMAIL: &'static str = "audio@the40thieves.org";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
-    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
-        main_input_channels: NonZeroU32::new(2),
-        main_output_channels: NonZeroU32::new(2),
-        ..AudioIOLayout::const_default()
-    }];
+    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[
+        AudioIOLayout {
+            main_input_channels: NonZeroU32::new(2),
+            main_output_channels: NonZeroU32::new(2),
+            ..AudioIOLayout::const_default()
+        },
+        AudioIOLayout {
+            main_input_channels: NonZeroU32::new(1),
+            main_output_channels: NonZeroU32::new(1),
+            ..AudioIOLayout::const_default()
+        },
+    ];
 
     const SAMPLE_ACCURATE_AUTOMATION: bool = true;
     type SysExMessage = ();
@@ -3658,14 +3680,15 @@ impl Plugin for ForgeVocalTunePlug {
         context: &mut impl InitContext<Self>,
     ) -> bool {
         self.sample_rate = f64::from(buffer_config.sample_rate);
-        self.reset();
+        self.dsp.reset(self.sample_rate);
+        self.analyzer.reset(self.sample_rate);
         context.set_latency_samples(self.dsp.latency_samples());
         true
     }
 
     fn reset(&mut self) {
         self.dsp.reset(self.sample_rate);
-        self.analyzer.reset(self.sample_rate);
+        self.analyzer.clear_state();
     }
 
     fn process(
@@ -3686,16 +3709,17 @@ impl Plugin for ForgeVocalTunePlug {
         self.dsp
             .set_retune_speed_ms(f64::from(self.params.retune_speed_ms.value()));
         self.dsp
-            .set_retune_amount(f64::from(self.params.retune_amount.value()));
-        self.dsp
             .set_humanize(f64::from(self.params.humanize.value()));
         self.dsp
             .set_formant_shift_st(f64::from(self.params.formant_shift_st.value()));
-        self.dsp.set_wet_mix(f64::from(self.params.wet_mix.value()));
 
         for mut channel_samples in buffer.iter_samples() {
+            self.dsp
+                .set_retune_amount(f64::from(self.params.retune_amount.smoothed.next()));
+            self.dsp
+                .set_wet_mix(f64::from(self.params.wet_mix.smoothed.next()));
             let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
-            let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
+            let in_r = channel_samples.get_mut(1).map_or(in_l, |s| *s);
             let (out_l, out_r) = self.dsp.process_stereo_sample(in_l, in_r);
             self.analyzer.push_stereo_sample(out_l, out_r);
             let corr_vis = (self.dsp.correction_cents() / 100.0) as f32;
