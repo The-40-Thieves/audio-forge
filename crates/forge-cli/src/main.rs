@@ -24,9 +24,9 @@ use forge_vocal::{
     track_vocal_pitch,
 };
 use forge_worker::{
-    SeparationConfig, generate_music_lyria, index_drum_sample_library,
-    resolve_default_local_worker, run_local_neural_denoise, run_local_transcribe_midi,
-    separate_stems,
+    SeparationConfig, generate_music_lyria, index_drum_sample_library, parse_backend,
+    parse_quality, resolve_default_local_worker, run_local_neural_denoise,
+    run_local_transcribe_midi, separate_stems,
 };
 
 #[derive(Parser)]
@@ -322,6 +322,30 @@ enum Commands {
         /// Worker timeout in seconds (1..=3600)
         #[arg(long, default_value_t = 300)]
         timeout_secs: u64,
+    },
+
+    /// Professional studio neural stem separation (BS-RoFormer 1297 / Mel-Band-RoFormer cascade, 2/4/6 stems + optional 5-piece DrumSep)
+    Separate {
+        /// Input audio file (WAV, FLAC, MP3, OGG, M4A)
+        input: PathBuf,
+        /// Output directory for separated WAV stems
+        #[arg(short, long)]
+        output_dir: PathBuf,
+        /// Primary stem count: 2 (Vocals/Inst), 4 (Vocals/Drums/Bass/Other), or 6 (+Guitar/Keys)
+        #[arg(long, default_value_t = 6)]
+        stems: u8,
+        /// Separation quality tier: `fast` (1-pass), `studio` (BS-RoFormer 1297 cascade), or `ultra` (dual-RoFormer ensemble)
+        #[arg(long, default_value = "studio")]
+        quality: String,
+        /// Disable BS-RoFormer de-reverb pass on isolated vocals
+        #[arg(long)]
+        no_dereverb: bool,
+        /// Also split isolated drums into Kick, Snare, Toms, Hi-Hat, and Cymbals (MDX23C DrumSep)
+        #[arg(long)]
+        drum_sep: bool,
+        /// Backend override: `auto`, `local_gpu`, `colab`, or `dsp`
+        #[arg(long)]
+        backend: Option<String>,
     },
 }
 
@@ -1003,6 +1027,30 @@ async fn main() -> anyhow::Result<()> {
                 std::time::Duration::from_secs(timeout_secs),
             )?;
             println!("{}", serde_json::to_string_pretty(&res)?);
+        }
+
+        Commands::Separate {
+            input,
+            output_dir,
+            stems,
+            quality,
+            no_dereverb,
+            drum_sep,
+            backend,
+        } => {
+            if !matches!(stems, 2 | 4 | 6) {
+                anyhow::bail!("--stems must be 2, 4, or 6 (got {stems})");
+            }
+            let mut cfg = SeparationConfig::from_env();
+            cfg.stems = stems;
+            cfg.quality = parse_quality(&quality)?;
+            cfg.dereverb = !no_dereverb;
+            cfg.drum_sep = drum_sep;
+            if let Some(b) = backend {
+                cfg.backend = parse_backend(&b, cfg.colab_url.as_deref())?;
+            }
+            let report = separate_stems(&input, &output_dir, &cfg)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
     }
 

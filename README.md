@@ -82,6 +82,7 @@ READY
 | `forge_master_distrokid` | Low-level mastering with an explicit LUFS and ceiling, reference-match EQ and ISRC tagging. |
 | `forge_neural_denoise` | Neural audio denoising via DeepFilterNet3 or Mel-Band-RoFormer on the local Python GPU worker. |
 | `forge_transcribe_midi` | Polyphonic audio-to-MIDI transcription via basic-pitch on the local Python GPU worker. |
+| `forge_separate_stems` | Studio-grade neural stem separation (BS-RoFormer 1297 / Mel-Band-RoFormer cascade, 2/4/6 stems + optional DrumSep) with Rust DSP fallback. |
 
 ### Delivery targets
 

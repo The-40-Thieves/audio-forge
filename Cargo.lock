@@ -1492,6 +1492,7 @@ dependencies = [
  "eframe",
  "forge-core",
  "forge-engine",
+ "forge-worker",
 ]
 
 [[package]]

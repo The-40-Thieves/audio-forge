@@ -17,6 +17,7 @@ from unittest import TestCase, main, mock
 import forge_gpu_worker as worker
 
 KIM = "model_mel_band_roformer_kim_vocals"
+BS_1297 = "model_bs_roformer_ep_317_sdr_12.9755"
 DEVERB = "deverb_bs_roformer_8_384dim_10depth"
 
 
@@ -121,13 +122,13 @@ class RunSeparateTests(TestCase):
 
     def test_vocal_named_input_returns_the_vocal_stem(self) -> None:
         result = self.run_separate("Lead_Vocal_mix.wav", dereverb=False)
-        self.assertEqual(result["vocals"], f"Lead_Vocal_mix_(Vocals)_{KIM}.wav")
-        self.assertEqual(result["other"], f"Lead_Vocal_mix_(Instrumental)_{KIM}.wav")
+        self.assertEqual(result["vocals"], f"Lead_Vocal_mix_(Vocals)_{BS_1297}.wav")
+        self.assertEqual(result["other"], f"Lead_Vocal_mix_(Instrumental)_{BS_1297}.wav")
 
     def test_dry_named_input_returns_the_dereverbed_vocal(self) -> None:
         result = self.run_separate("dry_take.wav", dereverb=True)
         self.assertEqual(
-            result["vocals"], f"dry_take_(Vocals)_{KIM}_(No Reverb)_{DEVERB}.wav"
+            result["vocals"], f"dry_take_(Vocals)_{BS_1297}_(No Reverb)_{DEVERB}.wav"
         )
 
 
@@ -293,7 +294,9 @@ class SixStemAndTranscribeTests(TestCase):
             out = Path(tmp)
             inp = out / "full_mix.wav"
             inp.write_bytes(b"RIFF")
-            res = worker.run_separate(inp, out, dereverb=False, stems=6)
+            res = worker.run_separate(
+                inp, out, dereverb=False, stems=6, quality="fast"
+            )
             expected = {
                 "vocals": "full_mix_(Vocals)_htdemucs_6s.wav",
                 "drums": "full_mix_(Drums)_htdemucs_6s.wav",
@@ -306,6 +309,107 @@ class SixStemAndTranscribeTests(TestCase):
                 self.assertIsNotNone(res[key], f"missing 6-stem slot: {key}")
                 self.assertEqual(Path(res[key]).name, filename)
                 self.assertTrue(Path(res[key]).is_file())
+
+    def test_studio_cascade_and_drumsep_populate_all_eleven_slots(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        class CascadeSeparator(FakeSeparator):
+            def separate(self, audio_file: str) -> list[str]:
+                calls.append((self.model, Path(audio_file).name))
+                base = Path(audio_file).stem
+                if self.model == "htdemucs_6s":
+                    stems = ("Vocals", "Drums", "Bass", "Guitar", "Piano", "Other")
+                elif self.model == "MDX23C-DrumSep-aufr33-jarredou":
+                    stems = ("Kick", "Snare", "Toms", "HH", "Cymbals")
+                else:
+                    stems = ("Instrumental", "Vocals")
+                names = [f"{base}_({stem})_{self.model}.wav" for stem in stems]
+                for name in names:
+                    (self.output_dir / name).write_bytes(b"RIFF")
+                return names
+
+        modules = {
+            "audio_separator": fake_module("audio_separator"),
+            "audio_separator.separator": fake_module(
+                "audio_separator.separator", Separator=CascadeSeparator
+            ),
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(sys.modules, modules),
+        ):
+            out = Path(tmp)
+            inp = out / "song.wav"
+            inp.write_bytes(b"RIFF")
+            res = worker.run_separate(
+                inp, out, dereverb=False, stems=6, quality="studio", drum_sep=True
+            )
+            self.assertEqual(calls[0], (BS_1297, "song.wav"))
+            self.assertEqual(
+                calls[1], ("htdemucs_6s", f"song_(Instrumental)_{BS_1297}.wav")
+            )
+            self.assertEqual(calls[2][0], "MDX23C-DrumSep-aufr33-jarredou")
+            for key in (
+                "vocals",
+                "drums",
+                "bass",
+                "guitar",
+                "keys",
+                "other",
+                "kick",
+                "snare",
+                "toms",
+                "hihat",
+                "cymbals",
+            ):
+                self.assertIsNotNone(res[key], f"missing cascade slot: {key}")
+
+    def test_ultra_ensemble_blends_bs_and_mel_roformer_wavs(self) -> None:
+        import array
+        import wave
+
+        def write_pcm(path: Path, sample_val: int) -> None:
+            with wave.open(str(path), "wb") as w:
+                w.setnchannels(2)
+                w.setsampwidth(2)
+                w.setframerate(48_000)
+                w.writeframes(array.array("h", [sample_val] * 64).tobytes())
+
+        class EnsembleSeparator(FakeSeparator):
+            def separate(self, audio_file: str) -> list[str]:
+                base = Path(audio_file).stem
+                val = 10_000 if self.model == BS_1297 else 20_000
+                names = [
+                    f"{base}_(Instrumental)_{self.model}.wav",
+                    f"{base}_(Vocals)_{self.model}.wav",
+                ]
+                for name in names:
+                    write_pcm(self.output_dir / name, val)
+                return names
+
+        modules = {
+            "audio_separator": fake_module("audio_separator"),
+            "audio_separator.separator": fake_module(
+                "audio_separator.separator", Separator=EnsembleSeparator
+            ),
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(sys.modules, modules),
+        ):
+            out = Path(tmp)
+            inp = out / "mix.wav"
+            write_pcm(inp, 15_000)
+            res = worker.run_separate(
+                inp, out, dereverb=False, stems=2, quality="ultra"
+            )
+            vocal_path = Path(res["vocals"])
+            self.assertEqual(vocal_path.name, "mix_(Vocals)_roformer_ensemble.wav")
+            with wave.open(str(vocal_path), "rb") as w:
+                samples = array.array("h")
+                samples.frombytes(w.readframes(4))
+            # 0.6 * 10_000 + 0.4 * 20_000 = 14_000
+            self.assertEqual(samples[0], 14_000)
 
     def test_transcribe_writes_midi_file(self) -> None:
         class FakeMidi:

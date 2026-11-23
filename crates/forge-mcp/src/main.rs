@@ -437,6 +437,22 @@ fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "forge_separate_stems",
+            "description": "Studio-grade neural stem separation (BS-RoFormer 1297 / Mel-Band-RoFormer cascade, 2/4/6 stems + optional BS-RoFormer de-reverb & 5-piece MDX23C DrumSep) with pure-Rust DSP fallback, confined to the MCP path sandbox.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "input": { "type": "string", "description": "Input audio file" },
+                    "output_dir": { "type": "string", "description": "Output directory for separated WAV stems" },
+                    "stems": { "type": "integer", "enum": [2, 4, 6], "default": 6, "description": "Primary stem count (2, 4, or 6)" },
+                    "quality": { "type": "string", "enum": ["fast", "studio", "ultra"], "default": "studio", "description": "Separation quality tier" },
+                    "dereverb": { "type": "boolean", "default": true, "description": "Run BS-RoFormer de-reverb on isolated vocals" },
+                    "drum_sep": { "type": "boolean", "default": false, "description": "Also split isolated drums into Kick, Snare, Toms, Hi-Hat, and Cymbals" }
+                },
+                "required": ["input", "output_dir"]
+            }
+        }),
+        json!({
             "name": "forge_ingest_to_reaper",
             "description": "Full autonomous pipeline: separate stems, clean & de-fizz audio, extract drum MIDI, build voice-led chords, deliver a verified master for the chosen target, install JSFX plugins, and generate a REAPER 7.82 .RPP project.",
             "inputSchema": {
@@ -613,6 +629,7 @@ fn dispatch_tool(
         "forge_ingest_to_reaper" => tool_ingest_to_reaper,
         "forge_neural_denoise" => tool_neural_denoise,
         "forge_transcribe_midi" => tool_transcribe_midi,
+        "forge_separate_stems" => tool_separate_stems,
         _ => {
             return Err(ForgeError::InvalidParameter(format!(
                 "Unknown tool: {name}"
@@ -1234,6 +1251,44 @@ fn build_session(spec: SessionSpec) -> ReaperProjectBuilder {
     rpp
 }
 
+fn tool_separate_stems(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
+    let input = path_arg(args, "input", sandbox)?;
+    let output_dir = path_arg(args, "output_dir", sandbox)?;
+    let stems_raw = args.get("stems").and_then(Value::as_u64).unwrap_or(6);
+    let stems = match stems_raw {
+        2 | 4 | 6 => stems_raw as u8,
+        other => {
+            return Err(ForgeError::InvalidParameter(format!(
+                "stems must be 2, 4, or 6, got {other}"
+            )));
+        }
+    };
+    let quality_str = args
+        .get("quality")
+        .and_then(Value::as_str)
+        .unwrap_or("studio");
+    let quality = forge_worker::parse_quality(quality_str)?;
+    let dereverb = args
+        .get("dereverb")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let drum_sep = args
+        .get("drum_sep")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let mut cfg = SeparationConfig::from_env();
+    cfg.stems = stems;
+    cfg.quality = quality;
+    cfg.dereverb = dereverb;
+    cfg.drum_sep = drum_sep;
+
+    let report = external::separate_stems_checked(sandbox, &input, &output_dir, &cfg)?;
+    let payload = serde_json::to_value(&report)
+        .map_err(|e| ForgeError::InvalidParameter(format!("Failed to serialize report: {e}")))?;
+    Ok(payload.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1351,6 +1406,10 @@ mod tests {
             (
                 "forge_transcribe_midi",
                 json!({ "input": "in.wav", "output_dir": "../midi_out" }),
+            ),
+            (
+                "forge_separate_stems",
+                json!({ "input": "in.wav", "output_dir": "../stems_out" }),
             ),
         ];
         for (tool, args) in cases {

@@ -57,6 +57,41 @@ pub struct SeparationReport {
     pub fallbacks: Vec<String>,
 }
 
+/// Quality tier for neural stem separation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeparationQuality {
+    /// Single-pass separation (Mel-Band-RoFormer Kim Vocal or HTDemucs directly).
+    Fast,
+    /// Studio-grade BS-RoFormer Viperx 1297 (~12.98 dB SDR) vocal isolation + vocal-free instrumental cascade.
+    #[default]
+    Studio,
+    /// Dual-RoFormer ensemble (BS-RoFormer 1297 + Mel-Band-RoFormer Kim Vocal) + vocal-free instrumental cascade.
+    Ultra,
+}
+
+impl SeparationQuality {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Studio => "studio",
+            Self::Ultra => "ultra",
+        }
+    }
+}
+
+/// Parses a separation quality tier (`fast`, `studio`, `ultra`).
+pub fn parse_quality(raw: &str) -> Result<SeparationQuality> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "fast" => Ok(SeparationQuality::Fast),
+        "studio" => Ok(SeparationQuality::Studio),
+        "ultra" => Ok(SeparationQuality::Ultra),
+        other => Err(ForgeError::InvalidParameter(format!(
+            "unknown separation quality '{other}' (expected fast, studio, or ultra)"
+        ))),
+    }
+}
+
 /// Everything routing needs. `from_env` reads the process environment; tests build it directly.
 #[derive(Debug, Clone)]
 pub struct SeparationConfig {
@@ -70,6 +105,31 @@ pub struct SeparationConfig {
     /// Fail instead of falling back to the DSP split when no neural backend produced stems
     /// (`FORGE_WORKER_REQUIRE_NEURAL`).
     pub require_neural: bool,
+    /// Number of primary stems to separate (`2`, `4`, or `6`; default `2`).
+    pub stems: u8,
+    /// Neural separation quality tier (`fast`, `studio`, `ultra`; default `studio`).
+    pub quality: SeparationQuality,
+    /// Run BS-RoFormer de-reverb on the isolated vocal stem (default `true`).
+    pub dereverb: bool,
+    /// Also split isolated drums into Kick, Snare, Toms, Hi-Hat, and Cymbals (default `false`).
+    pub drum_sep: bool,
+}
+
+impl Default for SeparationConfig {
+    fn default() -> Self {
+        Self {
+            backend: WorkerBackend::Auto,
+            local_worker: None,
+            colab_url: None,
+            local_timeout: DEFAULT_LOCAL_TIMEOUT,
+            http_timeout: DEFAULT_HTTP_TIMEOUT,
+            require_neural: false,
+            stems: 2,
+            quality: SeparationQuality::Studio,
+            dereverb: true,
+            drum_sep: false,
+        }
+    }
 }
 
 impl SeparationConfig {
@@ -96,6 +156,10 @@ impl SeparationConfig {
             http_timeout: env_secs("FORGE_COLAB_TIMEOUT_SECS", DEFAULT_HTTP_TIMEOUT),
             require_neural: env_nonempty("FORGE_WORKER_REQUIRE_NEURAL")
                 .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true")),
+            stems: 2,
+            quality: SeparationQuality::Studio,
+            dereverb: true,
+            drum_sep: false,
         }
     }
 }
@@ -193,10 +257,25 @@ impl Attempt<'_> {
         output_dir: &Path,
         config: &SeparationConfig,
     ) -> Result<StemBundle> {
-        let bundle = match self {
-            Self::Local(worker) => {
-                local_gpu::separate(worker, input, output_dir, config.local_timeout)?
+        let stems = match config.stems {
+            2 | 4 | 6 => config.stems,
+            other => {
+                return Err(ForgeError::InvalidParameter(format!(
+                    "stems must be 2, 4, or 6, got {other}"
+                )));
             }
+        };
+        let bundle = match self {
+            Self::Local(worker) => local_gpu::separate(
+                worker,
+                input,
+                output_dir,
+                stems,
+                config.quality.as_str(),
+                config.dereverb,
+                config.drum_sep,
+                config.local_timeout,
+            )?,
             Self::Colab(url) => colab::separate(url, input, output_dir, config.http_timeout)?,
         };
         if bundle.vocals.is_none() && bundle.other.is_none() {

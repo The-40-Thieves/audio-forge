@@ -301,6 +301,16 @@ pub struct StemBundle {
     pub guitar: Option<PathBuf>,
     pub keys: Option<PathBuf>,
     pub other: Option<PathBuf>,
+    #[serde(default)]
+    pub kick: Option<PathBuf>,
+    #[serde(default)]
+    pub snare: Option<PathBuf>,
+    #[serde(default)]
+    pub toms: Option<PathBuf>,
+    #[serde(default)]
+    pub hihat: Option<PathBuf>,
+    #[serde(default)]
+    pub cymbals: Option<PathBuf>,
     pub kick_midi: Option<PathBuf>,
     pub snare_midi: Option<PathBuf>,
     pub hats_midi: Option<PathBuf>,

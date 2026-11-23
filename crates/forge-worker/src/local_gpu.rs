@@ -71,6 +71,10 @@ pub(crate) fn separate(
     worker: &LocalWorkerCommand,
     input_path: &Path,
     output_dir: &Path,
+    stems: u8,
+    quality: &str,
+    dereverb: bool,
+    drum_sep: bool,
     timeout: Duration,
 ) -> Result<StemBundle> {
     let mut cmd = Command::new(&worker.program);
@@ -79,7 +83,17 @@ pub(crate) fn separate(
         .arg("--input")
         .arg(input_path)
         .arg("--output-dir")
-        .arg(output_dir);
+        .arg(output_dir)
+        .arg("--stems")
+        .arg(stems.to_string())
+        .arg("--quality")
+        .arg(quality);
+    if !dereverb {
+        cmd.arg("--no-dereverb");
+    }
+    if drum_sep {
+        cmd.arg("--drum-sep");
+    }
     let out = run_with_timeout(cmd, timeout)?;
     if !out.status.success() {
         return Err(ForgeError::WorkerError(format!(

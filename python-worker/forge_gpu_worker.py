@@ -17,8 +17,10 @@ Supported tasks:
 from __future__ import annotations
 
 import argparse
+import array
 import json
 import sys
+import wave
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 
@@ -29,10 +31,22 @@ DRUMS_TAGS = frozenset({"drums", "drum"})
 BASS_TAGS = frozenset({"bass"})
 GUITAR_TAGS = frozenset({"guitar"})
 KEYS_TAGS = frozenset({"piano", "keys", "keyboard"})
+KICK_TAGS = frozenset({"kick", "bd", "bassdrum"})
+SNARE_TAGS = frozenset({"snare", "sd"})
+TOMS_TAGS = frozenset({"toms", "tom"})
+HIHAT_TAGS = frozenset({"hh", "hihat", "hihats", "hats"})
+CYMBALS_TAGS = frozenset({"cymbals", "cymbal", "crash", "ride", "overheads", "oh"})
 DRY_TAGS = frozenset({"noreverb", "dry"})
 DENOISED_TAGS = frozenset({"dry", "nonoise", "denoised", "clean"})
+
+BS_ROFORMER_VOCAL_MODEL = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+MEL_ROFORMER_VOCAL_MODEL = "model_mel_band_roformer_kim_vocals.ckpt"
+DEREVERB_MODEL = "deverb_bs_roformer_8_384dim_10depth.ckpt"
 DENOISE_ROFORMER_MODEL = "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt"
+FOUR_STEM_MODEL = "htdemucs_ft.yaml"
 SIX_STEM_MODEL = "htdemucs_6s.yaml"
+DRUMSEP_MODEL = "MDX23C-DrumSep-aufr33-jarredou.ckpt"
+VALID_QUALITIES = frozenset({"fast", "studio", "ultra"})
 
 
 def stem_tag(filename: str) -> str | None:
@@ -72,11 +86,103 @@ def pick_stem(
     return None
 
 
+def _blend_wav_pair(
+    path_a: Path, path_b: Path, out_path: Path, weight_a: float = 0.6
+) -> Path:
+    """Weighted float64 PCM blend of two matching 16-bit WAV stems (stdlib only).
+
+    Falls back to ``path_a`` if inputs are not readable 16-bit PCM WAVs (e.g. in unit mocks).
+    """
+    try:
+        with wave.open(str(path_a), "rb") as wa, wave.open(str(path_b), "rb") as wb:
+            if (
+                wa.getnchannels() != wb.getnchannels()
+                or wa.getsampwidth() != wb.getsampwidth()
+                or wa.getframerate() != wb.getframerate()
+                or wa.getsampwidth() != 2
+            ):
+                return path_a
+            nframes = min(wa.getnframes(), wb.getnframes())
+            sa = array.array("h")
+            sb = array.array("h")
+            sa.frombytes(wa.readframes(nframes))
+            sb.frombytes(wb.readframes(nframes))
+            wb_f = 1.0 - weight_a
+            blended = array.array(
+                "h",
+                (
+                    max(-32768, min(32767, round(a * weight_a + b * wb_f)))
+                    for a, b in zip(sa, sb, strict=False)
+                ),
+            )
+            with wave.open(str(out_path), "wb") as wo:
+                wo.setnchannels(wa.getnchannels())
+                wo.setsampwidth(2)
+                wo.setframerate(wa.getframerate())
+                wo.writeframes(blended.tobytes())
+            return out_path
+    except (wave.Error, OSError):
+        return path_a
+
+
+def _run_vocal_stage(
+    sep: object,
+    resolved_input: Path,
+    resolved_output: Path,
+    quality: str,
+) -> tuple[Path | None, Path | None]:
+    """Run Stage 1 vocal/instrumental extraction according to quality tier."""
+    if quality == "fast":
+        sep.load_model(model_filename=MEL_ROFORMER_VOCAL_MODEL)  # type: ignore[attr-defined]
+        files = sep.separate(str(resolved_input))  # type: ignore[attr-defined]
+        return (
+            pick_stem(files, VOCAL_TAGS, resolved_output),
+            pick_stem(files, INSTRUMENTAL_TAGS, resolved_output),
+        )
+
+    # Studio & Ultra start with MVSEP SOTA BS-RoFormer Viperx 1297 (~12.98 dB SDR)
+    sep.load_model(model_filename=BS_ROFORMER_VOCAL_MODEL)  # type: ignore[attr-defined]
+    bs_files = sep.separate(str(resolved_input))  # type: ignore[attr-defined]
+    bs_vocal = pick_stem(bs_files, VOCAL_TAGS, resolved_output)
+    bs_inst = pick_stem(bs_files, INSTRUMENTAL_TAGS, resolved_output)
+
+    if quality != "ultra":
+        return bs_vocal, bs_inst
+
+    # Ultra: Dual-RoFormer ensemble (BS-RoFormer 0.6 + Mel-Band-RoFormer 0.4)
+    sep.load_model(model_filename=MEL_ROFORMER_VOCAL_MODEL)  # type: ignore[attr-defined]
+    mel_files = sep.separate(str(resolved_input))  # type: ignore[attr-defined]
+    mel_vocal = pick_stem(mel_files, VOCAL_TAGS, resolved_output)
+    mel_inst = pick_stem(mel_files, INSTRUMENTAL_TAGS, resolved_output)
+
+    base = _safe_stem(resolved_input)
+    if bs_vocal and mel_vocal and bs_vocal.exists() and mel_vocal.exists():
+        vocal_out = (resolved_output / f"{base}_(Vocals)_roformer_ensemble.wav").resolve()
+        if vocal_out.is_relative_to(resolved_output):
+            bs_vocal = _blend_wav_pair(bs_vocal, mel_vocal, vocal_out, weight_a=0.6)
+    if bs_inst and mel_inst and bs_inst.exists() and mel_inst.exists():
+        inst_out = (
+            resolved_output / f"{base}_(Instrumental)_roformer_ensemble.wav"
+        ).resolve()
+        if inst_out.is_relative_to(resolved_output):
+            bs_inst = _blend_wav_pair(bs_inst, mel_inst, inst_out, weight_a=0.6)
+    return bs_vocal, bs_inst
+
+
 def run_separate(
-    input_path: Path, output_dir: Path, dereverb: bool = True, stems: int = 2
+    input_path: Path,
+    output_dir: Path,
+    dereverb: bool = True,
+    stems: int = 2,
+    quality: str = "studio",
+    drum_sep: bool = False,
 ) -> dict[str, str | None]:
-    if stems not in {2, 6}:
-        raise ValueError(f"stems must be 2 or 6, got {stems!r}")
+    if stems not in {2, 4, 6}:
+        raise ValueError(f"stems must be 2, 4, or 6, got {stems!r}")
+    if quality not in VALID_QUALITIES:
+        raise ValueError(
+            f"quality must be one of {sorted(VALID_QUALITIES)}, got {quality!r}"
+        )
     resolved_input = input_path.resolve()
     if not resolved_input.is_file():
         raise FileNotFoundError(f"Input audio file not found: {resolved_input}")
@@ -91,50 +197,81 @@ def run_separate(
         ) from exc
 
     sep = Separator(output_dir=str(resolved_output), output_format="WAV")
-    if stems == 6:
-        sep.load_model(model_filename=SIX_STEM_MODEL)
+    drums: Path | None = None
+    bass: Path | None = None
+    guitar: Path | None = None
+    keys: Path | None = None
+    other: Path | None = None
+    kick: Path | None = None
+    snare: Path | None = None
+    toms: Path | None = None
+    hihat: Path | None = None
+    cymbals: Path | None = None
+
+    if stems == 2:
+        vocal_file, other = _run_vocal_stage(
+            sep, resolved_input, resolved_output, quality
+        )
+    elif quality == "fast":
+        # Fast single-pass 4-stem or 6-stem Demucs
+        sep.load_model(
+            model_filename=FOUR_STEM_MODEL if stems == 4 else SIX_STEM_MODEL
+        )
         files = sep.separate(str(resolved_input))
         vocal_file = pick_stem(files, VOCAL_TAGS, resolved_output)
-        if dereverb and vocal_file and vocal_file.exists():
-            sep.load_model(model_filename="deverb_bs_roformer_8_384dim_10depth.ckpt")
-            deverb_files = sep.separate(str(vocal_file))
-            vocal_file = (
-                pick_stem(deverb_files, DRY_TAGS, resolved_output) or vocal_file
-            )
         drums = pick_stem(files, DRUMS_TAGS, resolved_output)
         bass = pick_stem(files, BASS_TAGS, resolved_output)
-        guitar = pick_stem(files, GUITAR_TAGS, resolved_output)
-        keys = pick_stem(files, KEYS_TAGS, resolved_output)
+        guitar = pick_stem(files, GUITAR_TAGS, resolved_output) if stems == 6 else None
+        keys = pick_stem(files, KEYS_TAGS, resolved_output) if stems == 6 else None
         other = pick_stem(files, INSTRUMENTAL_TAGS, resolved_output)
-        return {
-            "vocals": str(vocal_file) if vocal_file else None,
-            "drums": str(drums) if drums else None,
-            "bass": str(bass) if bass else None,
-            "guitar": str(guitar) if guitar else None,
-            "keys": str(keys) if keys else None,
-            "other": str(other) if other else None,
-        }
+    else:
+        # Studio / Ultra Pro Cascade:
+        # Stage 1: Bleedless BS-RoFormer (or Dual-RoFormer Ensemble) extracts Vocals + Instrumental
+        vocal_file, inst_file = _run_vocal_stage(
+            sep, resolved_input, resolved_output, quality
+        )
+        # Stage 3: Run 4/6-stem Demucs strictly on the vocal-free Instrumental stem
+        cascade_input = (
+            inst_file if (inst_file is not None and inst_file.exists()) else resolved_input
+        )
+        sep.load_model(
+            model_filename=FOUR_STEM_MODEL if stems == 4 else SIX_STEM_MODEL
+        )
+        files = sep.separate(str(cascade_input))
+        drums = pick_stem(files, DRUMS_TAGS, resolved_output)
+        bass = pick_stem(files, BASS_TAGS, resolved_output)
+        guitar = pick_stem(files, GUITAR_TAGS, resolved_output) if stems == 6 else None
+        keys = pick_stem(files, KEYS_TAGS, resolved_output) if stems == 6 else None
+        other = pick_stem(files, INSTRUMENTAL_TAGS, resolved_output) or inst_file
 
-    # 1. Mel-Band-RoFormer Kim Vocal (MIT license, ~11 dB SDR)
-    sep.load_model(model_filename="model_mel_band_roformer_kim_vocals.ckpt")
-    primary_files = sep.separate(str(resolved_input))
-
-    vocal_file = pick_stem(primary_files, VOCAL_TAGS, resolved_output)
-    inst_file = pick_stem(primary_files, INSTRUMENTAL_TAGS, resolved_output)
-
-    # 2. Optional BS-RoFormer De-Reverb on isolated vocal stem
+    # Stage 2: Optional BS-RoFormer De-Reverb on isolated vocal stem
     if dereverb and vocal_file and vocal_file.exists():
-        sep.load_model(model_filename="deverb_bs_roformer_8_384dim_10depth.ckpt")
+        sep.load_model(model_filename=DEREVERB_MODEL)
         deverb_files = sep.separate(str(vocal_file))
         vocal_file = pick_stem(deverb_files, DRY_TAGS, resolved_output) or vocal_file
 
+    # Stage 4: Optional 5-piece DrumSep on isolated drums stem
+    if drum_sep and drums and drums.exists():
+        sep.load_model(model_filename=DRUMSEP_MODEL)
+        drum_files = sep.separate(str(drums))
+        kick = pick_stem(drum_files, KICK_TAGS, resolved_output)
+        snare = pick_stem(drum_files, SNARE_TAGS, resolved_output)
+        toms = pick_stem(drum_files, TOMS_TAGS, resolved_output)
+        hihat = pick_stem(drum_files, HIHAT_TAGS, resolved_output)
+        cymbals = pick_stem(drum_files, CYMBALS_TAGS, resolved_output)
+
     return {
         "vocals": str(vocal_file) if vocal_file else None,
-        "drums": None,
-        "bass": None,
-        "guitar": None,
-        "keys": None,
-        "other": str(inst_file) if inst_file else None,
+        "drums": str(drums) if drums else None,
+        "bass": str(bass) if bass else None,
+        "guitar": str(guitar) if guitar else None,
+        "keys": str(keys) if keys else None,
+        "other": str(other) if other else None,
+        "kick": str(kick) if kick else None,
+        "snare": str(snare) if snare else None,
+        "toms": str(toms) if toms else None,
+        "hihat": str(hihat) if hihat else None,
+        "cymbals": str(cymbals) if cymbals else None,
     }
 
 
@@ -293,12 +430,23 @@ def main() -> int:
 
     sep_p = sub.add_parser(
         "separate",
-        help="Run Mel-Band-RoFormer (2-stem) or HTDemucs (6-stem) separation",
+        help="Run studio-grade BS-RoFormer/Mel-RoFormer cascade (2/4/6-stem) + optional DrumSep",
     )
     sep_p.add_argument("--input", type=Path, required=True)
     sep_p.add_argument("--output-dir", type=Path, required=True)
     sep_p.add_argument("--no-dereverb", action="store_true")
-    sep_p.add_argument("--stems", type=int, default=2, choices=[2, 6])
+    sep_p.add_argument("--stems", type=int, default=2, choices=[2, 4, 6])
+    sep_p.add_argument(
+        "--quality",
+        default="studio",
+        choices=["fast", "studio", "ultra"],
+        help="Separation quality tier: fast (1-pass), studio (BS-RoFormer 1297 cascade), ultra (dual-RoFormer ensemble)",
+    )
+    sep_p.add_argument(
+        "--drum-sep",
+        action="store_true",
+        help="Also split isolated drums into Kick, Snare, Toms, Hi-Hat, and Cymbals (MDX23C DrumSep)",
+    )
 
     tr_p = sub.add_parser(
         "transcribe", help="Run polyphonic audio-to-MIDI transcription via basic-pitch"
@@ -346,6 +494,8 @@ def main() -> int:
                 args.output_dir,
                 dereverb=not args.no_dereverb,
                 stems=args.stems,
+                quality=args.quality,
+                drum_sep=args.drum_sep,
             )
             print(json.dumps(res))
         elif args.command == "transcribe":

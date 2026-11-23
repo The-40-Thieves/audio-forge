@@ -24,7 +24,8 @@ pub use local_gpu::{
     run_local_transcribe_midi,
 };
 pub use routing::{
-    BackendUsed, SeparationConfig, SeparationReport, WorkerBackend, parse_backend, separate_stems,
+    BackendUsed, SeparationConfig, SeparationQuality, SeparationReport, WorkerBackend,
+    parse_backend, parse_quality, separate_stems,
 };
 
 /// Calls Google DeepMind `Lyria 3.5` (`lyria-3.5`) or `Lyria 3 Clip` (`lyria-3-clip-preview`)
@@ -228,6 +229,7 @@ mod tests {
                 local_timeout: Duration::from_secs(1),
                 http_timeout: Duration::from_secs(1),
                 require_neural: false,
+                ..SeparationConfig::default()
             };
             let report = separate_stems(&input_wav, &stems_dir, &config).unwrap();
             prop_assert_eq!(report.backend, BackendUsed::PureRustDsp);
