@@ -76,4 +76,46 @@ fn cli_audit_restore_and_phase_align_execute_end_to_end() {
         String::from_utf8_lossy(&align_out.stderr)
     );
     assert!(aligned_wav.is_file());
+
+    // 4. `forge daw inspect --json` & `forge daw bounce`
+    let proj_path = dir.path().join("cli_test.forgeproj");
+    let bounce_wav = dir.path().join("cli_master_bounce.wav");
+    let stems_dir = dir.path().join("stems");
+    let mut proj = forge_engine::DawProject::new("CLI Bounce Test", 48_000, 120.0);
+    let obj_id = proj.alloc_id();
+    let obj = forge_engine::AudioObject::new(obj_id, "Tone", src_wav.clone(), 24_000);
+    proj.tracks[0].objects.push(obj);
+    proj.save_to_file(&proj_path).expect("save forgeproj");
+
+    let inspect_out = Command::new(bin)
+        .args(["daw", "inspect", "--json"])
+        .arg(&proj_path)
+        .output()
+        .expect("run forge daw inspect");
+    assert!(
+        inspect_out.status.success(),
+        "forge daw inspect failed: {}",
+        String::from_utf8_lossy(&inspect_out.stderr)
+    );
+    let inspect_json: serde_json::Value =
+        serde_json::from_slice(&inspect_out.stdout).expect("valid inspect JSON");
+    assert_eq!(inspect_json["name"], "CLI Bounce Test");
+    assert_eq!(inspect_json["audio_objects"], 1);
+
+    let bounce_out = Command::new(bin)
+        .args(["daw", "bounce"])
+        .arg(&proj_path)
+        .arg("-o")
+        .arg(&bounce_wav)
+        .arg("--stems-dir")
+        .arg(&stems_dir)
+        .output()
+        .expect("run forge daw bounce");
+    assert!(
+        bounce_out.status.success(),
+        "forge daw bounce failed: {}",
+        String::from_utf8_lossy(&bounce_out.stderr)
+    );
+    assert!(bounce_wav.is_file());
+    assert!(stems_dir.is_dir());
 }
