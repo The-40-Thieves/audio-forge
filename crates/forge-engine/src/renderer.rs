@@ -906,8 +906,10 @@ impl ObjectOrientedEngine {
         for fx in &project.master_inserts {
             inspect_fx(fx, &mut tail_secs);
         }
+        let any_solo = project.tracks.iter().any(|t| t.solo);
         for tr in &project.tracks {
-            if tr.mute {
+            let audible = if any_solo { tr.solo } else { !tr.mute };
+            if !audible {
                 continue;
             }
             for fx in &tr.inserts {
@@ -926,7 +928,8 @@ impl ObjectOrientedEngine {
                 continue;
             }
             let has_active_send = project.tracks.iter().any(|t| {
-                !t.mute
+                let audible = if any_solo { t.solo } else { !t.mute };
+                audible
                     && t.sends
                         .iter()
                         .any(|s| s.bus_id == bus.id && !s.mute && s.gain_db > -59.5)

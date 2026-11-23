@@ -228,9 +228,6 @@ impl ForgeDawApp {
     }
 
     fn import_wav_to_selected_track(&mut self) {
-        if self.project.tracks.is_empty() {
-            self.project.add_track("01 Audio Track");
-        }
         let raw = self.import_path_buf.trim().to_string();
         if raw.is_empty() {
             self.status_line = "Enter a WAV/audio file path to import".to_string();
@@ -243,6 +240,9 @@ impl ForgeDawApp {
         {
             Ok(buf) => {
                 let prev = self.project.clone();
+                if self.project.tracks.is_empty() {
+                    self.project.add_track("01 Audio Track");
+                }
                 let id = self.project.alloc_id();
                 let name = path
                     .file_stem()
