@@ -124,6 +124,10 @@ flowchart TD
      - `SHARED_SPECTRUM_SLOTS`, `publish_shared_spectrum`, `read_shared_spectrum`, `clear_shared_spectrum`: 8-slot lock-free `AtomicU32` cross-instance IPC bus (`FabFilter Pro-Q 4` / `Neutron 5` wireless instance communication). A per-slot sequence counter makes every read one whole frame; publishing never waits and skips a frame if another instance is mid-publish on the same slot. Unpublished and cleared slots read as silence (`-90 dB`). The plugin's bus-slot parameter is `0 = Off`, `1-8 = Slot A-H` (its text also parses back from `Off`, `Slot A`, a bare letter or the plain number, case-insensitively).
      - Slot ownership: each instance holds a `SpectrumBusOwner` (a unique id from a global `AtomicU64` counter). A successful publish records its owner in the slot under the seqlock, so the last writer owns the slot. `clear_shared_spectrum(owner, slot)` empties the slot only if `owner` is still its owner, checked again under the seqlock; it retries a bounded number of times while another writer holds the slot. An instance clears its slot when it moves to another one or is removed, so when two instances share a slot, the one that leaves never silences the other. When the owner itself leaves, the slot reads as silence until the other instance's next publish. All of it is lock-free, allocation-free and `unsafe`-free.
 
+  9. **`beat_grid.rs` — Onset/DP Beat Tracking & Stereo-Locked WSOLA Time-Warping (`analyze_beat_grid`, `warp_buffer_wsola`, `quantize_to_constant_bpm`):**
+      - Computes a 10 ms sub+broadband onset-flux envelope and Ellis-style DP beat/downbeat trajectory to measure `median_bpm`, `max_bpm_drift`, and per-bar `TempoPoint` nodes (`tempo_map`).
+      - Provides zero-pitch-shift stereo-locked WSOLA time-warping for `quantize_to_constant_bpm` and `align_vocal_double_dtw_elastic`, plus `sum_audio_buffers` (`restoration.rs`) and AI-telemetry-driven `DeFizzConfig::{ai_mix_from_audit, ai_vocal}` / `RestorationConfig::from_audit`.
+
 ---
 
 ### 2.3 `forge-vocal` — YIN F0 Pitch Tracker, Sibilant Bypass & Levinson-Durbin LPC Formant Shifter
@@ -160,7 +164,7 @@ flowchart TD
     - Master bus `<MASTERFXLIST>` with `Forge_OpenSoothe_DeFizz.jsfx`
     - 4-channel tracks (`NCHAN 4`) with automatic sidechain routing (`AUXRECV <src_track> ... 1024` routing source channels `1/2` into destination sidechain channels `3/4`)
     - Non-destructive `élastique 3.3.3 Pro` pitch-preserving playback (`PLAYRATE 1.0 1 0.0 229376`)
-    - Embedded `SM` Stretch Markers and `<PITCHENV` Take Pitch Envelopes
+    - Embedded `SM` Stretch Markers, `<PITCHENV` Take Pitch Envelopes, and `<TEMPOENVEX` variable beat-grid tempo maps (`tempo_map: Vec<TempoPoint>`)
     - `<RENDER_METADATA>` chunks with `ISRC` and `ID3:TSRC`
     - Absolute `FILE` media paths (REAPER resolves relative paths against the `.rpp` folder), quoted with whichever of `"`, `'` or a backtick the string does not contain, as REAPER does; `save_rpp` rejects paths it cannot represent (line breaks, NULs, all three quote characters, non-UTF-8)
   - `send_reaper_osc`: Sends live UDP Open Sound Control (`OSC`) packets (`rosc`) to `127.0.0.1:9000` for real-time transport, fader, and action triggering. It rejects addresses that are not OSC patterns (must start with `/`) and hosts that do not resolve, and sends from the unspecified address for a non-loopback host. UDP has no acknowledgement, so success means the packet was sent.
@@ -169,19 +173,20 @@ flowchart TD
 ---
 
 ### 2.6 `forge-worker` — Hybrid AI Model Dispatcher (Local RTX GPU + Colab A100 + Lyria 3.5)
-- **Files:** `crates/forge-worker/src/lib.rs`, `python-worker/forge_gpu_worker.py`, `notebooks/ForgeAudio_Colab_A100_Worker.ipynb`
+- **Files:** `crates/forge-worker/src/lib.rs`, `crates/forge-worker/src/{routing.rs, local_gpu.rs, colab.rs}`, `python-worker/forge_gpu_worker.py`, `notebooks/ForgeAudio_Colab_A100_Worker.ipynb`
 - **Key Components:**
   - `separate_stems`: Supports 4 backends (`WorkerBackend::Auto`, `LocalGpu`, `RemoteColab`, `PureRustDsp`). `forge-mcp` and `forge-cli` build a `SeparationConfig::from_env()`:
     - `FORGE_WORKER_BACKEND` picks the backend: `auto` (default), `local_gpu`, `colab` or `dsp`.
     - `Auto` tries the local GPU worker, then the Colab worker when `FORGE_COLAB_WORKER_URL` is set, then the Rust DSP splitter. `LocalGpu` and `RemoteColab` fall back to the Rust DSP splitter if they fail.
-    - Every skipped or failed backend is logged to stderr with its reason. The returned `SeparationReport` names the backend that ran (`local_gpu`, `remote_colab` or `pure_rust_dsp`) and lists the fallback reasons; `forge_ingest_to_reaper` returns both as `stem_separation`.
+    - Every skipped or failed backend is logged to stderr with its reason. The returned `SeparationReport` names the backend that ran (`local_gpu`, `remote_colab` or `pure_rust_dsp`), fallback reasons, and non-fatal `warnings`; `forge_ingest_to_reaper` returns them as `stem_separation`.
     - To fail instead of falling back to the Rust DSP splitter, set `FORGE_WORKER_REQUIRE_NEURAL=1`, pass `forge ingest --require-neural`, or pass `require_neural: true` to `forge_ingest_to_reaper`. The error lists why each neural backend failed or was skipped. `forge ingest` also prints the backend that ran and every fallback reason.
-    - The local worker is an ephemeral `uv run --no-sync --project python-worker python-worker/forge_gpu_worker.py separate` subprocess running **`Mel-Band-RoFormer` (Kim Vocal)** + **`BS-RoFormer` De-Reverb**, writing two stems (`vocals` and the instrumental `other`) to disk and exiting immediately so **0 MB of VRAM** remains occupied while mixing in REAPER. The script comes from `FORGE_GPU_WORKER_SCRIPT` or, failing that, from the source tree the binary was built from; neither the working directory nor the executable's location is searched. Installed binaries outside the source tree need `FORGE_GPU_WORKER_SCRIPT`. A run that exceeds `FORGE_GPU_WORKER_TIMEOUT_SECS` (default 900) has its process tree killed and is reported as a timeout.
-    - The Colab worker receives the input as base64 in `POST /api/v1/execute` (`task: separate_stems`) and returns base64 WAV stems (`vocals` and `other` only), which are written to `colab_<stem>.wav`. Requests are limited by `FORGE_COLAB_TIMEOUT_SECS` (default 900).
+    - The local worker is an ephemeral `uv run --no-sync --project python-worker python-worker/forge_gpu_worker.py separate` subprocess running verified `audio-separator` checkpoints (`vocals_mel_band_roformer.ckpt`, `model_bs_roformer_ep_317_sdr_12.9755.ckpt`, `BS-Roformer-SW.ckpt` primary with `htdemucs_ft.yaml`/`htdemucs_6s.yaml` fallback, `deverb_bs_roformer_8_384dim_10depth.ckpt`, `dereverb-echo_mel_band_roformer_sdr_13.4843_v2.ckpt`, `mel_band_roformer_bleed_suppressor_v1.ckpt`, `aspiration_mel_band_roformer_sdr_18.9845.ckpt`, `MDX23C-DrumSep-aufr33-jarredou.ckpt`, and `bs_roformer_vocals_revive_v3e_unwa.ckpt`), writing separated stems to disk and exiting immediately so **0 MB of VRAM** remains occupied while mixing in REAPER.
+    - Hybrid AI restoration & telemetry dispatchers: `neural_restore_hybrid` (Apollo / FlowHigh / AudioSR / SonicMaster / spectral exciter), `vocal_rescue_hybrid` (Resemble Enhance / Seed-VC / RoFormer chain), `track_beats_hybrid` (`beat-this` / `librosa` / pure-Rust `analyze_beat_grid` fallback), and `evaluate_quality_hybrid` (Audiobox Aesthetics / SingMOS / acoustic proxy fallback).
+    - The Colab worker receives the input as base64 in `POST /api/v1/execute` (`separate_stems`, `restore`, `vocal_rescue`, `beat_track`, `evaluate_quality`) and returns base64 WAV stems (up to 23 slots via `StemBundle`) or JSON telemetry. Requests are limited by `FORGE_COLAB_TIMEOUT_SECS` (default 900).
     - The Python worker picks each stem by the `_(<Stem>)_` tag that `audio-separator` writes, so the input file name cannot change which file is returned as the vocal.
-    - When `PureRustDsp` (or fallback) runs, executes a `<80 ms`, 0-VRAM Mid/Side + 4th-order Linkwitz-Riley + transient-mask 4-stem separator (`Vocals`, `Drums`, `Bass`, `Other`).
+    - When `PureRustDsp` (or fallback) runs, executes a `<80 ms`, 0-VRAM Mid/Side + 4th-order Linkwitz-Riley + transient-mask 4-stem separator (`Vocals`, `Drums`, `Bass`, `Other`), while `forge_dsp` provides `DeFizzConfig::{ai_mix_from_audit, ai_vocal}` (with HPSS shimmer suppression & `hard_mode`), `RestorationConfig::from_audit`, `sum_audio_buffers`, `beat_grid::{analyze_beat_grid, warp_buffer_wsola, quantize_to_constant_bpm}`, and `align_vocal_double_dtw_elastic`.
   - `generate_music_lyria`: Native async Rust client calling Google DeepMind's `Lyria 3.5` (`lyria-3.5`) or `Lyria 3 Clip` via `https://generativelanguage.googleapis.com/v1beta/interactions` using `GEMINI_API_KEY`.
-  - `index_drum_sample_library`: Scans local `.wav` drum sample folders and classifies every one-shot (`Kick`, `Snare`, `HiHat`) by `<120 Hz` sub-energy ratio, zero-crossing spectral centroid, and crest factor (`XLN Audio XO` / `Algonaut Atlas` equivalent).
+  - `index_drum_sample_library`, `DrumHit::from_ticks`, & `render_drum_sample_layer`: Scans local `.wav` drum sample folders, classifies one-shots (`Kick`, `Snare`, `HiHat`) by `<120 Hz` sub-energy ratio, spectral centroid, and crest factor, and renders phase-locked replacement layers.
 
 ---
 
@@ -202,8 +207,8 @@ flowchart TD
 ---
 
 ### 2.8 `forge-cli` & `forge-mcp` — Unified CLI Binary & JSON-RPC 2.0 MCP Agent Server
-- **`crates/forge-cli/src/main.rs` (`forge` binary):** Exposes 16 top-level subcommands (`audit`, `restore`, `unmask`, `phase-align`, `vocal`, `theory`, `deliver`, `master`, `ingest`, `reaper`, `sample-index`, `lyria`, `denoise`, `transcribe`, `separate`, `daw`) via `clap` derive macros.
-- **`crates/forge-mcp/src/main.rs` (`forge-mcp` binary):** Implements the Model Context Protocol (`protocolVersion: "2024-11-05"`) over `stdin`/`stdout` JSON-RPC 2.0, exposing 14 structured tools (`forge_deliver`, `forge_audit_audio`, `forge_restore_and_defizz`, `forge_spectral_unmask`, `forge_phase_align`, `forge_vocal_suite`, `forge_music_theory_midi`, `forge_master_distrokid`, `forge_ingest_to_reaper`, `forge_neural_denoise`, `forge_transcribe_midi`, `forge_separate_stems`, `forge_daw_inspect`, `forge_daw_bounce`) to Claude Code, Antigravity, Cursor, or custom studio agents.
+- **`crates/forge-cli/src/main.rs` (`forge` binary):** Exposes 20 top-level subcommands (`audit`, `restore`, `unmask`, `phase-align`, `vocal`, `theory`, `deliver`, `master`, `ingest`, `reaper`, `sample-index`, `lyria`, `denoise`, `transcribe`, `separate`, `daw`, `neural-restore`, `vocal-rescue`, `beat-track`, `evaluate`) via `clap` derive macros.
+- **`crates/forge-mcp/src/main.rs` (`forge-mcp` binary):** Implements the Model Context Protocol (`protocolVersion: "2024-11-05"`) over `stdin`/`stdout` JSON-RPC 2.0, exposing 18 structured tools (`forge_deliver`, `forge_audit_audio`, `forge_restore_and_defizz`, `forge_spectral_unmask`, `forge_phase_align`, `forge_vocal_suite`, `forge_music_theory_midi`, `forge_master_distrokid`, `forge_ingest_to_reaper`, `forge_neural_denoise`, `forge_transcribe_midi`, `forge_separate_stems`, `forge_daw_inspect`, `forge_daw_bounce`, `forge_neural_restore`, `forge_vocal_rescue`, `forge_beat_track`, `forge_evaluate_quality`) to Claude Code, Antigravity, Cursor, or custom studio agents.
 
 ---
 

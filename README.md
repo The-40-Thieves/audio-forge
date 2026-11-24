@@ -71,18 +71,22 @@ READY
 
 | Tool | What it returns |
 | :--- | :--- |
-| `forge_deliver` | A verified master for a target: before and after audits, pass/fail checks and the WAV, plus a `.delivery.json` report. |
-| `forge_ingest_to_reaper` | The full session from one song: separated stems, cleaned vocal, drum-trigger and chord MIDI, a verified master for the target, and a REAPER `.rpp` project with JSFX inserts. |
-| `forge_audit_audio` | BS.1770-4 integrated, short-term and momentary loudness, LRA, sample and true peak, crest factor, DC, clipping, stereo correlation and a fizz index. |
-| `forge_restore_and_defizz` | The restoration chain and spectral de-fizz, with an optional vocal clean-up pass. |
+| `forge_deliver` | A verified master for a target: before and after audits, pass/fail checks and the WAV, plus a `.delivery.json` report (with optional `ai_track_mode` telemetry tuning). |
+| `forge_ingest_to_reaper` | The full AI/live session from one song: separated stems, cleaned vocal/other stems, vocal-unmasked instruments, optional sample-layered drums, beat-grid quantization or `<TEMPOENVEX>`, re-summed telemetry master, and a REAPER `.rpp` project with JSFX inserts. |
+| `forge_audit_audio` | BS.1770-4 integrated, short-term and momentary loudness, LRA, sample and true peak, crest factor, DC, clipping, stereo & 2–12 kHz correlation, Mid/Side fizz p95, effective bandwidth cutoff, transient sharpness, and AI fizz index. |
+| `forge_restore_and_defizz` | The restoration chain and spectral de-fizz (`ai_mode`, `hard_mode`, `hpss_shimmer`, `ultrasonic_lpf_hz`), with an optional vocal clean-up pass. |
 | `forge_spectral_unmask` | Sidechain spectral ducking that clears space for a vocal or kick. |
-| `forge_phase_align` | Delay and polarity alignment of two stems (GCC-PHAT). |
+| `forge_phase_align` | Delay and polarity alignment of two stems (GCC-PHAT) or DTW / WSOLA-elastic vocal double alignment. |
 | `forge_vocal_suite` | Scale-locked pitch correction, formant-preserving shifting and harmonies. |
 | `forge_music_theory_midi` | Voice-led chord and bass MIDI, optional reharmonization, and an ABC score. |
 | `forge_master_distrokid` | Low-level mastering with an explicit LUFS and ceiling, reference-match EQ and ISRC tagging. |
 | `forge_neural_denoise` | Neural audio denoising via DeepFilterNet3 or Mel-Band-RoFormer on the local Python GPU worker. |
 | `forge_transcribe_midi` | Polyphonic audio-to-MIDI transcription via basic-pitch on the local Python GPU worker. |
-| `forge_separate_stems` | Studio-grade neural stem separation (BS-RoFormer 1297 / SCNet XL / BS-RoFormer SW cascade, 23-slot hierarchical sub-splitters + Apollo restore) with Rust DSP fallback. |
+| `forge_separate_stems` | Studio-grade neural stem separation (BS-RoFormer 1297 / Mel-Band-RoFormer / BS-RoFormer SW cascade, 23-slot hierarchical sub-splitters + `debleed`, `de_aspiration`, `dereverb_echo` & bandwidth restore) with Rust DSP fallback. |
+| `forge_neural_restore` | Neural bandwidth restoration and AI artifact cleanup via Apollo, FlowHigh, AudioSR, SonicMaster, or spectral exciter fallback. |
+| `forge_vocal_rescue` | Robotic/phasey AI vocal rescue via Resemble Enhance, Seed-VC zero-shot timbre transfer, or verified RoFormer chain. |
+| `forge_beat_track` | Beat, downbeat, median BPM, and tempo-drift map extraction (`beat-this`, `librosa`, `energy`, or pure-Rust onset DP). |
+| `forge_evaluate_quality` | Perceptual audio quality scoring (Meta Audiobox Aesthetics PQ/PC/CE/CU, SingMOS, or acoustic proxy metrics). |
 | `forge_daw_inspect` | Validate and inspect a ForgeStudio DAW `.forgeproj` session (BPM, sample rate, tracks, objects, MIDI clips, aux buses, total PDC). |
 | `forge_daw_bounce` | Headless 24-bit WAV mastering bounce (with BS.1770-4 audit) and optional batch per-track stem WAV export from a `.forgeproj` session. |
 

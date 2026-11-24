@@ -307,8 +307,27 @@ pub struct AuditReport {
     pub sibilance_5_14khz_db: f64,
     /// Composite 0..100 score quantifying neural codec / diffusion whistling & bandwidth artifacts.
     pub ai_fizz_index: f64,
+    /// 95th-percentile per-frame 2–10 kHz resonance prominence on Mid (mono) channel (dB).
+    #[serde(default)]
+    pub mid_fizz_p95_db: f64,
+    /// 95th-percentile per-frame 2–10 kHz resonance prominence on Side (`L - R`) channel (dB).
+    #[serde(default)]
+    pub side_fizz_p95_db: f64,
+    /// Upper frequency bound (Hz) above which stereo spectral energy drops >40 dB below 200–4000 Hz mean.
+    #[serde(default)]
+    pub effective_bandwidth_hz: f64,
+    /// 2–12 kHz bandpass stereo correlation (`-1.0..=1.0`; `1.0` for mono).
+    #[serde(default = "default_unity_correlation")]
+    pub high_mid_stereo_correlation: f64,
+    /// 95th-percentile 5 ms onset peak vs 50 ms RMS sharpness ratio (dB).
+    #[serde(default)]
+    pub transient_sharpness_db: f64,
     pub distrokid_ready: bool,
     pub recommendations: Vec<String>,
+}
+
+const fn default_unity_correlation() -> f64 {
+    1.0
 }
 
 /// Canonical stem bundle produced by separation or live multitrack ingest.

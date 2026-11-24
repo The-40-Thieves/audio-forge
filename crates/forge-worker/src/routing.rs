@@ -55,6 +55,8 @@ pub struct SeparationReport {
     pub bundle: StemBundle,
     pub backend: BackendUsed,
     pub fallbacks: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Quality tier for neural stem separation.
@@ -125,6 +127,12 @@ pub struct SeparationConfig {
     pub split_crowd: bool,
     /// Run optional Apollo / spectral bandwidth restoration post-pass on separated stems (default `false`).
     pub restore: bool,
+    /// Suppress residual vocal/instrument bleed on stems (`mel_band_roformer_bleed_suppressor_v1`, default `false`).
+    pub debleed: bool,
+    /// Remove excessive AI vocal breath hiss (`aspiration_mel_band_roformer`, default `false`).
+    pub de_aspiration: bool,
+    /// Use Mel-Band-RoFormer combined de-reverb + de-echo checkpoint instead of de-reverb only (default `false`).
+    pub dereverb_echo: bool,
 }
 
 impl Default for SeparationConfig {
@@ -146,6 +154,9 @@ impl Default for SeparationConfig {
             split_orchestral: false,
             split_crowd: false,
             restore: false,
+            debleed: false,
+            de_aspiration: false,
+            dereverb_echo: false,
         }
     }
 }
@@ -174,16 +185,7 @@ impl SeparationConfig {
             http_timeout: env_secs("FORGE_COLAB_TIMEOUT_SECS", DEFAULT_HTTP_TIMEOUT),
             require_neural: env_nonempty("FORGE_WORKER_REQUIRE_NEURAL")
                 .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true")),
-            stems: 2,
-            quality: SeparationQuality::Studio,
-            dereverb: true,
-            drum_sep: false,
-            split_lead_backing: false,
-            split_male_female: false,
-            split_guitar: false,
-            split_orchestral: false,
-            split_crowd: false,
-            restore: false,
+            ..Self::default()
         }
     }
 
@@ -292,7 +294,7 @@ impl Attempt<'_> {
         input: &Path,
         output_dir: &Path,
         config: &SeparationConfig,
-    ) -> Result<StemBundle> {
+    ) -> Result<(StemBundle, Vec<String>)> {
         let stems = match config.stems {
             2 | 4 | 6 => config.stems,
             other => {
@@ -301,22 +303,21 @@ impl Attempt<'_> {
                 )));
             }
         };
-        let bundle = match self {
+        let (bundle, warnings) = match self {
             Self::Local(worker) => local_gpu::separate(worker, input, output_dir, stems, config)?,
-            Self::Colab(url) => colab::separate(url, input, output_dir, config.http_timeout)?,
+            Self::Colab(url) => colab::separate(url, input, output_dir, config)?,
         };
         if bundle.vocals.is_none() && bundle.other.is_none() {
             return Err(ForgeError::WorkerError(
                 "worker returned neither a vocal nor an instrumental stem".to_string(),
             ));
         }
-        Ok(bundle)
+        Ok((bundle, warnings))
     }
 }
 
 /// Separates an audio file into a `StemBundle`. The local GPU and Colab workers return two
-/// stems (`Vocals` and `Other`, the instrumental); the Pure-Rust Mid/Side + Linkwitz-Riley
-/// fallback returns four (`Vocals`, `Drums`, `Bass`, `Other`).
+/// to 23 stems (`vocals`..`cymbals`); the Pure-Rust Mid/Side + Linkwitz-Riley fallback returns four.
 pub fn separate_stems(
     input_path: &Path,
     output_dir: &Path,
@@ -328,7 +329,9 @@ pub fn separate_stems(
     for attempt in plan(config, &mut skipped) {
         let backend = attempt.backend();
         match attempt.run(input_path, output_dir, config) {
-            Ok(bundle) => return Ok(finish(bundle, backend, fallbacks, skipped)),
+            Ok((bundle, warnings)) => {
+                return Ok(finish(bundle, backend, fallbacks, skipped, warnings));
+            }
             Err(e) => fallbacks.push(format!("{} failed: {e}", backend.as_str())),
         }
     }
@@ -344,7 +347,13 @@ pub fn separate_stems(
         )));
     }
     let bundle = dsp_split::separate_stems_dsp(input_path, output_dir)?;
-    Ok(finish(bundle, BackendUsed::PureRustDsp, fallbacks, skipped))
+    Ok(finish(
+        bundle,
+        BackendUsed::PureRustDsp,
+        fallbacks,
+        skipped,
+        Vec::new(),
+    ))
 }
 
 /// Logs and packages the result. Failures come first, then backends that were skipped.
@@ -353,16 +362,21 @@ fn finish(
     backend: BackendUsed,
     mut fallbacks: Vec<String>,
     skipped: Vec<String>,
+    warnings: Vec<String>,
 ) -> SeparationReport {
     fallbacks.extend(skipped);
     for reason in &fallbacks {
         eprintln!("forge-worker: {reason}");
+    }
+    for warn in &warnings {
+        eprintln!("forge-worker: warning: {warn}");
     }
     eprintln!("forge-worker: stem separation ran on {}", backend.as_str());
     SeparationReport {
         bundle,
         backend,
         fallbacks,
+        warnings,
     }
 }
 

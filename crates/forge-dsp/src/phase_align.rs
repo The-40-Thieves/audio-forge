@@ -7,7 +7,7 @@ use forge_core::{AudioBuffer, ForgeError, Result};
 use rustfft::{FftPlanner, num_complex::Complex};
 use serde::{Deserialize, Serialize};
 
-pub use crate::dtw_align::{StretchMarker, align_vocal_double_dtw};
+pub use crate::dtw_align::{StretchMarker, align_vocal_double_dtw, align_vocal_double_dtw_elastic};
 
 /// Result of GCC-PHAT phase and delay analysis between a reference and target track.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

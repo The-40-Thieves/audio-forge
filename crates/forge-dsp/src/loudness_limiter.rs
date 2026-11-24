@@ -576,6 +576,82 @@ fn compute_relative_gated_lufs(gated_abs: &[f64]) -> f64 {
     }
 }
 
+/// Maximum bin-over-neighborhood prominence (dB) across `b_lo..=b_hi` (excluding 3-bin main lobe).
+fn max_local_excess_db(mag_sq: &[f64], b_lo: usize, b_hi: usize, ref_floor: f64) -> f64 {
+    if b_hi <= b_lo + 8 || b_hi >= mag_sq.len() {
+        return 0.0;
+    }
+    let mut max_ratio = 1.0_f64;
+    for b in (b_lo + 4)..=(b_hi.saturating_sub(4)) {
+        let outer_mean = (mag_sq[b - 4]
+            + mag_sq[b - 3]
+            + mag_sq[b - 2]
+            + mag_sq[b + 2]
+            + mag_sq[b + 3]
+            + mag_sq[b + 4])
+            / 6.0;
+        let ref_env = outer_mean.max(ref_floor).max(1e-18);
+        let ratio = (mag_sq[b] / ref_env).sqrt();
+        if ratio > max_ratio {
+            max_ratio = ratio;
+        }
+    }
+    20.0 * max_ratio.log10()
+}
+
+fn percentile_sorted(vals: &mut [f64], pct: f64) -> f64 {
+    if vals.is_empty() {
+        return 0.0;
+    }
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = (((vals.len() - 1) as f64) * pct.clamp(0.0, 1.0)).round() as usize;
+    vals[idx.min(vals.len() - 1)]
+}
+
+/// 95th-percentile 5 ms block peak vs 50 ms local RMS (dB) over active blocks (`> -55 dBFS`).
+fn compute_transient_sharpness_db(channels: &[Vec<f64>], frames: usize, sr: f64) -> f64 {
+    if channels.is_empty() || frames < 32 {
+        return 0.0;
+    }
+    let short_blk = ((sr * 0.005).round() as usize).clamp(4, frames.max(4));
+    let win_half = ((sr * 0.025).round() as usize).max(short_blk);
+    let inv_ch = 1.0 / (channels.len() as f64);
+
+    let mut sq_prefix = vec![0.0_f64; frames + 1];
+    let mut max_abs = vec![0.0_f64; frames];
+    for (i, slot) in max_abs.iter_mut().enumerate() {
+        let mut sq_sum = 0.0_f64;
+        let mut peak = 0.0_f64;
+        for ch in channels {
+            let x = sanitize_sample_f64(ch[i]);
+            sq_sum += x * x;
+            peak = peak.max(x.abs());
+        }
+        *slot = peak;
+        sq_prefix[i + 1] = sq_prefix[i] + sq_sum * inv_ch;
+    }
+
+    let mut ratios_db = Vec::with_capacity(frames / short_blk + 1);
+    for blk_start in (0..frames).step_by(short_blk) {
+        let blk_end = (blk_start + short_blk).min(frames);
+        let blk_peak = max_abs[blk_start..blk_end]
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max);
+        let mid = (blk_start + blk_end) / 2;
+        let w_start = mid.saturating_sub(win_half);
+        let w_end = (mid + win_half).min(frames);
+        let w_len = w_end.saturating_sub(w_start).max(1);
+        let rms_50 = ((sq_prefix[w_end] - sq_prefix[w_start]) / (w_len as f64))
+            .sqrt()
+            .max(1e-12);
+        if rms_50 > 0.00178 {
+            ratios_db.push((20.0 * (blk_peak / rms_50).log10()).clamp(0.0, 40.0));
+        }
+    }
+    percentile_sorted(&mut ratios_db, 0.95)
+}
+
 /// Performs a full ITU-R BS.1770-4 loudness, phase, electrical, and AI-artifact audit.
 pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
     let sr = f64::from(buffer.sample_rate.max(1));
@@ -691,77 +767,154 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
         }
     }
 
-    // 4. Stereo & Sub-160Hz Phase Correlation
-    let (stereo_correlation, sub_160hz_correlation) = if ch_count >= 2 && frames > 0 {
-        let l = &buffer.channels[0];
-        let r = &buffer.channels[1];
-        let mut sum_lr = 0.0;
-        let mut sum_l2 = 0.0;
-        let mut sum_r2 = 0.0;
+    // 4. Stereo, Sub-160Hz, and High-Mid (2-12 kHz) Phase Correlation
+    let (stereo_correlation, sub_160hz_correlation, high_mid_stereo_correlation) =
+        if ch_count >= 2 && frames > 0 {
+            let l = &buffer.channels[0];
+            let r = &buffer.channels[1];
+            let mut sum_lr = 0.0;
+            let mut sum_l2 = 0.0;
+            let mut sum_r2 = 0.0;
 
-        let mut lp_l = Biquad::lowpass(sr, 160.0, 0.707);
-        let mut lp_r = Biquad::lowpass(sr, 160.0, 0.707);
-        let mut sub_lr = 0.0;
-        let mut sub_l2 = 0.0;
-        let mut sub_r2 = 0.0;
+            let mut lp_l = Biquad::lowpass(sr, 160.0, 0.707);
+            let mut lp_r = Biquad::lowpass(sr, 160.0, 0.707);
+            let mut sub_lr = 0.0;
+            let mut sub_l2 = 0.0;
+            let mut sub_r2 = 0.0;
 
-        for (&lv_raw, &rv_raw) in l.iter().zip(r.iter()) {
-            let lv = sanitize_sample_f64(lv_raw);
-            let rv = sanitize_sample_f64(rv_raw);
-            sum_lr += lv * rv;
-            sum_l2 += lv * lv;
-            sum_r2 += rv * rv;
+            let use_high_mid = sr > 5_000.0;
+            let hm_hi = 12_000.0_f64.min(sr * 0.47).max(2_200.0);
+            let mut hp2_l = Biquad::highpass(sr, 2_000.0, 0.707);
+            let mut hp2_r = Biquad::highpass(sr, 2_000.0, 0.707);
+            let mut lp12_l = Biquad::lowpass(sr, hm_hi, 0.707);
+            let mut lp12_r = Biquad::lowpass(sr, hm_hi, 0.707);
+            let mut hm_lr = 0.0;
+            let mut hm_l2 = 0.0;
+            let mut hm_r2 = 0.0;
 
-            let sl = lp_l.process_sample(lv);
-            let sr_v = lp_r.process_sample(rv);
-            sub_lr += sl * sr_v;
-            sub_l2 += sl * sl;
-            sub_r2 += sr_v * sr_v;
-        }
-        let corr = if sum_l2 * sum_r2 > 1e-18 {
-            (sum_lr / (sum_l2 * sum_r2).sqrt()).clamp(-1.0, 1.0)
+            for (&lv_raw, &rv_raw) in l.iter().zip(r.iter()) {
+                let lv = sanitize_sample_f64(lv_raw);
+                let rv = sanitize_sample_f64(rv_raw);
+                sum_lr += lv * rv;
+                sum_l2 += lv * lv;
+                sum_r2 += rv * rv;
+
+                let sl = lp_l.process_sample(lv);
+                let sr_v = lp_r.process_sample(rv);
+                sub_lr += sl * sr_v;
+                sub_l2 += sl * sl;
+                sub_r2 += sr_v * sr_v;
+
+                if use_high_mid {
+                    let hml = lp12_l.process_sample(hp2_l.process_sample(lv));
+                    let hmr = lp12_r.process_sample(hp2_r.process_sample(rv));
+                    hm_lr += hml * hmr;
+                    hm_l2 += hml * hml;
+                    hm_r2 += hmr * hmr;
+                }
+            }
+            let norm_corr = |lr: f64, l2: f64, r2: f64| -> f64 {
+                if l2 * r2 > 1e-18 {
+                    (lr / (l2 * r2).sqrt()).clamp(-1.0, 1.0)
+                } else {
+                    1.0
+                }
+            };
+            let corr = norm_corr(sum_lr, sum_l2, sum_r2);
+            let sub_corr = norm_corr(sub_lr, sub_l2, sub_r2);
+            let hm_corr = if use_high_mid {
+                norm_corr(hm_lr, hm_l2, hm_r2)
+            } else {
+                1.0
+            };
+            (corr, sub_corr, hm_corr)
         } else {
-            1.0
+            (1.0, 1.0, 1.0)
         };
-        let sub_corr = if sub_l2 * sub_r2 > 1e-18 {
-            (sub_lr / (sub_l2 * sub_r2).sqrt()).clamp(-1.0, 1.0)
-        } else {
-            1.0
-        };
-        (corr, sub_corr)
-    } else {
-        (1.0, 1.0)
-    };
 
-    // 5. Spectral Band & AI Fizz Index Analysis (2048-point FFT)
+    // 5. Spectral Band, Per-Frame Mid+Side Fizz & Bandwidth Cutoff Analysis (2048-point FFT)
     let fft_size = 2048_usize;
+    let half_bins = fft_size / 2;
     let hop = 1024_usize;
     let mut planner = FftPlanner::<f64>::new();
     let fft = planner.plan_fft_forward(fft_size);
-    let mut avg_mag_sq = vec![0.0_f64; fft_size / 2 + 1];
-    let mut max_peak_over_median_2_6k = 1.0_f64;
+    let mut avg_mag_sq = vec![0.0_f64; half_bins + 1];
+    let mut avg_side_sq = vec![0.0_f64; half_bins + 1];
+    let mut mid_frame_excess_db = Vec::new();
+    let mut side_frame_excess_db = Vec::new();
     let mut frame_count = 0_usize;
 
     let bin_hz = sr / (fft_size as f64);
-    let b_2k = ((2000.0 / bin_hz).round() as usize).clamp(2, fft_size / 2 - 5);
-    let b_6k = ((6000.0 / bin_hz).round() as usize).clamp(b_2k + 1, fft_size / 2 - 4);
+    let b_200 = ((200.0 / bin_hz).round() as usize).clamp(1, half_bins - 4);
+    let b_2k = ((2000.0 / bin_hz).round() as usize).clamp(2, half_bins - 5);
+    let b_4k = ((4000.0 / bin_hz).round() as usize).clamp(b_2k + 1, half_bins - 3);
+    let b_6k = ((6000.0 / bin_hz).round() as usize).clamp(b_2k + 1, half_bins - 4);
+    let b_10k = ((10_000.0 / bin_hz).round() as usize).clamp(b_6k + 1, half_bins - 2);
 
-    if mono.len() >= fft_size {
+    if frames >= fft_size {
         let window: Vec<f64> = (0..fft_size)
             .map(|i| 0.5 * (1.0 - (2.0 * PI * (i as f64) / (fft_size as f64)).cos()))
             .collect();
         let mut buf = vec![Complex::new(0.0, 0.0); fft_size];
+        let mut side_buf = vec![Complex::new(0.0, 0.0); fft_size];
+        let mut frame_pow = vec![0.0_f64; half_bins + 1];
         let mut scratch = vec![Complex::new(0.0, 0.0); fft.get_inplace_scratch_len()];
         let inv_n_sq = 1.0 / ((fft_size * fft_size) as f64);
+        let active_frame_floor_sq = 10.0_f64.powf(-55.0 / 10.0) / (half_bins as f64);
 
         let mut pos = 0;
-        while pos + fft_size <= mono.len() {
+        while pos + fft_size <= frames {
             for i in 0..fft_size {
                 buf[i] = Complex::new((mono[pos + i] - dc_offset) * window[i], 0.0);
             }
             fft.process_with_scratch(&mut buf, &mut scratch);
-            for (dst, c) in avg_mag_sq.iter_mut().zip(&buf[..=fft_size / 2]) {
-                *dst += (c.re * c.re + c.im * c.im) * inv_n_sq;
+            let mut mid_sum = 0.0_f64;
+            for (b, c) in buf[..=half_bins].iter().enumerate() {
+                let p = (c.re * c.re + c.im * c.im) * inv_n_sq;
+                frame_pow[b] = p;
+                avg_mag_sq[b] += p;
+                if b > 0 {
+                    mid_sum += p;
+                }
+            }
+            let mid_mean = (mid_sum / (half_bins as f64)).max(1e-18);
+            if mid_mean > active_frame_floor_sq {
+                let mid_lm_peak = frame_pow[1..b_2k].iter().copied().fold(1e-18_f64, f64::max);
+                mid_frame_excess_db.push(max_local_excess_db(
+                    &frame_pow,
+                    b_2k,
+                    b_10k,
+                    (mid_mean * 0.5).max(mid_lm_peak * 0.10),
+                ));
+            }
+
+            if ch_count >= 2 {
+                let l = &buffer.channels[0];
+                let r = &buffer.channels[1];
+                for i in 0..fft_size {
+                    let s =
+                        0.5 * (sanitize_sample_f64(l[pos + i]) - sanitize_sample_f64(r[pos + i]));
+                    side_buf[i] = Complex::new(s * window[i], 0.0);
+                }
+                fft.process_with_scratch(&mut side_buf, &mut scratch);
+                let mut side_sum = 0.0_f64;
+                for (b, c) in side_buf[..=half_bins].iter().enumerate() {
+                    let p = (c.re * c.re + c.im * c.im) * inv_n_sq;
+                    frame_pow[b] = p;
+                    avg_side_sq[b] += p;
+                    if b > 0 {
+                        side_sum += p;
+                    }
+                }
+                let side_mean = (side_sum / (half_bins as f64)).max(1e-18);
+                if side_mean > active_frame_floor_sq {
+                    side_frame_excess_db.push(max_local_excess_db(
+                        &frame_pow,
+                        b_2k,
+                        b_10k,
+                        side_mean * 0.4,
+                    ));
+                }
             }
 
             frame_count += 1;
@@ -770,47 +923,42 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
     }
 
     if frame_count > 0 {
+        let inv_frames = 1.0 / (frame_count as f64);
         for v in &mut avg_mag_sq {
-            *v /= frame_count as f64;
+            *v *= inv_frames;
+        }
+        for v in &mut avg_side_sq {
+            *v *= inv_frames;
         }
     }
 
-    let broadband_bin_mean =
-        (avg_mag_sq[1..].iter().sum::<f64>() / ((fft_size / 2) as f64)).max(1e-12);
+    let broadband_bin_mean = (avg_mag_sq[1..].iter().sum::<f64>() / (half_bins as f64)).max(1e-12);
     let low_mid_peak = avg_mag_sq[1..b_2k]
         .iter()
         .copied()
         .fold(1e-12_f64, f64::max);
-    for b in (b_2k + 4)..=(b_6k.saturating_sub(4)) {
-        let outer_mean = (avg_mag_sq[b - 4]
-            + avg_mag_sq[b - 3]
-            + avg_mag_sq[b - 2]
-            + avg_mag_sq[b + 2]
-            + avg_mag_sq[b + 3]
-            + avg_mag_sq[b + 4])
-            / 6.0;
-        let ref_env = outer_mean
-            .max(broadband_bin_mean * 0.5)
-            .max(low_mid_peak * 0.12);
-        let ratio = (avg_mag_sq[b] / ref_env).sqrt();
-        if ratio > max_peak_over_median_2_6k {
-            max_peak_over_median_2_6k = ratio;
-        }
-    }
+    let whistle_db = max_local_excess_db(
+        &avg_mag_sq,
+        b_2k,
+        b_6k,
+        (broadband_bin_mean * 0.5).max(low_mid_peak * 0.12),
+    );
+    let mid_fizz_p95_db = percentile_sorted(&mut mid_frame_excess_db, 0.95);
+    let side_fizz_p95_db = percentile_sorted(&mut side_frame_excess_db, 0.95);
 
     let band_db = |f_low: f64, f_high: f64| -> f64 {
-        let i0 = ((f_low / bin_hz).floor() as usize).clamp(1, fft_size / 2);
-        let i1 = ((f_high / bin_hz).ceil() as usize).clamp(i0, fft_size / 2);
+        let i0 = ((f_low / bin_hz).floor() as usize).clamp(1, half_bins);
+        let i1 = ((f_high / bin_hz).ceil() as usize).clamp(i0, half_bins);
         let sum_e: f64 = avg_mag_sq[i0..=i1].iter().sum();
         10.0 * sum_e.max(1e-15).log10()
     };
 
     // Near digital silence there is no programme to judge: band energy and RMS both sit at
     // their numeric floors, and their difference would read as a loud band.
-    // - `mono_silent` gates the mono-FFT band levels & fizz index (so a 180-degree out-of-phase
+    // - `mono_silent` gates the mono-FFT band levels (so a 180-degree out-of-phase
     //   stereo signal whose mono sum cancels to zero does not report bogus relative band levels).
-    // - `channel_silent` checks the loudest individual channel's RMS so electrical/phase warnings
-    //   (DC offset, negative stereo correlation, low crest factor) still fire on out-of-phase audio.
+    // - `channel_silent` checks the loudest individual channel's RMS so electrical/phase/Side warnings
+    //   (DC offset, negative stereo correlation, low crest factor, Side shimmer) still fire.
     let mono_silent = rms_db <= SILENCE_RMS_DBFS;
     let max_ch_rms = buffer
         .channels
@@ -844,15 +992,56 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
     let harshness_2_6khz_db = relative_band_db(2000.0, 6000.0);
     let sibilance_5_14khz_db = relative_band_db(5000.0, 14000.0);
 
-    // Composite AI Fizz Index (0..100): measures 2-6 kHz spectral whistle spike + upper-mid energy excess + sub phase smear
-    let whistle_db = 20.0 * max_peak_over_median_2_6k.log10();
-    let whistle_score = ((whistle_db - 6.0) * 4.5).clamp(0.0, 60.0);
-    let harsh_score = ((harshness_2_6khz_db + 8.0) * 3.0).clamp(0.0, 25.0);
-    let sub_smear_score = ((0.85 - sub_160hz_correlation) * 30.0).clamp(0.0, 15.0);
-    let ai_fizz_index = if mono_silent {
+    // Effective upper spectral bandwidth cutoff (Hz) across combined stereo spectrum
+    let effective_bandwidth_hz = if channel_silent || frame_count == 0 {
         0.0
     } else {
-        (whistle_score + harsh_score + sub_smear_score).clamp(0.0, 100.0)
+        let total_sq: Vec<f64> = avg_mag_sq
+            .iter()
+            .zip(avg_side_sq.iter())
+            .map(|(m, s)| m + s)
+            .collect();
+        let ref_span = (b_4k - b_200 + 1).max(1) as f64;
+        let mid_ref = total_sq[b_200..=b_4k].iter().sum::<f64>() / ref_span;
+        let all_mean = total_sq[1..].iter().sum::<f64>() / (half_bins as f64);
+        let cutoff_thresh = mid_ref.max(all_mean).max(1e-18) * 1e-4; // -40 dB drop
+        let mut cutoff_bin = 0_usize;
+        for b in (3..half_bins).rev() {
+            let local3 = (total_sq[b - 1] + total_sq[b] + total_sq[b + 1]) / 3.0;
+            if local3 >= cutoff_thresh {
+                cutoff_bin = b + 1;
+                break;
+            }
+        }
+        ((cutoff_bin as f64) * bin_hz).clamp(0.0, sr * 0.5)
+    };
+
+    let transient_sharpness_db = if channel_silent {
+        0.0
+    } else {
+        compute_transient_sharpness_db(&buffer.channels, frames, sr)
+    };
+
+    // Composite AI Fizz Index (0..100): measures 2-6 kHz mono whistle + Mid/Side p95 resonance + high-mid phase smear
+    let whistle_score = ((whistle_db - 6.0) * 4.5).clamp(0.0, 50.0);
+    let harsh_score = ((harshness_2_6khz_db + 8.0) * 3.0).clamp(0.0, 20.0);
+    let sub_smear_score = ((0.85 - sub_160hz_correlation) * 30.0).clamp(0.0, 15.0);
+    let mid_p95_score = ((mid_fizz_p95_db - 8.5) * 1.5).clamp(0.0, 15.0);
+    let side_p95_score = ((side_fizz_p95_db - 7.5) * 2.5).clamp(0.0, 25.0);
+    let phase_wash_score = if ch_count >= 2 {
+        ((0.25 - high_mid_stereo_correlation) * 25.0).clamp(0.0, 12.0)
+    } else {
+        0.0
+    };
+    let ai_fizz_index = if channel_silent {
+        0.0
+    } else {
+        let mid_component = if mono_silent {
+            0.0
+        } else {
+            whistle_score + harsh_score + sub_smear_score + mid_p95_score
+        };
+        (mid_component + side_p95_score + phase_wash_score).clamp(0.0, 100.0)
     };
 
     let distrokid_ready = (-16.5..=-7.5).contains(&integrated_lufs)
@@ -870,6 +1059,33 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
         recommendations.push(format!(
             "Elevated AI/Metallic Resonance detected (Fizz Index {:.1}/100, peak whistle +{:.1} dB in 2-6 kHz). Apply `forge restore` OpenSoothe De-Fizz.",
             ai_fizz_index, whistle_db
+        ));
+    }
+    if side_fizz_p95_db >= 9.0 && ch_count >= 2 && !channel_silent {
+        recommendations.push(format!(
+            "High Stereo-Side shimmer detected (Side p95 excess {:.1} dB). Apply `forge restore --mid-side 0.4` to tame Side harshness.",
+            side_fizz_p95_db
+        ));
+    }
+    if !channel_silent
+        && ch_count >= 2
+        && high_mid_stereo_correlation < 0.25
+        && frames >= (sr * 0.25) as usize
+    {
+        recommendations.push(format!(
+            "2-12 kHz stereo correlation is low ({:.2}, diffusion phase wash). Narrow high-band stereo width and de-fizz Side channel.",
+            high_mid_stereo_correlation
+        ));
+    }
+    if !channel_silent
+        && sr >= 44_100.0
+        && frames >= (sr as usize)
+        && effective_bandwidth_hz > 0.0
+        && effective_bandwidth_hz < 16_500.0
+    {
+        recommendations.push(format!(
+            "Narrow effective bandwidth cutoff at {:.0} Hz (AI codec brickwalling). Run `forge neural-restore` bandwidth extension.",
+            effective_bandwidth_hz
         ));
     }
     if sub_160hz_correlation < 0.85 {
@@ -907,6 +1123,16 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
             crest_factor_db
         ));
     }
+    if !mono_silent
+        && frames >= (sr * 0.5) as usize
+        && transient_sharpness_db > 0.0
+        && transient_sharpness_db < 4.5
+    {
+        recommendations.push(format!(
+            "Softened transient punch ({:.1} dB 5ms/50ms ratio). Consider transient restoration or drum layer reinforcement.",
+            transient_sharpness_db
+        ));
+    }
 
     AuditReport {
         sample_rate: buffer.sample_rate,
@@ -929,6 +1155,11 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
         harshness_2_6khz_db,
         sibilance_5_14khz_db,
         ai_fizz_index,
+        mid_fizz_p95_db,
+        side_fizz_p95_db,
+        effective_bandwidth_hz,
+        high_mid_stereo_correlation,
+        transient_sharpness_db,
         distrokid_ready,
         recommendations,
     }

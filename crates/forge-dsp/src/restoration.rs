@@ -8,7 +8,7 @@
 
 use std::f64::consts::PI;
 
-use forge_core::{AudioBuffer, Result};
+use forge_core::{AudioBuffer, AuditReport, ForgeError, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::loudness_limiter::{Biquad, sanitize_param_f64, sanitize_sample_f64};
@@ -47,6 +47,96 @@ impl Default for RestorationConfig {
     }
 }
 
+impl RestorationConfig {
+    /// Telemetry-driven restoration configuration built from an [`AuditReport`].
+    ///
+    /// Clean hum-free tracks (such as AI renders) never get an unnecessary 10-harmonic 60 Hz notch,
+    /// stereo highs are not artificially widened when Side shimmer or phase wash is elevated, and
+    /// sub-160 Hz mono-maker only engages when low-end correlation drops below `0.85`.
+    pub fn from_audit(audit: &AuditReport, ai_track_mode: bool) -> Self {
+        let hum_fundamental_hz = if audit.hum_50_60hz_db > -12.0 {
+            Some(60.0)
+        } else {
+            None
+        };
+        let mono_below_hz = if audit.channels >= 2 && audit.sub_160hz_correlation < 0.85 {
+            Some(160.0)
+        } else {
+            None
+        };
+        let stereo_width_highs = if ai_track_mode
+            || audit.side_fizz_p95_db >= 7.0
+            || audit.high_mid_stereo_correlation < 0.35
+        {
+            1.0
+        } else {
+            1.04
+        };
+        let carves_box_mud_320hz_db = if audit.box_mud_200_500hz_db > -4.0 {
+            -2.0
+        } else if audit.box_mud_200_500hz_db > -8.0 {
+            -1.0
+        } else {
+            0.0
+        };
+        Self {
+            remove_dc: true,
+            declip: audit.clipped_samples > 0 || audit.sample_peak_dbfs >= -1.5,
+            hum_fundamental_hz,
+            mono_below_hz,
+            stereo_width_highs,
+            carves_box_mud_320hz_db,
+            analog_tape_drive: if ai_track_mode { 0.10 } else { 0.12 },
+        }
+    }
+}
+
+/// Mixes multiple audio stems sample-accurately into one stereo (or channel-matched) sum.
+pub fn sum_audio_buffers(
+    buffers: &[&AudioBuffer],
+    target_frames: usize,
+    sample_rate: u32,
+) -> Result<AudioBuffer> {
+    if buffers.is_empty() {
+        return Err(ForgeError::InvalidParameter(
+            "sum_audio_buffers requires at least one stem buffer".to_string(),
+        ));
+    }
+    let sr = sample_rate.max(1);
+    let out_ch = buffers
+        .iter()
+        .map(|b| b.num_channels())
+        .max()
+        .unwrap_or(2)
+        .clamp(1, 2);
+    let frames = if target_frames > 0 {
+        target_frames
+    } else {
+        buffers.iter().map(|b| b.num_frames()).max().unwrap_or(0)
+    };
+    let mut summed = vec![vec![0.0_f64; frames]; out_ch];
+    for buf in buffers {
+        if buf.sample_rate != sr {
+            return Err(ForgeError::InvalidParameter(format!(
+                "Cannot sum stems with mismatched sample rates ({} Hz vs {sr} Hz)",
+                buf.sample_rate
+            )));
+        }
+        let n = frames.min(buf.num_frames());
+        for (dst_idx, dst_ch) in summed.iter_mut().enumerate() {
+            let src_ch = if dst_idx < buf.channels.len() {
+                &buf.channels[dst_idx]
+            } else {
+                &buf.channels[0]
+            };
+            for (dst, &src) in dst_ch[..n].iter_mut().zip(src_ch[..n].iter()) {
+                *dst += sanitize_sample_f64(src);
+            }
+        }
+    }
+    AudioBuffer::from_channels(summed, sr)
+}
+
 /// Removes DC offset and reconstructs clipped plateaus via cubic Hermite interpolation.
 pub fn remove_dc_and_declip(buffer: &mut AudioBuffer, declip: bool) {
     remove_dc_and_or_declip(buffer, true, declip);
@@ -74,12 +164,20 @@ fn remove_dc_and_or_declip(buffer: &mut AudioBuffer, remove_dc: bool, declip: bo
     }
 }
 
-/// Reconstructs runs of up to 64 clipped samples (`|x| >= 0.985`) via cubic Hermite arch
-/// reconstruction with properly scaled boundary tangents (allowing reconstructed peaks to
-/// recover above `1.0` instead of re-clipping them at the plateau).
+/// Reconstructs runs of hard-clipped (`|x| >= 0.985`, span `1..=64`) or normalized brickwall
+/// flat-top plateaus (`|x| >= 0.996 * peak`, `|dx| <= 1e-4 * peak`, span `3..=64` when
+/// `peak >= 0.50`) via cubic Hermite arch interpolation.
 fn declip_plateaus(ch: &mut [f64]) {
     let n = ch.len();
     let clip_thresh = 0.985_f64;
+    let peak_abs = ch.iter().fold(0.0_f64, |m, &x| m.max(x.abs()));
+    let plateau_ceil = if peak_abs >= 0.50 {
+        peak_abs * 0.996
+    } else {
+        f64::INFINITY
+    };
+    let plateau_eps = peak_abs * 1e-4;
+
     let mut i = 1_usize;
     while i + 2 < n {
         if ch[i].abs() >= clip_thresh {
@@ -87,38 +185,56 @@ fn declip_plateaus(ch: &mut [f64]) {
             while i + 1 < n && ch[i].abs() >= clip_thresh {
                 i += 1;
             }
-            let end = i;
-            let span = end.saturating_sub(start);
-            if (1..=64).contains(&span) && start >= 2 && end + 2 < n {
-                let y0 = ch[start - 1];
-                let y1 = ch[end];
-                // Estimate per-sample boundary slopes using 2nd-order backward/forward differences
-                // when 3 unclipped neighbors are available, falling back to 1st-order otherwise.
-                let slope0 = if start >= 3 {
-                    1.5 * y0 - 2.0 * ch[start - 2] + 0.5 * ch[start - 3]
-                } else {
-                    y0 - ch[start - 2]
-                };
-                let slope1 = -1.5 * y1 + 2.0 * ch[end + 1] - 0.5 * ch[end + 2];
-                let steps = (span + 1) as f64;
-                // Scale derivatives by `steps` (dt = 1/steps) so the Hermite curve matches the
-                // physical sample-rate slope at both clip boundaries, clamped for stability.
-                let m0 = (slope0 * steps).clamp(-4.0, 4.0);
-                let m1 = (slope1 * steps).clamp(-4.0, 4.0);
-                for k in 0..span {
-                    let t = ((k + 1) as f64) / steps;
-                    let t2 = t * t;
-                    let t3 = t2 * t;
-                    let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
-                    let h10 = t3 - 2.0 * t2 + t;
-                    let h01 = -2.0 * t3 + 3.0 * t2;
-                    let h11 = t3 - t2;
-                    let interp = h00 * y0 + h10 * m0 + h01 * y1 + h11 * m1;
-                    ch[start + k] = interp.clamp(-2.0, 2.0);
-                }
+            reconstruct_hermite_span(ch, start, i);
+        } else if ch[i].abs() >= plateau_ceil
+            && (ch[i] - ch[i - 1]).abs() <= plateau_eps
+            && ch[i].signum() == ch[i - 1].signum()
+        {
+            let start = i - 1;
+            let sign = ch[start].signum();
+            while i + 1 < n
+                && ch[i + 1].abs() >= plateau_ceil
+                && ch[i + 1].signum() == sign
+                && (ch[i + 1] - ch[i]).abs() <= plateau_eps
+            {
+                i += 1;
+            }
+            let end = i + 1;
+            if end.saturating_sub(start) >= 3 {
+                reconstruct_hermite_span(ch, start, end);
             }
         }
         i += 1;
+    }
+}
+
+fn reconstruct_hermite_span(ch: &mut [f64], start: usize, end: usize) {
+    let n = ch.len();
+    let span = end.saturating_sub(start);
+    if !(1..=64).contains(&span) || start < 2 || end + 2 >= n {
+        return;
+    }
+    let y0 = ch[start - 1];
+    let y1 = ch[end];
+    let slope0 = if start >= 3 {
+        1.5 * y0 - 2.0 * ch[start - 2] + 0.5 * ch[start - 3]
+    } else {
+        y0 - ch[start - 2]
+    };
+    let slope1 = -1.5 * y1 + 2.0 * ch[end + 1] - 0.5 * ch[end + 2];
+    let steps = (span + 1) as f64;
+    let m0 = (slope0 * steps).clamp(-4.0, 4.0);
+    let m1 = (slope1 * steps).clamp(-4.0, 4.0);
+    for k in 0..span {
+        let t = ((k + 1) as f64) / steps;
+        let t2 = t * t;
+        let t3 = t2 * t;
+        let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+        let h10 = t3 - 2.0 * t2 + t;
+        let h01 = -2.0 * t3 + 3.0 * t2;
+        let h11 = t3 - t2;
+        let interp = h00 * y0 + h10 * m0 + h01 * y1 + h11 * m1;
+        ch[start + k] = interp.clamp(-2.0, 2.0);
     }
 }
 

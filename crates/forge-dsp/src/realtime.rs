@@ -16,6 +16,9 @@ use crate::loudness_limiter::{
     flush_denormal_f64, next_uniform_bipolar, sanitize_param_f64, sanitize_sample_f32,
 };
 use crate::restoration::{LowBandSplit, MASTERING_18_BANDS_HZ};
+use crate::spectral_defizz::{
+    BAND_SKIRT_OCTAVES, focus_eq_multiplier, raised_cosine_band_mask, tilt_multiplier,
+};
 use crate::spectrum::{
     SPECTRUM_BANDS, SPECTRUM_FLOOR_DB, accumulate_stft_band_power, band_power_to_db,
     stft_band_bins, stft_band_power_norm,
@@ -303,50 +306,14 @@ impl OpenSootheStftCore {
         let bin_hz = self.ola.sample_rate / (self.ola.fft_size as f64);
         let clean_fizz = sanitize_param_f64(fizz_weight, 1.25, 0.0, 2.0);
         let clean_sib = sanitize_param_f64(sibilance_weight, 1.0, 0.0, 2.0);
-        let skirt_mask = |f: f64, lo: f64, hi: f64| -> f64 {
-            const SKIRT_OCT: f64 = 1.0 / 3.0;
-            if f <= 0.0 || lo >= hi {
-                return 0.0;
-            }
-            let lf = f.log2();
-            let llo = lo.log2();
-            let lhi = hi.log2();
-            if lf <= llo - SKIRT_OCT || lf >= lhi + SKIRT_OCT {
-                0.0
-            } else if lf < llo {
-                let t = (lf - (llo - SKIRT_OCT)) / SKIRT_OCT;
-                0.5 * (1.0 - (PI * t).cos())
-            } else if lf <= lhi {
-                1.0
-            } else {
-                let t = (lf - lhi) / SKIRT_OCT;
-                0.5 * (1.0 + (PI * t).cos())
-            }
-        };
         for (b, w_out) in self.band_weights.iter_mut().enumerate() {
             let f = (b as f64) * bin_hz;
-            let w_mud = 0.35 * skirt_mask(f, 250.0, 500.0);
-            let w_fizz = clean_fizz * skirt_mask(f, 1800.0, 6800.0);
-            let w_sib = clean_sib * skirt_mask(f, 5500.0, 14500.0);
+            let w_mud = 0.35 * raised_cosine_band_mask(f, 250.0, 500.0, BAND_SKIRT_OCTAVES);
+            let w_fizz =
+                clean_fizz * raised_cosine_band_mask(f, 1800.0, 6800.0, BAND_SKIRT_OCTAVES);
+            let w_sib = clean_sib * raised_cosine_band_mask(f, 5500.0, 14500.0, BAND_SKIRT_OCTAVES);
             *w_out = w_mud.max(w_fizz).max(w_sib);
         }
-    }
-
-    #[inline]
-    fn focus_eq_multiplier(freq_hz: f64, focus_db: [f64; 3]) -> f64 {
-        if focus_db[0].abs() < 1e-4 && focus_db[1].abs() < 1e-4 && focus_db[2].abs() < 1e-4 {
-            return 1.0;
-        }
-        // Smooth log-frequency weighting across Low (<400 Hz), Mid (400..4000 Hz), High (>4000 Hz)
-        let f = freq_hz.max(20.0);
-        let lf = f.log2();
-        let l_lo = 400.0_f64.log2();
-        let l_hi = 4000.0_f64.log2();
-        let w_low = ((l_lo + 0.5 - lf) / 1.0).clamp(0.0, 1.0);
-        let w_high = ((lf - (l_hi - 0.5)) / 1.0).clamp(0.0, 1.0);
-        let w_mid = (1.0 - w_low - w_high).max(0.0);
-        let db = w_low * focus_db[0] + w_mid * focus_db[1] + w_high * focus_db[2];
-        10.0_f64.powf(db / 20.0).clamp(0.15, 4.0)
     }
 
     #[inline]
@@ -422,19 +389,8 @@ impl OpenSootheStftCore {
             for (b, smoothed_val) in smoothed.iter_mut().enumerate().take(half_bins - 1).skip(1) {
                 let f = (b as f64) * bin_hz;
                 let base_w =
-                    self.band_weights[b] * focus * Self::focus_eq_multiplier(f, ctrl.focus_eq_db);
-                let weight = if ctrl.tilt_db_per_oct.abs() > 1e-6 && base_w > 0.01 {
-                    let tilt_mul = if f > 20.0 {
-                        10.0_f64
-                            .powf((ctrl.tilt_db_per_oct * (f / 1000.0).log2()) / 20.0)
-                            .clamp(0.15, 3.0)
-                    } else {
-                        1.0
-                    };
-                    (base_w * tilt_mul).clamp(0.0, 3.5)
-                } else {
-                    base_w.clamp(0.0, 3.5)
-                };
+                    self.band_weights[b] * focus * focus_eq_multiplier(f, ctrl.focus_eq_db);
+                let weight = (base_w * tilt_multiplier(f, ctrl.tilt_db_per_oct)).clamp(0.0, 3.5);
                 if weight <= 0.01 {
                     *smoothed_val = 1.0;
                     continue;

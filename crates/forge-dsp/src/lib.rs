@@ -1,5 +1,6 @@
 //! `forge-dsp` — Studio DSP, Restoration, Spectral Suppression, Unmasking, Alignment & Mastering.
 
+pub mod beat_grid;
 pub mod delivery;
 pub mod drum_midi;
 pub mod dtw_align;
@@ -12,12 +13,15 @@ pub mod spectral_defizz;
 pub mod spectral_unmask;
 pub mod spectrum;
 
+pub use beat_grid::{
+    BeatGridReport, TempoPoint, analyze_beat_grid, quantize_to_constant_bpm, warp_buffer_wsola,
+};
 pub use delivery::{
     DeliveryCheck, DeliveryOptions, DeliveryReport, DeliveryTarget, ToneMatch, deliver,
-    delivery_checks,
+    delivery_checks, resum_and_deliver_ai_stems,
 };
 pub use drum_midi::{DrumTriggerNotes, NoteMsg};
-pub use dtw_align::{StretchMarker, align_vocal_double_dtw};
+pub use dtw_align::{StretchMarker, align_vocal_double_dtw, align_vocal_double_dtw_elastic};
 pub use elite_dsp::{
     AdaaSin, AdaaTanh, AllpassDisperser, AnalogHardwareModel, AutoGainCompensator,
     GenreTonalTarget, JilesAthertonHysteresis, MAX_NAM_JSON_BYTES, NamWaveNetProfile,
@@ -41,6 +45,7 @@ pub use restoration::{
     MASTERING_18_BANDS_HZ, RestorationConfig, apply_18_band_eq, apply_analog_console_and_tape,
     apply_hum_notch_cascade, apply_mid_side_spatial_cleanup, clean_vocal_surgical,
     compute_reference_match_eq, remove_dc_and_declip, run_full_restoration_chain,
+    sum_audio_buffers,
 };
 pub use spectral_defizz::{DeFizzConfig, apply_spectral_defizz};
 pub use spectral_unmask::{UnmaskConfig, apply_spectral_unmask};

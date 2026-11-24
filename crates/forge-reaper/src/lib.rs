@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use forge_core::{ForgeError, Result};
-use forge_dsp::StretchMarker;
+use forge_dsp::{StretchMarker, TempoPoint};
 use forge_vocal::{PitchFrame, compile_reaper_take_pitch_envelope};
 use rosc::{OscMessage, OscPacket, OscType, encoder};
 use serde::{Deserialize, Serialize};
@@ -361,6 +361,9 @@ pub struct ReaperProjectBuilder {
     pub sample_rate: u32,
     pub isrc: Option<String>,
     pub markers: Vec<ReaperMarker>,
+    /// Optional bar-level variable tempo map serialized into REAPER `<TEMPOENVEX>`.
+    #[serde(default)]
+    pub tempo_map: Vec<TempoPoint>,
     pub tracks: Vec<ReaperTrackSpec>,
 }
 
@@ -514,6 +517,7 @@ impl ReaperProjectBuilder {
             sample_rate: sample_rate.clamp(8_000, 768_000),
             isrc: None,
             markers: Vec::new(),
+            tempo_map: Vec::new(),
             tracks: Vec::new(),
         }
     }
@@ -549,6 +553,23 @@ impl ReaperProjectBuilder {
             "<REAPER_PROJECT 0.1 \"7.82/win64\" 1761280000\n  RIPPLE 0\n  GROUPOVERRIDE 0 0 0\n  AUTOXFADE 129\n  ENVATTACH 3\n  SAMPLERATE {} 0 0\n  TEMPO {:.4} 4 4\n",
             clean_sr, clean_bpm
         ));
+
+        if !self.tempo_map.is_empty() {
+            rpp.push_str(
+                "  <TEMPOENVEX\n    EGUID {FORGE-TEMPOENVEX-0001}\n    ACT 1 -1\n    VIS 1 0 1\n    LANEHEIGHT 0 0\n    ARM 0\n    DEFSHAPE 1 -1 -1\n",
+            );
+            for pt in &self.tempo_map {
+                let safe_t = forge_dsp::sanitize_param_f64(pt.time_secs, 0.0, 0.0, 86_400.0);
+                let safe_bpm = forge_dsp::sanitize_param_f64(pt.bpm, clean_bpm, 30.0, 300.0);
+                let num = u32::from(pt.time_sig_num.clamp(1, 32));
+                let den = u32::from(pt.time_sig_den.clamp(1, 32));
+                let packed_ts = (den << 16) | num;
+                rpp.push_str(&format!(
+                    "    PT {safe_t:.5} {safe_bpm:.4} 1 {packed_ts} 0 0\n"
+                ));
+            }
+            rpp.push_str("  >\n");
+        }
 
         if let Some(ref isrc) = self.isrc {
             let safe_isrc = quote_rpp(isrc);
@@ -1059,5 +1080,31 @@ mod tests {
             assert!(path.ends_with(name));
             assert_eq!(std::fs::read_to_string(path).expect("read"), source);
         }
+    }
+
+    #[test]
+    fn rpp_emits_tempo_envelope_only_when_tempo_map_non_empty() {
+        let mut plain = ReaperProjectBuilder::new("Steady", 120.0, 48_000);
+        let plain_rpp = plain.build_rpp_string();
+        assert!(!plain_rpp.contains("<TEMPOENVEX"));
+
+        plain.tempo_map = vec![
+            forge_dsp::TempoPoint {
+                time_secs: 0.0,
+                bpm: 118.5,
+                time_sig_num: 4,
+                time_sig_den: 4,
+            },
+            forge_dsp::TempoPoint {
+                time_secs: 2.025,
+                bpm: 122.75,
+                time_sig_num: 4,
+                time_sig_den: 4,
+            },
+        ];
+        let drifted_rpp = plain.build_rpp_string();
+        assert!(drifted_rpp.contains("<TEMPOENVEX"));
+        assert!(drifted_rpp.contains("PT 0.00000 118.5000 1 262148 0 0"));
+        assert!(drifted_rpp.contains("PT 2.02500 122.7500 1 262148 0 0"));
     }
 }

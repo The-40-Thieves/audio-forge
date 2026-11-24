@@ -19,9 +19,9 @@ use forge_core::{AudioBuffer, ForgeError, StemBundle};
 use forge_dsp::{
     DeFizzConfig, DeliveryOptions, DeliveryTarget, DitherMode, GenreTonalTarget, LimiterStyle,
     RestorationConfig, ToneMatch, UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw,
-    apply_18_band_eq, apply_spectral_defizz, apply_spectral_unmask, audit_audio,
-    clean_vocal_surgical, compute_reference_match_eq, deliver, normalize_and_limit,
-    run_full_restoration_chain,
+    align_vocal_double_dtw_elastic, analyze_beat_grid, apply_18_band_eq, apply_spectral_defizz,
+    apply_spectral_unmask, audit_audio, clean_vocal_surgical, compute_reference_match_eq, deliver,
+    normalize_and_limit, quantize_to_constant_bpm, run_full_restoration_chain,
 };
 use forge_reaper::{
     ReaperProjectBuilder, ReaperTrackSpec, ReleaseMetadata, install_jsfx_plugins, jsfx_install_dir,
@@ -35,7 +35,7 @@ use forge_vocal::{
     PitchFrame, VocalScale, generate_vocal_harmony_stack, shift_vocal_pitch_formant_preserved,
     track_vocal_pitch,
 };
-use forge_worker::SeparationConfig;
+use forge_worker::{DrumHit, SeparationConfig};
 use sandbox::PathSandbox;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -326,6 +326,33 @@ fn mcp_tool(name: &str, description: &str, props: &[(&str, Value)], required: &[
     })
 }
 
+fn worker_tool(
+    name: &str,
+    desc: &str,
+    input_desc: &str,
+    output_dir_desc: Option<&str>,
+    backends: &[&str],
+    default_timeout_secs: i64,
+    extra: &[(&str, Value)],
+) -> Value {
+    let mut props = vec![("input", prop_str(None, input_desc))];
+    let mut required = vec!["input"];
+    if let Some(dir_desc) = output_dir_desc {
+        props.push(("output_dir", prop_str(None, dir_desc)));
+        required.push("output_dir");
+    }
+    props.push(("backend", prop_enum("string", backends, json!("auto"), "")));
+    props.extend_from_slice(extra);
+    props.push((
+        "timeout_secs",
+        prop_int(
+            Some(default_timeout_secs),
+            "Worker timeout in seconds (1..=3600)",
+        ),
+    ));
+    mcp_tool(name, desc, &props, &required)
+}
+
 fn tool_definitions() -> Vec<Value> {
     let targets = delivery_target_names();
     let mid_side_prop = || {
@@ -405,6 +432,21 @@ fn tool_definitions() -> Vec<Value> {
             false,
             "Run optional Apollo / spectral bandwidth restoration post-pass on separated stems",
         ),
+        (
+            "debleed",
+            false,
+            "Run Mel-Band-RoFormer stem bleed suppression pass on separated stems",
+        ),
+        (
+            "de_aspiration",
+            false,
+            "Run Aspiration Mel-Band-RoFormer breath/aspiration cleanup on isolated vocals",
+        ),
+        (
+            "dereverb_echo",
+            false,
+            "Use Mel-Band-RoFormer de-reverb/de-echo pass on isolated vocals",
+        ),
     ] {
         separate_props.push((flag, prop_bool(default, desc)));
     }
@@ -412,13 +454,13 @@ fn tool_definitions() -> Vec<Value> {
     vec![
         mcp_tool(
             "forge_audit_audio",
-            "Run an ITU-R BS.1770-4 / EBU R128 loudness, 4x polyphase True Peak (dBTP), LRA, and AI Spectral Fizz Index (2.5-6.5 kHz) audit on an audio file.",
+            "Run an ITU-R BS.1770-4 / EBU R128 loudness, 4x polyphase True Peak (dBTP), LRA, Mid/Side fizz, bandwidth cutoff, transient sharpness, and AI Spectral Fizz Index audit on an audio file.",
             &[("path", prop_str(None, "Path to audio file"))],
             &["path"],
         ),
         mcp_tool(
             "forge_restore_and_defizz",
-            "Clean AI-generated or live audio: DC offset, cubic Hermite de-clip, 50/60Hz hum removal, vocal de-click/de-plosive/de-breath, and OpenSoothe dynamic spectral de-fizz.",
+            "Clean AI-generated or live audio: DC offset, cubic Hermite de-clip, 50/60Hz hum removal, vocal de-click/de-plosive/de-breath, HPSS shimmer suppression, and OpenSoothe dynamic spectral de-fizz.",
             &[
                 ("input", prop_str(None, "")),
                 ("output", prop_str(None, "")),
@@ -437,6 +479,34 @@ fn tool_definitions() -> Vec<Value> {
                 (
                     "delta",
                     prop_bool(false, "Audition only the removed spectral resonance delta"),
+                ),
+                (
+                    "hard_mode",
+                    prop_bool(
+                        false,
+                        "Enable steeper suppression slope for stubborn AI codec buzz",
+                    ),
+                ),
+                (
+                    "hpss_shimmer",
+                    prop_num(
+                        Some(0.0),
+                        "HPSS erratic frame shimmer suppression boost (0.0..=1.0)",
+                    ),
+                ),
+                (
+                    "ultrasonic_lpf_hz",
+                    prop_num(
+                        None,
+                        "Optional gentle ultrasonic LPF cutoff Hz (1000..=22000)",
+                    ),
+                ),
+                (
+                    "ai_mode",
+                    prop_bool(
+                        false,
+                        "Derive telemetry-driven restoration and de-fizz settings automatically via audit_audio",
+                    ),
                 ),
             ],
             &["input", "output"],
@@ -465,6 +535,13 @@ fn tool_definitions() -> Vec<Value> {
                 ("target", prop_str(None, "")),
                 ("output", prop_str(None, "")),
                 ("vocal_dtw", prop_bool(false, "")),
+                (
+                    "elastic",
+                    prop_bool(
+                        false,
+                        "Use WSOLA elastic stretch warping when vocal_dtw is true",
+                    ),
+                ),
             ],
             &["reference", "target", "output"],
         ),
@@ -567,46 +644,43 @@ fn tool_definitions() -> Vec<Value> {
                     "dither_bits",
                     prop_int(Some(24), "Target bit depth for dither (8..=24)"),
                 ),
+                (
+                    "ai_track_mode",
+                    prop_bool(
+                        false,
+                        "Treat input as AI-generated audio (telemetry-driven de-fizz, avoids artificial high widening)",
+                    ),
+                ),
+                (
+                    "hpss_shimmer",
+                    prop_num(
+                        None,
+                        "Override HPSS erratic shimmer suppression ratio (0.0..=1.0)",
+                    ),
+                ),
             ],
             &["input", "output"],
         ),
-        mcp_tool(
+        worker_tool(
             "forge_neural_denoise",
             "Run neural audio denoising via DeepFilterNet3 or Mel-Band-RoFormer on the local Python GPU worker, confined to the MCP path sandbox.",
+            "Input audio file",
+            Some("Output directory for denoised audio"),
             &[
-                ("input", prop_str(None, "Input audio file")),
-                (
-                    "output_dir",
-                    prop_str(None, "Output directory for denoised audio"),
-                ),
-                (
-                    "backend",
-                    prop_enum(
-                        "string",
-                        &[
-                            "auto",
-                            "deepfilternet",
-                            "deepfilternet3",
-                            "mel-band-roformer",
-                            "roformer",
-                        ],
-                        json!("auto"),
-                        "",
-                    ),
-                ),
-                (
-                    "attenuation_limit_db",
-                    prop_num(
-                        None,
-                        "Optional attenuation limit in dB (0..=100, DeepFilterNet3)",
-                    ),
-                ),
-                (
-                    "timeout_secs",
-                    prop_int(Some(300), "Worker timeout in seconds (1..=3600)"),
-                ),
+                "auto",
+                "deepfilternet",
+                "deepfilternet3",
+                "mel-band-roformer",
+                "roformer",
             ],
-            &["input", "output_dir"],
+            300,
+            &[(
+                "attenuation_limit_db",
+                prop_num(
+                    None,
+                    "Optional attenuation limit in dB (0..=100, DeepFilterNet3)",
+                ),
+            )],
         ),
         mcp_tool(
             "forge_transcribe_midi",
@@ -626,7 +700,7 @@ fn tool_definitions() -> Vec<Value> {
         ),
         mcp_tool(
             "forge_separate_stems",
-            "Studio-grade neural stem separation (BS-RoFormer 1297 / SCNet XL / BS-RoFormer SW cascade, 2/4/6 stems + optional BS-RoFormer de-reverb, RoFormer Karaoke Lead/Backing split, 5-piece MDX23C DrumSep & Apollo spectral restoration) with pure-Rust DSP fallback, confined to the MCP path sandbox.",
+            "Studio-grade neural stem separation (BS-RoFormer 1297 / Mel-Band-RoFormer / BS-RoFormer SW cascade, 2/4/6 stems + de-reverb/de-echo/debleed/de-aspiration, Karaoke Lead/Backing split, 5-piece MDX23C DrumSep & bandwidth restoration) with pure-Rust DSP fallback, confined to the MCP path sandbox.",
             &separate_props,
             &["input", "output_dir"],
         ),
@@ -663,7 +737,7 @@ fn tool_definitions() -> Vec<Value> {
         ),
         mcp_tool(
             "forge_ingest_to_reaper",
-            "Full autonomous pipeline: separate stems, clean & de-fizz audio, extract drum MIDI, build voice-led chords, deliver a verified master for the chosen target, install JSFX plugins, and generate a REAPER 7.82 .RPP project.",
+            "Full autonomous AI-track pipeline: separate stems, clean & de-fizz vocal/other stems, unmask instruments, optionally layer drum one-shots, track beat grid / quantize stems or emit <TEMPOENVEX>, re-sum clean stems and deliver a verified master, install JSFX, and generate a REAPER 7.82 .RPP project.",
             &[
                 ("input", prop_str(None, "")),
                 ("output_dir", prop_str(None, "")),
@@ -689,8 +763,119 @@ fn tool_definitions() -> Vec<Value> {
                         "Fail instead of falling back to the DSP stem split when no GPU or Colab worker produces stems",
                     ),
                 ),
+                (
+                    "drum_samples_dir",
+                    prop_str(
+                        None,
+                        "Optional sandboxed directory of .wav drum one-shots for phase-locked Kick/Snare/HiHat reinforcement",
+                    ),
+                ),
+                (
+                    "drum_replace_mix",
+                    prop_num(
+                        Some(0.5),
+                        "Wet mix ratio for sample-layered drums (0.0..=1.0)",
+                    ),
+                ),
+                (
+                    "quantize_grid",
+                    prop_bool(
+                        false,
+                        "WSOLA time-warp separated stems onto a constant bpm grid instead of emitting variable <TEMPOENVEX>",
+                    ),
+                ),
             ],
             &["input", "output_dir"],
+        ),
+        worker_tool(
+            "forge_neural_restore",
+            "Run neural bandwidth restoration and AI artifact cleanup (Apollo, FlowHigh, AudioSR, SonicMaster, or spectral exciter fallback) within the MCP path sandbox.",
+            "Input audio file",
+            Some("Output directory for restored audio"),
+            &[
+                "auto",
+                "apollo",
+                "flowhigh",
+                "audiosr",
+                "sonicmaster",
+                "exciter",
+            ],
+            600,
+            &[
+                (
+                    "prompt",
+                    prop_str(None, "Optional instruction prompt (used by SonicMaster)"),
+                ),
+                (
+                    "chunk_secs",
+                    prop_num(None, "Processing chunk length in seconds (0.5..=120.0)"),
+                ),
+            ],
+        ),
+        worker_tool(
+            "forge_vocal_rescue",
+            "Rescue robotic or phasey AI vocals (Resemble Enhance, Seed-VC zero-shot timbre, or RoFormer chain) within the MCP path sandbox.",
+            "Input vocal stem",
+            Some("Output directory for rescued vocal"),
+            &["auto", "resemble-enhance", "seed-vc", "roformer-clean"],
+            600,
+            &[
+                (
+                    "reference_voice",
+                    prop_str(
+                        None,
+                        "Optional clean human reference vocal WAV inside sandbox",
+                    ),
+                ),
+                (
+                    "dereverb",
+                    prop_bool(true, "Run de-reverb/de-echo cleaning"),
+                ),
+                (
+                    "de_aspiration",
+                    prop_bool(true, "Run vocal aspiration suppression"),
+                ),
+            ],
+        ),
+        worker_tool(
+            "forge_beat_track",
+            "Extract beats, downbeats, median BPM, and tempo-drift map (beat-this, librosa, energy, or pure-Rust onset DP) within the MCP path sandbox.",
+            "Input audio file",
+            None,
+            &[
+                "auto",
+                "beat-this",
+                "librosa",
+                "energy",
+                "rust",
+                "pure_rust_onset",
+            ],
+            300,
+            &[(
+                "hint_bpm",
+                prop_num(None, "Optional BPM hint (30.0..=300.0) for Rust fallback"),
+            )],
+        ),
+        worker_tool(
+            "forge_evaluate_quality",
+            "Evaluate perceptual audio quality (Meta Audiobox Aesthetics PQ/PC/CE/CU, SingMOS, or acoustic proxy) within the MCP path sandbox.",
+            "Input audio file",
+            None,
+            &["auto", "audiobox", "singmos", "acoustic-proxy", "rust"],
+            300,
+            &[
+                (
+                    "reference",
+                    prop_str(
+                        None,
+                        "Optional reference WAV inside sandbox for paired comparison",
+                    ),
+                ),
+                (
+                    "vocal",
+                    prop_bool(false, "Prioritize vocal quality (SingMOS)"),
+                ),
+            ],
         ),
     ]
 }
@@ -791,6 +976,38 @@ fn bounded_f64_arg(
     Ok(v)
 }
 
+fn optional_bounded_f64_arg(
+    args: &Value,
+    key: &str,
+    min: f64,
+    max: f64,
+) -> Result<Option<f64>, ForgeError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(_) => Ok(Some(bounded_f64_arg(args, key, min, min, max)?)),
+    }
+}
+
+fn validate_backend_arg<'a>(args: &Value, allowed: &[&'a str]) -> Result<&'a str, ForgeError> {
+    let raw = match args.get("backend") {
+        None | Some(Value::Null) => "auto",
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| ForgeError::InvalidParameter("'backend' must be a string".into()))?,
+    }
+    .trim();
+    allowed
+        .iter()
+        .copied()
+        .find(|c| c.eq_ignore_ascii_case(raw))
+        .ok_or_else(|| {
+            ForgeError::InvalidParameter(format!(
+                "unknown 'backend' '{raw}' (expected one of {})",
+                allowed.join(", ")
+            ))
+        })
+}
+
 fn timeout_secs_arg(args: &Value) -> Result<Duration, ForgeError> {
     let secs = match args.get("timeout_secs") {
         None | Some(Value::Null) => 300_u64,
@@ -853,6 +1070,10 @@ fn dispatch_tool(
         "forge_separate_stems" => tool_separate_stems,
         "forge_daw_inspect" => tool_daw_inspect,
         "forge_daw_bounce" => tool_daw_bounce,
+        "forge_neural_restore" => tool_neural_restore,
+        "forge_vocal_rescue" => tool_vocal_rescue,
+        "forge_beat_track" => tool_beat_track,
+        "forge_evaluate_quality" => tool_evaluate_quality,
         _ => {
             return Err(ForgeError::InvalidParameter(format!(
                 "Unknown tool: {name}"
@@ -871,6 +1092,7 @@ fn tool_deliver(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, Forge
     options.repair = bool_arg(args, "repair", true);
     options.defizz = bool_arg(args, "defizz", true);
     options.vocal = bool_arg(args, "vocal", false);
+    options.ai_track_mode = bool_arg(args, "ai_track_mode", false);
     match args.get("limiter_style") {
         None | Some(Value::Null) => {}
         Some(raw) => {
@@ -911,8 +1133,14 @@ fn tool_deliver(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, Forge
     } else if let Some(genre) = args.get("genre").and_then(Value::as_str) {
         options.tone_match = Some(ToneMatch::Genre(GenreTonalTarget::parse(genre)));
     }
+    let hpss_shimmer = optional_bounded_f64_arg(args, "hpss_shimmer", 0.0, 1.0)?;
 
     let buf = sandbox.load_audio(&input)?;
+    if let Some(shimmer) = hpss_shimmer {
+        let mut cfg = DeFizzConfig::ai_mix_from_audit(&audit_audio(&buf));
+        cfg.hpss_shimmer_suppress = shimmer;
+        options.defizz_config = Some(cfg);
+    }
     let (master, report) = deliver(&buf, &options)?;
     if options.dither != DitherMode::None {
         let pcm_bits = if options.dither_bits <= 16 { 16 } else { 24 };
@@ -942,22 +1170,54 @@ fn tool_audit_audio(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, F
 fn tool_restore_and_defizz(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
     let input = path_arg(args, "input", sandbox)?;
     let output = path_arg(args, "output", sandbox)?;
-    let config = DeFizzConfig {
-        sensitivity_db: f64_arg(args, "sensitivity_db", 3.5),
-        max_depth_db: f64_arg(args, "defizz_depth_db", 9.0),
-        tilt_db_per_oct: bounded_f64_arg(args, "tilt", 0.0, -6.0, 6.0)?,
-        stereo_link: bounded_f64_arg(args, "stereo_link", 1.0, 0.0, 1.0)?,
-        mid_side_balance: bounded_f64_arg(args, "mid_side", 0.0, -1.0, 1.0)?,
-        delta_listen: bool_arg(args, "delta", false),
-        ..DeFizzConfig::default()
-    };
+    let ai_mode = bool_arg(args, "ai_mode", false);
+    let vocal = bool_arg(args, "vocal", false);
+    let sens_opt = optional_bounded_f64_arg(args, "sensitivity_db", 0.1, 24.0)?;
+    let depth_opt = optional_bounded_f64_arg(args, "defizz_depth_db", 0.0, 24.0)?;
+    let tilt = bounded_f64_arg(args, "tilt", 0.0, -6.0, 6.0)?;
+    let stereo_link = bounded_f64_arg(args, "stereo_link", 1.0, 0.0, 1.0)?;
+    let mid_side = bounded_f64_arg(args, "mid_side", 0.0, -1.0, 1.0)?;
+    let delta = bool_arg(args, "delta", false);
+    let hard_mode = bool_arg(args, "hard_mode", false);
+    let hpss_shimmer = bounded_f64_arg(args, "hpss_shimmer", 0.0, 0.0, 1.0)?;
+    let ultrasonic_lpf_hz = optional_bounded_f64_arg(args, "ultrasonic_lpf_hz", 1000.0, 22_000.0)?;
 
     let raw = sandbox.load_audio(&input)?;
     let before = audit_audio(&raw);
-    let mut stage1 = run_full_restoration_chain(&raw, &RestorationConfig::default())?;
-    if bool_arg(args, "vocal", false) {
+    let rest_cfg = if ai_mode {
+        RestorationConfig::from_audit(&before, true)
+    } else {
+        RestorationConfig::default()
+    };
+    let mut stage1 = run_full_restoration_chain(&raw, &rest_cfg)?;
+    if vocal {
         stage1 = clean_vocal_surgical(&stage1, true, true, -12.0)?;
     }
+    let mut config = if ai_mode {
+        DeFizzConfig::ai_mix_from_audit(&audit_audio(&stage1))
+    } else {
+        DeFizzConfig::default()
+    };
+    if let Some(s) = sens_opt {
+        config.sensitivity_db = s;
+    }
+    if let Some(d) = depth_opt {
+        config.max_depth_db = d;
+    }
+    config.tilt_db_per_oct = tilt;
+    config.stereo_link = stereo_link;
+    if args.get("mid_side").and_then(Value::as_f64).is_some() || !ai_mode {
+        config.mid_side_balance = mid_side;
+    }
+    config.delta_listen = delta;
+    config.hard_mode |= hard_mode;
+    if hpss_shimmer > 0.0 {
+        config.hpss_shimmer_suppress = hpss_shimmer;
+    }
+    if let Some(lpf) = ultrasonic_lpf_hz {
+        config.ultrasonic_lpf_hz = Some(lpf);
+    }
+
     let cleaned = apply_spectral_defizz(&stage1, &config)?;
     let after = audit_audio(&cleaned);
     sandbox.save_wav(&cleaned, &output, 24)?;
@@ -1001,32 +1261,21 @@ fn tool_spectral_unmask(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutpu
 fn tool_neural_denoise(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
     let input = path_arg(args, "input", sandbox)?;
     let output_dir = path_arg(args, "output_dir", sandbox)?;
-    let raw_backend = match args.get("backend") {
-        None | Some(Value::Null) => "auto",
-        Some(v) => v
-            .as_str()
-            .ok_or_else(|| ForgeError::InvalidParameter("'backend' must be a string".into()))?,
+    let backend = match validate_backend_arg(
+        args,
+        &[
+            "auto",
+            "deepfilternet",
+            "deepfilternet3",
+            "mel-band-roformer",
+            "roformer",
+        ],
+    )? {
+        "deepfilternet3" => "deepfilternet",
+        "roformer" => "mel-band-roformer",
+        other => other,
     };
-    let backend = match raw_backend.trim().to_ascii_lowercase().as_str() {
-        "auto" => "auto",
-        "deepfilternet" | "deepfilternet3" => "deepfilternet",
-        "mel-band-roformer" | "roformer" => "mel-band-roformer",
-        other => {
-            return Err(ForgeError::InvalidParameter(format!(
-                "unknown 'backend' '{other}' (expected auto, deepfilternet, deepfilternet3, mel-band-roformer, or roformer)"
-            )));
-        }
-    };
-    let attenuation_limit_db = match args.get("attenuation_limit_db") {
-        None | Some(Value::Null) => None,
-        Some(_) => Some(bounded_f64_arg(
-            args,
-            "attenuation_limit_db",
-            0.0,
-            0.0,
-            100.0,
-        )?),
-    };
+    let attenuation_limit_db = optional_bounded_f64_arg(args, "attenuation_limit_db", 0.0, 100.0)?;
     let timeout = timeout_secs_arg(args)?;
     let res = external::neural_denoise_checked(
         sandbox,
@@ -1047,18 +1296,115 @@ fn tool_transcribe_midi(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutpu
     Ok(serde_json::to_value(res)?.into())
 }
 
+fn tool_neural_restore(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
+    let input = path_arg(args, "input", sandbox)?;
+    let output_dir = path_arg(args, "output_dir", sandbox)?;
+    let backend = validate_backend_arg(
+        args,
+        &[
+            "auto",
+            "apollo",
+            "flowhigh",
+            "audiosr",
+            "sonicmaster",
+            "exciter",
+        ],
+    )?;
+    let prompt = args.get("prompt").and_then(Value::as_str);
+    let chunk_secs = optional_bounded_f64_arg(args, "chunk_secs", 0.5, 120.0)?;
+    let timeout = timeout_secs_arg(args)?;
+    let res = external::neural_restore_checked(
+        sandbox,
+        &input,
+        &output_dir,
+        backend,
+        prompt,
+        chunk_secs,
+        timeout,
+    )?;
+    Ok(serde_json::to_value(res)?.into())
+}
+
+fn tool_vocal_rescue(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
+    let input = path_arg(args, "input", sandbox)?;
+    let output_dir = path_arg(args, "output_dir", sandbox)?;
+    let backend = validate_backend_arg(
+        args,
+        &["auto", "resemble-enhance", "seed-vc", "roformer-clean"],
+    )?;
+    let reference_voice = optional_path_arg(args, "reference_voice", sandbox)?;
+    let dereverb = bool_arg(args, "dereverb", true);
+    let de_aspiration = bool_arg(args, "de_aspiration", true);
+    let timeout = timeout_secs_arg(args)?;
+    let res = external::vocal_rescue_checked(
+        sandbox,
+        &input,
+        &output_dir,
+        backend,
+        reference_voice.as_deref(),
+        dereverb,
+        de_aspiration,
+        timeout,
+    )?;
+    Ok(serde_json::to_value(res)?.into())
+}
+
+fn tool_beat_track(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
+    let input = path_arg(args, "input", sandbox)?;
+    let hint_bpm = optional_bounded_f64_arg(args, "hint_bpm", 30.0, 300.0)?;
+    let backend = validate_backend_arg(
+        args,
+        &[
+            "auto",
+            "beat-this",
+            "librosa",
+            "energy",
+            "rust",
+            "pure_rust_onset",
+        ],
+    )?;
+    let timeout = timeout_secs_arg(args)?;
+    let res = external::beat_track_checked(sandbox, &input, hint_bpm, backend, timeout)?;
+    Ok(serde_json::to_value(res)?.into())
+}
+
+fn tool_evaluate_quality(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
+    let input = path_arg(args, "input", sandbox)?;
+    let reference = optional_path_arg(args, "reference", sandbox)?;
+    let vocal = bool_arg(args, "vocal", false);
+    let backend = validate_backend_arg(
+        args,
+        &["auto", "audiobox", "singmos", "acoustic-proxy", "rust"],
+    )?;
+    let timeout = timeout_secs_arg(args)?;
+    let res = external::evaluate_quality_checked(
+        sandbox,
+        &input,
+        reference.as_deref(),
+        vocal,
+        backend,
+        timeout,
+    )?;
+    Ok(serde_json::to_value(res)?.into())
+}
+
 fn tool_phase_align(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
     let reference = path_arg(args, "reference", sandbox)?;
     let target = path_arg(args, "target", sandbox)?;
     let output = path_arg(args, "output", sandbox)?;
+    let elastic = bool_arg(args, "elastic", false);
 
     let ref_buf = sandbox.load_audio(&reference)?;
     let tgt_buf = sandbox.load_audio(&target)?;
     if bool_arg(args, "vocal_dtw", false) {
-        let (warped, markers) = align_vocal_double_dtw(&ref_buf, &tgt_buf, 120.0)?;
+        let (warped, markers) = if elastic {
+            align_vocal_double_dtw_elastic(&ref_buf, &tgt_buf, 120.0)?
+        } else {
+            align_vocal_double_dtw(&ref_buf, &tgt_buf, 120.0)?
+        };
         sandbox.save_wav(&warped, &output, 24)?;
         Ok(json!({
-            "mode": "vocal_dtw",
+            "mode": if elastic { "vocal_dtw_elastic" } else { "vocal_dtw" },
             "output": output,
             "stretch_markers_count": markers.len()
         })
@@ -1243,24 +1589,110 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
     let bpm = validate_bpm(f64_arg(args, "bpm", 120.0))?;
     let scale = VocalScale::parse(str_arg_or(args, "scale", "D minor"))?;
     let chords = str_arg_or(args, "chords", "Dm9 Bbmaj7 Gm9 A7b13");
+    let drum_samples_dir = optional_path_arg(args, "drum_samples_dir", sandbox)?;
+    let drum_replace_mix = bounded_f64_arg(args, "drum_replace_mix", 0.5, 0.0, 1.0)?;
+    let quantize_grid = bool_arg(args, "quantize_grid", false);
 
     sandbox.create_dir_all(&paths.output_dir)?;
     sandbox.create_dir_all(&paths.midi_dir)?;
 
-    let require_neural = bool_arg(args, "require_neural", false);
-    let (bundle, stem_separation) =
-        separate_ingest_stems(sandbox, &input, &paths.stems_dir, require_neural)?;
-    let vocal_pitch_frames = ingest_vocal_frames(sandbox, bundle.vocals.as_deref(), &scale)?;
-
-    let drum_buf = sandbox.load_audio(&sandbox.check(bundle.drums.as_ref().unwrap_or(&input))?)?;
-    let duration_secs = drum_buf.duration_secs();
-    write_ingest_midi(sandbox, &paths, &drum_buf, bpm, chords)?;
-
     let full_mix = sandbox.load_audio(&input)?;
-    let (mastered, delivery) = deliver(&full_mix, &DeliveryOptions::for_target(target))?;
+    let beat_grid = analyze_beat_grid(&full_mix, Some(bpm));
+
+    let require_neural = bool_arg(args, "require_neural", false);
+    let (mut bundle, stem_separation) =
+        separate_ingest_stems(sandbox, &input, &paths.stems_dir, require_neural)?;
+
+    let mut primary_stems: Vec<(PathBuf, AudioBuffer)> = Vec::new();
+    let (vocal_pitch_frames, cleaned_vocal) =
+        ingest_vocal_frames(sandbox, bundle.vocals.as_deref(), &scale)?;
+    if let (Some(voc_path), Some(voc_buf)) = (&bundle.vocals, &cleaned_vocal) {
+        primary_stems.push((sandbox.check(voc_path)?, voc_buf.clone()));
+    }
+
+    if let Some(ref other_path) = bundle.other {
+        let checked = sandbox.check(other_path)?;
+        let other_clean = clean_ingested_other(sandbox, &checked, cleaned_vocal.as_ref())?;
+        primary_stems.push((checked, other_clean));
+    }
+
+    let mut drum_buf =
+        sandbox.load_audio(&sandbox.check(bundle.drums.as_ref().unwrap_or(&input))?)?;
+    let (kick_notes, snare_notes, hat_notes) =
+        write_ingest_midi(sandbox, &paths, &drum_buf, bpm, chords)?;
+
+    let mut drum_hits_layered = 0_usize;
+    if let Some(ref samples_dir) = drum_samples_dir {
+        let tv = |ns: &[NoteEvent]| -> Vec<(u32, u8)> {
+            ns.iter().map(|n| (n.start_tick, n.velocity)).collect()
+        };
+        let hits = DrumHit::from_note_groups(
+            [
+                ("Kick", tv(&kick_notes)),
+                ("Snare", tv(&snare_notes)),
+                ("HiHat", tv(&hat_notes)),
+            ],
+            bpm,
+            480,
+            drum_buf.sample_rate,
+        );
+        let (layered, count) = external::render_drum_layer_checked(
+            sandbox,
+            samples_dir,
+            drum_buf.num_frames(),
+            drum_buf.sample_rate,
+            &hits,
+            drum_replace_mix,
+            &drum_buf,
+        )?;
+        drum_hits_layered = count;
+        let out_drum = match bundle.drums {
+            Some(ref p) => sandbox.check(p)?,
+            None => sandbox.check(&paths.stems_dir.join("Drums_Layered.wav"))?,
+        };
+        sandbox.save_wav(&layered, &out_drum, 24)?;
+        bundle.drums = Some(out_drum);
+        drum_buf = layered;
+    }
+    if let Some(ref drums_path) = bundle.drums {
+        primary_stems.push((sandbox.check(drums_path)?, drum_buf));
+    }
+
+    for opt_path in [&bundle.bass, &bundle.guitar, &bundle.keys]
+        .into_iter()
+        .flatten()
+    {
+        let checked = sandbox.check(opt_path)?;
+        let buf = sandbox.load_audio(&checked)?;
+        primary_stems.push((checked, buf));
+    }
+
+    let mut quantized_applied = false;
+    if quantize_grid && beat_grid.beats_secs.len() >= 2 {
+        for (path, buf) in &mut primary_stems {
+            let (warped, _) = quantize_to_constant_bpm(buf, &beat_grid.beats_secs, bpm)?;
+            sandbox.save_wav(&warped, path, 24)?;
+            *buf = warped;
+        }
+        quantized_applied = true;
+    }
+
+    let target_frames = primary_stems
+        .iter()
+        .map(|(_, b)| b.num_frames())
+        .max()
+        .unwrap_or_else(|| full_mix.num_frames());
+    let duration_secs = (target_frames as f64) / f64::from(full_mix.sample_rate.max(1));
+    let refs: Vec<&AudioBuffer> = primary_stems.iter().map(|(_, b)| b).collect();
+    let (mastered, delivery) = forge_dsp::resum_and_deliver_ai_stems(&refs, &full_mix, target)?;
     sandbox.save_wav(&mastered, &paths.master, 24)?;
     sandbox.write_json(&paths.delivery, &delivery)?;
 
+    let tempo_map = if !quantized_applied && beat_grid.max_bpm_drift >= 1.5 {
+        beat_grid.tempo_map.clone()
+    } else {
+        Vec::new()
+    };
     let session = SessionSpec {
         bpm,
         sample_rate: full_mix.sample_rate,
@@ -1269,7 +1701,10 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
         drums: bundle.drums,
         bass: bundle.bass,
         other: bundle.other,
+        guitar: bundle.guitar,
+        keys: bundle.keys,
         vocal_pitch_frames,
+        tempo_map,
         chords_midi: paths.chords_midi.clone(),
         drum_midi: paths.drum_midi.clone(),
     };
@@ -1289,13 +1724,20 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
             "master_lufs": delivery.after.integrated_lufs,
             "master_true_peak_dbtp": delivery.after.true_peak_dbtp,
             "ai_fizz_index": delivery.after.ai_fizz_index,
-            "stem_separation": stem_separation
+            "stem_separation": stem_separation,
+            "beat_grid": {
+                "median_bpm": beat_grid.median_bpm,
+                "max_bpm_drift": beat_grid.max_bpm_drift,
+                "beats_detected": beat_grid.beats_secs.len(),
+                "quantized": quantized_applied,
+            },
+            "drum_hits_layered": drum_hits_layered
         }),
     })
 }
 
 /// Separates stems on the backend the environment selects (`FORGE_WORKER_BACKEND`) and
-/// returns them with `{"backend", "fallbacks"}` so callers can see which backend ran. The
+/// returns them with `{"backend", "fallbacks", "warnings"}` so callers can see which backend ran. The
 /// worker is an external step, so [`external::separate_stems_checked`] re-checks its paths
 /// and verifies every stem through the root handle.
 fn separate_ingest_stems(
@@ -1307,18 +1749,24 @@ fn separate_ingest_stems(
     let mut config = SeparationConfig::from_env();
     config.require_neural |= require_neural;
     let report = external::separate_stems_checked(sandbox, input, stems_dir, &config)?;
-    let info = json!({ "backend": report.backend, "fallbacks": report.fallbacks });
+    let info = json!({
+        "backend": report.backend,
+        "fallbacks": report.fallbacks,
+        "warnings": report.warnings
+    });
     Ok((report.bundle, info))
 }
 
-/// Writes the drum-trigger MIDI (from `drum_buf`) and the voice-led chord MIDI.
+type DrumTriggerMidi = (Vec<NoteEvent>, Vec<NoteEvent>, Vec<NoteEvent>);
+
+/// Writes the drum-trigger MIDI (from `drum_buf`) and the voice-led chord MIDI, returning triggers.
 fn write_ingest_midi(
     sandbox: &PathSandbox,
     paths: &IngestPaths,
     drum_buf: &AudioBuffer,
     bpm: f64,
     chords: &str,
-) -> Result<(), ForgeError> {
+) -> Result<DrumTriggerMidi, ForgeError> {
     let (kick_notes, snare_notes, hat_notes) = extract_drum_midi_triggers(drum_buf, bpm, 480);
     sandbox.write_midi(
         &paths.drum_midi,
@@ -1336,33 +1784,51 @@ fn write_ingest_midi(
         bpm,
         480,
         &[("Voiced_Chords", &chord_notes), ("Sub_Bass", &bass_notes)],
-    )
+    )?;
+    Ok((kick_notes, snare_notes, hat_notes))
 }
 
-/// The pitch contour of the separated vocal (cleaned in place), or none without a vocal.
+/// The pitch contour and cleaned buffer of the separated vocal, or none without a vocal.
 fn ingest_vocal_frames(
     sandbox: &PathSandbox,
     vocal: Option<&std::path::Path>,
     scale: &VocalScale,
-) -> Result<Vec<PitchFrame>, ForgeError> {
+) -> Result<(Vec<PitchFrame>, Option<AudioBuffer>), ForgeError> {
     match vocal {
         Some(voc_path) => clean_ingested_vocal(sandbox, &sandbox.check(voc_path)?, scale),
-        None => Ok(Vec::new()),
+        None => Ok((Vec::new(), None)),
     }
 }
 
-/// Cleans and de-fizzes the separated vocal in place; returns its pitch contour.
+/// Cleans and de-fizzes the separated vocal in place using `ai_vocal`; returns pitch frames & buffer.
 fn clean_ingested_vocal(
     sandbox: &PathSandbox,
     voc_path: &std::path::Path,
     scale: &VocalScale,
-) -> Result<Vec<PitchFrame>, ForgeError> {
+) -> Result<(Vec<PitchFrame>, Option<AudioBuffer>), ForgeError> {
     let voc_buf = sandbox.load_audio(voc_path)?;
     let voc_clean = clean_vocal_surgical(&voc_buf, true, true, -10.0)?;
-    let voc_defizz = apply_spectral_defizz(&voc_clean, &DeFizzConfig::default())?;
+    let voc_defizz = apply_spectral_defizz(&voc_clean, &DeFizzConfig::ai_vocal())?;
     let frames = track_vocal_pitch(&voc_defizz, scale, 0.85);
     sandbox.save_wav(&voc_defizz, voc_path, 24)?;
-    Ok(frames)
+    Ok((frames, Some(voc_defizz)))
+}
+
+/// De-fizzes and optionally vocal-unmasks the `other` instrumental stem in place.
+fn clean_ingested_other(
+    sandbox: &PathSandbox,
+    other_path: &std::path::Path,
+    cleaned_vocal: Option<&AudioBuffer>,
+) -> Result<AudioBuffer, ForgeError> {
+    let other_buf = sandbox.load_audio(other_path)?;
+    let defizz_cfg = DeFizzConfig::ai_mix_from_audit(&audit_audio(&other_buf));
+    let mut other_clean = apply_spectral_defizz(&other_buf, &defizz_cfg)?;
+    if let Some(voc) = cleaned_vocal {
+        other_clean =
+            apply_spectral_unmask(&other_clean, voc, &UnmaskConfig::vocal_over_instruments())?;
+    }
+    sandbox.save_wav(&other_clean, other_path, 24)?;
+    Ok(other_clean)
 }
 
 /// Inputs for the generated REAPER session.
@@ -1374,7 +1840,10 @@ struct SessionSpec {
     drums: Option<PathBuf>,
     bass: Option<PathBuf>,
     other: Option<PathBuf>,
+    guitar: Option<PathBuf>,
+    keys: Option<PathBuf>,
     vocal_pitch_frames: Vec<PitchFrame>,
+    tempo_map: Vec<forge_dsp::TempoPoint>,
     chords_midi: PathBuf,
     drum_midi: PathBuf,
 }
@@ -1382,6 +1851,7 @@ struct SessionSpec {
 fn build_session(spec: SessionSpec) -> ReaperProjectBuilder {
     let mut rpp =
         ReaperProjectBuilder::new("ForgeAudio Studio Session", spec.bpm, spec.sample_rate);
+    rpp.tempo_map = spec.tempo_map;
     rpp.add_default_song_structure_markers();
     rpp.tracks.push(
         ReaperTrackSpec::audio(
@@ -1438,6 +1908,24 @@ fn build_session(spec: SessionSpec) -> ReaperProjectBuilder {
         0.85,
         0x01FF_8844,
     ));
+    if let Some(guitar) = spec.guitar {
+        rpp.tracks.push(ReaperTrackSpec::audio(
+            "07 Guitar",
+            Some(guitar),
+            spec.duration_secs,
+            0.80,
+            0x0144_AAFF,
+        ));
+    }
+    if let Some(keys) = spec.keys {
+        rpp.tracks.push(ReaperTrackSpec::audio(
+            "08 Keys / Piano",
+            Some(keys),
+            spec.duration_secs,
+            0.80,
+            0x01AA_FF44,
+        ));
+    }
     rpp
 }
 
@@ -1473,6 +1961,9 @@ fn tool_separate_stems(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput
     let split_crowd = bool_arg(args, "split_crowd", false);
     let all_stems = bool_arg(args, "all_stems", false);
     let restore = bool_arg(args, "restore", false);
+    let debleed = bool_arg(args, "debleed", false);
+    let de_aspiration = bool_arg(args, "de_aspiration", false);
+    let dereverb_echo = bool_arg(args, "dereverb_echo", false);
 
     let mut cfg = SeparationConfig::from_env();
     cfg.stems = stems;
@@ -1489,6 +1980,9 @@ fn tool_separate_stems(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput
         cfg.dereverb = dereverb;
     }
     cfg.restore = restore;
+    cfg.debleed = debleed;
+    cfg.de_aspiration = de_aspiration;
+    cfg.dereverb_echo = dereverb_echo;
 
     let report = external::separate_stems_checked(sandbox, &input, &output_dir, &cfg)?;
     let payload = serde_json::to_value(&report)
@@ -1957,7 +2451,10 @@ mod tests {
             drums: None,
             bass: None,
             other: None,
+            guitar: None,
+            keys: None,
             vocal_pitch_frames: Vec::new(),
+            tempo_map: Vec::new(),
             chords_midi: resource.path().join("chords.mid"),
             drum_midi: resource.path().join("drums.mid"),
         });
@@ -2088,5 +2585,144 @@ mod tests {
         );
         assert!(is_error(&bad_backend));
         assert!(text(&bad_backend).contains("backend"));
+    }
+
+    #[test]
+    fn ai_suite_tools_sandbox_enforcement_and_ingest_features() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sb = sandbox_in(root.path());
+
+        // Write drifting-tempo click+harmonic WAV (100 BPM -> 132 BPM) so beat grid + <TEMPOENVEX>
+        // trigger while maintaining sustained bed RMS so delivery hits -14 LUFS under -1 dBTP.
+        let sr = 48_000_u32;
+        let frames = (sr as usize) * 8;
+        let mut ch: Vec<f64> = (0..frames)
+            .map(|i| {
+                let ts = (i as f64) / f64::from(sr);
+                0.22 * (2.0 * std::f64::consts::PI * 220.0 * ts).sin()
+            })
+            .collect();
+        let mut t = 0.2_f64;
+        while t < 7.7 {
+            let start = (t * f64::from(sr)).round() as usize;
+            for k in 0..600 {
+                if start + k < frames {
+                    let env = (-(k as f64) / 100.0).exp();
+                    ch[start + k] += 0.35
+                        * env
+                        * (2.0 * std::f64::consts::PI * 105.0 * (k as f64) / f64::from(sr)).sin();
+                }
+            }
+            let bpm = if t < 4.0 { 100.0 } else { 132.0 };
+            t += 60.0 / bpm;
+        }
+        AudioBuffer::from_channels(vec![ch.clone(), ch], sr)
+            .unwrap()
+            .save_wav(root.path().join("ai_song.wav"), 24)
+            .unwrap();
+
+        // Write one kick drum one-shot into a sandboxed folder
+        let kit_dir = root.path().join("kit");
+        std::fs::create_dir_all(&kit_dir).unwrap();
+        let kick: Vec<f64> = (0..1800)
+            .map(|i| {
+                0.8 * (-(i as f64) / 250.0).exp()
+                    * (2.0 * std::f64::consts::PI * 65.0 * (i as f64) / f64::from(sr)).sin()
+            })
+            .collect();
+        AudioBuffer::from_channels(vec![kick.clone(), kick], sr)
+            .unwrap()
+            .save_wav(kit_dir.join("kick.wav"), 24)
+            .unwrap();
+
+        // 1. Beat track & evaluate quality via pure-Rust fallbacks inside sandbox
+        let beats = call_tool(
+            &sb,
+            "forge_beat_track",
+            json!({ "input": "ai_song.wav", "hint_bpm": 115.0, "backend": "rust" }),
+        );
+        assert!(!is_error(&beats), "{}", text(&beats));
+        let beats_json: Value = serde_json::from_str(text(&beats)).unwrap();
+        assert_eq!(beats_json["backend"], "pure_rust_onset");
+        assert!(!beats_json["beats_secs"].as_array().unwrap().is_empty());
+
+        let eval = call_tool(
+            &sb,
+            "forge_evaluate_quality",
+            json!({ "input": "ai_song.wav", "reference": "ai_song.wav", "vocal": true, "backend": "rust" }),
+        );
+        assert!(!is_error(&eval), "{}", text(&eval));
+        let eval_json: Value = serde_json::from_str(text(&eval)).unwrap();
+        assert_eq!(eval_json["backend"], "rust-acoustic-proxy");
+
+        // 2. Sandbox traversal rejection across new path arguments
+        for (tool, args) in [
+            (
+                "forge_neural_restore",
+                json!({ "input": "../escape.wav", "output_dir": "out" }),
+            ),
+            (
+                "forge_vocal_rescue",
+                json!({ "input": "ai_song.wav", "output_dir": "out", "reference_voice": "../escape.wav" }),
+            ),
+            (
+                "forge_evaluate_quality",
+                json!({ "input": "ai_song.wav", "reference": "../escape.wav" }),
+            ),
+            (
+                "forge_ingest_to_reaper",
+                json!({ "input": "ai_song.wav", "output_dir": "sess", "drum_samples_dir": "../escape_kit" }),
+            ),
+        ] {
+            let err = call_tool(&sb, tool, args);
+            assert!(is_error(&err), "{tool} must reject parent escape");
+        }
+
+        // 3. forge_deliver with ai_track_mode + hpss_shimmer
+        let delivered = call_tool(
+            &sb,
+            "forge_deliver",
+            json!({
+                "input": "ai_song.wav",
+                "output": "ai_master.wav",
+                "ai_track_mode": true,
+                "hpss_shimmer": 0.4
+            }),
+        );
+        assert!(!is_error(&delivered), "{}", text(&delivered));
+
+        // 4. forge_ingest_to_reaper (DSP fallback -> stem re-sum + drum layer + <TEMPOENVEX>)
+        let ingested = call_tool(
+            &sb,
+            "forge_ingest_to_reaper",
+            json!({
+                "input": "ai_song.wav",
+                "output_dir": "reaper_sess",
+                "bpm": 115.0,
+                "drum_samples_dir": "kit",
+                "drum_replace_mix": 0.5
+            }),
+        );
+        assert!(!is_error(&ingested), "{}", text(&ingested));
+        let ingest_json: Value = serde_json::from_str(text(&ingested)).unwrap();
+        assert!(ingest_json["beat_grid"]["beats_detected"].as_u64().unwrap() > 0);
+        assert!(
+            root.path()
+                .join("reaper_sess/ForgeAudio_Session.rpp")
+                .is_file()
+        );
+        let rpp_txt =
+            std::fs::read_to_string(root.path().join("reaper_sess/ForgeAudio_Session.rpp"))
+                .unwrap();
+        if ingest_json["beat_grid"]["max_bpm_drift"]
+            .as_f64()
+            .unwrap_or(0.0)
+            >= 1.5
+        {
+            assert!(
+                rpp_txt.contains("<TEMPOENVEX"),
+                "expected <TEMPOENVEX> in .rpp"
+            );
+        }
     }
 }
