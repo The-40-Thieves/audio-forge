@@ -73,7 +73,7 @@ proptest = "1.12"
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_process_allocs"] }
 nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
 nih_plug_xtask = { git = "https://github.com/robbert-vdh/nih-plug.git" }
-cpal = "0.15"
+cpal = "0.18"
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu", "glow", "x11", "wayland"] }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 
