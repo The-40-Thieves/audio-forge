@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import array
+import hashlib
 import json
 import math
 import os
@@ -33,6 +34,7 @@ import sys
 from collections.abc import Mapping, Sequence
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
+from typing import Any
 
 # Normalized stem tags (lowercase, alphanumerics only) for each role.
 VOCAL_TAGS = frozenset({"vocals", "vocal"})
@@ -85,6 +87,26 @@ BS_ROFORMER_SIX_STEM_MODEL = "BS-Roformer-SW.ckpt"
 FOUR_STEM_MODEL = "htdemucs_ft.yaml"
 SIX_STEM_MODEL = "htdemucs_6s.yaml"
 DRUMSEP_MODEL = "MDX23C-DrumSep-aufr33-jarredou.ckpt"
+
+VERIFIED_MODEL_REGISTRY: tuple[tuple[str, str, str], ...] = (
+    (MEL_ROFORMER_VOCAL_MODEL, "vocal_fast", "fast"),
+    (BS_ROFORMER_VOCAL_MODEL, "vocal_studio", "studio"),
+    (DEREVERB_MODEL, "dereverb", "studio"),
+    (DEREVERB_ECHO_MODEL, "dereverb_echo", "studio"),
+    (DENOISE_ROFORMER_MODEL, "denoise", "studio"),
+    (DEBLEED_MODEL, "debleed", "studio"),
+    (ASPIRATION_MODEL, "de_aspiration", "studio"),
+    (BS_ROFORMER_SIX_STEM_MODEL, "six_stem_primary", "studio"),
+    (KARAOKE_MODEL, "karaoke", "all"),
+    (MALE_FEMALE_MODEL, "male_female", "all"),
+    (WIND_MODEL, "wind", "all"),
+    (CROWD_MODEL, "crowd", "all"),
+    (VOCAL_REVIVE_MODEL, "vocal_revive", "all"),
+    (FOUR_STEM_MODEL, "four_stem_fallback", "all"),
+    (SIX_STEM_MODEL, "six_stem_fallback", "all"),
+    (DRUMSEP_MODEL, "drumsep", "all"),
+)
+VALID_MODEL_PROFILES = frozenset({"fast", "studio", "all"})
 
 VALID_QUALITIES = frozenset({"fast", "studio", "ultra"})
 VALID_RESTORE_BACKENDS = frozenset(
@@ -156,6 +178,50 @@ def _pick_clean_output(
         if resolved.is_relative_to(resolved_dir) and resolved.is_file():
             return candidate
     return None
+
+
+def _probe_wav_sample_rate(path: Path) -> int | None:
+    """Read RIFF WAV sample rate from header bytes without decoding samples."""
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return None
+    if len(head) < 36 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+        return None
+    pos = 12
+    while pos + 8 <= len(head):
+        tag = head[pos : pos + 4]
+        chunk_size = struct.unpack_from("<I", head, pos + 4)[0]
+        body_start = pos + 8
+        if tag == b"fmt " and body_start + 16 <= len(head):
+            _fmt, _nch, sr, _br, _ba, _bits = struct.unpack_from(
+                "<HHIIHH", head, body_start
+            )
+            return sr if sr > 0 else None
+        if tag == b"data":
+            break
+        pos = body_start + chunk_size + (chunk_size & 1)
+    return None
+
+
+def _instantiate_separator(
+    separator_cls: Any,
+    output_dir: Path,
+    input_path: Path | None = None,
+) -> Any:
+    """Create an audio-separator instance preserving the input WAV sample rate."""
+    kwargs: dict[str, object] = {
+        "output_dir": str(output_dir),
+        "output_format": "WAV",
+    }
+    sr = _probe_wav_sample_rate(input_path) if input_path is not None else None
+    if sr is not None and 8_000 <= sr <= 384_000:
+        try:
+            return separator_cls(**kwargs, sample_rate=sr)
+        except TypeError:
+            pass
+    return separator_cls(**kwargs)
 
 
 def _read_wav_float(
@@ -571,7 +637,7 @@ def run_separate(
             "Run: uv sync --project python-worker --extra gpu (or --extra cpu for CPU)"
         ) from exc
 
-    sep = Separator(output_dir=str(resolved_output), output_format="WAV")
+    sep: Any = _instantiate_separator(Separator, resolved_output, resolved_input)
     warnings: list[str] = []
     drums: Path | None = None
     bass: Path | None = None
@@ -853,7 +919,7 @@ def _denoise_with_deepfilternet(
 def _denoise_with_roformer(input_path: Path, output_dir: Path) -> Path:
     from audio_separator.separator import Separator
 
-    sep = Separator(output_dir=str(output_dir), output_format="WAV")
+    sep: Any = _instantiate_separator(Separator, output_dir, input_path)
     sep.load_model(model_filename=DENOISE_ROFORMER_MODEL)
     outputs = sep.separate(str(input_path))
     cleaned = pick_stem(outputs, DENOISED_TAGS, output_dir)
@@ -1091,7 +1157,7 @@ def _rescue_via_roformer_chain(
 ) -> tuple[Path, list[str]]:
     from audio_separator.separator import Separator
 
-    sep = Separator(output_dir=str(output_dir), output_format="WAV")
+    sep: Any = _instantiate_separator(Separator, output_dir, input_path)
     current = input_path
     stages: list[str] = []
     if dereverb:
@@ -1509,6 +1575,145 @@ def run_yue2_remote(
     }
 
 
+def _load_sha256_manifest() -> dict[str, str]:
+    raw = os.environ.get("FORGE_MODEL_SHA256_MANIFEST", "").strip()
+    if not raw:
+        return {}
+    path = Path(raw).expanduser().resolve()
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, Mapping):
+        raise ValueError("FORGE_MODEL_SHA256_MANIFEST must contain a JSON object")
+    out: dict[str, str] = {}
+    for k, v in data.items():
+        if isinstance(k, str) and isinstance(v, str):
+            digest = v.strip().lower()
+            if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise ValueError(f"Invalid SHA-256 digest for model {k!r}")
+            out[k] = digest
+    return out
+
+
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _select_models_for_profile(profile: str) -> list[tuple[str, str, str]]:
+    if profile not in VALID_MODEL_PROFILES:
+        raise ValueError(
+            f"Unsupported profile {profile!r}; expected one of {sorted(VALID_MODEL_PROFILES)}"
+        )
+    allowed = (
+        {"fast"}
+        if profile == "fast"
+        else {"fast", "studio"}
+        if profile == "studio"
+        else {"fast", "studio", "all"}
+    )
+    return [entry for entry in VERIFIED_MODEL_REGISTRY if entry[2] in allowed]
+
+
+def _default_model_dir(model_dir: Path | None) -> Path:
+    if model_dir is not None:
+        return model_dir.expanduser().resolve()
+    env_dir = os.environ.get("AUDIO_SEPARATOR_MODEL_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir).expanduser().resolve()
+    return (Path.home() / ".cache" / "audio-separator-models").resolve()
+
+
+def run_list_models(
+    profile: str = "all",
+    model_dir: Path | None = None,
+    verify_sha256: bool = False,
+) -> dict[str, object]:
+    """List verified audio-separator checkpoints, cache status, and optional SHA-256 verification."""
+    target_dir = _default_model_dir(model_dir)
+    manifest = _load_sha256_manifest() if verify_sha256 else {}
+    items: list[dict[str, object]] = []
+    for filename, role, mod_profile in _select_models_for_profile(profile):
+        cached_path = target_dir / filename
+        is_cached = cached_path.is_file()
+        actual_sha = (
+            _file_sha256(cached_path) if (verify_sha256 and is_cached) else None
+        )
+        expected_sha = manifest.get(filename)
+        sha_ok = (
+            (actual_sha == expected_sha)
+            if (actual_sha is not None and expected_sha is not None)
+            else None
+        )
+        items.append(
+            {
+                "filename": filename,
+                "role": role,
+                "profile": mod_profile,
+                "cached": is_cached,
+                "sha256": actual_sha,
+                "expected_sha256": expected_sha,
+                "sha256_ok": sha_ok,
+            }
+        )
+    return {
+        "profile": profile,
+        "model_dir": str(target_dir),
+        "models": items,
+    }
+
+
+def run_warm_cache(
+    profile: str = "studio",
+    model_dir: Path | None = None,
+    verify_sha256: bool = False,
+    dry_run: bool = False,
+) -> dict[str, object]:
+    """Pre-download verified checkpoints into model_dir and verify SHA-256 digests when configured."""
+    target_dir = _default_model_dir(model_dir)
+    manifest = _load_sha256_manifest()
+    selected = _select_models_for_profile(profile)
+    warnings: list[str] = []
+    warmed: list[str] = []
+    verified: dict[str, bool] = {}
+
+    if not dry_run:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        from audio_separator.separator import Separator
+
+        sep = Separator(model_file_dir=str(target_dir))
+    else:
+        sep = None
+
+    for filename, _role, _mod_profile in selected:
+        if sep is not None:
+            sep.load_model(model_filename=filename)  # type: ignore[attr-defined]
+        warmed.append(filename)
+        cached_path = target_dir / filename
+        if verify_sha256 and cached_path.is_file():
+            digest = _file_sha256(cached_path)
+            expected = manifest.get(filename)
+            if expected is not None:
+                ok = digest == expected
+                verified[filename] = ok
+                if not ok:
+                    raise RuntimeError(
+                        f"SHA-256 mismatch for {filename}: got {digest}, expected {expected}"
+                    )
+            else:
+                warnings.append(f"No SHA-256 entry in manifest for {filename}")
+
+    return {
+        "profile": profile,
+        "model_dir": str(target_dir),
+        "dry_run": dry_run,
+        "models": warmed,
+        "verified": verified,
+        "warnings": warnings,
+    }
+
+
 def _add_io_parser(
     sub: argparse._SubParsersAction[argparse.ArgumentParser],
     name: str,
@@ -1660,6 +1865,25 @@ def main() -> int:
         "--timeout", type=float, default=600.0, help="Seconds to wait for the Space"
     )
 
+    lm_p = sub.add_parser(
+        "list-models",
+        help="List verified RoFormer/MDX23C checkpoints and local cache status",
+    )
+    lm_p.add_argument("--profile", default="all", choices=sorted(VALID_MODEL_PROFILES))
+    lm_p.add_argument("--model-dir", type=Path, default=None)
+    lm_p.add_argument("--verify-sha256", action="store_true")
+
+    wc_p = sub.add_parser(
+        "warm-cache",
+        help="Pre-download verified checkpoints into model-dir with optional SHA-256 check",
+    )
+    wc_p.add_argument(
+        "--profile", default="studio", choices=sorted(VALID_MODEL_PROFILES)
+    )
+    wc_p.add_argument("--model-dir", type=Path, default=None)
+    wc_p.add_argument("--verify-sha256", action="store_true")
+    wc_p.add_argument("--dry-run", action="store_true")
+
     args = parser.parse_args()
     try:
         res: Mapping[str, object]
@@ -1733,6 +1957,21 @@ def main() -> int:
                 args.seed,
                 args.space,
                 args.timeout,
+            )
+            print(json.dumps(res))
+        elif args.command == "list-models":
+            res = run_list_models(
+                profile=args.profile,
+                model_dir=args.model_dir,
+                verify_sha256=args.verify_sha256,
+            )
+            print(json.dumps(res))
+        elif args.command == "warm-cache":
+            res = run_warm_cache(
+                profile=args.profile,
+                model_dir=args.model_dir,
+                verify_sha256=args.verify_sha256,
+                dry_run=args.dry_run,
             )
             print(json.dumps(res))
         return 0

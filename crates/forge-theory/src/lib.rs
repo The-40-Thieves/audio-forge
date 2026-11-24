@@ -793,26 +793,24 @@ mod tests {
 
     #[test]
     fn test_malformed_chord_symbols_are_rejected() {
-        let cases = [
-            ("Cxyz", "Unknown chord quality"),
-            ("C7b10", "Unknown chord quality"),
-            ("Cmsus4", "sus cannot follow a minor third"),
-            ("Cm5", "power chord"),
-            ("C##", "Unknown chord quality"),
-            ("C7(b9", "unclosed"),
-            ("C7b9)", "unbalanced"),
-            ("C7((b9))", "nested"),
-            ("C/H", "Invalid slash bass"),
-            ("C/", "Invalid slash bass"),
-            ("C/E/G", "Invalid slash bass"),
-            ("C/Em", "Invalid slash bass"),
-            ("H7", "Invalid root note"),
-            ("", "Empty chord symbol"),
-        ];
-        for (symbol, needle) in cases {
+        let assert_bad = |symbol: &str, needle: &str| {
             let err = parse_chord(symbol).expect_err(symbol).to_string();
             assert!(err.contains(needle), "{symbol}: {err}");
-        }
+        };
+        assert_bad("Cxyz", "Unknown chord quality");
+        assert_bad("C7b10", "Unknown chord quality");
+        assert_bad("Cmsus4", "sus cannot follow a minor third");
+        assert_bad("Cm5", "power chord");
+        assert_bad("C##", "Unknown chord quality");
+        assert_bad("C7(b9", "unclosed");
+        assert_bad("C7b9)", "unbalanced");
+        assert_bad("C7((b9))", "nested");
+        assert_bad("C/H", "Invalid slash bass");
+        assert_bad("C/", "Invalid slash bass");
+        assert_bad("C/E/G", "Invalid slash bass");
+        assert_bad("C/Em", "Invalid slash bass");
+        assert_bad("H7", "Invalid root note");
+        assert_bad("", "Empty chord symbol");
     }
 
     proptest! {

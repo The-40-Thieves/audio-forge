@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import array
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -827,6 +828,59 @@ class NewTasksTests(TestCase):
             self.assertEqual(ev["backend"], "acoustic-proxy")
             self.assertIn("metrics", ev)
             self.assertIsNotNone(ev["reference_metrics"])
+
+    def test_list_models_and_warm_cache_with_sha256_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_dir = root / "models"
+            model_dir.mkdir()
+            fast_file = model_dir / worker.MEL_ROFORMER_VOCAL_MODEL
+            fast_file.write_bytes(b"weights-v1")
+            digest = hashlib.sha256(b"weights-v1").hexdigest()
+            manifest = root / "sha256.json"
+            manifest.write_text(
+                json.dumps({worker.MEL_ROFORMER_VOCAL_MODEL: digest}),
+                encoding="utf-8",
+            )
+            prev_manifest = os.environ.get("FORGE_MODEL_SHA256_MANIFEST")
+            os.environ["FORGE_MODEL_SHA256_MANIFEST"] = str(manifest)
+            try:
+                listed = worker.run_list_models(
+                    profile="fast", model_dir=model_dir, verify_sha256=True
+                )
+                models = listed["models"]
+                self.assertIsInstance(models, list)
+                assert isinstance(models, list)
+                self.assertEqual(len(models), 1)
+                self.assertTrue(models[0]["cached"])
+                self.assertTrue(models[0]["sha256_ok"])
+
+                warmed = worker.run_warm_cache(
+                    profile="fast",
+                    model_dir=model_dir,
+                    verify_sha256=True,
+                    dry_run=True,
+                )
+                self.assertEqual(
+                    warmed["verified"], {worker.MEL_ROFORMER_VOCAL_MODEL: True}
+                )
+
+                manifest.write_text(
+                    json.dumps({worker.MEL_ROFORMER_VOCAL_MODEL: "0" * 64}),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(RuntimeError):
+                    worker.run_warm_cache(
+                        profile="fast",
+                        model_dir=model_dir,
+                        verify_sha256=True,
+                        dry_run=True,
+                    )
+            finally:
+                if prev_manifest is None:
+                    os.environ.pop("FORGE_MODEL_SHA256_MANIFEST", None)
+                else:
+                    os.environ["FORGE_MODEL_SHA256_MANIFEST"] = prev_manifest
 
 
 if __name__ == "__main__":

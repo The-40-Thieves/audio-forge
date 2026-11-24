@@ -764,6 +764,15 @@ fn tool_definitions() -> Vec<Value> {
                     ),
                 ),
                 (
+                    "backend",
+                    prop_enum(
+                        "string",
+                        &["auto", "local", "colab", "rust"],
+                        json!("auto"),
+                        "Stem separation backend override (defaults to env FORGE_WORKER_BACKEND or auto)",
+                    ),
+                ),
+                (
                     "drum_samples_dir",
                     prop_str(
                         None,
@@ -1600,8 +1609,14 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
     let beat_grid = analyze_beat_grid(&full_mix, Some(bpm));
 
     let require_neural = bool_arg(args, "require_neural", false);
-    let (mut bundle, stem_separation) =
-        separate_ingest_stems(sandbox, &input, &paths.stems_dir, require_neural)?;
+    let backend_override = args.get("backend").and_then(Value::as_str);
+    let (mut bundle, stem_separation) = separate_ingest_stems(
+        sandbox,
+        &input,
+        &paths.stems_dir,
+        require_neural,
+        backend_override,
+    )?;
 
     let mut primary_stems: Vec<(PathBuf, AudioBuffer)> = Vec::new();
     let (vocal_pitch_frames, cleaned_vocal) =
@@ -1745,9 +1760,38 @@ fn separate_ingest_stems(
     input: &Path,
     stems_dir: &Path,
     require_neural: bool,
+    backend_override: Option<&str>,
 ) -> Result<(StemBundle, Value), ForgeError> {
     let mut config = SeparationConfig::from_env();
     config.require_neural |= require_neural;
+    if let Some(raw) = backend_override {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" | "" => {}
+            "local" | "local_gpu" => {
+                config.backend = forge_worker::WorkerBackend::LocalGpu;
+            }
+            "rust" | "dsp" | "pure_rust_dsp" => {
+                config.backend = forge_worker::WorkerBackend::PureRustDsp;
+            }
+            "colab" | "remote" | "remote_colab" => {
+                let url = std::env::var("FORGE_COLAB_WORKER_URL")
+                    .ok()
+                    .map(|u| u.trim().to_string())
+                    .filter(|u| !u.is_empty())
+                    .ok_or_else(|| {
+                        ForgeError::WorkerError(
+                            "backend='colab' requires FORGE_COLAB_WORKER_URL to be set".to_string(),
+                        )
+                    })?;
+                config.backend = forge_worker::WorkerBackend::RemoteColab { base_url: url };
+            }
+            other => {
+                return Err(ForgeError::InvalidParameter(format!(
+                    "Invalid ingest separation backend '{other}' (expected auto, local, colab, or rust)"
+                )));
+            }
+        }
+    }
     let report = external::separate_stems_checked(sandbox, input, stems_dir, &config)?;
     let info = json!({
         "backend": report.backend,
@@ -2699,6 +2743,7 @@ mod tests {
                 "input": "ai_song.wav",
                 "output_dir": "reaper_sess",
                 "bpm": 115.0,
+                "backend": "rust",
                 "drum_samples_dir": "kit",
                 "drum_replace_mix": 0.5
             }),

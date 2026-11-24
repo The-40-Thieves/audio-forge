@@ -75,7 +75,7 @@ nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
 nih_plug_xtask = { git = "https://github.com/robbert-vdh/nih-plug.git" }
 cpal = "0.18"
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "wgpu", "glow", "x11", "wayland"] }
-rfd = { version = "0.16", default-features = false, features = ["xdg-portal", "tokio"] }
+rfd = { version = "0.18", default-features = false, features = ["xdg-portal"] }
 
 # nih-plug's CLAP wrapper aborts the host on corrupt state and never asks the host to rescan
 # parameter values after loading state, which fails clap-validator. Until the fixes land upstream,

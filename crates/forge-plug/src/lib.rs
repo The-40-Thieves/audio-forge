@@ -434,12 +434,10 @@ mod tests {
             ("slot a", 1),
             ("SLOT H", 8),
             ("Slot  c", 3),
-            ("d", 4),
-            ("G", 7),
-            ("0", 0),
-            ("5", 5),
-            ("8", 8),
         ] {
+            assert_eq!(bus_slot_from_string(text), Some(value), "{text:?}");
+        }
+        for (text, value) in [("d", 4), ("G", 7), ("0", 0), ("5", 5), ("8", 8)] {
             assert_eq!(bus_slot_from_string(text), Some(value), "{text:?}");
         }
         for text in ["", "Slot", "Slot I", "I", "9", "-1", "Slot AB", "on"] {
