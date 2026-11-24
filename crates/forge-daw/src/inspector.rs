@@ -7,11 +7,11 @@ use crate::fx_ui::draw_fx_slot_controls;
 use crate::{ForgeDawApp, InspectorTab};
 
 impl ForgeDawApp {
-    pub(crate) fn draw_object_editor(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::right("object_editor")
-            .min_width(310.0)
-            .default_width(340.0)
-            .show(ctx, |ui| {
+    pub(crate) fn draw_object_editor(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::right("object_editor")
+            .min_size(310.0)
+            .default_size(340.0)
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.inspector_tab, InspectorTab::Object, "Object");
                     ui.selectable_value(

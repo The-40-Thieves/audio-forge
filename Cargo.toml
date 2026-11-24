@@ -74,7 +74,7 @@ nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["a
 nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
 nih_plug_xtask = { git = "https://github.com/robbert-vdh/nih-plug.git" }
 cpal = "0.18"
-eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu", "glow", "x11", "wayland"] }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "wgpu", "glow", "x11", "wayland"] }
 rfd = { version = "0.16", default-features = false, features = ["xdg-portal", "tokio"] }
 
 # nih-plug's CLAP wrapper aborts the host on corrupt state and never asks the host to rescan

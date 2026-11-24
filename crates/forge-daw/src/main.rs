@@ -604,8 +604,8 @@ impl ForgeDawApp {
         }
     }
 
-    fn draw_transport_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("transport_bar").show(ctx, |ui| {
+    fn draw_transport_bar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("transport_bar").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(
@@ -869,8 +869,8 @@ impl ForgeDawApp {
         });
     }
 
-    fn draw_arrange_timeline(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn draw_arrange_timeline(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("ARRANGE TIMELINE").strong());
                 ui.separator();
@@ -1503,15 +1503,15 @@ impl ForgeDawApp {
 }
 
 impl eframe::App for ForgeDawApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_stem_split_result();
-        self.pointer_down = ctx.input(|i| i.pointer.primary_down());
+        self.pointer_down = ui.input(|i| i.pointer.primary_down());
         // Drag-and-drop audio file import directly onto the DAW window
-        let dropped: Vec<PathBuf> = ctx.input(|i| {
+        let dropped: Vec<PathBuf> = ui.input(|i| {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|f| f.path.clone())
+                .map(|f| f.path().to_path_buf())
                 .collect()
         });
         for path in dropped {
@@ -1519,8 +1519,8 @@ impl eframe::App for ForgeDawApp {
             self.import_wav_to_selected_track();
         }
 
-        if !ctx.wants_keyboard_input() {
-            let (space, split, marker, del, undo, redo, dup) = ctx.input(|i| {
+        if !ui.egui_wants_keyboard_input() {
+            let (space, split, marker, del, undo, redo, dup) = ui.input(|i| {
                 (
                     i.key_pressed(egui::Key::Space),
                     i.key_pressed(egui::Key::S) && !i.modifiers.ctrl && !i.modifiers.command,
@@ -1558,10 +1558,10 @@ impl eframe::App for ForgeDawApp {
             }
         }
 
-        self.draw_transport_bar(ctx);
-        self.draw_object_editor(ctx);
-        self.draw_mixer_dock(ctx);
-        self.draw_arrange_timeline(ctx);
+        self.draw_transport_bar(ui);
+        self.draw_object_editor(ui);
+        self.draw_mixer_dock(ui);
+        self.draw_arrange_timeline(ui);
 
         // Reset drag-coalescing AFTER widgets finish so a slider release-frame `.changed()`
         // stays coalesced with the drag gesture instead of pushing a second undo snapshot.
@@ -1570,9 +1570,9 @@ impl eframe::App for ForgeDawApp {
         }
 
         if self.audio.as_ref().is_some_and(LiveAudioEngine::is_playing) || self.recorder.is_some() {
-            ctx.request_repaint();
+            ui.request_repaint();
         } else if self.stem_split_rx.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            ui.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 }
@@ -1601,10 +1601,18 @@ mod tests {
         let opts = build_native_options(eframe::Renderer::Wgpu);
         assert_eq!(opts.renderer, eframe::Renderer::Wgpu);
         assert_eq!(opts.multisampling, 4);
-        assert!(opts.vsync);
         assert_eq!(
-            opts.hardware_acceleration,
-            eframe::HardwareAcceleration::Preferred
+            opts.wgpu_options.surface.present_mode,
+            eframe::wgpu::PresentMode::AutoVsync
+        );
+        assert_eq!(
+            opts.wgpu_options.surface.desired_maximum_frame_latency,
+            Some(2)
+        );
+        assert!(opts.glow_options.vsync);
+        assert_eq!(
+            opts.glow_options.hardware_acceleration,
+            eframe::egui_glow::HardwareAcceleration::Preferred
         );
     }
 
