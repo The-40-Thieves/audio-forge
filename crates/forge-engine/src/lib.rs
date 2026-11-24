@@ -17,12 +17,13 @@ pub mod project;
 pub mod renderer;
 
 pub use audio_io::{LiveAudioEngine, LiveRecorder};
+pub use forge_dsp::{BeatGridReport, TempoPoint, analyze_beat_grid, resample_buffer_sinc};
 pub use fx::FxProcessor;
 pub use midi::{MidiClip, MidiNote, PolySynth, SynthPreset};
 pub use project::{
     AudioObject, AutomationLane, AutomationPoint, AuxBus, DawProject, DawProjectSummary, FadeCurve,
-    FxSlotConfig, MAX_PROJECT_JSON_BYTES, MAX_UNDO_DEPTH, ObjectEq3, PROJECT_SCHEMA_VERSION,
-    TimelineMarker, Track, TrackSend, UndoStack, WaveformPeaks,
+    FxSlotConfig, MAX_PROJECT_JSON_BYTES, MAX_TEMPO_POINTS, MAX_UNDO_DEPTH, ObjectEq3,
+    PROJECT_SCHEMA_VERSION, TimelineMarker, Track, TrackSend, UndoStack, WaveformPeaks,
 };
 pub use renderer::{ClipCache, EngineMeters, ObjectOrientedEngine, resample_buffer_linear};
 
@@ -509,5 +510,84 @@ mod tests {
         // Oversized JSON payload (> 16 MiB) must fail fast before serde parsing.
         let oversized = format!(r#"{{"name":"{}"}}"#, "a".repeat(17 * 1024 * 1024));
         assert!(DawProject::from_json(&oversized).is_err());
+    }
+
+    #[test]
+    fn legacy_forgeproj_json_deserializes_with_defaults_and_tempo_map_roundtrips() {
+        let mut val = serde_json::to_value(DawProject::new("LegacyCompat", 48_000, 120.0)).unwrap();
+        let obj = val.as_object_mut().unwrap();
+        obj.remove("tempo_map");
+        val["tracks"][0]["inserts"] = serde_json::json!([{
+            "OpenSoothe": {
+                "bypass": false,
+                "sensitivity_db": 3.5,
+                "max_depth_db": 9.0,
+                "sharpness_bins": 10,
+                "low_latency": true,
+                "tilt_db_per_oct": 0.0
+            }
+        }]);
+        let mut loaded =
+            DawProject::from_json(&serde_json::to_string(&val).unwrap()).expect("legacy json");
+        assert!(loaded.tempo_map.is_empty());
+        assert!(matches!(
+            loaded.tracks[0].inserts[0],
+            FxSlotConfig::OpenSoothe {
+                stereo_link,
+                ultrasonic_lpf_hz,
+                hard_mode: false,
+                ..
+            } if (stereo_link - 1.0).abs() < 1e-6 && ultrasonic_lpf_hz == 0.0
+        ));
+
+        loaded.tempo_map = vec![
+            TempoPoint {
+                time_secs: 0.0,
+                bpm: 120.0,
+                time_sig_num: 4,
+                time_sig_den: 4,
+            },
+            TempoPoint {
+                time_secs: 2.0,
+                bpm: 150.0,
+                time_sig_num: 4,
+                time_sig_den: 4,
+            },
+        ];
+        // At 2.0 s @ 120 BPM => 4.0 beats; +1.2 s @ 150 BPM (+3.0 beats) => 7.0 beats at 3.2 s
+        assert!((loaded.secs_to_beat(3.2) - 7.0).abs() < 1e-9);
+        assert!((loaded.beat_to_secs(7.0) - 3.2).abs() < 1e-9);
+        assert!((loaded.bpm_at_secs(2.5) - 150.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bounce_offline_runs_all_expanded_fx_slots_cleanly() {
+        let mut proj = DawProject::new("ParityFx", 48_000, 120.0);
+        let mut cache = ClipCache::default();
+        let clip_path = PathBuf::from("mem://parity_tone.wav");
+        cache.insert_memory_clip(clip_path.clone(), sine_clip(48_000, 4_800, 220.0, 0.35));
+        let mut obj = AudioObject::new(1, "Tone", clip_path, 4_800);
+        obj.fx_chain = vec![
+            FxSlotConfig::OpenSoothe {
+                bypass: false,
+                sensitivity_db: 3.0,
+                max_depth_db: 9.0,
+                sharpness_bins: 10,
+                low_latency: true,
+                tilt_db_per_oct: -0.5,
+                ultrasonic_lpf_hz: 16_500.0,
+                mid_side_balance: 0.25,
+                stereo_link: 0.75,
+                hard_mode: true,
+            },
+            FxSlotConfig::default_open_spacer(),
+            FxSlotConfig::default_phase_match_eq(),
+            FxSlotConfig::default_neural_preamp(),
+            FxSlotConfig::default_drum_trigger(),
+        ];
+        proj.tracks[0].objects.push(obj);
+        let bounced = ObjectOrientedEngine::bounce_offline(&proj, &cache, 4_800).expect("bounce");
+        assert_eq!(bounced.num_frames(), 4_800);
+        assert!(bounced.channels.iter().flatten().all(|s| s.is_finite()));
     }
 }

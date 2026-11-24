@@ -12,9 +12,10 @@ use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use forge_core::{AudioBuffer, ForgeError, Result};
+use forge_dsp::{RealtimeSincResampler, resample_buffer_sinc};
 
 use crate::project::DawProject;
-use crate::renderer::{ClipCache, EngineMeters, ObjectOrientedEngine, resample_buffer_linear};
+use crate::renderer::{ClipCache, EngineMeters, ObjectOrientedEngine};
 
 /// Commands sent from the UI/control thread to the audio output thread without locking the engine.
 enum EngineCommand {
@@ -30,15 +31,20 @@ enum RetiredResource {
     Engine(Box<ObjectOrientedEngine>),
 }
 
-/// Pre-allocated zero-allocation real-time linear resampler bridging `project_sr` to `device_sr`
-/// inside the hardware audio output callback when the OS audio device runs at a different rate.
+/// Pre-allocated zero-allocation real-time polyphase sinc resampler bridging `project_sr` to
+/// `device_sr` inside the hardware audio output callback when rates differ.
 struct RealtimeOutputResampler {
     src_l: Vec<f32>,
     src_r: Vec<f32>,
+    src_idx: usize,
     src_len: usize,
-    src_pos: f64,
-    prev_l: f32,
-    prev_r: f32,
+    sinc: RealtimeSincResampler,
+    cached_project_sr: f64,
+    cached_device_sr: f64,
+    q_l: [f32; 64],
+    q_r: [f32; 64],
+    q_idx: usize,
+    q_len: usize,
 }
 
 impl RealtimeOutputResampler {
@@ -46,18 +52,25 @@ impl RealtimeOutputResampler {
         Self {
             src_l: vec![0.0_f32; block_cap.max(256)],
             src_r: vec![0.0_f32; block_cap.max(256)],
+            src_idx: 0,
             src_len: 0,
-            src_pos: 0.0,
-            prev_l: 0.0,
-            prev_r: 0.0,
+            sinc: RealtimeSincResampler::new(48_000.0, 48_000.0),
+            cached_project_sr: 48_000.0,
+            cached_device_sr: 48_000.0,
+            q_l: [0.0; 64],
+            q_r: [0.0; 64],
+            q_idx: 0,
+            q_len: 0,
         }
     }
 
     fn reset(&mut self) {
+        self.src_idx = 0;
         self.src_len = 0;
-        self.src_pos = 0.0;
-        self.prev_l = 0.0;
-        self.prev_r = 0.0;
+        self.q_idx = 0;
+        self.q_len = 0;
+        self.sinc
+            .reset(self.cached_project_sr, self.cached_device_sr);
     }
 
     /// Renders `out_frames` at `device_sr` by pulling project-rate blocks from `engine` with
@@ -93,31 +106,38 @@ impl RealtimeOutputResampler {
             return;
         }
 
-        let step = project_sr / device_sr.max(8_000.0);
-        let cap = self.src_l.len();
+        if (project_sr - self.cached_project_sr).abs() > 0.5
+            || (device_sr - self.cached_device_sr).abs() > 0.5
+        {
+            self.cached_project_sr = project_sr;
+            self.cached_device_sr = device_sr;
+            self.sinc.reset(project_sr, device_sr);
+            self.src_idx = 0;
+            self.src_len = 0;
+            self.q_idx = 0;
+            self.q_len = 0;
+        }
 
+        let cap = self.src_l.len();
         for frame in 0..out_frames {
-            while self.src_pos >= (self.src_len as f64) {
-                if self.src_len > 0 {
-                    self.prev_l = self.src_l[self.src_len - 1];
-                    self.prev_r = self.src_r[self.src_len - 1];
-                    self.src_pos -= self.src_len as f64;
+            while self.q_idx >= self.q_len {
+                if self.src_idx >= self.src_len {
+                    engine.render_block(&mut self.src_l[..cap], &mut self.src_r[..cap]);
+                    self.src_len = cap;
+                    self.src_idx = 0;
                 }
-                engine.render_block(&mut self.src_l[..cap], &mut self.src_r[..cap]);
-                self.src_len = cap;
+                let in_l = self.src_l[self.src_idx];
+                let in_r = self.src_r[self.src_idx];
+                self.src_idx += 1;
+                self.q_idx = 0;
+                self.q_len =
+                    self.sinc
+                        .process_stereo_sample(in_l, in_r, &mut self.q_l, &mut self.q_r);
             }
 
-            let idx1 = (self.src_pos.floor() as usize).min(self.src_len - 1);
-            let frac = (self.src_pos - self.src_pos.floor()) as f32;
-            let (s0_l, s0_r) = if idx1 == 0 {
-                (self.prev_l, self.prev_r)
-            } else {
-                (self.src_l[idx1 - 1], self.src_r[idx1 - 1])
-            };
-            let s1_l = self.src_l[idx1];
-            let s1_r = self.src_r[idx1];
-            let l = s0_l + (s1_l - s0_l) * frac;
-            let r = s0_r + (s1_r - s0_r) * frac;
+            let l = self.q_l[self.q_idx];
+            let r = self.q_r[self.q_idx];
+            self.q_idx += 1;
 
             let base = frame * ch;
             data[base] = l;
@@ -127,7 +147,6 @@ impl RealtimeOutputResampler {
             for extra in 2..ch {
                 data[base + extra] = 0.0;
             }
-            self.src_pos += step;
         }
     }
 }
@@ -731,7 +750,7 @@ impl LiveRecorder {
             });
         }
         let raw = AudioBuffer::from_channels(vec![l, r], self.input_sr)?;
-        let converted = resample_buffer_linear(&raw, target_sr)?;
+        let converted = resample_buffer_sinc(&raw, target_sr)?;
         if let Some(parent) = output_wav.parent()
             && !parent.as_os_str().is_empty()
         {

@@ -2,12 +2,40 @@
 //! engines per-object, per-track, and on the master bus.
 
 use forge_dsp::{
-    IspOversampling, RealtimeDensityAndClipper, RealtimeFdnReverb, RealtimeMasterLimiter,
-    RealtimeOpenSoothe, RealtimeSubAndTapeBus, RealtimeTransientTonalSplit, RealtimeVocalSurgical,
+    AnalogHardwareModel, IspOversampling, RealtimeDensityAndClipper, RealtimeDrumTrigger,
+    RealtimeFdnReverb, RealtimeMasterLimiter, RealtimeMasteringEq18, RealtimeNeuralPreamp,
+    RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSubAndTapeBus,
+    RealtimeTransientTonalSplit, RealtimeVocalSurgical,
 };
 use forge_vocal::{RealtimeVocalTune, VocalTuneScaleMode};
 
 use crate::project::FxSlotConfig;
+
+fn hardware_model_from_idx(idx: u8) -> AnalogHardwareModel {
+    match idx {
+        0 => AnalogHardwareModel::Neve1073ClassA,
+        1 => AnalogHardwareModel::Fet1176AllButtons,
+        2 => AnalogHardwareModel::TubeV76Triode,
+        _ => AnalogHardwareModel::StuderA800Tape,
+    }
+}
+
+fn apply_three_band_curve(eq: &mut RealtimeMasteringEq18, low_db: f32, mid_db: f32, air_db: f32) {
+    let mut gains = [0.0_f64; 18];
+    let lo = f64::from(low_db);
+    let mid = f64::from(mid_db);
+    let air = f64::from(air_db);
+    for slot in &mut gains[0..3] {
+        *slot = lo;
+    }
+    for slot in &mut gains[7..13] {
+        *slot = mid;
+    }
+    for slot in &mut gains[14..18] {
+        *slot = air;
+    }
+    eq.set_gains(&gains, 1.0);
+}
 
 /// Live zero-alloc DSP runtime corresponding to one [`FxSlotConfig`].
 pub enum FxProcessor {
@@ -20,6 +48,14 @@ pub enum FxProcessor {
     DensityClipper(Box<RealtimeDensityAndClipper>),
     SpaceVerb(Box<RealtimeFdnReverb>),
     VocalTune(Box<RealtimeVocalTune>),
+    OpenSpacer(Box<RealtimeOpenSpacer>),
+    PhaseMatchEq {
+        aligner: Box<RealtimePhaseAligner>,
+        eq: Box<RealtimeMasteringEq18>,
+        cached_curve: [f32; 3],
+    },
+    NeuralPreamp(Box<RealtimeNeuralPreamp>),
+    DrumTrigger(Box<RealtimeDrumTrigger>),
 }
 
 impl FxProcessor {
@@ -28,9 +64,20 @@ impl FxProcessor {
         let sr = sample_rate.max(8_000.0);
         match cfg {
             FxSlotConfig::GainTrim { .. } => Self::GainTrim,
-            FxSlotConfig::OpenSoothe { low_latency, .. } => {
+            FxSlotConfig::OpenSoothe {
+                low_latency,
+                ultrasonic_lpf_hz,
+                mid_side_balance,
+                stereo_link,
+                hard_mode,
+                ..
+            } => {
                 let mut d = RealtimeOpenSoothe::new(sr);
                 d.set_low_latency(*low_latency);
+                d.set_ultrasonic_lpf_hz(f64::from(*ultrasonic_lpf_hz));
+                d.set_mid_side_balance(f64::from(*mid_side_balance));
+                d.set_stereo_link(f64::from(*stereo_link));
+                d.set_hard_mode(*hard_mode);
                 Self::OpenSoothe(Box::new(d))
             }
             FxSlotConfig::VocalSurgical { .. } => {
@@ -56,6 +103,42 @@ impl FxProcessor {
             }
             FxSlotConfig::SpaceVerb { .. } => Self::SpaceVerb(Box::new(RealtimeFdnReverb::new(sr))),
             FxSlotConfig::VocalTune { .. } => Self::VocalTune(Box::new(RealtimeVocalTune::new(sr))),
+            FxSlotConfig::OpenSpacer {
+                mid_side_balance,
+                delta_listen,
+                ..
+            } => {
+                let mut d = RealtimeOpenSpacer::new(sr);
+                d.set_mid_side_balance(f64::from(*mid_side_balance));
+                d.set_delta_listen(*delta_listen);
+                Self::OpenSpacer(Box::new(d))
+            }
+            FxSlotConfig::PhaseMatchEq {
+                delay_samples,
+                invert_polarity,
+                low_shelf_db,
+                mid_dip_db,
+                air_shelf_db,
+                ..
+            } => {
+                let mut aligner = Box::new(RealtimePhaseAligner::new(sr));
+                aligner.set_alignment(*delay_samples, *invert_polarity);
+                let mut eq = Box::new(RealtimeMasteringEq18::new(sr));
+                apply_three_band_curve(&mut eq, *low_shelf_db, *mid_dip_db, *air_shelf_db);
+                Self::PhaseMatchEq {
+                    aligner,
+                    eq,
+                    cached_curve: [*low_shelf_db, *mid_dip_db, *air_shelf_db],
+                }
+            }
+            FxSlotConfig::NeuralPreamp { model, .. } => {
+                let mut d = RealtimeNeuralPreamp::new(hardware_model_from_idx(*model));
+                d.set_sample_rate(sr);
+                Self::NeuralPreamp(Box::new(d))
+            }
+            FxSlotConfig::DrumTrigger { .. } => {
+                Self::DrumTrigger(Box::new(RealtimeDrumTrigger::new(sr)))
+            }
         }
     }
 
@@ -69,6 +152,7 @@ impl FxProcessor {
             Self::OpenSoothe(d) => d.latency_samples() as usize,
             Self::MasterLimiter(d) => d.latency_samples() as usize,
             Self::VocalTune(d) => d.latency_samples() as usize,
+            Self::OpenSpacer(d) => d.latency_samples() as usize,
             _ => 0,
         }
     }
@@ -85,6 +169,16 @@ impl FxProcessor {
             Self::DensityClipper(d) => d.reset(sr),
             Self::SpaceVerb(d) => d.reset(sr),
             Self::VocalTune(d) => d.reset(sr),
+            Self::OpenSpacer(d) => d.reset(sr),
+            Self::PhaseMatchEq { aligner, eq, .. } => {
+                aligner.reset();
+                eq.reset();
+            }
+            Self::NeuralPreamp(d) => {
+                d.set_sample_rate(sr);
+                d.reset();
+            }
+            Self::DrumTrigger(d) => d.reset(sr),
         }
     }
 
@@ -107,11 +201,19 @@ impl FxProcessor {
                     sharpness_bins,
                     low_latency,
                     tilt_db_per_oct,
+                    ultrasonic_lpf_hz,
+                    mid_side_balance,
+                    stereo_link,
+                    hard_mode,
                     ..
                 },
             ) => {
                 d.set_low_latency(*low_latency);
                 d.set_tilt_db_per_oct(f64::from(*tilt_db_per_oct));
+                d.set_ultrasonic_lpf_hz(f64::from(*ultrasonic_lpf_hz));
+                d.set_mid_side_balance(f64::from(*mid_side_balance));
+                d.set_stereo_link(f64::from(*stereo_link));
+                d.set_hard_mode(*hard_mode);
                 d.process_stereo_sample(
                     in_l,
                     in_r,
@@ -268,6 +370,76 @@ impl FxProcessor {
                 d.set_formant_shift_st(f64::from(*formant_shift_st));
                 d.set_wet_mix(f64::from(*wet_mix));
                 d.process_stereo_sample(in_l, in_r)
+            }
+            (
+                Self::OpenSpacer(d),
+                FxSlotConfig::OpenSpacer {
+                    amount,
+                    max_cut_db,
+                    low_hz,
+                    high_hz,
+                    mid_side_balance,
+                    delta_listen,
+                    ..
+                },
+            ) => {
+                d.set_mid_side_balance(f64::from(*mid_side_balance));
+                d.set_delta_listen(*delta_listen);
+                d.process_sample(
+                    in_l,
+                    in_r,
+                    in_l,
+                    in_r,
+                    f64::from(*low_hz),
+                    f64::from(*high_hz),
+                    f64::from(*amount),
+                    f64::from(*max_cut_db),
+                )
+            }
+            (
+                Self::PhaseMatchEq {
+                    aligner,
+                    eq,
+                    cached_curve,
+                },
+                FxSlotConfig::PhaseMatchEq {
+                    delay_samples,
+                    invert_polarity,
+                    low_shelf_db,
+                    mid_dip_db,
+                    air_shelf_db,
+                    ..
+                },
+            ) => {
+                aligner.set_alignment(*delay_samples, *invert_polarity);
+                let target_curve = [*low_shelf_db, *mid_dip_db, *air_shelf_db];
+                if *cached_curve != target_curve {
+                    *cached_curve = target_curve;
+                    apply_three_band_curve(eq, *low_shelf_db, *mid_dip_db, *air_shelf_db);
+                }
+                let (al, ar) = aligner.process_stereo_sample(in_l, in_r);
+                eq.process_stereo_sample(al, ar)
+            }
+            (
+                Self::NeuralPreamp(d),
+                FxSlotConfig::NeuralPreamp {
+                    model,
+                    input_drive_db,
+                    output_trim_db,
+                    ..
+                },
+            ) => {
+                d.set_model(hardware_model_from_idx(*model));
+                d.process_stereo_sample(
+                    in_l,
+                    in_r,
+                    f64::from(*input_drive_db),
+                    f64::from(*output_trim_db),
+                )
+            }
+            (Self::DrumTrigger(d), FxSlotConfig::DrumTrigger { threshold_db, .. }) => {
+                let _ = d.process_stereo_sample(in_l, in_r, f64::from(*threshold_db));
+                (in_l, in_r)
             }
             _ => (in_l, in_r),
         }

@@ -24,6 +24,11 @@ impl ForgeDawApp {
                         InspectorTab::TrackBusFx,
                         "Track/Bus FX",
                     );
+                    ui.selectable_value(
+                        &mut self.inspector_tab,
+                        InspectorTab::AiStudio,
+                        "AI Studio",
+                    );
                 });
                 ui.separator();
 
@@ -34,6 +39,10 @@ impl ForgeDawApp {
                     }
                     InspectorTab::TrackBusFx => {
                         self.draw_track_bus_fx_inspector(ui);
+                        return;
+                    }
+                    InspectorTab::AiStudio => {
+                        self.draw_ai_studio_inspector(ui);
                         return;
                     }
                     InspectorTab::Object => {}
@@ -436,11 +445,18 @@ impl ForgeDawApp {
 
 type FxPresetEntry = (&'static str, fn() -> FxSlotConfig);
 
-const FX_PRESETS: [FxPresetEntry; 8] = [
+const FX_PRESETS: [FxPresetEntry; 12] = [
     (
         "Forge OpenSoothe De-Fizz",
         FxSlotConfig::default_open_soothe,
     ),
+    ("Forge OpenSpacer Unmask", FxSlotConfig::default_open_spacer),
+    (
+        "Forge Phase & MatchEQ",
+        FxSlotConfig::default_phase_match_eq,
+    ),
+    ("Forge Neural Preamp", FxSlotConfig::default_neural_preamp),
+    ("Forge Drum Trigger", FxSlotConfig::default_drum_trigger),
     ("Forge Vocal Surgical", FxSlotConfig::default_vocal_surgical),
     ("Forge Vocal Tune", FxSlotConfig::default_vocal_tune),
     ("Forge SubMono & Tape", FxSlotConfig::default_sub_mono_tape),
@@ -616,6 +632,163 @@ impl ForgeDawApp {
 
         if changed {
             self.commit_project_change(prev);
+        }
+    }
+
+    pub(crate) fn draw_ai_studio_inspector(&mut self, ui: &mut egui::Ui) {
+        ui.heading(
+            egui::RichText::new("AI TRACK STUDIO").color(egui::Color32::from_rgb(192, 132, 252)),
+        );
+        ui.label(
+            egui::RichText::new(
+                "One-click AI artifact audit, beat-grid tempo map, De-Fizz, neural restore & vocal rescue",
+            )
+            .small()
+            .color(egui::Color32::from_rgb(148, 163, 184)),
+        );
+        ui.separator();
+
+        if self.selected_object_id.is_none() {
+            ui.label("Select an Audio Object on the timeline to run AI Track Studio tools.");
+            return;
+        }
+
+        let busy = self.ai_job_rx.is_some();
+        if busy {
+            ui.label(
+                egui::RichText::new(format!("Running {}...", self.ai_job_label))
+                    .color(egui::Color32::from_rgb(250, 204, 21)),
+            );
+        }
+
+        ui.add_enabled_ui(!busy, |ui| {
+            if ui.button("Audit AI Artifacts").clicked() {
+                self.start_ai_studio_job("Audit AI Artifacts", |src, _out, _st, _bpm| {
+                    let buf = forge_core::AudioBuffer::load(&src).map_err(|e| e.to_string())?;
+                    let r = forge_dsp::audit_audio(&buf);
+                    Ok(crate::AiJobOutcome::Summary(format!(
+                        "Fizz {:.1}/100 | M/S {:.1}/{:.1} dB | Corr(2-12k) {:+.2} | BW {:.0} Hz | Sharp {:.1} dB | {:.1} LUFS / {:.1} dBTP",
+                        r.ai_fizz_index,
+                        r.mid_fizz_p95_db,
+                        r.side_fizz_p95_db,
+                        r.high_mid_stereo_correlation,
+                        r.effective_bandwidth_hz,
+                        r.transient_sharpness_db,
+                        r.integrated_lufs,
+                        r.true_peak_dbtp,
+                    )))
+                });
+            }
+            if ui.button("Detect Tempo Map").clicked() {
+                self.start_ai_studio_job("Detect Tempo Map", |src, _out, _st, bpm| {
+                    let rep = forge_worker::track_beats_hybrid(
+                        &src,
+                        Some(bpm),
+                        "auto",
+                        std::time::Duration::from_secs(120),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    Ok(crate::AiJobOutcome::TempoMap(rep))
+                });
+            }
+            if ui.button("Apply AI De-Fizz Preset").clicked() {
+                self.apply_ai_defizz_preset();
+            }
+            if ui.button("Neural Denoise").clicked() {
+                self.start_ai_studio_job("Neural Denoise", |src, out, st, _bpm| {
+                    let w = forge_worker::resolve_default_local_worker()
+                        .map_err(|e| e.to_string())?;
+                    let r = forge_worker::run_local_neural_denoise(
+                        &w,
+                        &src,
+                        &out,
+                        "auto",
+                        Some(18.0),
+                        std::time::Duration::from_secs(180),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    Ok(crate::AiJobOutcome::ProducedStem {
+                        track_title: format!("AI Denoised ({})", r.backend),
+                        obj_name: format!("Denoised ({})", r.backend),
+                        path: r.denoised,
+                        start_samples: st,
+                        summary: format!("Neural denoise complete ({})", r.backend),
+                    })
+                });
+            }
+            if ui.button("Neural Restore").clicked() {
+                self.start_ai_studio_job("Neural Restore", |src, out, st, _bpm| {
+                    let r = forge_worker::neural_restore_hybrid(
+                        &src,
+                        &out,
+                        "auto",
+                        None,
+                        None,
+                        std::time::Duration::from_secs(240),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    Ok(crate::AiJobOutcome::ProducedStem {
+                        track_title: format!("AI Restored ({})", r.backend),
+                        obj_name: format!("Restored ({})", r.backend),
+                        path: r.restored,
+                        start_samples: st,
+                        summary: format!("Neural restore complete ({})", r.backend),
+                    })
+                });
+            }
+            if ui.button("Vocal Rescue").clicked() {
+                self.start_ai_studio_job("Vocal Rescue", |src, out, st, _bpm| {
+                    let r = forge_worker::vocal_rescue_hybrid(
+                        &src,
+                        &out,
+                        "auto",
+                        None,
+                        true,
+                        true,
+                        std::time::Duration::from_secs(240),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    Ok(crate::AiJobOutcome::ProducedStem {
+                        track_title: format!("AI Vocal Rescue ({})", r.backend),
+                        obj_name: format!("Rescued ({})", r.backend),
+                        path: r.rescued,
+                        start_samples: st,
+                        summary: format!("Vocal rescue complete ({})", r.backend),
+                    })
+                });
+            }
+            if ui.button("Evaluate Quality").clicked() {
+                self.start_ai_studio_job("Evaluate Quality", |src, _out, _st, _bpm| {
+                    let r = forge_worker::evaluate_quality_hybrid(
+                        &src,
+                        None,
+                        false,
+                        "auto",
+                        std::time::Duration::from_secs(120),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let pq = r
+                        .metrics
+                        .production_quality
+                        .map_or_else(|| "N/A".to_string(), |v| format!("{v:.2}"));
+                    Ok(crate::AiJobOutcome::Summary(format!(
+                        "Quality ({}): score {:.2} | PQ {pq} | crest {:.1} dB | HF {:.1} dB",
+                        r.backend,
+                        r.metrics.composite_score,
+                        r.metrics.crest_factor_db,
+                        r.metrics.hf_ratio_db,
+                    )))
+                });
+            }
+        });
+
+        if !self.ai_audit_summary.is_empty() {
+            ui.separator();
+            ui.label(
+                egui::RichText::new(&self.ai_audit_summary)
+                    .small()
+                    .color(egui::Color32::from_rgb(226, 232, 240)),
+            );
         }
     }
 }

@@ -3,27 +3,42 @@
 use eframe::egui;
 use forge_engine::FxSlotConfig;
 
+fn slider(
+    ui: &mut egui::Ui,
+    val: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    text: &str,
+) -> bool {
+    ui.add(egui::Slider::new(val, range).text(text)).changed()
+}
+
 pub(crate) fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) -> bool {
     let mut changed = false;
     match fx {
         FxSlotConfig::GainTrim { gain_db, .. } => {
-            changed |= ui
-                .add(egui::Slider::new(gain_db, -24.0..=24.0).text("Gain (dB)"))
-                .changed();
+            changed |= slider(ui, gain_db, -24.0..=24.0, "Gain (dB)");
         }
         FxSlotConfig::OpenSoothe {
             sensitivity_db,
             max_depth_db,
             low_latency,
+            tilt_db_per_oct,
+            ultrasonic_lpf_hz,
+            mid_side_balance,
+            stereo_link,
+            hard_mode,
             ..
         } => {
-            changed |= ui
-                .add(egui::Slider::new(sensitivity_db, 0.5..=12.0).text("Sens (dB)"))
-                .changed();
-            changed |= ui
-                .add(egui::Slider::new(max_depth_db, 0.5..=18.0).text("Depth (dB)"))
-                .changed();
-            changed |= ui.checkbox(low_latency, "Low-Latency (5.3 ms)").changed();
+            changed |= slider(ui, sensitivity_db, 0.5..=12.0, "Sens (dB)");
+            changed |= slider(ui, max_depth_db, 0.5..=18.0, "Depth (dB)");
+            changed |= slider(ui, tilt_db_per_oct, -6.0..=6.0, "Tilt (dB/oct)");
+            changed |= slider(ui, ultrasonic_lpf_hz, 0.0..=22_000.0, "Ultra LPF (0=Off)");
+            changed |= slider(ui, mid_side_balance, -1.0..=1.0, "M/S Focus");
+            changed |= slider(ui, stereo_link, 0.0..=1.0, "Stereo Link");
+            ui.horizontal(|ui| {
+                changed |= ui.checkbox(low_latency, "Low-Lat (5.3ms)").changed();
+                changed |= ui.checkbox(hard_mode, "Hard Mode").changed();
+            });
         }
         FxSlotConfig::VocalSurgical {
             declick,
@@ -187,9 +202,60 @@ pub(crate) fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) ->
             changed |= ui
                 .add(egui::Slider::new(formant_shift_st, -12.0..=12.0).text("Formant (st)"))
                 .changed();
+            changed |= slider(ui, wet_mix, 0.0..=1.0, "Wet Mix");
+        }
+        FxSlotConfig::OpenSpacer {
+            amount,
+            max_cut_db,
+            low_hz,
+            high_hz,
+            mid_side_balance,
+            delta_listen,
+            ..
+        } => {
+            changed |= slider(ui, amount, 0.0..=1.0, "Unmask Amt");
+            changed |= slider(ui, max_cut_db, 0.5..=24.0, "Max Cut (dB)");
+            changed |= slider(ui, low_hz, 20.0..=4_000.0, "Low Hz");
+            changed |= slider(ui, high_hz, 1_000.0..=20_000.0, "High Hz");
+            changed |= slider(ui, mid_side_balance, -1.0..=1.0, "M/S Focus");
+            changed |= ui.checkbox(delta_listen, "Delta Listen").changed();
+        }
+        FxSlotConfig::PhaseMatchEq {
+            delay_samples,
+            invert_polarity,
+            low_shelf_db,
+            mid_dip_db,
+            air_shelf_db,
+            ..
+        } => {
             changed |= ui
-                .add(egui::Slider::new(wet_mix, 0.0..=1.0).text("Wet Mix"))
+                .add(egui::Slider::new(delay_samples, 0..=4096).text("Delay (smp)"))
                 .changed();
+            changed |= ui.checkbox(invert_polarity, "Invert Polarity").changed();
+            changed |= slider(ui, low_shelf_db, -12.0..=12.0, "Low Shelf (dB)");
+            changed |= slider(ui, mid_dip_db, -12.0..=12.0, "Mid Dip (dB)");
+            changed |= slider(ui, air_shelf_db, -12.0..=12.0, "Air Shelf (dB)");
+        }
+        FxSlotConfig::NeuralPreamp {
+            model,
+            input_drive_db,
+            output_trim_db,
+            ..
+        } => {
+            const MODELS: [&str; 4] = ["Neve 1073", "FET 1176", "Tube V76", "Studer A800"];
+            egui::ComboBox::from_id_salt(ui.scope_id().with("nam_model"))
+                .width(120.0)
+                .selected_text(MODELS[usize::from((*model).min(3))])
+                .show_ui(ui, |ui| {
+                    for (i, label) in MODELS.iter().enumerate() {
+                        changed |= ui.selectable_value(model, i as u8, *label).changed();
+                    }
+                });
+            changed |= slider(ui, input_drive_db, -12.0..=24.0, "Drive (dB)");
+            changed |= slider(ui, output_trim_db, -24.0..=12.0, "Trim (dB)");
+        }
+        FxSlotConfig::DrumTrigger { threshold_db, .. } => {
+            changed |= slider(ui, threshold_db, -60.0..=0.0, "Thresh (dB)");
         }
     }
     changed

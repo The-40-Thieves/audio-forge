@@ -197,34 +197,9 @@ impl EngineMeters {
     }
 }
 
-/// Resamples `buf` to `target_sr` using linear interpolation (used when importing clips whose
-/// sample rate differs from the project rate).
+/// Resamples `buf` to `target_sr` using normalized Kaiser-windowed sinc interpolation.
 pub fn resample_buffer_linear(buf: &AudioBuffer, target_sr: u32) -> Result<AudioBuffer> {
-    if buf.sample_rate == 0 || target_sr == 0 {
-        return Err(ForgeError::InvalidParameter(
-            "Sample rate must be greater than 0 Hz".to_string(),
-        ));
-    }
-    if buf.sample_rate == target_sr || buf.num_frames() == 0 {
-        return Ok(buf.clone());
-    }
-    let src_len = buf.num_frames();
-    let ratio = f64::from(buf.sample_rate) / f64::from(target_sr);
-    let dst_len = ((src_len as f64) / ratio).round().max(1.0) as usize;
-    let mut channels = Vec::with_capacity(buf.channels.len());
-    for ch in &buf.channels {
-        let mut out = Vec::with_capacity(dst_len);
-        for i in 0..dst_len {
-            let src_pos = (i as f64) * ratio;
-            let idx0 = (src_pos.floor() as usize).min(src_len - 1);
-            let idx1 = (idx0 + 1).min(src_len - 1);
-            let frac = src_pos - (idx0 as f64);
-            let s = ch[idx0] + (ch[idx1] - ch[idx0]) * frac;
-            out.push(s);
-        }
-        channels.push(out);
-    }
-    AudioBuffer::from_channels(channels, target_sr)
+    forge_dsp::resample_buffer_sinc(buf, target_sr)
 }
 
 /// Pre-loaded audio clip cache shared between the UI (for waveform peaks) and the audio engine.
@@ -256,7 +231,7 @@ impl ClipCache {
             }
         }
         let raw = AudioBuffer::load(path)?;
-        let converted = resample_buffer_linear(&raw, target_sr)?;
+        let converted = forge_dsp::resample_buffer_sinc(&raw, target_sr)?;
         let buf = Arc::new(converted);
         let peaks = Arc::new(WaveformPeaks::from_buffer(&buf, 256));
         self.clips.insert(path.to_path_buf(), Arc::clone(&buf));

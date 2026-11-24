@@ -19,6 +19,8 @@ pub const MAX_OBJECTS_PER_TRACK: usize = 4_096;
 pub const MAX_FX_SLOTS: usize = 32;
 pub const MAX_PROJECT_DURATION_SECS: u64 = 4 * 3600;
 pub const MAX_BOUNCE_FRAMES: usize = 128 * 1024 * 1024;
+/// Maximum tempo map nodes accepted in `.forgeproj` deserialization.
+pub const MAX_TEMPO_POINTS: usize = 16_384;
 /// Maximum undo history depth kept in memory.
 pub const MAX_UNDO_DEPTH: usize = 64;
 
@@ -85,6 +87,14 @@ pub enum FxSlotConfig {
         sharpness_bins: usize,
         low_latency: bool,
         tilt_db_per_oct: f32,
+        #[serde(default)]
+        ultrasonic_lpf_hz: f32,
+        #[serde(default)]
+        mid_side_balance: f32,
+        #[serde(default = "default_one_f32")]
+        stereo_link: f32,
+        #[serde(default)]
+        hard_mode: bool,
     },
     VocalSurgical {
         bypass: bool,
@@ -140,6 +150,33 @@ pub enum FxSlotConfig {
         formant_shift_st: f32,
         wet_mix: f32,
     },
+    OpenSpacer {
+        bypass: bool,
+        amount: f32,
+        max_cut_db: f32,
+        low_hz: f32,
+        high_hz: f32,
+        mid_side_balance: f32,
+        delta_listen: bool,
+    },
+    PhaseMatchEq {
+        bypass: bool,
+        delay_samples: usize,
+        invert_polarity: bool,
+        low_shelf_db: f32,
+        mid_dip_db: f32,
+        air_shelf_db: f32,
+    },
+    NeuralPreamp {
+        bypass: bool,
+        model: u8,
+        input_drive_db: f32,
+        output_trim_db: f32,
+    },
+    DrumTrigger {
+        bypass: bool,
+        threshold_db: f32,
+    },
 }
 
 macro_rules! match_fx_bypass {
@@ -153,7 +190,11 @@ macro_rules! match_fx_bypass {
             | FxSlotConfig::SplitEq { bypass: $b, .. }
             | FxSlotConfig::DensityClipper { bypass: $b, .. }
             | FxSlotConfig::SpaceVerb { bypass: $b, .. }
-            | FxSlotConfig::VocalTune { bypass: $b, .. } => $body,
+            | FxSlotConfig::VocalTune { bypass: $b, .. }
+            | FxSlotConfig::OpenSpacer { bypass: $b, .. }
+            | FxSlotConfig::PhaseMatchEq { bypass: $b, .. }
+            | FxSlotConfig::NeuralPreamp { bypass: $b, .. }
+            | FxSlotConfig::DrumTrigger { bypass: $b, .. } => $body,
         }
     };
 }
@@ -170,6 +211,10 @@ impl FxSlotConfig {
             Self::DensityClipper { .. } => "Forge Density & Clipper",
             Self::SpaceVerb { .. } => "Forge SpaceVerb FDN",
             Self::VocalTune { .. } => "Forge Vocal Tune",
+            Self::OpenSpacer { .. } => "Forge OpenSpacer Unmask",
+            Self::PhaseMatchEq { .. } => "Forge Phase & MatchEQ",
+            Self::NeuralPreamp { .. } => "Forge Neural Preamp",
+            Self::DrumTrigger { .. } => "Forge Drum Trigger",
         }
     }
 
@@ -189,6 +234,10 @@ impl FxSlotConfig {
             sharpness_bins: 10,
             low_latency: true,
             tilt_db_per_oct: 0.0,
+            ultrasonic_lpf_hz: 0.0,
+            mid_side_balance: 0.0,
+            stereo_link: 1.0,
+            hard_mode: false,
         }
     }
 
@@ -264,6 +313,45 @@ impl FxSlotConfig {
             density: 0.3,
             clip_drive_db: 2.0,
             ceiling_db: -0.5,
+        }
+    }
+
+    pub fn default_open_spacer() -> Self {
+        Self::OpenSpacer {
+            bypass: false,
+            amount: 0.45,
+            max_cut_db: 6.0,
+            low_hz: 180.0,
+            high_hz: 8_000.0,
+            mid_side_balance: 0.0,
+            delta_listen: false,
+        }
+    }
+
+    pub fn default_phase_match_eq() -> Self {
+        Self::PhaseMatchEq {
+            bypass: false,
+            delay_samples: 0,
+            invert_polarity: false,
+            low_shelf_db: 0.0,
+            mid_dip_db: 0.0,
+            air_shelf_db: 0.0,
+        }
+    }
+
+    pub fn default_neural_preamp() -> Self {
+        Self::NeuralPreamp {
+            bypass: false,
+            model: 0,
+            input_drive_db: 3.0,
+            output_trim_db: 0.0,
+        }
+    }
+
+    pub fn default_drum_trigger() -> Self {
+        Self::DrumTrigger {
+            bypass: false,
+            threshold_db: -24.0,
         }
     }
 }
@@ -645,6 +733,8 @@ pub struct DawProject {
     pub tracks: Vec<Track>,
     #[serde(default)]
     pub aux_buses: Vec<AuxBus>,
+    #[serde(default)]
+    pub tempo_map: Vec<forge_dsp::TempoPoint>,
     pub markers: Vec<TimelineMarker>,
     next_id: u64,
 }
@@ -703,6 +793,7 @@ impl DawProject {
                     wet_mix: 1.0,
                 }],
             }],
+            tempo_map: Vec::new(),
             markers: vec![TimelineMarker {
                 name: "Start".to_string(),
                 sample_pos: 0,
@@ -901,7 +992,94 @@ impl DawProject {
             }
         }
         proj.next_id = max_id;
+        proj.tempo_map
+            .retain(|tp| tp.time_secs.is_finite() && tp.time_secs >= 0.0 && tp.bpm.is_finite());
+        for tp in &mut proj.tempo_map {
+            tp.bpm = tp.bpm.clamp(20.0, 300.0);
+            tp.time_sig_num = tp.time_sig_num.clamp(1, 32);
+            tp.time_sig_den = match tp.time_sig_den {
+                2 | 4 | 8 | 16 => tp.time_sig_den,
+                _ => 4,
+            };
+        }
+        proj.tempo_map
+            .sort_by(|a, b| a.time_secs.total_cmp(&b.time_secs));
+        proj.tempo_map
+            .dedup_by(|a, b| (a.time_secs - b.time_secs).abs() < 1e-6);
+        proj.tempo_map.truncate(MAX_TEMPO_POINTS);
         Ok(proj)
+    }
+
+    fn clean_base_bpm(&self) -> f64 {
+        if self.bpm.is_finite() {
+            self.bpm.clamp(20.0, 300.0)
+        } else {
+            120.0
+        }
+    }
+
+    /// Returns the instantaneous tempo (BPM) active at `secs >= 0.0`, accounting for `tempo_map`.
+    pub fn bpm_at_secs(&self, secs: f64) -> f64 {
+        let base = self.clean_base_bpm();
+        if !secs.is_finite() || secs <= 0.0 || self.tempo_map.is_empty() {
+            return self
+                .tempo_map
+                .first()
+                .filter(|tp| tp.time_secs <= 1e-6 && tp.bpm.is_finite())
+                .map_or(base, |tp| tp.bpm.clamp(20.0, 300.0));
+        }
+        let mut active = base;
+        for tp in &self.tempo_map {
+            if tp.time_secs.is_finite() && tp.bpm.is_finite() && tp.time_secs <= secs + 1e-9 {
+                active = tp.bpm.clamp(20.0, 300.0);
+            }
+        }
+        active
+    }
+
+    fn walk_tempo_map(&self, target: f64, to_beats: bool) -> f64 {
+        if !target.is_finite() || target <= 0.0 {
+            return 0.0;
+        }
+        let mut t_prev = 0.0_f64;
+        let mut beat_acc = 0.0_f64;
+        let mut cur_bpm = self.clean_base_bpm();
+        for tp in &self.tempo_map {
+            if !tp.time_secs.is_finite() || !tp.bpm.is_finite() || tp.time_secs < 0.0 {
+                continue;
+            }
+            let t_next = tp.time_secs.max(t_prev);
+            let seg_bpm = tp.bpm.clamp(20.0, 300.0);
+            if t_next > t_prev {
+                let db = (t_next - t_prev) * (cur_bpm / 60.0);
+                if to_beats {
+                    if target <= t_next {
+                        return beat_acc + (target - t_prev) * (cur_bpm / 60.0);
+                    }
+                } else if target <= beat_acc + db {
+                    return t_prev + (target - beat_acc) * (60.0 / cur_bpm);
+                }
+                beat_acc += db;
+                t_prev = t_next;
+            }
+            cur_bpm = seg_bpm;
+        }
+        if to_beats {
+            beat_acc + (target - t_prev) * (cur_bpm / 60.0)
+        } else {
+            t_prev + (target - beat_acc) * (60.0 / cur_bpm)
+        }
+    }
+
+    /// Converts timeline `secs >= 0.0` into cumulative quarter-note beats using piecewise-constant
+    /// `tempo_map` segments (strictly increasing inverse of [`Self::beat_to_secs`]).
+    pub fn secs_to_beat(&self, secs: f64) -> f64 {
+        self.walk_tempo_map(secs, true)
+    }
+
+    /// Converts cumulative quarter-note `beat >= 0.0` back into timeline seconds using `tempo_map`.
+    pub fn beat_to_secs(&self, beat: f64) -> f64 {
+        self.walk_tempo_map(beat, false)
     }
 
     /// Saves the project atomically via a sibling temporary file + rename so crashes never

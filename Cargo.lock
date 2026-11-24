@@ -1686,6 +1686,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "forge-core",
+ "forge-dsp",
  "forge-engine",
  "forge-worker",
  "rfd",
