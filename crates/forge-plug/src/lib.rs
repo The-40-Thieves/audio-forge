@@ -122,6 +122,49 @@ mod tests {
             prop_assert!(pk_out.is_finite() && (-100.0..=40.0).contains(&pk_out));
             prop_assert!(gr.is_finite() && (-90.0..=24.0).contains(&gr));
         }
+
+        #[test]
+        fn prop_gui_ai_telemetry_self_heals_from_nan_inf(
+            corr in prop::num::f32::ANY,
+            mid_db in prop::num::f32::ANY,
+            side_db in prop::num::f32::ANY,
+        ) {
+            let tel = GuiTelemetry::default();
+            tel.high_mid_corr.store(f32::NAN.to_bits(), Ordering::Relaxed);
+            tel.mid_fizz_db.store(f32::INFINITY.to_bits(), Ordering::Relaxed);
+            tel.side_fizz_db.store(f32::NEG_INFINITY.to_bits(), Ordering::Relaxed);
+
+            tel.update_ai_telemetry(corr, mid_db, side_db);
+
+            let c = f32::from_bits(tel.high_mid_corr.load(Ordering::Relaxed));
+            let m = f32::from_bits(tel.mid_fizz_db.load(Ordering::Relaxed));
+            let s = f32::from_bits(tel.side_fizz_db.load(Ordering::Relaxed));
+
+            prop_assert!(c.is_finite() && (-1.0..=1.0).contains(&c));
+            prop_assert!(m.is_finite() && (-90.0..=12.0).contains(&m));
+            prop_assert!(s.is_finite() && (-90.0..=12.0).contains(&s));
+        }
+    }
+
+    #[test]
+    fn open_soothe_params_keep_legacy_ids_and_add_ulpf() {
+        let plug = ForgeOpenSoothePlug::default();
+        let params = plug.params();
+        let ids: Vec<String> = params
+            .param_map()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        for expected in [
+            "sens", "depth", "sharp", "delta", "submono", "tape", "limit", "ceil", "bus_slot",
+            "tilt", "slink", "msbal", "lowlat", "atk", "rel", "hard", "foc_lo", "foc_mid",
+            "foc_hi", "ulpf",
+        ] {
+            assert!(
+                ids.iter().any(|id| id == expected),
+                "missing OpenSoothe param id '{expected}'"
+            );
+        }
     }
 
     #[test]

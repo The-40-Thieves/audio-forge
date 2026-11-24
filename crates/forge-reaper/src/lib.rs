@@ -18,6 +18,13 @@ pub const JSFX_OPENSPACER: &str = include_str!("../../../reaper-jsfx/Forge_OpenS
 pub const JSFX_SUBBASS: &str = include_str!("../../../reaper-jsfx/Forge_SubBass_Reinforce.jsfx");
 pub const JSFX_VOCAL_SURGICAL: &str =
     include_str!("../../../reaper-jsfx/Forge_Vocal_Surgical.jsfx");
+pub const JSFX_MASTER_LIMITER: &str =
+    include_str!("../../../reaper-jsfx/Forge_Master_Limiter.jsfx");
+pub const JSFX_SPLITEQ: &str = include_str!("../../../reaper-jsfx/Forge_SplitEQ.jsfx");
+pub const JSFX_DENSITY_CLIPPER: &str =
+    include_str!("../../../reaper-jsfx/Forge_Density_Clipper.jsfx");
+pub const JSFX_SPACEVERB: &str = include_str!("../../../reaper-jsfx/Forge_SpaceVerb.jsfx");
+pub const JSFX_PHASE_MATCH_EQ: &str = include_str!("../../../reaper-jsfx/Forge_Phase_MatchEQ.jsfx");
 
 /// Folder under REAPER's `Effects` directory that the generated `.rpp` FX references
 /// (`<JS "ForgeAudio/...">`) point into.
@@ -79,7 +86,7 @@ pub fn reaper_resource_dir() -> Result<PathBuf> {
     find_resource_dir(std::env::consts::OS, &ResourceEnv::from_process())
 }
 
-/// Installs all 4 ForgeAudio JSFX plugins into `custom_dir`, or by default into
+/// Installs all 9 ForgeAudio JSFX plugins into `custom_dir`, or by default into
 /// `Effects/ForgeAudio` under [`reaper_resource_dir`], which is where the generated
 /// sessions' FX references resolve.
 pub fn install_jsfx_plugins(custom_dir: Option<&Path>) -> Result<Vec<PathBuf>> {
@@ -90,15 +97,8 @@ pub fn install_jsfx_plugins(custom_dir: Option<&Path>) -> Result<Vec<PathBuf>> {
 
     std::fs::create_dir_all(&base_dir)?;
 
-    let plugins = [
-        ("Forge_OpenSoothe_DeFizz.jsfx", JSFX_OPENSOOTHE),
-        ("Forge_OpenSpacer_Unmask.jsfx", JSFX_OPENSPACER),
-        ("Forge_SubBass_Reinforce.jsfx", JSFX_SUBBASS),
-        ("Forge_Vocal_Surgical.jsfx", JSFX_VOCAL_SURGICAL),
-    ];
-
-    let mut installed = Vec::with_capacity(plugins.len());
-    for (filename, content) in plugins {
+    let mut installed = Vec::with_capacity(JSFX_PLUGINS.len());
+    for (filename, content) in JSFX_PLUGINS {
         let p = base_dir.join(filename);
         std::fs::write(&p, content)?;
         installed.push(p);
@@ -715,11 +715,16 @@ pub fn send_reaper_osc(host_port: &str, address: &str, value: Option<f32>) -> Re
 /// Every bundled JSFX plugin as `(file name, source)`, the set [`install_jsfx_plugins`]
 /// writes (a test keeps the two in sync). Callers that must create the files themselves (through a directory handle, for
 /// example) can write these entries directly.
-pub const JSFX_PLUGINS: [(&str, &str); 4] = [
+pub const JSFX_PLUGINS: [(&str, &str); 9] = [
     ("Forge_OpenSoothe_DeFizz.jsfx", JSFX_OPENSOOTHE),
     ("Forge_OpenSpacer_Unmask.jsfx", JSFX_OPENSPACER),
     ("Forge_SubBass_Reinforce.jsfx", JSFX_SUBBASS),
     ("Forge_Vocal_Surgical.jsfx", JSFX_VOCAL_SURGICAL),
+    ("Forge_Master_Limiter.jsfx", JSFX_MASTER_LIMITER),
+    ("Forge_SplitEQ.jsfx", JSFX_SPLITEQ),
+    ("Forge_Density_Clipper.jsfx", JSFX_DENSITY_CLIPPER),
+    ("Forge_SpaceVerb.jsfx", JSFX_SPACEVERB),
+    ("Forge_Phase_MatchEQ.jsfx", JSFX_PHASE_MATCH_EQ),
 ];
 
 #[cfg(test)]
@@ -1076,9 +1081,17 @@ mod tests {
 
         let installed = install_jsfx_plugins(Some(&dir.path().join("fx"))).expect("install");
         assert_eq!(installed.len(), JSFX_PLUGINS.len());
+        assert_eq!(installed.len(), 9);
         for (path, (name, source)) in installed.iter().zip(JSFX_PLUGINS) {
             assert!(path.ends_with(name));
             assert_eq!(std::fs::read_to_string(path).expect("read"), source);
+            assert!(
+                source.contains("Apache-2.0"),
+                "{name} missing Apache-2.0 header"
+            );
+            assert!(source.contains("@init"), "{name} missing @init");
+            assert!(source.contains("@slider"), "{name} missing @slider");
+            assert!(source.contains("@sample"), "{name} missing @sample");
         }
     }
 

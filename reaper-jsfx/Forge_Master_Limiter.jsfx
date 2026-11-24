@@ -1,0 +1,58 @@
+desc:ForgeAudio - Lookahead Brickwall Master Limiter (True-Peak Safe)
+//tags: dynamics limiter mastering brickwall
+//author: ForgeAudio (Apache-2.0)
+
+options:gmem=ForgeAudioStudio
+
+slider1:0.0<-6.0,18.0,0.1>Input Drive (dB)
+slider2:-1.0<-6.0,-0.1,0.1>Output Ceiling (dBTP)
+slider3:85.0<10.0,400.0,5.0>Release Time (ms)
+slider4:0<0,1,1{Off,On}>Unity Gain Audition
+
+@init
+srate_safe = max(srate, 44100);
+lookahead = min(512, max(16, floor(srate_safe * 0.003)));
+buf_size = 1024;
+buf_l = 0;
+buf_r = 1024;
+w_pos = 0;
+gain_env = 1.0;
+rel_env = 1.0;
+att_a = exp(-1.0 / (srate_safe * 0.0005));
+pdc_delay = lookahead;
+
+@slider
+drive_lin = 10 ^ (slider1 / 20);
+ceil_lin = 10 ^ (min(-0.1, slider2) / 20);
+rel_a = exp(-1.0 / (srate_safe * (max(10.0, slider3) * 0.001)));
+rel_slow_a = exp(-1.0 / (srate_safe * (max(30.0, slider3 * 3.0) * 0.001)));
+unity_mode = slider4 > 0.5;
+comp_lin = unity_mode ? min(1.0, 1.0 / max(0.01, drive_lin)) : 1.0;
+pdc_delay = lookahead;
+
+@sample
+in_l = spl0 * drive_lin;
+in_r = spl1 * drive_lin;
+buf_l[w_pos] = in_l;
+buf_r[w_pos] = in_r;
+
+// Measure 2x linear midpoint + sample peak over lookahead input
+peak_in = max(abs(in_l), abs(in_r));
+prev_idx = (w_pos - 1 + buf_size) % buf_size;
+mid_l = 0.5 * (in_l + buf_l[prev_idx]);
+mid_r = 0.5 * (in_r + buf_r[prev_idx]);
+peak_tp = max(peak_in, max(abs(mid_l), abs(mid_r)));
+
+req_g = peak_tp > ceil_lin ? (ceil_lin / max(1e-9, peak_tp)) : 1.0;
+rel_env = req_g < rel_env ? req_g : (rel_slow_a * rel_env + (1.0 - rel_slow_a) * req_g);
+eff_req = min(req_g, rel_env);
+gain_env = eff_req < gain_env ? (att_a * gain_env + (1.0 - att_a) * eff_req) : (rel_a * gain_env + (1.0 - rel_a) * eff_req);
+
+r_pos = (w_pos - lookahead + buf_size) % buf_size;
+w_pos = (w_pos + 1) % buf_size;
+
+out_l = min(ceil_lin, max(-ceil_lin, buf_l[r_pos] * gain_env)) * comp_lin;
+out_r = min(ceil_lin, max(-ceil_lin, buf_r[r_pos] * gain_env)) * comp_lin;
+gmem[2] = 20.0 * log10(max(0.001, gain_env));
+spl0 = out_l;
+spl1 = out_r;

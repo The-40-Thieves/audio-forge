@@ -1,0 +1,54 @@
+desc:ForgeAudio - Upward Density Compressor & First-Order ADAA Soft Clipper
+//tags: saturation clipper density upward-compressor
+//author: ForgeAudio (Apache-2.0)
+
+slider1:0.30<0.0,1.0,0.01>Upward Density Amount
+slider2:2.0<0.0,12.0,0.1>ADAA Clip Drive (dB)
+slider3:-0.5<-12.0,0.0,0.1>Clip Ceiling (dB)
+
+@init
+srate_safe = max(srate, 44100);
+env_rms = 0.001;
+rms_a = exp(-1.0 / (srate_safe * 0.035));
+prev_u_l = 0.0; prev_f1_l = 0.0;
+prev_u_r = 0.0; prev_f1_r = 0.0;
+ln2 = log(2.0);
+
+@slider
+density_amt = slider1;
+drive_lin = 10 ^ (slider2 / 20);
+ceil_lin = 10 ^ (slider3 / 20);
+inv_ceil = 1.0 / max(0.01, ceil_lin);
+
+@sample
+lvl = max(abs(spl0), abs(spl1));
+env_rms = rms_a * env_rms + (1.0 - rms_a) * lvl;
+// Upward density lift on quiet sustained material (-48 dB .. -16 dB)
+env_db = 20.0 * log10(max(1e-5, env_rms));
+lift_db = density_amt * max(0.0, min(8.0, (-16.0 - env_db) * 0.25));
+lift_g = 10 ^ (lift_db / 20);
+
+x_l = spl0 * lift_g;
+x_r = spl1 * lift_g;
+
+// 1st-order ADAA tanh waveshaper: F1(u) = |u| + ln(1 + exp(-2*|u|)) - ln(2)
+u_l = x_l * drive_lin * inv_ceil;
+au_l = abs(u_l);
+f1_l = au_l + log(1.0 + exp(-2.0 * au_l)) - ln2;
+du_l = u_l - prev_u_l;
+mid_l = 0.5 * (u_l + prev_u_l);
+y_l = abs(du_l) < 0.0001 ? ((exp(mid_l) - exp(-mid_l)) / (exp(mid_l) + exp(-mid_l))) : ((f1_l - prev_f1_l) / du_l);
+prev_u_l = u_l;
+prev_f1_l = f1_l;
+
+u_r = x_r * drive_lin * inv_ceil;
+au_r = abs(u_r);
+f1_r = au_r + log(1.0 + exp(-2.0 * au_r)) - ln2;
+du_r = u_r - prev_u_r;
+mid_r = 0.5 * (u_r + prev_u_r);
+y_r = abs(du_r) < 0.0001 ? ((exp(mid_r) - exp(-mid_r)) / (exp(mid_r) + exp(-mid_r))) : ((f1_r - prev_f1_r) / du_r);
+prev_u_r = u_r;
+prev_f1_r = f1_r;
+
+spl0 = y_l * ceil_lin;
+spl1 = y_r * ceil_lin;

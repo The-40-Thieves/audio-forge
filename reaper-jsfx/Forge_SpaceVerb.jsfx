@@ -1,0 +1,74 @@
+desc:ForgeAudio - SpaceVerb Hadamard FDN Reverb with Damping & Ducking
+//tags: reverb fdn space ducking
+//author: ForgeAudio (Apache-2.0)
+
+slider1:2.2<0.2,10.0,0.1>Decay RT60 (s)
+slider2:0.40<0.05,0.90,0.01>High-Frequency Damping
+slider3:0.35<0.0,1.0,0.01>Vocal Ducking
+slider4:0.25<0.0,1.0,0.01>Wet Mix
+
+@init
+srate_safe = max(srate, 44100);
+stride = 8192;
+d0_base = 0;
+d1_base = stride;
+d2_base = stride * 2;
+d3_base = stride * 3;
+len0 = min(stride - 1, max(64, floor(srate_safe * 0.0293)));
+len1 = min(stride - 1, max(64, floor(srate_safe * 0.0371)));
+len2 = min(stride - 1, max(64, floor(srate_safe * 0.0531)));
+len3 = min(stride - 1, max(64, floor(srate_safe * 0.0713)));
+p0 = 0; p1 = 0; p2 = 0; p3 = 0;
+lp0 = 0; lp1 = 0; lp2 = 0; lp3 = 0;
+duck_env = 0.0;
+duck_a = exp(-1.0 / (srate_safe * 0.025));
+
+@slider
+rt60 = max(0.2, slider1);
+damp = min(0.90, max(0.05, slider2));
+duck_amt = slider3;
+wet_mix = slider4;
+fb0 = min(0.985, 10 ^ (-3.0 * (len0 / srate_safe) / rt60));
+fb1 = min(0.985, 10 ^ (-3.0 * (len1 / srate_safe) / rt60));
+fb2 = min(0.985, 10 ^ (-3.0 * (len2 / srate_safe) / rt60));
+fb3 = min(0.985, 10 ^ (-3.0 * (len3 / srate_safe) / rt60));
+
+@sample
+dry_l = spl0;
+dry_r = spl1;
+duck_env = duck_a * duck_env + (1.0 - duck_a) * max(abs(dry_l), abs(dry_r));
+duck_g = 1.0 / (1.0 + duck_env * duck_amt * 8.0);
+
+r0 = d0_base[p0];
+r1 = d1_base[p1];
+r2 = d2_base[p2];
+r3 = d3_base[p3];
+
+// Orthogonal 4x4 Walsh-Hadamard scattering matrix (1/2 factor)
+a0 = r0 + r1; a1 = r0 - r1;
+a2 = r2 + r3; a3 = r2 - r3;
+h0 = 0.5 * (a0 + a2);
+h1 = 0.5 * (a1 + a3);
+h2 = 0.5 * (a0 - a2);
+h3 = 0.5 * (a1 - a3);
+
+// Damped loop write-back
+lp0 = (1.0 - damp) * h0 + damp * lp0;
+lp1 = (1.0 - damp) * h1 + damp * lp1;
+lp2 = (1.0 - damp) * h2 + damp * lp2;
+lp3 = (1.0 - damp) * h3 + damp * lp3;
+
+d0_base[p0] = dry_l * 0.35 + lp0 * fb0;
+d1_base[p1] = dry_r * 0.35 + lp1 * fb1;
+d2_base[p2] = dry_l * 0.35 + lp2 * fb2;
+d3_base[p3] = dry_r * 0.35 + lp3 * fb3;
+
+p0 = (p0 + 1) % len0;
+p1 = (p1 + 1) % len1;
+p2 = (p2 + 1) % len2;
+p3 = (p3 + 1) % len3;
+
+wet_l = 0.5 * (r0 + r2) * duck_g;
+wet_r = 0.5 * (r1 + r3) * duck_g;
+spl0 = dry_l * (1.0 - wet_mix * 0.5) + wet_l * wet_mix;
+spl1 = dry_r * (1.0 - wet_mix * 0.5) + wet_r * wet_mix;

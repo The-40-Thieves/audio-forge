@@ -1,0 +1,63 @@
+desc:ForgeAudio - Sample Delay Phase Aligner & 3-Band Match Tilt EQ
+//tags: phase aligner equalizer mastering
+//author: ForgeAudio (Apache-2.0)
+
+slider1:0<0,2048,1>Delay Compensation (Samples)
+slider2:0<0,1,1{Normal,Invert Polarity}>Polarity
+slider3:0.0<-12.0,12.0,0.1>Low Shelf (<120 Hz, dB)
+slider4:0.0<-12.0,12.0,0.1>Mid Presence (1.2 kHz, dB)
+slider5:0.0<-12.0,12.0,0.1>Air Shelf (>7.5 kHz, dB)
+
+@init
+srate_safe = max(srate, 44100);
+buf_size = 4096;
+dl_base = 0;
+dr_base = buf_size;
+w_pos = 0;
+lp_l = 0; lp_r = 0;
+mid_ic1_l = 0; mid_ic2_l = 0;
+mid_ic1_r = 0; mid_ic2_r = 0;
+hp_l = 0; hp_r = 0;
+
+@slider
+delay_smp = min(2048, max(0, floor(slider1)));
+pol_sign = slider2 > 0.5 ? -1.0 : 1.0;
+lo_trim = (10 ^ (slider3 / 20)) - 1.0;
+mid_trim = (10 ^ (slider4 / 20)) - 1.0;
+air_trim = (10 ^ (slider5 / 20)) - 1.0;
+
+alpha_lo = 1.0 - exp(-2.0 * $pi * min(120.0, srate_safe * 0.45) / srate_safe);
+alpha_air = 1.0 - exp(-2.0 * $pi * min(7500.0, srate_safe * 0.45) / srate_safe);
+g_mid = tan($pi * min(1200.0, srate_safe * 0.45) / srate_safe);
+k_mid = 1.0 / 0.85;
+a1_m = 1.0 / (1.0 + g_mid * (g_mid + k_mid));
+a2_m = g_mid * a1_m;
+a3_m = g_mid * a2_m;
+
+@sample
+dl_base[w_pos] = spl0;
+dr_base[w_pos] = spl1;
+r_pos = (w_pos - delay_smp + buf_size) % buf_size;
+w_pos = (w_pos + 1) % buf_size;
+
+x0 = dl_base[r_pos] * pol_sign;
+x1 = dr_base[r_pos] * pol_sign;
+
+lp_l += alpha_lo * (x0 - lp_l);
+lp_r += alpha_lo * (x1 - lp_r);
+
+v3_l = x0 - mid_ic2_l; v1_l = a1_m * mid_ic1_l + a2_m * v3_l; v2_l = mid_ic2_l + a2_m * mid_ic1_l + a3_m * v3_l;
+mid_ic1_l = 2.0 * v1_l - mid_ic1_l; mid_ic2_l = 2.0 * v2_l - mid_ic2_l;
+bp_l = k_mid * v1_l;
+
+v3_r = x1 - mid_ic2_r; v1_r = a1_m * mid_ic1_r + a2_m * v3_r; v2_r = mid_ic2_r + a2_m * mid_ic1_r + a3_m * v3_r;
+mid_ic1_r = 2.0 * v1_r - mid_ic1_r; mid_ic2_r = 2.0 * v2_r - mid_ic2_r;
+bp_r = k_mid * v1_r;
+
+hp_l += alpha_air * (x0 - hp_l);
+hp_r += alpha_air * (x1 - hp_r);
+air_l = x0 - hp_l;
+air_r = x1 - hp_r;
+
+spl0 = x0 + lp_l * lo_trim + bp_l * mid_trim + air_l * air_trim;
+spl1 = x1 + lp_r * lo_trim + bp_r * mid_trim + air_r * air_trim;
