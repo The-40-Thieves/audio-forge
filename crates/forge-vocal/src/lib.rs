@@ -364,6 +364,33 @@ fn suppress_isolated_octave_glitches(
     }
 }
 
+/// Converts externally tracked `(time_secs, f0_hz)` frames (such as neural `RMVPE` / `FCPE`
+/// output from `forge-worker`'s `f0-track`) into snapped `PitchFrame` automation trajectories,
+/// sanitizing non-finite inputs and running isolated octave-glitch suppression.
+pub fn pitch_frames_from_external_f0(
+    raw_frames: &[(f64, f64)],
+    scale: &VocalScale,
+    retune_strength: f64,
+) -> Vec<PitchFrame> {
+    let strength = if retune_strength.is_finite() {
+        retune_strength.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let mut frames: Vec<PitchFrame> = raw_frames
+        .iter()
+        .filter(|(t, _)| t.is_finite())
+        .map(|&(t, f0)| {
+            let safe_t = t.max(0.0);
+            let safe_f0 = if f0.is_finite() && f0 > 0.0 { f0 } else { 0.0 };
+            pitch_frame(safe_t, safe_f0, scale, strength)
+        })
+        .collect();
+    frames.sort_by(|a, b| a.time_secs.total_cmp(&b.time_secs));
+    suppress_isolated_octave_glitches(&mut frames, scale, strength);
+    frames
+}
+
 /// Computes a 10th-order Linear Predictive Coding (LPC) spectral tilt/formant balance ratio
 /// using Levinson-Durbin recursion on a short frame, returning the high-to-low formant tilt in dB.
 pub fn estimate_lpc_formant_tilt_db(frame: &[f64]) -> f64 {
@@ -1252,5 +1279,30 @@ mod tests {
             tail_rms > 0.05,
             "trailing voiced audio was silenced or poisoned after NaN (tail_rms={tail_rms})"
         );
+    }
+
+    #[test]
+    fn test_pitch_frames_from_external_f0_snaps_and_suppresses_octave_glitch() {
+        let scale = VocalScale::parse("C major").unwrap();
+        let raw = vec![
+            (0.04, 218.0),
+            (0.00, 222.0),
+            (0.02, 444.0), // isolated octave jump between 222 Hz and 218 Hz -> suppressed
+            (0.06, f64::NAN),
+            (0.08, 261.6256),
+        ];
+        let frames = pitch_frames_from_external_f0(&raw, &scale, 1.0);
+        assert_eq!(frames.len(), 5);
+        assert!((frames[0].time_secs - 0.00).abs() < 1e-12);
+        // Middle frame must be snapped down from 444 Hz octave jump back toward ~220 Hz (A3 = MIDI 57)
+        assert!(
+            (frames[1].f0_hz - 220.0).abs() < 10.0,
+            "expected octave glitch suppressed near 220 Hz, got {}",
+            frames[1].f0_hz
+        );
+        assert!((frames[1].target_midi_pitch - 57.0).abs() < 1e-6);
+        assert_eq!(frames[3].f0_hz, 0.0);
+        assert!((frames[4].target_midi_pitch - 60.0).abs() < 1e-6);
+        assert!(frames.iter().all(|f| f.correction_semitones.is_finite()));
     }
 }

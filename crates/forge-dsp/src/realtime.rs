@@ -262,6 +262,9 @@ struct OpenSootheStftCore {
     last_gr_db: f32,
     last_spectrum_db: [f32; 32],
     last_band_gr_db: [f32; 32],
+    high_mid_correlation: f64,
+    mid_fizz_db: f64,
+    side_fizz_db: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -287,6 +290,9 @@ impl OpenSootheStftCore {
             last_gr_db: 0.0,
             last_spectrum_db: [SPECTRUM_FLOOR_DB; SPECTRUM_BANDS],
             last_band_gr_db: [0.0; 32],
+            high_mid_correlation: 1.0,
+            mid_fizz_db: f64::from(SPECTRUM_FLOOR_DB),
+            side_fizz_db: f64::from(SPECTRUM_FLOOR_DB),
         };
         core.update_band_weights(1.35, 1.15);
         core
@@ -299,6 +305,9 @@ impl OpenSootheStftCore {
         self.last_gr_db = 0.0;
         self.last_spectrum_db = [SPECTRUM_FLOOR_DB; SPECTRUM_BANDS];
         self.last_band_gr_db = [0.0; 32];
+        self.high_mid_correlation = 1.0;
+        self.mid_fizz_db = f64::from(SPECTRUM_FLOOR_DB);
+        self.side_fizz_db = f64::from(SPECTRUM_FLOOR_DB);
         self.update_band_weights(1.35, 1.15);
     }
 
@@ -374,6 +383,7 @@ impl OpenSootheStftCore {
         };
 
         self.ola.analyze_stereo(use_ms);
+        self.update_high_mid_telemetry(bin_hz, spec_norm, use_ms);
 
         for (ch_idx, &ms_f) in ms_focus.iter().enumerate() {
             let focus = if use_ms { ms_f } else { 1.0 };
@@ -477,6 +487,54 @@ impl OpenSootheStftCore {
                 (20.0 * min_band_g.max(1.0e-4).log10() as f32).clamp(-24.0, 0.0);
         }
     }
+
+    /// Computes smoothed 2–12 kHz stereo correlation and Mid/Side fizz levels in dBFS (zero-alloc).
+    fn update_high_mid_telemetry(&mut self, bin_hz: f64, spec_norm: f64, use_ms: bool) {
+        let half_bins = self.ola.half_bins;
+        if half_bins < 3 || !bin_hz.is_finite() || bin_hz <= 0.0 {
+            return;
+        }
+        let b_lo = ((2_000.0 / bin_hz).floor() as usize).clamp(1, half_bins - 1);
+        let b_hi = ((12_000.0 / bin_hz).ceil() as usize).clamp(b_lo, half_bins - 1);
+        let mut lr_cross = 0.0_f64;
+        let mut l_pow = 0.0_f64;
+        let mut r_pow = 0.0_f64;
+        let mut m_pow = 0.0_f64;
+        let mut s_pow = 0.0_f64;
+        for b in b_lo..=b_hi {
+            let cl = self.ola.spec_l[b];
+            let cr = self.ola.spec_r[b];
+            let (l, r, m, s) = if use_ms {
+                (cl + cr, cl - cr, cl, cr)
+            } else {
+                (cl, cr, (cl + cr) * 0.5, (cl - cr) * 0.5)
+            };
+            lr_cross += l.re * r.re + l.im * r.im;
+            l_pow += l.norm_sqr();
+            r_pow += r.norm_sqr();
+            m_pow += m.norm_sqr();
+            s_pow += s.norm_sqr();
+        }
+        let denom = (l_pow * r_pow).sqrt();
+        let inst_corr = if denom > 1e-18 {
+            (lr_cross / denom).clamp(-1.0, 1.0)
+        } else {
+            1.0
+        };
+        let bin_count = ((b_hi - b_lo + 1) as f64).max(1.0);
+        let scale = spec_norm / bin_count;
+        let floor = f64::from(SPECTRUM_FLOOR_DB);
+        let inst_mid_db = (10.0 * (m_pow * scale).max(1e-12).log10()).clamp(floor, 0.0);
+        let inst_side_db = (10.0 * (s_pow * scale).max(1e-12).log10()).clamp(floor, 0.0);
+
+        self.high_mid_correlation = flush_denormal_f64(
+            (0.7 * self.high_mid_correlation + 0.3 * inst_corr).clamp(-1.0, 1.0),
+        );
+        self.mid_fizz_db =
+            flush_denormal_f64((0.7 * self.mid_fizz_db + 0.3 * inst_mid_db).clamp(floor, 0.0));
+        self.side_fizz_db =
+            flush_denormal_f64((0.7 * self.side_fizz_db + 0.3 * inst_side_db).clamp(floor, 0.0));
+    }
 }
 
 /// Real-Time Zero-Allocation **OpenSoothe** OLA-STFT Dynamic Spectral Resonance & AI De-Fizz Processor.
@@ -488,13 +546,18 @@ pub struct RealtimeOpenSoothe {
     tracking: OpenSootheStftCore,
     low_latency: bool,
     ctrl: OpenSootheControlState,
+    sample_rate: f64,
+    ultrasonic_lpf_hz: f64,
+    ulpf_l: CytomicSvf,
+    ulpf_r: CytomicSvf,
 }
 
 impl RealtimeOpenSoothe {
     pub fn new(sample_rate: f64) -> Self {
+        let clean_sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
         Self {
-            ultra: OpenSootheStftCore::new(sample_rate, 2048, 512),
-            tracking: OpenSootheStftCore::new(sample_rate, 256, 64),
+            ultra: OpenSootheStftCore::new(clean_sr, 2048, 512),
+            tracking: OpenSootheStftCore::new(clean_sr, 256, 64),
             low_latency: false,
             ctrl: OpenSootheControlState {
                 tilt_db_per_oct: 0.0,
@@ -505,6 +568,10 @@ impl RealtimeOpenSoothe {
                 hard_mode: false,
                 focus_eq_db: [0.0; 3],
             },
+            sample_rate: clean_sr,
+            ultrasonic_lpf_hz: 0.0,
+            ulpf_l: CytomicSvf::lowpass(clean_sr, 18_000.0, FRAC_1_SQRT_2),
+            ulpf_r: CytomicSvf::lowpass(clean_sr, 18_000.0, FRAC_1_SQRT_2),
         }
     }
 
@@ -548,8 +615,20 @@ impl RealtimeOpenSoothe {
     }
 
     pub fn reset(&mut self, sample_rate: f64) {
-        self.ultra.reset(sample_rate);
-        self.tracking.reset(sample_rate);
+        let clean_sr = sanitize_param_f64(sample_rate, 48_000.0, 8_000.0, 768_000.0);
+        self.sample_rate = clean_sr;
+        self.ultra.reset(clean_sr);
+        self.tracking.reset(clean_sr);
+        self.ulpf_l.reset();
+        self.ulpf_r.reset();
+        let lpf_hz = if self.ultrasonic_lpf_hz > 0.0 {
+            self.ultrasonic_lpf_hz
+                .clamp(1_000.0, (0.48 * clean_sr).max(1_000.0))
+        } else {
+            18_000.0_f64.min(0.48 * clean_sr)
+        };
+        self.ulpf_l.set_lowpass(clean_sr, lpf_hz, FRAC_1_SQRT_2);
+        self.ulpf_r.set_lowpass(clean_sr, lpf_hz, FRAC_1_SQRT_2);
     }
 
     pub fn update_band_weights(&mut self, fizz_weight: f64, sibilance_weight: f64) {
@@ -618,6 +697,48 @@ impl RealtimeOpenSoothe {
         ];
     }
 
+    /// Sets optional ultrasonic gentle Butterworth LPF cutoff in Hz (`<= 0.0` or `>= 0.49 * sr`
+    /// bypasses cleanly). Zero-alloc.
+    #[inline]
+    pub fn set_ultrasonic_lpf_hz(&mut self, hz: f64) {
+        let nyquist_guard = (0.48 * self.sample_rate).max(1_000.0);
+        if !hz.is_finite() || hz <= 0.0 || hz >= nyquist_guard {
+            self.ultrasonic_lpf_hz = 0.0;
+            return;
+        }
+        let clamped = hz.clamp(1_000.0, nyquist_guard);
+        if self.ultrasonic_lpf_hz == 0.0 {
+            self.ulpf_l.reset();
+            self.ulpf_r.reset();
+        }
+        if (clamped - self.ultrasonic_lpf_hz).abs() > 0.5 || self.ultrasonic_lpf_hz == 0.0 {
+            self.ulpf_l
+                .set_lowpass(self.sample_rate, clamped, FRAC_1_SQRT_2);
+            self.ulpf_r
+                .set_lowpass(self.sample_rate, clamped, FRAC_1_SQRT_2);
+            self.ultrasonic_lpf_hz = clamped;
+        }
+    }
+
+    pub fn ultrasonic_lpf_hz(&self) -> f64 {
+        self.ultrasonic_lpf_hz
+    }
+
+    /// Smoothed 2–12 kHz stereo correlation (`-1.0..=1.0`). Zero-alloc.
+    pub fn high_mid_correlation(&self) -> f64 {
+        self.active().high_mid_correlation
+    }
+
+    /// Smoothed Mid-channel high-band fizz level (dBFS). Zero-alloc.
+    pub fn mid_fizz_db(&self) -> f64 {
+        self.active().mid_fizz_db
+    }
+
+    /// Smoothed Side-channel high-band fizz level (dBFS). Zero-alloc.
+    pub fn side_fizz_db(&self) -> f64 {
+        self.active().side_fizz_db
+    }
+
     #[inline]
     pub fn process_stereo_sample(
         &mut self,
@@ -629,7 +750,7 @@ impl RealtimeOpenSoothe {
         delta_listen: bool,
     ) -> (f32, f32) {
         let ctrl = self.ctrl;
-        self.active_mut().process_stereo_sample(
+        let (out_l, out_r) = self.active_mut().process_stereo_sample(
             in_l,
             in_r,
             sensitivity_db,
@@ -637,7 +758,15 @@ impl RealtimeOpenSoothe {
             sharpness_bins,
             delta_listen,
             ctrl,
-        )
+        );
+        if self.ultrasonic_lpf_hz > 0.0 && !delta_listen {
+            (
+                self.ulpf_l.process_sample(f64::from(out_l)) as f32,
+                self.ulpf_r.process_sample(f64::from(out_r)) as f32,
+            )
+        } else {
+            (out_l, out_r)
+        }
     }
 }
 

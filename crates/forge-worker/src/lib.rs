@@ -20,11 +20,11 @@ mod local_gpu;
 mod routing;
 
 pub use local_gpu::{
-    BUILD_SOURCE_ROOT, LocalWorkerCommand, MidiTranscribeResult, NeuralDenoiseResult,
-    NeuralRestoreResult, QualityEvalMetrics, QualityEvalResult, VocalRescueResult,
-    resolve_default_local_worker, run_local_beat_track, run_local_evaluate_quality,
-    run_local_neural_denoise, run_local_neural_restore, run_local_transcribe_midi,
-    run_local_vocal_rescue,
+    BUILD_SOURCE_ROOT, F0TrackFrame, F0TrackResult, LocalWorkerCommand, MidiTranscribeResult,
+    NeuralDenoiseResult, NeuralRestoreResult, QualityEvalMetrics, QualityEvalResult,
+    VocalRescueResult, resolve_default_local_worker, run_local_beat_track,
+    run_local_evaluate_quality, run_local_f0_track, run_local_neural_denoise,
+    run_local_neural_restore, run_local_transcribe_midi, run_local_vocal_rescue,
 };
 pub use routing::{
     BackendUsed, SeparationConfig, SeparationQuality, SeparationReport, WorkerBackend,

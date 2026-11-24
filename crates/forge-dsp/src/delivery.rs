@@ -335,33 +335,12 @@ pub fn deliver(
     Ok((mastered, report))
 }
 
-/// Resamples `buf` to `target_sr` when rates differ (preserving sample-rate coherence across stems).
+/// Resamples `buf` to `target_sr` using windowed-sinc resampling when sample rates differ.
 fn match_stem_sample_rate(buf: &AudioBuffer, target_sr: u32) -> Result<AudioBuffer> {
     if buf.sample_rate == target_sr || buf.num_frames() == 0 {
         return Ok(buf.clone());
     }
-    let ratio = f64::from(target_sr) / f64::from(buf.sample_rate.max(1));
-    let out_frames = ((buf.num_frames() as f64) * ratio).round().max(1.0) as usize;
-    let inv_ratio = f64::from(buf.sample_rate.max(1)) / f64::from(target_sr.max(1));
-    let n = buf.num_frames();
-    let channels = buf
-        .channels
-        .iter()
-        .map(|src| {
-            (0..out_frames)
-                .map(|i| {
-                    let pos = (i as f64) * inv_ratio;
-                    let idx = (pos.floor() as usize).min(n - 1);
-                    let frac = pos - (idx as f64);
-                    let s0 = src[idx];
-                    let s1 = src[(idx + 1).min(n - 1)];
-                    let y = s0 + (s1 - s0) * frac;
-                    if y.is_finite() { y } else { 0.0 }
-                })
-                .collect()
-        })
-        .collect();
-    AudioBuffer::from_channels(channels, target_sr)
+    crate::resample::resample_buffer_sinc(buf, target_sr)
 }
 
 /// Sums active primary cleaned stems (or uses `fallback` if none) and runs telemetry-driven

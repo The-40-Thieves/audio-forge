@@ -302,3 +302,34 @@ fn full_wavenet_nam_and_opensoothe_low_latency_do_not_allocate() {
         soothe.reset(48_000.0);
     });
 }
+
+#[test]
+fn realtime_sinc_resampler_and_opensoothe_ulpf_do_not_allocate() {
+    use forge_dsp::RealtimeSincResampler;
+
+    let mut resampler = RealtimeSincResampler::new(44_100.0, 48_000.0);
+    let mut soothe = RealtimeOpenSoothe::new(48_000.0);
+    let mut out_l = [0.0_f32; 4];
+    let mut out_r = [0.0_f32; 4];
+
+    assert_no_allocs("RealtimeSincResampler + OpenSoothe ulpf", || {
+        soothe.set_ultrasonic_lpf_hz(16_500.0);
+        for i in 0..FRAMES {
+            let (l, r) = signal(i);
+            let count = resampler.process_stereo_sample(l, r, &mut out_l, &mut out_r);
+            for k in 0..count {
+                let (sl, sr) = soothe.process_stereo_sample(out_l[k], out_r[k], 3.5, 9.0, 8, false);
+                std::hint::black_box((
+                    sl,
+                    sr,
+                    soothe.high_mid_correlation(),
+                    soothe.mid_fizz_db(),
+                    soothe.side_fizz_db(),
+                ));
+            }
+        }
+        soothe.set_ultrasonic_lpf_hz(0.0);
+        resampler.reset(48_000.0, 44_100.0);
+        soothe.reset(44_100.0);
+    });
+}

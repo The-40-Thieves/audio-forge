@@ -8,6 +8,7 @@ pub mod elite_dsp;
 pub mod loudness_limiter;
 pub mod phase_align;
 pub mod realtime;
+pub mod resample;
 pub mod restoration;
 pub mod spectral_defizz;
 pub mod spectral_unmask;
@@ -41,6 +42,7 @@ pub use realtime::{
     RealtimeMasteringEq18, RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner,
     RealtimeSubAndTapeBus, RealtimeVocalSurgical,
 };
+pub use resample::{RealtimeSincResampler, resample_buffer_sinc};
 pub use restoration::{
     MASTERING_18_BANDS_HZ, RestorationConfig, apply_18_band_eq, apply_analog_console_and_tape,
     apply_hum_notch_cascade, apply_mid_side_spatial_cleanup, clean_vocal_surgical,

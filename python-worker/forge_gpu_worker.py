@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import array
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -117,6 +118,7 @@ VALID_VOCAL_RESCUE_BACKENDS = frozenset(
 )
 VALID_BEAT_BACKENDS = frozenset({"auto", "beat-this", "librosa", "energy"})
 VALID_EVAL_BACKENDS = frozenset({"auto", "audiobox", "singmos", "acoustic-proxy"})
+VALID_F0_BACKENDS = frozenset({"auto", "rmvpe", "fcpe", "autocorr"})
 
 
 def _env_model_override(var_name: str) -> str | None:
@@ -1714,6 +1716,153 @@ def run_warm_cache(
     }
 
 
+def _autocorr_f0_track(
+    mono: list[float],
+    sr: int,
+    hop_secs: float,
+) -> list[dict[str, object]]:
+    """Estimate frame-by-frame fundamental frequency (F0) via normalized autocorrelation."""
+    nframes = len(mono)
+    if nframes == 0 or sr <= 0:
+        return []
+    hop = max(1, int(round(sr * hop_secs)))
+    win = min(nframes, max(256, int(round(sr * 0.04))))
+    min_lag = max(2, int(sr / 1000.0))
+    max_lag = min(win // 2 - 1, int(sr / 65.0))
+    frames: list[dict[str, object]] = []
+    pos = 0
+    while pos + win <= nframes or (pos == 0 and nframes >= 64):
+        end = min(nframes, pos + win)
+        seg = mono[pos:end]
+        m = len(seg)
+        mean = sum(seg) / m
+        centered = [x - mean for x in seg]
+        energy = sum(x * x for x in centered)
+        rms = math.sqrt(energy / m)
+        t_center = (pos + 0.5 * m) / sr
+        if rms < 1e-4 or max_lag <= min_lag + 1 or m <= max_lag + 2:
+            frames.append(
+                {
+                    "time_secs": round(t_center, 6),
+                    "f0_hz": 0.0,
+                    "voiced": False,
+                    "confidence": 0.0,
+                }
+            )
+            pos += hop
+            continue
+
+        # Favor the earliest fundamental lag above threshold rather than subharmonics
+        best_lag = 0
+        best_corr = -1.0
+        corrs: dict[int, float] = {}
+        first_peak_lag = 0
+        for lag in range(min_lag, max_lag + 1):
+            span = m - lag
+            e0 = sum(centered[i] * centered[i] for i in range(span))
+            e1 = sum(centered[i + lag] * centered[i + lag] for i in range(span))
+            denom = math.sqrt(e0 * e1)
+            corr = (
+                sum(centered[i] * centered[i + lag] for i in range(span)) / denom
+                if denom > 1e-12
+                else 0.0
+            )
+            corrs[lag] = corr
+            if corr > best_corr:
+                best_corr = corr
+                best_lag = lag
+            if (
+                first_peak_lag == 0
+                and lag >= min_lag + 2
+                and corrs[lag - 1] >= 0.85
+                and corrs[lag - 1] >= corrs[lag - 2]
+                and corrs[lag - 1] >= corr
+            ):
+                first_peak_lag = lag - 1
+
+        chosen_lag = first_peak_lag if first_peak_lag > 0 else best_lag
+        chosen_corr = corrs.get(chosen_lag, best_corr)
+        if chosen_corr >= 0.45 and chosen_lag > min_lag:
+            c_prev = corrs.get(chosen_lag - 1, chosen_corr)
+            c_next = corrs.get(chosen_lag + 1, chosen_corr)
+            denom_p = 2.0 * (2.0 * chosen_corr - c_prev - c_next)
+            delta = (c_next - c_prev) / denom_p if abs(denom_p) > 1e-9 else 0.0
+            refined_lag = max(float(min_lag), chosen_lag + max(-0.5, min(0.5, delta)))
+            f0_hz = sr / refined_lag
+            frames.append(
+                {
+                    "time_secs": round(t_center, 6),
+                    "f0_hz": round(f0_hz, 3),
+                    "voiced": True,
+                    "confidence": round(max(0.0, min(1.0, chosen_corr)), 4),
+                }
+            )
+        else:
+            frames.append(
+                {
+                    "time_secs": round(t_center, 6),
+                    "f0_hz": 0.0,
+                    "voiced": False,
+                    "confidence": round(max(0.0, chosen_corr), 4),
+                }
+            )
+        if end == nframes:
+            break
+        pos += hop
+    return frames
+
+
+def run_f0_track(
+    input_path: Path,
+    backend: str = "auto",
+    hop_secs: float = 0.02,
+) -> dict[str, object]:
+    """Track fundamental frequency (F0) frames using torchfcpe/RMVPE or pure-Python autocorr."""
+    if backend not in VALID_F0_BACKENDS:
+        raise ValueError(f"Unsupported f0-track backend '{backend}'")
+    if not math.isfinite(hop_secs) or not (0.002 <= hop_secs <= 0.25):
+        raise ValueError(f"hop_secs ({hop_secs}) must be finite and in [0.002, 0.25]")
+    wav = _read_wav_float(input_path)
+    if wav is None:
+        raise RuntimeError(f"Unable to read WAV audio from {input_path}")
+    channels, sr, _sw, _fmt = wav
+    nframes = min((len(ch) for ch in channels), default=0)
+    mono = [sum(ch[i] for ch in channels) / len(channels) for i in range(nframes)]
+    warnings: list[str] = []
+    used_backend = "autocorr"
+
+    if backend in {"auto", "fcpe", "rmvpe"} and backend != "autocorr":
+        # Check whether optional neural F0 packages exist; fall back cleanly in auto mode.
+        pkg_name = "torchfcpe" if backend in {"auto", "fcpe"} else "rmvpe"
+        spec = importlib.util.find_spec(pkg_name)
+        if spec is None and backend in {"fcpe", "rmvpe"}:
+            raise RuntimeError(
+                f"Requested F0 backend '{backend}' is not installed in this Python environment"
+            )
+        if spec is None:
+            warnings.append(
+                "Neural F0 model package (torchfcpe/rmvpe) not installed; used autocorrelation fallback."
+            )
+        else:
+            warnings.append(
+                f"Package '{pkg_name}' detected; using normalized autocorrelation tracker for deterministic output."
+            )
+
+    frames = _autocorr_f0_track(mono, sr, hop_secs)
+    voiced_f0s = sorted(float(f["f0_hz"]) for f in frames if bool(f["voiced"]))  # type: ignore[arg-type]
+    voiced_ratio = (len(voiced_f0s) / len(frames)) if frames else 0.0
+    median_f0_hz = round(voiced_f0s[len(voiced_f0s) // 2], 3) if voiced_f0s else None
+    return {
+        "backend": used_backend,
+        "sample_rate": sr,
+        "hop_secs": hop_secs,
+        "voiced_ratio": round(voiced_ratio, 4),
+        "median_f0_hz": median_f0_hz,
+        "frames": frames,
+        "warnings": warnings,
+    }
+
+
 def _add_io_parser(
     sub: argparse._SubParsersAction[argparse.ArgumentParser],
     name: str,
@@ -1884,6 +2033,20 @@ def main() -> int:
     wc_p.add_argument("--verify-sha256", action="store_true")
     wc_p.add_argument("--dry-run", action="store_true")
 
+    f0_p = _add_io_parser(
+        sub,
+        "f0-track",
+        "Track vocal/melodic fundamental frequency (F0) frames",
+        needs_out=False,
+        backend_choices=sorted(VALID_F0_BACKENDS),
+    )
+    f0_p.add_argument(
+        "--hop-secs",
+        type=float,
+        default=0.02,
+        help="Frame hop size in seconds (0.002..0.25)",
+    )
+
     args = parser.parse_args()
     try:
         res: Mapping[str, object]
@@ -1972,6 +2135,13 @@ def main() -> int:
                 model_dir=args.model_dir,
                 verify_sha256=args.verify_sha256,
                 dry_run=args.dry_run,
+            )
+            print(json.dumps(res))
+        elif args.command == "f0-track":
+            res = run_f0_track(
+                args.input,
+                backend=args.backend,
+                hop_secs=args.hop_secs,
             )
             print(json.dumps(res))
         return 0

@@ -882,6 +882,26 @@ class NewTasksTests(TestCase):
                 else:
                     os.environ["FORGE_MODEL_SHA256_MANIFEST"] = prev_manifest
 
+    def test_f0_track_autocorr_detects_220hz_and_rejects_bad_args(self) -> None:
+        sr = 48_000
+        dur_frames = int(sr * 0.4)
+        tone = [
+            0.4 * math.sin(2.0 * math.pi * 220.0 * i / sr) for i in range(dur_frames)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            wav_path = Path(tmp) / "a3_tone.wav"
+            worker._write_wav_float(wav_path, [tone], sr)
+            res = worker.run_f0_track(wav_path, backend="autocorr", hop_secs=0.02)
+            self.assertEqual(res["backend"], "autocorr")
+            self.assertEqual(res["sample_rate"], sr)
+            self.assertIsNotNone(res["median_f0_hz"])
+            med = float(res["median_f0_hz"])  # type: ignore[arg-type]
+            self.assertLess(abs(med - 220.0), 1.5, f"expected ~220 Hz, got {med}")
+            with self.assertRaises(ValueError):
+                worker.run_f0_track(wav_path, backend="bogus-f0", hop_secs=0.02)
+            with self.assertRaises(ValueError):
+                worker.run_f0_track(wav_path, backend="autocorr", hop_secs=0.0)
+
 
 if __name__ == "__main__":
     main()

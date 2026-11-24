@@ -226,6 +226,43 @@ fn test_beat_grid_tracks_drifting_tempo_and_wsola_quantizes() {
 }
 
 #[test]
+fn test_realtime_opensoothe_ulpf_and_ms_telemetry() {
+    use forge_dsp::RealtimeOpenSoothe;
+
+    let sr = 48_000.0_f64;
+    let mut soothe = RealtimeOpenSoothe::new(sr);
+    soothe.set_ultrasonic_lpf_hz(14_000.0);
+    assert!((soothe.ultrasonic_lpf_hz() - 14_000.0).abs() < 1e-6);
+
+    // Feed out-of-phase 6 kHz fizz on Side + 20 kHz ultrasonic energy for several hops
+    let mut out_rms_sq = 0.0_f64;
+    let total_samples = 4096_usize;
+    for i in 0..total_samples {
+        let t = (i as f64) / sr;
+        let ultra = 0.4 * (2.0 * PI * 20_000.0 * t).sin() as f32;
+        let side_fizz = 0.25 * (2.0 * PI * 6_000.0 * t).sin() as f32;
+        let (yl, yr) =
+            soothe.process_stereo_sample(ultra + side_fizz, ultra - side_fizz, 3.5, 9.0, 8, false);
+        assert!(yl.is_finite() && yr.is_finite());
+        if i >= 3072 {
+            out_rms_sq += 0.5 * (f64::from(yl) * f64::from(yl) + f64::from(yr) * f64::from(yr));
+        }
+    }
+    let corr = soothe.high_mid_correlation();
+    assert!((-1.0..=1.0).contains(&corr) && corr.is_finite());
+    assert!(
+        corr < 0.0,
+        "expected negative high-mid correlation for out-of-phase 6 kHz fizz, got {corr}"
+    );
+    assert!(soothe.side_fizz_db() > soothe.mid_fizz_db());
+    let out_rms = (out_rms_sq / 1024.0).sqrt();
+    assert!(
+        out_rms < 0.35,
+        "expected attenuation of 20k+6k energy, rms={out_rms}"
+    );
+}
+
+#[test]
 fn test_elastic_dtw_aligns_vocal_double() {
     let sr = 48_000_u32;
     let frames = (sr as usize) * 2;

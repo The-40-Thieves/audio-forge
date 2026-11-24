@@ -218,6 +218,28 @@ pub struct QualityEvalResult {
     pub warnings: Vec<String>,
 }
 
+/// Single frame emitted by `forge_gpu_worker.py f0-track`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct F0TrackFrame {
+    pub time_secs: f64,
+    pub f0_hz: f64,
+    pub voiced: bool,
+    pub confidence: f64,
+}
+
+/// Neural/autocorrelation fundamental-frequency (`f0-track`) report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct F0TrackResult {
+    pub backend: String,
+    pub sample_rate: u32,
+    pub hop_secs: f64,
+    pub voiced_ratio: f64,
+    pub median_f0_hz: Option<f64>,
+    pub frames: Vec<F0TrackFrame>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
 /// Resolves the default local GPU worker command from `FORGE_GPU_WORKER_SCRIPT` or
 /// `BUILD_SOURCE_ROOT`.
 pub fn resolve_default_local_worker() -> Result<LocalWorkerCommand> {
@@ -287,6 +309,27 @@ pub fn run_local_neural_restore(
         cmd.arg("--chunk-secs").arg(format!("{cs}"));
     }
     run_worker_json(cmd, timeout, "GPU worker restore", "restore")
+}
+
+/// Runs neural/autocorrelation fundamental-frequency (`F0`) tracking via the local GPU worker.
+pub fn run_local_f0_track(
+    worker: &LocalWorkerCommand,
+    input_path: &Path,
+    backend: &str,
+    hop_secs: f64,
+    timeout: Duration,
+) -> Result<F0TrackResult> {
+    if !hop_secs.is_finite() || !(0.002..=0.25).contains(&hop_secs) {
+        return Err(ForgeError::InvalidParameter(format!(
+            "hop_secs ({hop_secs}) must be finite and in 0.002..=0.25"
+        )));
+    }
+    let mut cmd = worker_in_only_cmd(worker, "f0-track", input_path);
+    cmd.arg("--backend")
+        .arg(backend)
+        .arg("--hop-secs")
+        .arg(format!("{hop_secs}"));
+    run_worker_json(cmd, timeout, "GPU worker f0-track", "f0-track")
 }
 
 /// Runs neural vocal rescue / timbre resynthesis (`Seed-VC` / `Resemble Enhance` / `RoFormer`).
@@ -538,6 +581,39 @@ mod client_tests {
             }
         };
         (dir, cmd)
+    }
+
+    #[test]
+    fn f0_track_client_parses_json_and_validates_hop() {
+        let (_dir, worker) = mock_worker_echo(
+            &[
+                "Tracking F0 with autocorr fallback...",
+                r#"{"backend":"autocorr","sample_rate":48000,"hop_secs":0.02,"voiced_ratio":1.0,"median_f0_hz":220.0,"frames":[{"time_secs":0.02,"f0_hz":220.0,"voiced":true,"confidence":0.95}],"warnings":[]}"#,
+            ],
+            0,
+        );
+        let err = run_local_f0_track(
+            &worker,
+            Path::new("vocal.wav"),
+            "auto",
+            0.0,
+            Duration::from_secs(10),
+        )
+        .expect_err("zero hop must be rejected");
+        assert!(err.to_string().contains("hop_secs"), "{err}");
+
+        let res = run_local_f0_track(
+            &worker,
+            Path::new("vocal.wav"),
+            "autocorr",
+            0.02,
+            Duration::from_secs(10),
+        )
+        .expect("f0-track json");
+        assert_eq!(res.backend, "autocorr");
+        assert_eq!(res.sample_rate, 48_000);
+        assert_eq!(res.frames.len(), 1);
+        assert!((res.frames[0].f0_hz - 220.0).abs() < 1e-6);
     }
 
     #[test]
