@@ -306,9 +306,11 @@ class SixStemAndTranscribeTests(TestCase):
                 "other": "full_mix_(Other)_htdemucs_6s.wav",
             }
             for key, filename in expected.items():
-                self.assertIsNotNone(res[key], f"missing 6-stem slot: {key}")
-                self.assertEqual(Path(res[key]).name, filename)
-                self.assertTrue(Path(res[key]).is_file())
+                val = res[key]
+                self.assertIsNotNone(val, f"missing 6-stem slot: {key}")
+                assert val is not None
+                self.assertEqual(Path(val).name, filename)
+                self.assertTrue(Path(val).is_file())
 
     def test_studio_cascade_and_drumsep_populate_all_eleven_slots(self) -> None:
         calls: list[tuple[str, str]] = []
@@ -317,6 +319,7 @@ class SixStemAndTranscribeTests(TestCase):
             def separate(self, audio_file: str) -> list[str]:
                 calls.append((self.model, Path(audio_file).name))
                 base = Path(audio_file).stem
+                stems: tuple[str, ...]
                 if self.model in {"BS-Roformer-SW", "htdemucs_6s"}:
                     stems = ("Vocals", "Drums", "Bass", "Guitar", "Piano", "Other")
                 elif self.model == "MDX23C-DrumSep-aufr33-jarredou":
@@ -407,6 +410,7 @@ class SixStemAndTranscribeTests(TestCase):
 
             def separate(self, audio_file: str) -> list[str]:
                 base = Path(audio_file).stem
+                stems: tuple[str, ...]
                 if self.model == "htdemucs_ft":
                     stems = ("Vocals", "Drums", "Bass", "Other")
                 else:
@@ -435,10 +439,16 @@ class SixStemAndTranscribeTests(TestCase):
             self.assertIn(worker.SCNET_FOUR_STEM_MODEL, loaded_models)
             self.assertIn(worker.FOUR_STEM_MODEL, loaded_models)
             self.assertIn(worker.APOLLO_RESTORE_MODEL, loaded_models)
+            vocals_path = res["vocals"]
+            self.assertIsNotNone(vocals_path)
+            assert vocals_path is not None
             self.assertTrue(
-                Path(res["vocals"]).name.endswith("_restored.wav"), res["vocals"]
+                Path(vocals_path).name.endswith("_restored.wav"), vocals_path
             )
-            self.assertTrue(Path(res["drums"]).is_file())
+            drums_path = res["drums"]
+            self.assertIsNotNone(drums_path)
+            assert drums_path is not None
+            self.assertTrue(Path(drums_path).is_file())
 
     def test_full_hierarchical_23_slot_cascade_populates_all_sub_stems(self) -> None:
         model_outputs: dict[str, tuple[str, ...]] = {
@@ -530,8 +540,10 @@ class SixStemAndTranscribeTests(TestCase):
             )
             self.assertEqual(len(expected_keys), 23)
             for key in expected_keys:
-                self.assertIsNotNone(res[key], f"missing hierarchical slot: {key}")
-                self.assertTrue(Path(res[key]).is_file())
+                val = res[key]
+                self.assertIsNotNone(val, f"missing hierarchical slot: {key}")
+                assert val is not None
+                self.assertTrue(Path(val).is_file())
 
     def test_ultra_ensemble_blends_bs_and_mel_roformer_wavs(self) -> None:
         import array
@@ -572,7 +584,10 @@ class SixStemAndTranscribeTests(TestCase):
             res = worker.run_separate(
                 inp, out, dereverb=False, stems=2, quality="ultra"
             )
-            vocal_path = Path(res["vocals"])
+            vocal_str = res["vocals"]
+            self.assertIsNotNone(vocal_str)
+            assert vocal_str is not None
+            vocal_path = Path(vocal_str)
             self.assertEqual(vocal_path.name, "mix_(Vocals)_roformer_ensemble.wav")
             with wave.open(str(vocal_path), "rb") as w:
                 samples = array.array("h")

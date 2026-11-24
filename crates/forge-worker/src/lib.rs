@@ -46,6 +46,8 @@ pub async fn generate_music_lyria(
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(180))
+        .connect_timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| ForgeError::WorkerError(format!("HTTP client init failed: {e}")))?;
 
@@ -55,7 +57,7 @@ pub async fn generate_music_lyria(
         "response_format": { "type": "audio" }
     });
 
-    let resp = client
+    let mut resp = client
         .post("https://generativelanguage.googleapis.com/v1beta/interactions")
         .header("x-goog-api-key", api_key)
         .json(&payload)
@@ -63,17 +65,55 @@ pub async fn generate_music_lyria(
         .await
         .map_err(|e| ForgeError::WorkerError(format!("Lyria API request failed: {e}")))?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+    let status = resp.status();
+    if !status.is_success() {
+        const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+        let mut err_raw = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| ForgeError::WorkerError(format!("Lyria response stream failed: {e}")))?
+        {
+            let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(err_raw.len());
+            if remaining == 0 {
+                break;
+            }
+            let take = chunk.len().min(remaining);
+            err_raw.extend_from_slice(&chunk[..take]);
+            if err_raw.len() >= MAX_ERROR_BODY_BYTES {
+                break;
+            }
+        }
+        let body = String::from_utf8_lossy(&err_raw);
         return Err(ForgeError::WorkerError(format!(
-            "Lyria API returned HTTP {status}: {body}"
+            "Lyria API returned HTTP {status}: {}",
+            body.chars().take(1024).collect::<String>()
         )));
     }
 
-    let body_json: serde_json::Value = resp
-        .json()
+    const MAX_LYRIA_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+    if let Some(len) = resp.content_length()
+        && len > MAX_LYRIA_RESPONSE_BYTES as u64
+    {
+        return Err(ForgeError::WorkerError(format!(
+            "Lyria response ({len} bytes) exceeds safety limit ({MAX_LYRIA_RESPONSE_BYTES} bytes)"
+        )));
+    }
+    let mut raw = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
         .await
+        .map_err(|e| ForgeError::WorkerError(format!("Lyria response stream failed: {e}")))?
+    {
+        if raw.len().saturating_add(chunk.len()) > MAX_LYRIA_RESPONSE_BYTES {
+            return Err(ForgeError::WorkerError(format!(
+                "Lyria response exceeded safety limit ({MAX_LYRIA_RESPONSE_BYTES} bytes)"
+            )));
+        }
+        raw.extend_from_slice(&chunk);
+    }
+
+    let body_json: serde_json::Value = serde_json::from_slice(&raw)
         .map_err(|e| ForgeError::WorkerError(format!("Invalid JSON from Lyria API: {e}")))?;
 
     let b64_audio = body_json

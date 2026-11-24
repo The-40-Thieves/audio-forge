@@ -12,6 +12,13 @@ use crate::midi::{MidiClip, SynthPreset};
 pub const PROJECT_SCHEMA_VERSION: u32 = 1;
 /// Maximum `.forgeproj` JSON file size accepted (16 MiB) to prevent memory exhaustion.
 pub const MAX_PROJECT_JSON_BYTES: usize = 16 * 1024 * 1024;
+/// Structural safety limits on deserialized `.forgeproj` sessions to prevent OOM DoS.
+pub const MAX_TRACKS: usize = 256;
+pub const MAX_AUX_BUSES: usize = 64;
+pub const MAX_OBJECTS_PER_TRACK: usize = 4_096;
+pub const MAX_FX_SLOTS: usize = 32;
+pub const MAX_PROJECT_DURATION_SECS: u64 = 4 * 3600;
+pub const MAX_BOUNCE_FRAMES: usize = 128 * 1024 * 1024;
 /// Maximum undo history depth kept in memory.
 pub const MAX_UNDO_DEPTH: usize = 64;
 
@@ -789,28 +796,70 @@ impl DawProject {
         }
 
         let mut max_id = proj.next_id;
+        let max_samples = u64::from(proj.sample_rate).saturating_mul(MAX_PROJECT_DURATION_SECS);
+        if proj.tracks.len() > MAX_TRACKS
+            || proj.aux_buses.len() > MAX_AUX_BUSES
+            || proj.master_inserts.len() > MAX_FX_SLOTS
+        {
+            return Err(ForgeError::InvalidParameter(
+                "Project exceeds maximum track, aux bus, or master insert limits".to_string(),
+            ));
+        }
         let clean_f32 = |v: &mut f32, def: f32, lo: f32, hi: f32| {
             *v = if v.is_finite() { v.clamp(lo, hi) } else { def };
         };
         for bus in &mut proj.aux_buses {
+            if bus.inserts.len() > MAX_FX_SLOTS {
+                return Err(ForgeError::InvalidParameter(
+                    "Aux bus exceeds maximum FX insert slots".to_string(),
+                ));
+            }
             max_id = max_id.max(bus.id.saturating_add(1));
             clean_f32(&mut bus.gain_db, 0.0, -60.0, 12.0);
             clean_f32(&mut bus.pan, 0.0, -1.0, 1.0);
         }
         for tr in &mut proj.tracks {
+            if tr.objects.len() > MAX_OBJECTS_PER_TRACK || tr.inserts.len() > MAX_FX_SLOTS {
+                return Err(ForgeError::InvalidParameter(
+                    "Track exceeds maximum object or FX insert limits".to_string(),
+                ));
+            }
             max_id = max_id.max(tr.id.saturating_add(1));
             clean_f32(&mut tr.gain_db, 0.0, -60.0, 12.0);
             clean_f32(&mut tr.pan, 0.0, -1.0, 1.0);
             tr.volume_auto.points.retain(|p| p.value.is_finite());
+            tr.volume_auto.points.sort_by_key(|p| p.sample_pos);
             tr.pan_auto.points.retain(|p| p.value.is_finite());
+            tr.pan_auto.points.sort_by_key(|p| p.sample_pos);
+            for send in &mut tr.sends {
+                clean_f32(&mut send.gain_db, -12.0, -120.0, 12.0);
+            }
             for obj in &mut tr.objects {
+                if obj.fx_chain.len() > MAX_FX_SLOTS {
+                    return Err(ForgeError::InvalidParameter(
+                        "Audio object exceeds maximum FX chain slots".to_string(),
+                    ));
+                }
+                if obj.timeline_end_samples() > max_samples {
+                    return Err(ForgeError::InvalidParameter(
+                        "Audio object extends beyond maximum project duration".to_string(),
+                    ));
+                }
                 max_id = max_id.max(obj.id.saturating_add(1));
                 clean_f32(&mut obj.gain_db, 0.0, -48.0, 24.0);
                 clean_f32(&mut obj.pan, 0.0, -1.0, 1.0);
                 clean_f32(&mut obj.time_stretch, 1.0, 0.5, 2.0);
                 clean_f32(&mut obj.pitch_semitones, 0.0, -12.0, 12.0);
+                clean_f32(&mut obj.eq.low_db, 0.0, -24.0, 24.0);
+                clean_f32(&mut obj.eq.mid_db, 0.0, -24.0, 24.0);
+                clean_f32(&mut obj.eq.high_db, 0.0, -24.0, 24.0);
             }
             for mc in &mut tr.midi_clips {
+                if mc.timeline_end_samples() > max_samples {
+                    return Err(ForgeError::InvalidParameter(
+                        "MIDI clip extends beyond maximum project duration".to_string(),
+                    ));
+                }
                 max_id = max_id.max(mc.id.saturating_add(1));
                 for n in &mut mc.notes {
                     max_id = max_id.max(n.id.saturating_add(1));

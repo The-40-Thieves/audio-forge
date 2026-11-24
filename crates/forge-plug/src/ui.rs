@@ -93,6 +93,26 @@ pub struct AbBankState {
     pub last_synced_json: String,
 }
 
+/// Resolves a stored parameter ID against `params`, mapping legacy renamed IDs
+/// (such as OpenSoothe's pre-migration `"ms"` key -> `"msbal"`) when the exact ID
+/// is absent from `params` and the canonical key is not already present in `entries`.
+fn resolve_param_ref<'a>(
+    params: &[(&'static str, ParamRef<'a>)],
+    entries: &[(String, f32)],
+    target_id: &str,
+) -> Option<ParamRef<'a>> {
+    if let Some((_, pref)) = params.iter().find(|(id, _)| *id == target_id) {
+        return Some(*pref);
+    }
+    if target_id == "ms" && !entries.iter().any(|(id, _)| id == "msbal") {
+        return params
+            .iter()
+            .find(|(id, _)| *id == "msbal")
+            .map(|(_, pref)| *pref);
+    }
+    None
+}
+
 impl AbBankState {
     /// Serializes the A/B bank snapshot to compact JSON.
     pub fn to_json(&self) -> String {
@@ -177,8 +197,8 @@ impl AbBankState {
             &self.slot_a
         };
         for (target_id, norm) in recalled {
-            if let Some((_, pref)) = params.iter().find(|(id, _)| *id == target_id.as_str()) {
-                apply_fn(*pref, *norm);
+            if let Some(pref) = resolve_param_ref(params, recalled, target_id) {
+                apply_fn(pref, *norm);
             }
         }
         self.active_slot = target;
@@ -256,8 +276,8 @@ pub fn apply_user_preset_with(
 ) -> usize {
     let mut applied = 0_usize;
     for (target_id, norm) in &preset.values {
-        if let Some((_, pref)) = params.iter().find(|(id, _)| *id == target_id.as_str()) {
-            apply_fn(*pref, *norm);
+        if let Some(pref) = resolve_param_ref(params, &preset.values, target_id) {
+            apply_fn(pref, *norm);
             applied += 1;
         }
     }
@@ -1434,5 +1454,45 @@ mod tests {
         let huge = "a".repeat(MAX_PRESET_JSON_BYTES + 1);
         assert!(import_user_preset_json(&huge).is_err());
         assert!(AbBankState::from_json(&huge).is_none());
+    }
+
+    #[test]
+    fn legacy_ms_key_restores_msbal_in_ab_banks_and_user_presets() {
+        use nih_plug::prelude::FloatRange;
+
+        let p_msbal = FloatParam::new(
+            "Mid/Side Focus",
+            0.0,
+            FloatRange::Linear {
+                min: -1.0,
+                max: 1.0,
+            },
+        );
+        let params = [("msbal", ParamRef::Float(&p_msbal))];
+
+        let legacy_ab_json = r#"{"active_slot":0,"slot_a":[["ms",0.5]],"slot_b":[["ms",0.85]]}"#;
+        let mut ab = AbBankState::from_json(legacy_ab_json).expect("legacy A/B JSON parses");
+        let mut ab_applied = Vec::new();
+        ab.switch_with(1, &params, |_pref, v| ab_applied.push(v));
+        assert_eq!(ab_applied.len(), 1);
+        assert!((ab_applied[0] - 0.85).abs() < 1e-6);
+
+        let legacy_preset_json = r#"{"name":"Legacy Soothe","values":[["ms",0.25]]}"#;
+        let imported = import_user_preset_json(legacy_preset_json).expect("legacy preset parses");
+        let mut preset_applied = Vec::new();
+        let count = apply_user_preset_with(&params, &imported, |_pref, v| preset_applied.push(v));
+        assert_eq!(count, 1);
+        assert_eq!(preset_applied.len(), 1);
+        assert!((preset_applied[0] - 0.25).abs() < 1e-6);
+
+        let both_keys_json = r#"{"name":"Both Keys","values":[["ms",0.1],["msbal",0.9]]}"#;
+        let imported_both =
+            import_user_preset_json(both_keys_json).expect("dual-key preset parses");
+        let mut both_applied = Vec::new();
+        let both_count =
+            apply_user_preset_with(&params, &imported_both, |_pref, v| both_applied.push(v));
+        assert_eq!(both_count, 1);
+        assert_eq!(both_applied.len(), 1);
+        assert!((both_applied[0] - 0.9).abs() < 1e-6);
     }
 }

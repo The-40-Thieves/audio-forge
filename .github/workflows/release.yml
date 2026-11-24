@@ -18,6 +18,10 @@ env:
     libasound2-dev libgl-dev libjack-dev libx11-xcb-dev libxcb1-dev libxcb-dri2-0-dev
     libxcb-icccm4-dev libxcursor-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: build (${{ matrix.os }})
@@ -68,7 +72,7 @@ jobs:
           mkdir -p "dist/$out/plugins" "dist/$out/bin" "dist/$out/jsfx" "dist/$out/python-worker"
           cp -R target/bundled/*.vst3 target/bundled/*.clap "dist/$out/plugins/"
           cp reaper-jsfx/*.jsfx "dist/$out/jsfx/"
-          cp python-worker/forge_gpu_worker.py python-worker/pyproject.toml "dist/$out/python-worker/"
+          cp python-worker/forge_gpu_worker.py python-worker/pyproject.toml python-worker/uv.lock "dist/$out/python-worker/"
           cp LICENSE README.md "dist/$out/"
           if [ -f NOTICE ]; then cp NOTICE "dist/$out/"; fi
           for bin in forge forge-mcp forge-daw; do

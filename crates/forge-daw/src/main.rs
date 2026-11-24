@@ -316,9 +316,7 @@ impl ForgeDawApp {
 
     fn toggle_record(&mut self) {
         if let Some(rec) = self.recorder.take() {
-            let tr_idx = rec
-                .track_idx()
-                .min(self.project.tracks.len().saturating_sub(1));
+            let rec_track_idx = rec.track_idx();
             let start_pos = rec.start_timeline_samples();
             let id = self.project.alloc_id();
             let media_dir = self.project_media_dir();
@@ -326,6 +324,10 @@ impl ForgeDawApp {
             match rec.stop_and_save(&out_wav, self.project.sample_rate) {
                 Ok(buf) => {
                     let prev = self.project.clone();
+                    if self.project.tracks.is_empty() {
+                        self.project.add_track("Recorded Track");
+                    }
+                    let tr_idx = rec_track_idx.min(self.project.tracks.len().saturating_sub(1));
                     let len = buf.num_frames() as u64;
                     self.cache.insert_memory_clip(out_wav.clone(), buf);
                     let mut obj = AudioObject::new(id, format!("Take {id}"), out_wav, len);
@@ -347,6 +349,10 @@ impl ForgeDawApp {
                 eng.set_playing(false);
             }
         } else {
+            if self.project.tracks.is_empty() {
+                self.status_line = "No tracks available for recording".to_string();
+                return;
+            }
             let armed_idx = self
                 .project
                 .tracks
@@ -419,37 +425,44 @@ impl ForgeDawApp {
                 self.stem_split_rx = None;
                 let prev = self.project.clone();
                 let target_sr = self.project.sample_rate;
-                let roles: [(&str, &Option<PathBuf>); 6] = [
-                    ("Vocals", &report.bundle.vocals),
-                    ("Drums", &report.bundle.drums),
-                    ("Bass", &report.bundle.bass),
-                    ("Guitar", &report.bundle.guitar),
-                    ("Keys", &report.bundle.keys),
-                    ("Other", &report.bundle.other),
-                ];
                 let mut added = 0_usize;
-                for (label, maybe_path) in roles {
-                    if let Some(stem_path) = maybe_path
-                        && let Ok(buf) = self.cache.load_clip_for_rate(stem_path, target_sr)
-                    {
-                        let len = buf.num_frames() as u64;
-                        let tr_idx = self.project.tracks.len();
-                        self.project.add_track(format!("Stem: {label}"));
-                        let id = self.project.alloc_id();
-                        let mut obj = AudioObject::new(id, label, stem_path.clone(), len);
-                        obj.timeline_start_samples = start_pos;
-                        self.project.tracks[tr_idx].objects.push(obj);
-                        added += 1;
+                let mut failed = 0_usize;
+                for (label, maybe_path) in report.bundle.audio_stems() {
+                    if let Some(stem_path) = maybe_path {
+                        match self.cache.load_clip_for_rate(stem_path, target_sr) {
+                            Ok(buf) => {
+                                let len = buf.num_frames() as u64;
+                                let tr_idx = self.project.tracks.len();
+                                self.project.add_track(format!("Stem: {label}"));
+                                let id = self.project.alloc_id();
+                                let mut obj = AudioObject::new(id, label, stem_path.clone(), len);
+                                obj.timeline_start_samples = start_pos;
+                                self.project.tracks[tr_idx].objects.push(obj);
+                                added += 1;
+                            }
+                            Err(_) => {
+                                failed += 1;
+                            }
+                        }
                     }
                 }
                 if added > 0 {
                     self.commit_project_change(prev);
                 }
-                self.status_line = format!(
-                    "Stem split complete ({}, {} stems imported)",
-                    report.backend.as_str(),
-                    added
-                );
+                self.status_line = if failed > 0 {
+                    format!(
+                        "Stem split complete ({}, {} stems imported, {} failed to load)",
+                        report.backend.as_str(),
+                        added,
+                        failed
+                    )
+                } else {
+                    format!(
+                        "Stem split complete ({}, {} stems imported)",
+                        report.backend.as_str(),
+                        added
+                    )
+                };
             }
             Ok(Err(err)) => {
                 self.stem_split_rx = None;
@@ -458,6 +471,7 @@ impl ForgeDawApp {
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.stem_split_rx = None;
+                self.status_line = "Stem split worker terminated unexpectedly".to_string();
             }
         }
     }
@@ -656,7 +670,7 @@ impl ForgeDawApp {
                         .add(
                             egui::DragValue::new(&mut start_s)
                                 .speed(0.1)
-                                .range(0.0..=3600.0)
+                                .range(0.0..=3599.75)
                                 .suffix("s"),
                         )
                         .changed();
@@ -1256,10 +1270,17 @@ impl ForgeDawApp {
                                             }
                                         }
                                         DragMode::TrimLeft => {
-                                            let max_shift =
-                                                obj.length_samples.saturating_sub(256) as i64;
-                                            let min_shift = -(obj.source_offset_samples as i64)
-                                                .min(obj.timeline_start_samples as i64);
+                                            let max_shift = obj
+                                                .length_samples
+                                                .saturating_sub(256)
+                                                .min(i64::MAX as u64)
+                                                as i64;
+                                            let min_lim = obj
+                                                .source_offset_samples
+                                                .min(obj.timeline_start_samples)
+                                                .min(i64::MAX as u64)
+                                                as i64;
+                                            let min_shift = (-min_lim).min(max_shift);
                                             let shift = delta_smp.clamp(min_shift, max_shift);
                                             if shift >= 0 {
                                                 let s = shift as u64;
@@ -1550,6 +1571,8 @@ impl eframe::App for ForgeDawApp {
 
         if self.audio.as_ref().is_some_and(LiveAudioEngine::is_playing) || self.recorder.is_some() {
             ctx.request_repaint();
+        } else if self.stem_split_rx.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 }

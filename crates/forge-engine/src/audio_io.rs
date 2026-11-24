@@ -714,7 +714,13 @@ impl LiveRecorder {
         let (l, r) = self
             .collector
             .take()
-            .and_then(|h| h.join().ok())
+            .map(|h| {
+                h.join().map_err(|_| ForgeError::AudioIo {
+                    path: output_wav.display().to_string(),
+                    message: "Recording collector thread panicked".to_string(),
+                })
+            })
+            .transpose()?
             .unwrap_or_default();
         if l.is_empty() {
             return Err(ForgeError::AudioIo {
@@ -724,7 +730,9 @@ impl LiveRecorder {
         }
         let raw = AudioBuffer::from_channels(vec![l, r], self.input_sr)?;
         let converted = resample_buffer_linear(&raw, target_sr)?;
-        if let Some(parent) = output_wav.parent() {
+        if let Some(parent) = output_wav.parent()
+            && !parent.as_os_str().is_empty()
+        {
             std::fs::create_dir_all(parent)?;
         }
         converted.save_wav(output_wav, 24)?;

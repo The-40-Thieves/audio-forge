@@ -1409,42 +1409,30 @@ fn tool_daw_bounce(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, Fo
     let stems_dir = optional_path_arg(args, "stems_dir", sandbox)?;
 
     let (proj, cache, _) = load_sandboxed_daw_project(&project_path, sandbox, true)?;
-    let tail_frames = (proj.sample_rate as usize).saturating_mul(2);
-    let total = (proj.total_length_samples() as usize).saturating_add(tail_frames);
+    let base_frames = usize::try_from(proj.total_length_samples()).map_err(|_| {
+        ForgeError::InvalidParameter("Project duration overflows platform pointer width".into())
+    })?;
+    let tail_frames = forge_engine::ObjectOrientedEngine::compute_reverb_tail_frames(&proj);
+    let total = base_frames.saturating_add(tail_frames);
     let master_buf = forge_engine::ObjectOrientedEngine::bounce_offline(&proj, &cache, total)?;
     sandbox.save_wav(&master_buf, &output_path, 24)?;
     let report = audit_audio(&master_buf);
 
-    let mut stems_exported = 0_usize;
-    if let Some(dir) = stems_dir {
+    let stems_exported = if let Some(dir) = stems_dir {
         sandbox.create_dir_all(&dir)?;
-        for (ti, tr) in proj.tracks.iter().enumerate() {
-            if tr.mute || (tr.objects.is_empty() && tr.midi_clips.is_empty()) {
-                continue;
-            }
-            let mut stem_proj = proj.clone();
-            for (j, t) in stem_proj.tracks.iter_mut().enumerate() {
-                t.solo = j == ti;
-                t.mute = j != ti;
-            }
-            let safe_name: String = tr
-                .name
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect();
-            let stem_path = sandbox.check(&dir.join(format!("{:02}_{safe_name}.wav", ti + 1)))?;
-            let stem_buf =
-                forge_engine::ObjectOrientedEngine::bounce_offline(&stem_proj, &cache, total)?;
-            sandbox.save_wav(&stem_buf, &stem_path, 24)?;
-            stems_exported += 1;
-        }
-    }
+        forge_engine::ObjectOrientedEngine::bounce_stems_with(
+            &proj,
+            &cache,
+            |ti, safe_name, stem_buf| {
+                let stem_path =
+                    sandbox.check(&dir.join(format!("{:02}_{safe_name}.wav", ti + 1)))?;
+                sandbox.save_wav(stem_buf, &stem_path, 24)?;
+                Ok(())
+            },
+        )?
+    } else {
+        0
+    };
     let payload = json!({
         "output": output_path.display().to_string(),
         "integrated_lufs": report.integrated_lufs,

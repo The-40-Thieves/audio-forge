@@ -18,14 +18,29 @@ const STEM_KEYS: [&str; 6] = ["vocals", "drums", "bass", "guitar", "keys", "othe
 const MAX_COLAB_UPLOAD_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_COLAB_RESPONSE_BYTES: u64 = 512 * 1024 * 1024;
 
-fn validate_colab_url(base_url: &str) -> Result<()> {
+fn validate_colab_url(base_url: &str) -> Result<reqwest::Url> {
     let trimmed = base_url.trim();
-    if trimmed.starts_with("https://")
-        || trimmed.starts_with("http://localhost")
-        || trimmed.starts_with("http://127.0.0.1")
-        || trimmed.starts_with("http://[::1]")
-    {
-        return Ok(());
+    let url = reqwest::Url::parse(trimmed).map_err(|e| {
+        ForgeError::WorkerError(format!(
+            "FORGE_COLAB_WORKER_URL is not a valid URL ('{trimmed}'): {e}"
+        ))
+    })?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ForgeError::WorkerError(
+            "FORGE_COLAB_WORKER_URL must not embed userinfo credentials".to_string(),
+        ));
+    }
+    let loopback = matches!(url.host_str(), Some("localhost"))
+        || url
+            .host_str()
+            .and_then(|h| {
+                h.trim_matches(|c| c == '[' || c == ']')
+                    .parse::<std::net::IpAddr>()
+                    .ok()
+            })
+            .is_some_and(|ip| ip.is_loopback());
+    if url.scheme() == "https" || (url.scheme() == "http" && loopback) {
+        return Ok(url);
     }
     Err(ForgeError::WorkerError(format!(
         "FORGE_COLAB_WORKER_URL must use https:// (or localhost http:// for local testing), got '{trimmed}'"
@@ -85,6 +100,7 @@ async fn post_json(url: &str, body: &Value, timeout: Duration) -> Result<Value> 
     let client = reqwest::Client::builder()
         .timeout(timeout)
         .connect_timeout(timeout.min(Duration::from_secs(30)))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| ForgeError::WorkerError(format!("HTTP client init failed: {e}")))?;
     let mut req = client.post(url).json(body);
@@ -94,7 +110,7 @@ async fn post_json(url: &str, body: &Value, timeout: Duration) -> Result<Value> 
             req = req.bearer_auth(t);
         }
     }
-    let resp = req.send().await.map_err(|e| {
+    let mut resp = req.send().await.map_err(|e| {
         let kind = if e.is_timeout() {
             "timed out"
         } else {
@@ -110,16 +126,25 @@ async fn post_json(url: &str, body: &Value, timeout: Duration) -> Result<Value> 
             "Colab response ({len} bytes) exceeds safety limit ({MAX_COLAB_RESPONSE_BYTES} bytes)"
         )));
     }
-    let text = resp.text().await.map_err(|e| {
+    let mut raw = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
         ForgeError::WorkerError(format!("Colab response from {url} was cut off: {e}"))
-    })?;
+    })? {
+        if raw.len().saturating_add(chunk.len()) > MAX_COLAB_RESPONSE_BYTES as usize {
+            return Err(ForgeError::WorkerError(format!(
+                "Colab response exceeded safety limit ({MAX_COLAB_RESPONSE_BYTES} bytes)"
+            )));
+        }
+        raw.extend_from_slice(&chunk);
+    }
     if !status.is_success() {
+        let preview = String::from_utf8_lossy(&raw);
         return Err(ForgeError::WorkerError(format!(
             "Colab worker returned HTTP {status}: {}",
-            text.chars().take(400).collect::<String>()
+            preview.chars().take(400).collect::<String>()
         )));
     }
-    serde_json::from_str(&text)
+    serde_json::from_slice(&raw)
         .map_err(|e| ForgeError::WorkerError(format!("Colab worker sent invalid JSON: {e}")))
 }
 
@@ -157,4 +182,37 @@ fn write_stems(reply: &Value, output_dir: &Path) -> Result<StemBundle> {
         other,
         ..StemBundle::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_colab_url_rejects_host_confusion_and_allows_https_or_loopback() {
+        for bad in [
+            "http://localhost.evil.com",
+            "http://127.0.0.1.nip.io",
+            "http://localhost@169.254.169.254",
+            "https://user:pass@example.com",
+            "http://example.com",
+            "ftp://example.com",
+        ] {
+            assert!(
+                validate_colab_url(bad).is_err(),
+                "must reject unsafe URL '{bad}'"
+            );
+        }
+        for good in [
+            "https://abc123.ngrok-free.app",
+            "http://localhost:8000",
+            "http://127.0.0.1:8000/",
+            "http://[::1]:8000",
+        ] {
+            assert!(
+                validate_colab_url(good).is_ok(),
+                "must allow valid URL '{good}'"
+            );
+        }
+    }
 }

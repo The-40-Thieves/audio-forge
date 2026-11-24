@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use forge_core::{AudioBuffer, AuditReport, Result};
+use forge_core::{AudioBuffer, AuditReport, ForgeError, Result};
 use forge_dsp::{
     Biquad, ParamSmoother, RealtimeSpectrumAnalyzer32, audit_audio, flush_denormal_f64,
 };
@@ -200,7 +200,12 @@ impl EngineMeters {
 /// Resamples `buf` to `target_sr` using linear interpolation (used when importing clips whose
 /// sample rate differs from the project rate).
 pub fn resample_buffer_linear(buf: &AudioBuffer, target_sr: u32) -> Result<AudioBuffer> {
-    if buf.sample_rate == target_sr || buf.num_frames() == 0 || target_sr == 0 {
+    if buf.sample_rate == 0 || target_sr == 0 {
+        return Err(ForgeError::InvalidParameter(
+            "Sample rate must be greater than 0 Hz".to_string(),
+        ));
+    }
+    if buf.sample_rate == target_sr || buf.num_frames() == 0 {
         return Ok(buf.clone());
     }
     let src_len = buf.num_frames();
@@ -1007,6 +1012,12 @@ impl ObjectOrientedEngine {
         cache: &ClipCache,
         total_frames: usize,
     ) -> Result<AudioBuffer> {
+        if total_frames > crate::project::MAX_BOUNCE_FRAMES {
+            return Err(ForgeError::InvalidParameter(format!(
+                "Bounce frame count ({total_frames}) exceeds safety limit ({})",
+                crate::project::MAX_BOUNCE_FRAMES
+            )));
+        }
         let mut engine = Self::compile(project, cache);
         engine.loop_enabled = false;
         let pdc = engine.total_pdc_samples();
@@ -1034,7 +1045,7 @@ impl ObjectOrientedEngine {
         AudioBuffer::from_channels(vec![ch_l, ch_r], project.sample_rate)
     }
 
-    fn compute_reverb_tail_frames(project: &DawProject) -> usize {
+    pub fn compute_reverb_tail_frames(project: &DawProject) -> usize {
         let mut tail_secs = 0.0_f32;
         let inspect_fx = |fx: &crate::project::FxSlotConfig, acc: &mut f32| {
             if !fx.is_bypassed()
@@ -1042,7 +1053,7 @@ impl ObjectOrientedEngine {
                     decay_rt60_secs, ..
                 } = fx
             {
-                *acc = acc.max((*decay_rt60_secs * 1.5).clamp(0.5, 8.0));
+                *acc = acc.max((*decay_rt60_secs * 1.5).clamp(0.5, 20.0));
             }
         };
         for fx in &project.master_inserts {
@@ -1095,10 +1106,60 @@ impl ObjectOrientedEngine {
         output_wav: &Path,
     ) -> Result<AuditReport> {
         let tail_frames = Self::compute_reverb_tail_frames(project);
-        let total = (project.total_length_samples() as usize).saturating_add(tail_frames);
+        let base_frames = usize::try_from(project.total_length_samples()).map_err(|_| {
+            ForgeError::InvalidParameter("Project timeline length overflows usize".to_string())
+        })?;
+        let total = base_frames.saturating_add(tail_frames);
         let buf = Self::bounce_offline(project, cache, total)?;
         buf.save_wav(output_wav, 24)?;
         Ok(audit_audio(&buf))
+    }
+
+    /// Renders every unmuted track as a soloed, PDC-aligned stereo [`AudioBuffer`] with FX tail
+    /// preservation and invokes `on_stem(track_index, sanitized_track_name, &buffer)`.
+    pub fn bounce_stems_with<F>(
+        project: &DawProject,
+        cache: &ClipCache,
+        mut on_stem: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(usize, &str, &AudioBuffer) -> Result<()>,
+    {
+        let mut count = 0_usize;
+        for (ti, tr) in project.tracks.iter().enumerate() {
+            if tr.mute || (tr.objects.is_empty() && tr.midi_clips.is_empty()) {
+                continue;
+            }
+            let mut stem_proj = project.clone();
+            for (j, t) in stem_proj.tracks.iter_mut().enumerate() {
+                t.solo = j == ti;
+                t.mute = j != ti;
+            }
+            let tail_frames = Self::compute_reverb_tail_frames(&stem_proj);
+            let base_frames = usize::try_from(stem_proj.total_length_samples()).map_err(|_| {
+                ForgeError::InvalidParameter("Project timeline length overflows usize".to_string())
+            })?;
+            let total = base_frames.saturating_add(tail_frames);
+            let mut safe_name: String = tr
+                .name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .take(64)
+                .collect();
+            if safe_name.trim_matches('_').is_empty() {
+                safe_name = "track".to_string();
+            }
+            let buf = Self::bounce_offline(&stem_proj, cache, total)?;
+            on_stem(ti, &safe_name, &buf)?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Samplitude-style **Batch Multi-Track Stem Export**: renders every unmuted track as its own
@@ -1111,35 +1172,12 @@ impl ObjectOrientedEngine {
     ) -> Result<Vec<PathBuf>> {
         std::fs::create_dir_all(output_dir)?;
         let mut written = Vec::new();
-
-        for (ti, tr) in project.tracks.iter().enumerate() {
-            if tr.mute || (tr.objects.is_empty() && tr.midi_clips.is_empty()) {
-                continue;
-            }
-            let mut stem_proj = project.clone();
-            for (j, t) in stem_proj.tracks.iter_mut().enumerate() {
-                t.solo = j == ti;
-                t.mute = j != ti;
-            }
-            let tail_frames = Self::compute_reverb_tail_frames(&stem_proj);
-            let total = (stem_proj.total_length_samples() as usize).saturating_add(tail_frames);
-            let safe_name: String = tr
-                .name
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect();
+        Self::bounce_stems_with(project, cache, |ti, safe_name, buf| {
             let stem_path = output_dir.join(format!("{:02}_{safe_name}.wav", ti + 1));
-            let buf = Self::bounce_offline(&stem_proj, cache, total)?;
             buf.save_wav(&stem_path, 24)?;
             written.push(stem_path);
-        }
-
+            Ok(())
+        })?;
         Ok(written)
     }
 }
