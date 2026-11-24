@@ -3,7 +3,7 @@ title: "audio-forge"
 description: "An audio delivery pipeline AI agents can drive."
 ---
 
-Documentation for audio-forge, published from [`docs`](https://github.com/The-40-Thieves/audio-forge/tree/66f549f7fad10f985fc78a44a9ee0655d60af178/docs) in The-40-Thieves/audio-forge.
+Documentation for audio-forge, published from [`docs`](https://github.com/The-40-Thieves/audio-forge/tree/57147139215b6350aebf7477c8802002a8036a91/docs) in The-40-Thieves/audio-forge.
 
 ## Guides
 

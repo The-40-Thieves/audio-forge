@@ -1,6 +1,9 @@
 ---
 title: "Code Review — 2026-10-25"
 ---
+> [!NOTE]
+> Historical point-in-time snapshot captured at commit `c2f7cb6` on branch `chore/update-stack`. Many security, reliability, DSP, and CI findings documented here have since been resolved in subsequent PRs on `main`; inspect current source files before treating any item below as still open.
+
 Reviewed at commit `c2f7cb6` (branch `chore/update-stack`). No code was changed as part of this review.
 
 ## Method

@@ -203,7 +203,7 @@ flowchart TD
 ---
 
 ### 2.8 `forge-cli` & `forge-mcp` — Unified CLI Binary & JSON-RPC 2.0 MCP Agent Server
-- **`crates/forge-cli/src/main.rs` (`forge` binary):** Exposes 9 subcommands (`audit`, `restore`, `unmask`, `phase-align`, `vocal`, `theory`, `master`, `ingest`, `samples`) via `clap` derive macros.
+- **`crates/forge-cli/src/main.rs` (`forge` binary):** Exposes 16 top-level subcommands (`audit`, `restore`, `unmask`, `phase-align`, `vocal`, `theory`, `deliver`, `master`, `ingest`, `reaper`, `sample-index`, `lyria`, `denoise`, `transcribe`, `separate`, `daw`) via `clap` derive macros.
 - **`crates/forge-mcp/src/main.rs` (`forge-mcp` binary):** Implements the Model Context Protocol (`protocolVersion: "2024-11-05"`) over `stdin`/`stdout` JSON-RPC 2.0, exposing 14 structured tools (`forge_deliver`, `forge_audit_audio`, `forge_restore_and_defizz`, `forge_spectral_unmask`, `forge_phase_align`, `forge_vocal_suite`, `forge_music_theory_midi`, `forge_master_distrokid`, `forge_ingest_to_reaper`, `forge_neural_denoise`, `forge_transcribe_midi`, `forge_separate_stems`, `forge_daw_inspect`, `forge_daw_bounce`) to Claude Code, Antigravity, Cursor, or custom studio agents.
 
 ---
@@ -340,13 +340,14 @@ Add the following entry to your MCP configuration (`mcp_config.json` or `.mcp.js
 {
   "mcpServers": {
     "forge-audio": {
-      "command": "C:/Users/misla/.gemini/antigravity/scratch/audio-forge/target/release/forge-mcp.exe",
+      "command": "/path/to/audio-forge/target/release/forge-mcp",
       "args": [],
-      "env": { "FORGE_MCP_ROOT": "E:/Music" }
+      "env": { "FORGE_MCP_ROOT": "/path/to/your/audio/workspace" }
     }
   }
 }
 ```
+(On Windows, point `"command"` to `<repo>\target\release\forge-mcp.exe` and `"FORGE_MCP_ROOT"` to your project folder, e.g. `E:/Music`.)
 `FORGE_MCP_ROOT` lists the directories the server may read and write (separated like `PATH`). If it is unset, the server's launch directory is used. Any tool path that resolves outside these roots, or contains `..`, is rejected before any file I/O.
 
 **MCP file-access security.** The path check runs when a request arrives; the I/O itself is anchored so a later swap cannot redirect it. At startup the server opens each root once as a `cap-std` directory handle (`crates/forge-mcp/src/sandbox.rs`). Every read, write, `mkdir` and remove then goes through that handle by root-relative path (`crates/forge-mcp/src/anchored.rs`), and `cap-std` refuses `..` and any symlink that leads out of the root. A directory or file that a local process swaps for an escaping symlink after the check therefore fails to open instead of being followed. `forge-mcp` opens the files itself and passes the handles to the reader/writer APIs of the library crates (`AudioBuffer::load_from_reader` / `save_wav_to_writer`, `write_midi_to_writer`, `ReaperProjectBuilder::write_rpp`). Non-WAV input is decoded by FFmpeg from a private copy of the opened file, never from the client path.
@@ -355,8 +356,8 @@ External steps that invoke path-based tools — ISRC tagging in `forge_master_di
 
 ### Step 5: Optional GPU Sidecar Setup (`Mel-Band-RoFormer` / `YuE2-3B`)
 ```bash
-cd python-worker
-uv venv
-uv pip install -r pyproject.toml
+uv sync --project python-worker --extra gpu
 ```
-Or open `notebooks/ForgeAudio_Colab_A100_Worker.ipynb` in Google Colab (A100/L4) for cloud-accelerated vocal/instrumental separation. Both GPU paths return two stems; the Rust DSP splitter returns four (`Vocals`, `Drums`, `Bass`, `Other`).
+(Or use `--extra cpu` for CPU-only ONNX execution, and use `uv run --with deepfilternet ...` when running DeepFilterNet3 in isolation due to its `numpy<2` pin.)
+
+Or open `notebooks/ForgeAudio_Colab_A100_Worker.ipynb` in Google Colab (A100/L4) for cloud-accelerated separation (`FORGE_COLAB_WORKER_URL` + `FORGE_COLAB_API_TOKEN`). Depending on flags (`--stems`, `--quality`, `--drum-sep`, `--split-lead-backing`, `--split-male-female`, `--split-guitar`, `--split-orchestral`, `--split-crowd`, `--all-stems`), the neural worker populates up to **23 audio stem slots** (`StemBundle`), while the offline Rust DSP splitter returns four (`Vocals`, `Drums`, `Bass`, `Other`).
