@@ -304,6 +304,19 @@ pub struct ObjectOrientedEngine {
     meters: EngineMeters,
 }
 
+fn compile_fx_chain(slots: &[crate::project::FxSlotConfig], sr: f64) -> (Vec<FxProcessor>, usize) {
+    let procs: Vec<FxProcessor> = slots
+        .iter()
+        .map(|c| FxProcessor::from_config(c, sr))
+        .collect();
+    let latency: usize = procs
+        .iter()
+        .zip(slots)
+        .map(|(p, c)| p.latency_samples(c))
+        .sum();
+    (procs, latency)
+}
+
 impl ObjectOrientedEngine {
     /// Compiles `project` into an executable real-time audio graph (runs off-audio-thread).
     pub fn compile(project: &DawProject, cache: &ClipCache) -> Self {
@@ -316,16 +329,7 @@ impl ObjectOrientedEngine {
             let mut max_obj_latency = 0_usize;
 
             for obj in &track.objects {
-                let fx: Vec<FxProcessor> = obj
-                    .fx_chain
-                    .iter()
-                    .map(|c| FxProcessor::from_config(c, sr))
-                    .collect();
-                let fx_latency: usize = fx
-                    .iter()
-                    .zip(&obj.fx_chain)
-                    .map(|(p, c)| p.latency_samples(c))
-                    .sum();
+                let (fx, fx_latency) = compile_fx_chain(&obj.fx_chain, sr);
                 max_obj_latency = max_obj_latency.max(fx_latency);
                 obj_runtimes.push(ObjectRuntime {
                     config: obj.clone(),
@@ -343,16 +347,7 @@ impl ObjectOrientedEngine {
                 obj_rt.pdc = PdcDelayLine::new(pad);
             }
 
-            let inserts: Vec<FxProcessor> = track
-                .inserts
-                .iter()
-                .map(|c| FxProcessor::from_config(c, sr))
-                .collect();
-            let track_fx_lat: usize = inserts
-                .iter()
-                .zip(&track.inserts)
-                .map(|(p, c)| p.latency_samples(c))
-                .sum();
+            let (inserts, track_fx_lat) = compile_fx_chain(&track.inserts, sr);
             let total_latency = max_obj_latency + track_fx_lat;
             max_track_latency = max_track_latency.max(total_latency);
 
@@ -385,16 +380,7 @@ impl ObjectOrientedEngine {
         let mut aux_buses = Vec::with_capacity(project.aux_buses.len());
         let mut max_aux_latency = 0_usize;
         for bus in &project.aux_buses {
-            let inserts: Vec<FxProcessor> = bus
-                .inserts
-                .iter()
-                .map(|c| FxProcessor::from_config(c, sr))
-                .collect();
-            let fx_latency: usize = inserts
-                .iter()
-                .zip(&bus.inserts)
-                .map(|(p, c)| p.latency_samples(c))
-                .sum();
+            let (inserts, fx_latency) = compile_fx_chain(&bus.inserts, sr);
             max_aux_latency = max_aux_latency.max(fx_latency);
             aux_buses.push(AuxBusRuntime {
                 config: bus.clone(),
@@ -411,16 +397,7 @@ impl ObjectOrientedEngine {
         }
         let main_bus_pdc = PdcDelayLine::new(max_aux_latency);
 
-        let master_inserts: Vec<FxProcessor> = project
-            .master_inserts
-            .iter()
-            .map(|c| FxProcessor::from_config(c, sr))
-            .collect();
-        let master_lat: usize = master_inserts
-            .iter()
-            .zip(&project.master_inserts)
-            .map(|(p, c)| p.latency_samples(c))
-            .sum();
+        let (master_inserts, master_lat) = compile_fx_chain(&project.master_inserts, sr);
         let total_pdc_samples = max_track_latency + max_aux_latency + master_lat;
 
         let track_peaks_db = vec![-90.0; tracks.len()];
@@ -499,62 +476,50 @@ impl ObjectOrientedEngine {
         )
     }
 
+    fn fx_chain_latency_changed(
+        prev: &[crate::project::FxSlotConfig],
+        next: &[crate::project::FxSlotConfig],
+    ) -> bool {
+        prev.len() != next.len()
+            || prev
+                .iter()
+                .zip(next.iter())
+                .any(|(a, b)| Self::fx_latency_changed(a, b))
+    }
+
     /// Checks off-audio-thread whether `next` has the exact same track, object, aux, and FX-latency
     /// topology as `prev` so it can be applied via [`Self::sync_mix_params_swap`] without recompiling.
     pub fn topology_compatible(prev: &DawProject, next: &DawProject) -> bool {
         if prev.sample_rate != next.sample_rate
             || prev.tracks.len() != next.tracks.len()
             || prev.aux_buses.len() != next.aux_buses.len()
-            || prev.master_inserts.len() != next.master_inserts.len()
         {
             return false;
         }
-        for (a, b) in prev.aux_buses.iter().zip(next.aux_buses.iter()) {
-            if a.id != b.id || a.inserts.len() != b.inserts.len() {
-                return false;
-            }
-            if a.inserts
-                .iter()
-                .zip(b.inserts.iter())
-                .any(|(x, y)| Self::fx_latency_changed(x, y))
-            {
-                return false;
-            }
-        }
         if prev
-            .master_inserts
+            .aux_buses
             .iter()
-            .zip(next.master_inserts.iter())
-            .any(|(x, y)| Self::fx_latency_changed(x, y))
+            .zip(next.aux_buses.iter())
+            .any(|(a, b)| a.id != b.id || Self::fx_chain_latency_changed(&a.inserts, &b.inserts))
         {
+            return false;
+        }
+        if Self::fx_chain_latency_changed(&prev.master_inserts, &next.master_inserts) {
             return false;
         }
         for (a, b) in prev.tracks.iter().zip(next.tracks.iter()) {
             if a.id != b.id
                 || a.objects.len() != b.objects.len()
-                || a.inserts.len() != b.inserts.len()
+                || Self::fx_chain_latency_changed(&a.inserts, &b.inserts)
             {
                 return false;
             }
-            if a.inserts
-                .iter()
-                .zip(b.inserts.iter())
-                .any(|(x, y)| Self::fx_latency_changed(x, y))
-            {
-                return false;
-            }
-            for (oa, ob) in a.objects.iter().zip(b.objects.iter()) {
-                if oa.id != ob.id
+            if a.objects.iter().zip(b.objects.iter()).any(|(oa, ob)| {
+                oa.id != ob.id
                     || oa.source_path != ob.source_path
-                    || oa.fx_chain.len() != ob.fx_chain.len()
-                    || oa
-                        .fx_chain
-                        .iter()
-                        .zip(ob.fx_chain.iter())
-                        .any(|(x, y)| Self::fx_latency_changed(x, y))
-                {
-                    return false;
-                }
+                    || Self::fx_chain_latency_changed(&oa.fx_chain, &ob.fx_chain)
+            }) {
+                return false;
             }
         }
         true
@@ -577,34 +542,19 @@ impl ObjectOrientedEngine {
         for (bus_rt, bus_cfg) in self.aux_buses.iter().zip(project.aux_buses.iter()) {
             if bus_rt.config.id != bus_cfg.id
                 || bus_rt.inserts.len() != bus_cfg.inserts.len()
-                || bus_rt
-                    .config
-                    .inserts
-                    .iter()
-                    .zip(bus_cfg.inserts.iter())
-                    .any(|(a, b)| Self::fx_latency_changed(a, b))
+                || Self::fx_chain_latency_changed(&bus_rt.config.inserts, &bus_cfg.inserts)
             {
                 return false;
             }
         }
-        if self
-            .master_insert_cfgs
-            .iter()
-            .zip(project.master_inserts.iter())
-            .any(|(a, b)| Self::fx_latency_changed(a, b))
-        {
+        if Self::fx_chain_latency_changed(&self.master_insert_cfgs, &project.master_inserts) {
             return false;
         }
         for (tr_rt, tr_cfg) in self.tracks.iter().zip(project.tracks.iter()) {
             if tr_rt.config.id != tr_cfg.id
                 || tr_rt.objects.len() != tr_cfg.objects.len()
                 || tr_rt.inserts.len() != tr_cfg.inserts.len()
-                || tr_rt
-                    .config
-                    .inserts
-                    .iter()
-                    .zip(tr_cfg.inserts.iter())
-                    .any(|(a, b)| Self::fx_latency_changed(a, b))
+                || Self::fx_chain_latency_changed(&tr_rt.config.inserts, &tr_cfg.inserts)
             {
                 return false;
             }
@@ -612,12 +562,7 @@ impl ObjectOrientedEngine {
                 if obj_rt.config.id != obj_cfg.id
                     || obj_rt.config.source_path != obj_cfg.source_path
                     || obj_rt.fx.len() != obj_cfg.fx_chain.len()
-                    || obj_rt
-                        .config
-                        .fx_chain
-                        .iter()
-                        .zip(obj_cfg.fx_chain.iter())
-                        .any(|(a, b)| Self::fx_latency_changed(a, b))
+                    || Self::fx_chain_latency_changed(&obj_rt.config.fx_chain, &obj_cfg.fx_chain)
                 {
                     return false;
                 }

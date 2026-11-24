@@ -694,46 +694,41 @@ def main() -> int:
         choices=["fast", "studio", "ultra"],
         help="Separation quality tier: fast (1-pass), studio (BS-RoFormer 1297 cascade), ultra (dual-RoFormer ensemble)",
     )
-    sep_p.add_argument(
-        "--drum-sep",
-        action="store_true",
-        help="Also split isolated drums into Kick, Snare, Toms, Hi-Hat, and Cymbals (MDX23C DrumSep)",
-    )
-    sep_p.add_argument(
-        "--split-lead-backing",
-        action="store_true",
-        help="Also split isolated vocals into Lead Vocals and Backing Vocals / Harmonies (RoFormer Karaoke)",
-    )
-    sep_p.add_argument(
-        "--split-male-female",
-        action="store_true",
-        help="Also split isolated vocals into Male and Female vocal stems (Mel-Band-RoFormer)",
-    )
-    sep_p.add_argument(
-        "--split-guitar",
-        action="store_true",
-        help="Also split isolated guitar into Electric Guitar and Acoustic Guitar",
-    )
-    sep_p.add_argument(
-        "--split-orchestral",
-        action="store_true",
-        help="Also extract Strings, Brass, Woodwinds, and Synth from residual Other stem",
-    )
-    sep_p.add_argument(
-        "--split-crowd",
-        action="store_true",
-        help="Also extract live Crowd / Audience / Room Noise from residual Other stem",
-    )
-    sep_p.add_argument(
-        "--all-stems",
-        action="store_true",
-        help="Enable full 23-slot hierarchical pro cascade (6-stem + DrumSep + Karaoke + Male/Female + Guitar + Orchestral/Synth + Crowd)",
-    )
-    sep_p.add_argument(
-        "--restore",
-        action="store_true",
-        help="Run optional Apollo / spectral bandwidth restoration post-pass on separated stems",
-    )
+    for flag, help_text in (
+        (
+            "--drum-sep",
+            "Also split isolated drums into Kick, Snare, Toms, Hi-Hat, and Cymbals (MDX23C DrumSep)",
+        ),
+        (
+            "--split-lead-backing",
+            "Also split isolated vocals into Lead Vocals and Backing Vocals / Harmonies (RoFormer Karaoke)",
+        ),
+        (
+            "--split-male-female",
+            "Also split isolated vocals into Male and Female vocal stems (Mel-Band-RoFormer)",
+        ),
+        (
+            "--split-guitar",
+            "Also split isolated guitar into Electric Guitar and Acoustic Guitar",
+        ),
+        (
+            "--split-orchestral",
+            "Also extract Strings, Brass, Woodwinds, and Synth from residual Other stem",
+        ),
+        (
+            "--split-crowd",
+            "Also extract live Crowd / Audience / Room Noise from residual Other stem",
+        ),
+        (
+            "--all-stems",
+            "Enable full 23-slot hierarchical pro cascade (6-stem + DrumSep + Karaoke + Male/Female + Guitar + Orchestral/Synth + Crowd)",
+        ),
+        (
+            "--restore",
+            "Run optional Apollo / spectral bandwidth restoration post-pass on separated stems",
+        ),
+    ):
+        sep_p.add_argument(flag, action="store_true", help=help_text)
 
     tr_p = sub.add_parser(
         "transcribe", help="Run polyphonic audio-to-MIDI transcription via basic-pitch"

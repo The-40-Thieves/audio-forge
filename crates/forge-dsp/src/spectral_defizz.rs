@@ -13,17 +13,17 @@ use serde::{Deserialize, Serialize};
 use crate::loudness_limiter::{sanitize_param_f64, sanitize_sample_f64};
 
 /// STFT frame length in samples.
-const FFT_SIZE: usize = 2048;
+pub(crate) const FFT_SIZE: usize = 2048;
 /// STFT hop between frames in samples (75% overlap for COLA reconstruction with Hann^2 window).
-const HOP: usize = 512;
+pub(crate) const HOP: usize = 512;
 /// Number of non-redundant positive-frequency bins.
-const HALF_BINS: usize = FFT_SIZE / 2 + 1;
+pub(crate) const HALF_BINS: usize = FFT_SIZE / 2 + 1;
 /// Attack time constant in seconds for spectral gain smoothing.
 const ATTACK_TAU_SECS: f64 = 0.010;
 /// Release time constant in seconds for spectral gain smoothing.
 const RELEASE_TAU_SECS: f64 = 0.055;
 /// Raised-cosine band transition width in octaves.
-const BAND_SKIRT_OCTAVES: f64 = 1.0 / 3.0;
+pub(crate) const BAND_SKIRT_OCTAVES: f64 = 1.0 / 3.0;
 
 /// Configuration for OpenSoothe Dynamic Spectral Resonance Suppression.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

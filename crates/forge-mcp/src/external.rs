@@ -109,6 +109,52 @@ fn tag_into(
     commit_staged(sandbox, &stage_out_dir, &staged_out, &out)
 }
 
+struct StagedWorkerIo {
+    _stage: tempfile::TempDir,
+    output_dir: PathBuf,
+    staged_in: PathBuf,
+    staged_out: PathBuf,
+}
+
+fn prepare_staged_io(
+    sandbox: &PathSandbox,
+    input: &Path,
+    output_dir: &Path,
+) -> Result<StagedWorkerIo, ForgeError> {
+    let output_dir = sandbox.check(output_dir)?;
+    sandbox.create_dir_all(&output_dir)?;
+    sandbox.verify_dir(&output_dir)?;
+
+    let stage = tempfile::tempdir()?;
+    let stage_in_dir = stage.path().join("in");
+    let staged_out = stage.path().join("out");
+    std::fs::create_dir_all(&stage_in_dir)?;
+    std::fs::create_dir_all(&staged_out)?;
+    let staged_in = stage_in(sandbox, input, &stage_in_dir)?;
+    Ok(StagedWorkerIo {
+        _stage: stage,
+        output_dir,
+        staged_in,
+        staged_out,
+    })
+}
+
+fn commit_staged_named(
+    sandbox: &PathSandbox,
+    io: &StagedWorkerIo,
+    produced: &Path,
+    label: &str,
+) -> Result<PathBuf, ForgeError> {
+    let file_name = produced.file_name().ok_or_else(|| {
+        ForgeError::InvalidParameter(format!(
+            "Staged {label} file '{}' has no file name",
+            produced.display()
+        ))
+    })?;
+    let dest = io.output_dir.join(file_name);
+    commit_staged(sandbox, &io.staged_out, produced, &dest)
+}
+
 /// Separates `input` into a private staging directory on the backend `config` selects, then
 /// copies every produced stem into `stems_dir` through `cap-std` root handles and rewrites
 /// the bundle paths to their sandboxed destinations.
@@ -118,19 +164,9 @@ pub fn separate_stems_checked(
     stems_dir: &Path,
     config: &SeparationConfig,
 ) -> Result<SeparationReport, ForgeError> {
-    let stems_dir = sandbox.check(stems_dir)?;
-    sandbox.create_dir_all(&stems_dir)?;
-    sandbox.verify_dir(&stems_dir)?;
-
-    let stage = tempfile::tempdir()?;
-    let stage_in_dir = stage.path().join("in");
-    let staged_out = stage.path().join("out");
-    std::fs::create_dir_all(&stage_in_dir)?;
-    std::fs::create_dir_all(&staged_out)?;
-    let staged_in = stage_in(sandbox, input, &stage_in_dir)?;
-
-    let mut report = separate_stems(&staged_in, &staged_out, config)?;
-    commit_bundle(sandbox, &staged_out, &stems_dir, &mut report.bundle)?;
+    let io = prepare_staged_io(sandbox, input, stems_dir)?;
+    let mut report = separate_stems(&io.staged_in, &io.staged_out, config)?;
+    commit_bundle(sandbox, &io.staged_out, &io.output_dir, &mut report.bundle)?;
     Ok(report)
 }
 
@@ -145,34 +181,17 @@ pub fn neural_denoise_checked(
     attenuation_limit_db: Option<f64>,
     timeout: Duration,
 ) -> Result<NeuralDenoiseResult, ForgeError> {
-    let output_dir = sandbox.check(output_dir)?;
-    sandbox.create_dir_all(&output_dir)?;
-    sandbox.verify_dir(&output_dir)?;
-
     let worker = resolve_default_local_worker()?;
-    let stage = tempfile::tempdir()?;
-    let stage_in_dir = stage.path().join("in");
-    let staged_out = stage.path().join("out");
-    std::fs::create_dir_all(&stage_in_dir)?;
-    std::fs::create_dir_all(&staged_out)?;
-    let staged_in = stage_in(sandbox, input, &stage_in_dir)?;
-
+    let io = prepare_staged_io(sandbox, input, output_dir)?;
     let mut res = run_local_neural_denoise(
         &worker,
-        &staged_in,
-        &staged_out,
+        &io.staged_in,
+        &io.staged_out,
         backend,
         attenuation_limit_db,
         timeout,
     )?;
-    let file_name = res.denoised.file_name().ok_or_else(|| {
-        ForgeError::InvalidParameter(format!(
-            "Staged denoised file '{}' has no file name",
-            res.denoised.display()
-        ))
-    })?;
-    let dest = output_dir.join(file_name);
-    res.denoised = commit_staged(sandbox, &staged_out, &res.denoised, &dest)?;
+    res.denoised = commit_staged_named(sandbox, &io, &res.denoised, "denoised")?;
     Ok(res)
 }
 
@@ -184,27 +203,10 @@ pub fn transcribe_midi_checked(
     output_dir: &Path,
     timeout: Duration,
 ) -> Result<MidiTranscribeResult, ForgeError> {
-    let output_dir = sandbox.check(output_dir)?;
-    sandbox.create_dir_all(&output_dir)?;
-    sandbox.verify_dir(&output_dir)?;
-
     let worker = resolve_default_local_worker()?;
-    let stage = tempfile::tempdir()?;
-    let stage_in_dir = stage.path().join("in");
-    let staged_out = stage.path().join("out");
-    std::fs::create_dir_all(&stage_in_dir)?;
-    std::fs::create_dir_all(&staged_out)?;
-    let staged_in = stage_in(sandbox, input, &stage_in_dir)?;
-
-    let mut res = run_local_transcribe_midi(&worker, &staged_in, &staged_out, timeout)?;
-    let file_name = res.midi.file_name().ok_or_else(|| {
-        ForgeError::InvalidParameter(format!(
-            "Staged MIDI file '{}' has no file name",
-            res.midi.display()
-        ))
-    })?;
-    let dest = output_dir.join(file_name);
-    res.midi = commit_staged(sandbox, &staged_out, &res.midi, &dest)?;
+    let io = prepare_staged_io(sandbox, input, output_dir)?;
+    let mut res = run_local_transcribe_midi(&worker, &io.staged_in, &io.staged_out, timeout)?;
+    res.midi = commit_staged_named(sandbox, &io, &res.midi, "MIDI")?;
     Ok(res)
 }
 

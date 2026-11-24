@@ -275,233 +275,423 @@ fn run_tool(tool_name: &str, args: &Value, sandbox: &PathSandbox) -> (String, bo
     }
 }
 
+fn schema_prop(ty: &str, default: Option<Value>, enum_vals: Option<Value>, desc: &str) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert("type".to_string(), json!(ty));
+    if let Some(vals) = enum_vals {
+        map.insert("enum".to_string(), vals);
+    }
+    if let Some(def) = default {
+        map.insert("default".to_string(), def);
+    }
+    if !desc.is_empty() {
+        map.insert("description".to_string(), json!(desc));
+    }
+    Value::Object(map)
+}
+
+fn prop_str(default: Option<&str>, desc: &str) -> Value {
+    schema_prop("string", default.map(|d| json!(d)), None, desc)
+}
+
+fn prop_bool(default: bool, desc: &str) -> Value {
+    schema_prop("boolean", Some(json!(default)), None, desc)
+}
+
+fn prop_num(default: Option<f64>, desc: &str) -> Value {
+    schema_prop("number", default.map(|d| json!(d)), None, desc)
+}
+
+fn prop_int(default: Option<i64>, desc: &str) -> Value {
+    schema_prop("integer", default.map(|d| json!(d)), None, desc)
+}
+
+fn prop_enum<T: Serialize>(ty: &str, values: &[T], default: Value, desc: &str) -> Value {
+    schema_prop(ty, Some(default), Some(json!(values)), desc)
+}
+
+fn mcp_tool(name: &str, description: &str, props: &[(&str, Value)], required: &[&str]) -> Value {
+    let mut properties = serde_json::Map::new();
+    for (k, v) in props {
+        properties.insert((*k).to_string(), v.clone());
+    }
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": {
+            "type": "object",
+            "properties": Value::Object(properties),
+            "required": required
+        }
+    })
+}
+
 fn tool_definitions() -> Vec<Value> {
+    let targets = delivery_target_names();
+    let mid_side_prop = || {
+        prop_num(
+            Some(0.0),
+            "Mid/Side balance (-1.0=Mid only, 0.0=linked, +1.0=Side only)",
+        )
+    };
+    let mut separate_props = vec![
+        ("input", prop_str(None, "Input audio file")),
+        (
+            "output_dir",
+            prop_str(None, "Output directory for separated WAV stems"),
+        ),
+        (
+            "stems",
+            prop_enum(
+                "integer",
+                &[2, 4, 6],
+                json!(6),
+                "Primary stem count (2, 4, or 6)",
+            ),
+        ),
+        (
+            "quality",
+            prop_enum(
+                "string",
+                &["fast", "studio", "ultra"],
+                json!("studio"),
+                "Separation quality tier",
+            ),
+        ),
+    ];
+    for &(flag, default, desc) in &[
+        (
+            "dereverb",
+            true,
+            "Run BS-RoFormer de-reverb on isolated vocals",
+        ),
+        (
+            "drum_sep",
+            false,
+            "Also split isolated drums into Kick, Snare, Toms, Hi-Hat, and Cymbals",
+        ),
+        (
+            "split_lead_backing",
+            false,
+            "Also split isolated vocals into Lead Vocals and Backing Vocals / Harmonies (RoFormer Karaoke)",
+        ),
+        (
+            "split_male_female",
+            false,
+            "Also split isolated vocals into Male and Female vocal stems",
+        ),
+        (
+            "split_guitar",
+            false,
+            "Also split isolated guitar into Electric Guitar and Acoustic Guitar",
+        ),
+        (
+            "split_orchestral",
+            false,
+            "Also extract Strings, Brass, Woodwinds, and Synth from residual Other stem",
+        ),
+        (
+            "split_crowd",
+            false,
+            "Also extract live Crowd / Audience / Room Noise from residual Other stem",
+        ),
+        (
+            "all_stems",
+            false,
+            "Enable full 23-slot hierarchical pro studio cascade (all sub-splitters)",
+        ),
+        (
+            "restore",
+            false,
+            "Run optional Apollo / spectral bandwidth restoration post-pass on separated stems",
+        ),
+    ] {
+        separate_props.push((flag, prop_bool(default, desc)));
+    }
+
     vec![
-        json!({
-            "name": "forge_audit_audio",
-            "description": "Run an ITU-R BS.1770-4 / EBU R128 loudness, 4x polyphase True Peak (dBTP), LRA, and AI Spectral Fizz Index (2.5-6.5 kHz) audit on an audio file.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Path to audio file" }
-                },
-                "required": ["path"]
-            }
-        }),
-        json!({
-            "name": "forge_restore_and_defizz",
-            "description": "Clean AI-generated or live audio: DC offset, cubic Hermite de-clip, 50/60Hz hum removal, vocal de-click/de-plosive/de-breath, and OpenSoothe dynamic spectral de-fizz.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "input": { "type": "string" },
-                    "output": { "type": "string" },
-                    "vocal": { "type": "boolean", "default": false },
-                    "defizz_depth_db": { "type": "number", "default": 9.0 },
-                    "sensitivity_db": { "type": "number", "default": 3.5 },
-                    "tilt": { "type": "number", "default": 0.0, "description": "Spectral tilt in dB/oct (-6.0..=6.0)" },
-                    "stereo_link": { "type": "number", "default": 1.0, "description": "Stereo link ratio (0.0..=1.0)" },
-                    "mid_side": { "type": "number", "default": 0.0, "description": "Mid/Side balance (-1.0=Mid only, 0.0=linked, +1.0=Side only)" },
-                    "delta": { "type": "boolean", "default": false, "description": "Audition only the removed spectral resonance delta" }
-                },
-                "required": ["input", "output"]
-            }
-        }),
-        json!({
-            "name": "forge_spectral_unmask",
-            "description": "Run OpenSpacer (Trackspacer equivalent) sidechain STFT dynamic frequency unmasking between a sidechain trigger (vocal or kick) and target bed (music or bass).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string" },
-                    "sidechain": { "type": "string" },
-                    "output": { "type": "string" },
-                    "kick_bass_mode": { "type": "boolean", "default": false },
-                    "mid_side": { "type": "number", "default": 0.0, "description": "Mid/Side balance (-1.0=Mid only, 0.0=linked, +1.0=Side only)" },
-                    "delta": { "type": "boolean", "default": false, "description": "Audition only the carved sidechain delta" }
-                },
-                "required": ["target", "sidechain", "output"]
-            }
-        }),
-        json!({
-            "name": "forge_phase_align",
-            "description": "Align multi-mic phase via GCC-PHAT (Auto-Align equivalent) or vocal doubles via FastDTW stretch markers (VocAlign equivalent).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "reference": { "type": "string" },
-                    "target": { "type": "string" },
-                    "output": { "type": "string" },
-                    "vocal_dtw": { "type": "boolean", "default": false }
-                },
-                "required": ["reference", "target", "output"]
-            }
-        }),
-        json!({
-            "name": "forge_vocal_suite",
-            "description": "Run YIN pitch tracking, formant-preserving pitch correction, 3-part chord-aware vocal harmony generation, and REAPER <PITCHENV compilation.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "input": { "type": "string" },
-                    "output_dir": { "type": "string" },
-                    "scale": { "type": "string", "default": "D minor" },
-                    "retune_strength": { "type": "number", "default": 0.85 },
-                    "generate_harmonies": { "type": "boolean", "default": true }
-                },
-                "required": ["input", "output_dir"]
-            }
-        }),
-        json!({
-            "name": "forge_music_theory_midi",
-            "description": "Generate voice-led MIDI chords, Neo-Soul/Jazz reharmonizations, Dilla/MPC humanized grooves, and ABC notation.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "chords": { "type": "string" },
-                    "output_midi": { "type": "string" },
-                    "bpm": { "type": "number", "default": 92.0 },
-                    "style": { "type": "string", "default": "neo-soul" }
-                },
-                "required": ["chords", "output_midi"]
-            }
-        }),
-        json!({
-            "name": "forge_master_distrokid",
-            "description": "Master stereo audio to -14.0 LUFS / -1.0 dBTP with Reference Match EQ, 18-band Mastering EQ, and optional ISO 3901 ISRC tagging.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "input": { "type": "string" },
-                    "output": { "type": "string" },
-                    "reference": { "type": "string" },
-                    "target_lufs": { "type": "number", "default": -14.0 },
-                    "ceiling_dbtp": { "type": "number", "default": -1.0 },
-                    "isrc": { "type": "string" },
-                    "title": { "type": "string" },
-                    "artist": { "type": "string" }
-                },
-                "required": ["input", "output"]
-            }
-        }),
-        json!({
-            "name": "forge_deliver",
-            "description": "Deliver a mix to a distribution target in one call: audit, repair (DC, clipping, hum), de-fizz, optional reference/genre tone match, loudness-normalize and true-peak limit, then re-audit. Returns before/after BS.1770-4 audits and explicit pass/fail checks (loudness within 1 LU, true peak under ceiling, no clipping, sample rate >= 44.1 kHz). Writes a 24-bit WAV and a .delivery.json report next to it.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "input": { "type": "string", "description": "Input mix or stem (WAV)" },
-                    "output": { "type": "string", "description": "Output master WAV path" },
-                    "target": { "type": "string", "enum": delivery_target_names(), "default": "spotify" },
-                    "target_lufs": { "type": "number", "description": "Required when target is 'custom'" },
-                    "ceiling_dbtp": { "type": "number", "description": "Required when target is 'custom'" },
-                    "repair": { "type": "boolean", "default": true },
-                    "defizz": { "type": "boolean", "default": true },
-                    "vocal": { "type": "boolean", "default": false, "description": "Vocal clean-up; use on vocal stems only" },
-                    "reference": { "type": "string", "description": "Reference track WAV for 18-band tone match" },
-                    "genre": { "type": "string", "description": "Genre tonal-balance target (pop, hiphop, neosoul, edm, rock, jazz); ignored when reference is set" },
-                    "limiter_style": { "type": "string", "enum": ["transparent", "punchy", "dynamic", "aggressive"], "default": "transparent" },
-                    "channel_link": { "type": "number", "default": 1.0, "description": "Stereo limiter channel link ratio (0.0..=1.0)" },
-                    "dither": { "type": "string", "enum": ["none", "tpdf", "noise-shaped"], "default": "none" },
-                    "dither_bits": { "type": "integer", "default": 24, "description": "Target bit depth for dither (8..=24)" }
-                },
-                "required": ["input", "output"]
-            }
-        }),
-        json!({
-            "name": "forge_neural_denoise",
-            "description": "Run neural audio denoising via DeepFilterNet3 or Mel-Band-RoFormer on the local Python GPU worker, confined to the MCP path sandbox.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "input": { "type": "string", "description": "Input audio file" },
-                    "output_dir": { "type": "string", "description": "Output directory for denoised audio" },
-                    "backend": { "type": "string", "enum": ["auto", "deepfilternet", "deepfilternet3", "mel-band-roformer", "roformer"], "default": "auto" },
-                    "attenuation_limit_db": { "type": "number", "description": "Optional attenuation limit in dB (0..=100, DeepFilterNet3)" },
-                    "timeout_secs": { "type": "integer", "default": 300, "description": "Worker timeout in seconds (1..=3600)" }
-                },
-                "required": ["input", "output_dir"]
-            }
-        }),
-        json!({
-            "name": "forge_transcribe_midi",
-            "description": "Run polyphonic audio-to-MIDI transcription via basic-pitch on the local Python GPU worker, confined to the MCP path sandbox.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "input": { "type": "string", "description": "Input audio file" },
-                    "output_dir": { "type": "string", "description": "Output directory for transcribed MIDI" },
-                    "timeout_secs": { "type": "integer", "default": 300, "description": "Worker timeout in seconds (1..=3600)" }
-                },
-                "required": ["input", "output_dir"]
-            }
-        }),
-        json!({
-            "name": "forge_separate_stems",
-            "description": "Studio-grade neural stem separation (BS-RoFormer 1297 / SCNet XL / BS-RoFormer SW cascade, 2/4/6 stems + optional BS-RoFormer de-reverb, RoFormer Karaoke Lead/Backing split, 5-piece MDX23C DrumSep & Apollo spectral restoration) with pure-Rust DSP fallback, confined to the MCP path sandbox.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "input": { "type": "string", "description": "Input audio file" },
-                    "output_dir": { "type": "string", "description": "Output directory for separated WAV stems" },
-                    "stems": { "type": "integer", "enum": [2, 4, 6], "default": 6, "description": "Primary stem count (2, 4, or 6)" },
-                    "quality": { "type": "string", "enum": ["fast", "studio", "ultra"], "default": "studio", "description": "Separation quality tier" },
-                    "dereverb": { "type": "boolean", "default": true, "description": "Run BS-RoFormer de-reverb on isolated vocals" },
-                    "drum_sep": { "type": "boolean", "default": false, "description": "Also split isolated drums into Kick, Snare, Toms, Hi-Hat, and Cymbals" },
-                    "split_lead_backing": { "type": "boolean", "default": false, "description": "Also split isolated vocals into Lead Vocals and Backing Vocals / Harmonies (RoFormer Karaoke)" },
-                    "split_male_female": { "type": "boolean", "default": false, "description": "Also split isolated vocals into Male and Female vocal stems" },
-                    "split_guitar": { "type": "boolean", "default": false, "description": "Also split isolated guitar into Electric Guitar and Acoustic Guitar" },
-                    "split_orchestral": { "type": "boolean", "default": false, "description": "Also extract Strings, Brass, Woodwinds, and Synth from residual Other stem" },
-                    "split_crowd": { "type": "boolean", "default": false, "description": "Also extract live Crowd / Audience / Room Noise from residual Other stem" },
-                    "all_stems": { "type": "boolean", "default": false, "description": "Enable full 23-slot hierarchical pro studio cascade (all sub-splitters)" },
-                    "restore": { "type": "boolean", "default": false, "description": "Run optional Apollo / spectral bandwidth restoration post-pass on separated stems" }
-                },
-                "required": ["input", "output_dir"]
-            }
-        }),
-        json!({
-            "name": "forge_daw_inspect",
-            "description": "Validate and inspect a ForgeStudio DAW `.forgeproj` session (BPM, sample rate, tracks, audio objects, MIDI clips, aux buses, total PDC) within the MCP path sandbox.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "project": { "type": "string", "description": "Path to `.forgeproj` session file" }
-                },
-                "required": ["project"]
-            }
-        }),
-        json!({
-            "name": "forge_daw_bounce",
-            "description": "Headless 24-bit WAV mastering bounce (with ITU-R BS.1770-4 audit) and optional batch stem export from a ForgeStudio DAW `.forgeproj` session within the MCP path sandbox.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "project": { "type": "string", "description": "Path to `.forgeproj` session file" },
-                    "output": { "type": "string", "description": "Output 24-bit WAV master bounce path" },
-                    "stems_dir": { "type": "string", "description": "Optional directory for batch per-track stem WAV export" }
-                },
-                "required": ["project", "output"]
-            }
-        }),
-        json!({
-            "name": "forge_ingest_to_reaper",
-            "description": "Full autonomous pipeline: separate stems, clean & de-fizz audio, extract drum MIDI, build voice-led chords, deliver a verified master for the chosen target, install JSFX plugins, and generate a REAPER 7.82 .RPP project.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "input": { "type": "string" },
-                    "output_dir": { "type": "string" },
-                    "target": { "type": "string", "enum": delivery_target_names(), "default": "spotify" },
-                    "target_lufs": { "type": "number", "description": "Required when target is 'custom'" },
-                    "ceiling_dbtp": { "type": "number", "description": "Required when target is 'custom'" },
-                    "bpm": { "type": "number", "default": 120.0 },
-                    "scale": { "type": "string", "default": "D minor" },
-                    "chords": { "type": "string", "default": "Dm9 Bbmaj7 Gm9 A7b13" },
-                    "require_neural": { "type": "boolean", "default": false, "description": "Fail instead of falling back to the DSP stem split when no GPU or Colab worker produces stems" }
-                },
-                "required": ["input", "output_dir"]
-            }
-        }),
+        mcp_tool(
+            "forge_audit_audio",
+            "Run an ITU-R BS.1770-4 / EBU R128 loudness, 4x polyphase True Peak (dBTP), LRA, and AI Spectral Fizz Index (2.5-6.5 kHz) audit on an audio file.",
+            &[("path", prop_str(None, "Path to audio file"))],
+            &["path"],
+        ),
+        mcp_tool(
+            "forge_restore_and_defizz",
+            "Clean AI-generated or live audio: DC offset, cubic Hermite de-clip, 50/60Hz hum removal, vocal de-click/de-plosive/de-breath, and OpenSoothe dynamic spectral de-fizz.",
+            &[
+                ("input", prop_str(None, "")),
+                ("output", prop_str(None, "")),
+                ("vocal", prop_bool(false, "")),
+                ("defizz_depth_db", prop_num(Some(9.0), "")),
+                ("sensitivity_db", prop_num(Some(3.5), "")),
+                (
+                    "tilt",
+                    prop_num(Some(0.0), "Spectral tilt in dB/oct (-6.0..=6.0)"),
+                ),
+                (
+                    "stereo_link",
+                    prop_num(Some(1.0), "Stereo link ratio (0.0..=1.0)"),
+                ),
+                ("mid_side", mid_side_prop()),
+                (
+                    "delta",
+                    prop_bool(false, "Audition only the removed spectral resonance delta"),
+                ),
+            ],
+            &["input", "output"],
+        ),
+        mcp_tool(
+            "forge_spectral_unmask",
+            "Run OpenSpacer (Trackspacer equivalent) sidechain STFT dynamic frequency unmasking between a sidechain trigger (vocal or kick) and target bed (music or bass).",
+            &[
+                ("target", prop_str(None, "")),
+                ("sidechain", prop_str(None, "")),
+                ("output", prop_str(None, "")),
+                ("kick_bass_mode", prop_bool(false, "")),
+                ("mid_side", mid_side_prop()),
+                (
+                    "delta",
+                    prop_bool(false, "Audition only the carved sidechain delta"),
+                ),
+            ],
+            &["target", "sidechain", "output"],
+        ),
+        mcp_tool(
+            "forge_phase_align",
+            "Align multi-mic phase via GCC-PHAT (Auto-Align equivalent) or vocal doubles via FastDTW stretch markers (VocAlign equivalent).",
+            &[
+                ("reference", prop_str(None, "")),
+                ("target", prop_str(None, "")),
+                ("output", prop_str(None, "")),
+                ("vocal_dtw", prop_bool(false, "")),
+            ],
+            &["reference", "target", "output"],
+        ),
+        mcp_tool(
+            "forge_vocal_suite",
+            "Run YIN pitch tracking, formant-preserving pitch correction, 3-part chord-aware vocal harmony generation, and REAPER <PITCHENV compilation.",
+            &[
+                ("input", prop_str(None, "")),
+                ("output_dir", prop_str(None, "")),
+                ("scale", prop_str(Some("D minor"), "")),
+                ("retune_strength", prop_num(Some(0.85), "")),
+                ("generate_harmonies", prop_bool(true, "")),
+            ],
+            &["input", "output_dir"],
+        ),
+        mcp_tool(
+            "forge_music_theory_midi",
+            "Generate voice-led MIDI chords, Neo-Soul/Jazz reharmonizations, Dilla/MPC humanized grooves, and ABC notation.",
+            &[
+                ("chords", prop_str(None, "")),
+                ("output_midi", prop_str(None, "")),
+                ("bpm", prop_num(Some(92.0), "")),
+                ("style", prop_str(Some("neo-soul"), "")),
+            ],
+            &["chords", "output_midi"],
+        ),
+        mcp_tool(
+            "forge_master_distrokid",
+            "Master stereo audio to -14.0 LUFS / -1.0 dBTP with Reference Match EQ, 18-band Mastering EQ, and optional ISO 3901 ISRC tagging.",
+            &[
+                ("input", prop_str(None, "")),
+                ("output", prop_str(None, "")),
+                ("reference", prop_str(None, "")),
+                ("target_lufs", prop_num(Some(-14.0), "")),
+                ("ceiling_dbtp", prop_num(Some(-1.0), "")),
+                ("isrc", prop_str(None, "")),
+                ("title", prop_str(None, "")),
+                ("artist", prop_str(None, "")),
+            ],
+            &["input", "output"],
+        ),
+        mcp_tool(
+            "forge_deliver",
+            "Deliver a mix to a distribution target in one call: audit, repair (DC, clipping, hum), de-fizz, optional reference/genre tone match, loudness-normalize and true-peak limit, then re-audit. Returns before/after BS.1770-4 audits and explicit pass/fail checks (loudness within 1 LU, true peak under ceiling, no clipping, sample rate >= 44.1 kHz). Writes a 24-bit WAV and a .delivery.json report next to it.",
+            &[
+                ("input", prop_str(None, "Input mix or stem (WAV)")),
+                ("output", prop_str(None, "Output master WAV path")),
+                (
+                    "target",
+                    prop_enum("string", &targets, json!("spotify"), ""),
+                ),
+                (
+                    "target_lufs",
+                    prop_num(None, "Required when target is 'custom'"),
+                ),
+                (
+                    "ceiling_dbtp",
+                    prop_num(None, "Required when target is 'custom'"),
+                ),
+                ("repair", prop_bool(true, "")),
+                ("defizz", prop_bool(true, "")),
+                (
+                    "vocal",
+                    prop_bool(false, "Vocal clean-up; use on vocal stems only"),
+                ),
+                (
+                    "reference",
+                    prop_str(None, "Reference track WAV for 18-band tone match"),
+                ),
+                (
+                    "genre",
+                    prop_str(
+                        None,
+                        "Genre tonal-balance target (pop, hiphop, neosoul, edm, rock, jazz); ignored when reference is set",
+                    ),
+                ),
+                (
+                    "limiter_style",
+                    prop_enum(
+                        "string",
+                        &["transparent", "punchy", "dynamic", "aggressive"],
+                        json!("transparent"),
+                        "",
+                    ),
+                ),
+                (
+                    "channel_link",
+                    prop_num(Some(1.0), "Stereo limiter channel link ratio (0.0..=1.0)"),
+                ),
+                (
+                    "dither",
+                    prop_enum(
+                        "string",
+                        &["none", "tpdf", "noise-shaped"],
+                        json!("none"),
+                        "",
+                    ),
+                ),
+                (
+                    "dither_bits",
+                    prop_int(Some(24), "Target bit depth for dither (8..=24)"),
+                ),
+            ],
+            &["input", "output"],
+        ),
+        mcp_tool(
+            "forge_neural_denoise",
+            "Run neural audio denoising via DeepFilterNet3 or Mel-Band-RoFormer on the local Python GPU worker, confined to the MCP path sandbox.",
+            &[
+                ("input", prop_str(None, "Input audio file")),
+                (
+                    "output_dir",
+                    prop_str(None, "Output directory for denoised audio"),
+                ),
+                (
+                    "backend",
+                    prop_enum(
+                        "string",
+                        &[
+                            "auto",
+                            "deepfilternet",
+                            "deepfilternet3",
+                            "mel-band-roformer",
+                            "roformer",
+                        ],
+                        json!("auto"),
+                        "",
+                    ),
+                ),
+                (
+                    "attenuation_limit_db",
+                    prop_num(
+                        None,
+                        "Optional attenuation limit in dB (0..=100, DeepFilterNet3)",
+                    ),
+                ),
+                (
+                    "timeout_secs",
+                    prop_int(Some(300), "Worker timeout in seconds (1..=3600)"),
+                ),
+            ],
+            &["input", "output_dir"],
+        ),
+        mcp_tool(
+            "forge_transcribe_midi",
+            "Run polyphonic audio-to-MIDI transcription via basic-pitch on the local Python GPU worker, confined to the MCP path sandbox.",
+            &[
+                ("input", prop_str(None, "Input audio file")),
+                (
+                    "output_dir",
+                    prop_str(None, "Output directory for transcribed MIDI"),
+                ),
+                (
+                    "timeout_secs",
+                    prop_int(Some(300), "Worker timeout in seconds (1..=3600)"),
+                ),
+            ],
+            &["input", "output_dir"],
+        ),
+        mcp_tool(
+            "forge_separate_stems",
+            "Studio-grade neural stem separation (BS-RoFormer 1297 / SCNet XL / BS-RoFormer SW cascade, 2/4/6 stems + optional BS-RoFormer de-reverb, RoFormer Karaoke Lead/Backing split, 5-piece MDX23C DrumSep & Apollo spectral restoration) with pure-Rust DSP fallback, confined to the MCP path sandbox.",
+            &separate_props,
+            &["input", "output_dir"],
+        ),
+        mcp_tool(
+            "forge_daw_inspect",
+            "Validate and inspect a ForgeStudio DAW `.forgeproj` session (BPM, sample rate, tracks, audio objects, MIDI clips, aux buses, total PDC) within the MCP path sandbox.",
+            &[(
+                "project",
+                prop_str(None, "Path to `.forgeproj` session file"),
+            )],
+            &["project"],
+        ),
+        mcp_tool(
+            "forge_daw_bounce",
+            "Headless 24-bit WAV mastering bounce (with ITU-R BS.1770-4 audit) and optional batch stem export from a ForgeStudio DAW `.forgeproj` session within the MCP path sandbox.",
+            &[
+                (
+                    "project",
+                    prop_str(None, "Path to `.forgeproj` session file"),
+                ),
+                (
+                    "output",
+                    prop_str(None, "Output 24-bit WAV master bounce path"),
+                ),
+                (
+                    "stems_dir",
+                    prop_str(
+                        None,
+                        "Optional directory for batch per-track stem WAV export",
+                    ),
+                ),
+            ],
+            &["project", "output"],
+        ),
+        mcp_tool(
+            "forge_ingest_to_reaper",
+            "Full autonomous pipeline: separate stems, clean & de-fizz audio, extract drum MIDI, build voice-led chords, deliver a verified master for the chosen target, install JSFX plugins, and generate a REAPER 7.82 .RPP project.",
+            &[
+                ("input", prop_str(None, "")),
+                ("output_dir", prop_str(None, "")),
+                (
+                    "target",
+                    prop_enum("string", &targets, json!("spotify"), ""),
+                ),
+                (
+                    "target_lufs",
+                    prop_num(None, "Required when target is 'custom'"),
+                ),
+                (
+                    "ceiling_dbtp",
+                    prop_num(None, "Required when target is 'custom'"),
+                ),
+                ("bpm", prop_num(Some(120.0), "")),
+                ("scale", prop_str(Some("D minor"), "")),
+                ("chords", prop_str(Some("Dm9 Bbmaj7 Gm9 A7b13"), "")),
+                (
+                    "require_neural",
+                    prop_bool(
+                        false,
+                        "Fail instead of falling back to the DSP stem split when no GPU or Colab worker produces stems",
+                    ),
+                ),
+            ],
+            &["input", "output_dir"],
+        ),
     ]
 }
 
@@ -1193,94 +1383,61 @@ fn build_session(spec: SessionSpec) -> ReaperProjectBuilder {
     let mut rpp =
         ReaperProjectBuilder::new("ForgeAudio Studio Session", spec.bpm, spec.sample_rate);
     rpp.add_default_song_structure_markers();
-    rpp.tracks.push(ReaperTrackSpec {
-        name: "01 Lead Vocal".to_string(),
-        file_path: spec.vocal,
-        is_midi: false,
-        duration_secs: spec.duration_secs,
-        volume_lin: 0.85,
-        pan: 0.0,
-        color: 0x0155_88FF,
-        jsfx_inserts: vec![
-            "Forge_Vocal_Surgical.jsfx".to_string(),
-            "Forge_OpenSoothe_DeFizz.jsfx".to_string(),
-        ],
-        sidechain_from_track: None,
-        stretch_markers: Vec::new(),
-        pitch_envelope: spec.vocal_pitch_frames,
-    });
+    rpp.tracks.push(
+        ReaperTrackSpec::audio(
+            "01 Lead Vocal",
+            spec.vocal,
+            spec.duration_secs,
+            0.85,
+            0x0155_88FF,
+        )
+        .with_jsfx(["Forge_Vocal_Surgical.jsfx", "Forge_OpenSoothe_DeFizz.jsfx"])
+        .with_pitch_envelope(spec.vocal_pitch_frames),
+    );
     let has_drums = spec.drums.is_some();
     if let Some(drums) = spec.drums {
-        rpp.tracks.push(ReaperTrackSpec {
-            name: "02 Drums".to_string(),
-            file_path: Some(drums),
-            is_midi: false,
-            duration_secs: spec.duration_secs,
-            volume_lin: 0.90,
-            pan: 0.0,
-            color: 0x01FF_5555,
-            jsfx_inserts: Vec::new(),
-            sidechain_from_track: None,
-            stretch_markers: Vec::new(),
-            pitch_envelope: Vec::new(),
-        });
+        rpp.tracks.push(ReaperTrackSpec::audio(
+            "02 Drums",
+            Some(drums),
+            spec.duration_secs,
+            0.90,
+            0x01FF_5555,
+        ));
     }
     if let Some(bass) = spec.bass {
-        rpp.tracks.push(ReaperTrackSpec {
-            name: "03 Bass".to_string(),
-            file_path: Some(bass),
-            is_midi: false,
-            duration_secs: spec.duration_secs,
-            volume_lin: 0.88,
-            pan: 0.0,
-            color: 0x01AA_66FF,
-            jsfx_inserts: vec!["Forge_OpenSpacer_Unmask.jsfx".to_string()],
-            sidechain_from_track: if has_drums { Some(1) } else { None },
-            stretch_markers: Vec::new(),
-            pitch_envelope: Vec::new(),
-        });
+        rpp.tracks.push(
+            ReaperTrackSpec::audio("03 Bass", Some(bass), spec.duration_secs, 0.88, 0x01AA_66FF)
+                .with_jsfx(["Forge_OpenSpacer_Unmask.jsfx"])
+                .with_sidechain(if has_drums { Some(1) } else { None }),
+        );
     }
     if let Some(other) = spec.other {
-        rpp.tracks.push(ReaperTrackSpec {
-            name: "04 Instruments / Other".to_string(),
-            file_path: Some(other),
-            is_midi: false,
-            duration_secs: spec.duration_secs,
-            volume_lin: 0.82,
-            pan: 0.0,
-            color: 0x0144_DD88,
-            jsfx_inserts: vec!["Forge_OpenSpacer_Unmask.jsfx".to_string()],
-            sidechain_from_track: Some(0),
-            stretch_markers: Vec::new(),
-            pitch_envelope: Vec::new(),
-        });
+        rpp.tracks.push(
+            ReaperTrackSpec::audio(
+                "04 Instruments / Other",
+                Some(other),
+                spec.duration_secs,
+                0.82,
+                0x0144_DD88,
+            )
+            .with_jsfx(["Forge_OpenSpacer_Unmask.jsfx"])
+            .with_sidechain(Some(0)),
+        );
     }
-    rpp.tracks.push(ReaperTrackSpec {
-        name: "05 MIDI Chords & Sub-Bass".to_string(),
-        file_path: Some(spec.chords_midi),
-        is_midi: true,
-        duration_secs: spec.duration_secs,
-        volume_lin: 0.85,
-        pan: 0.0,
-        color: 0x01FF_CC44,
-        jsfx_inserts: Vec::new(),
-        sidechain_from_track: None,
-        stretch_markers: Vec::new(),
-        pitch_envelope: Vec::new(),
-    });
-    rpp.tracks.push(ReaperTrackSpec {
-        name: "06 Drum MIDI Triggers".to_string(),
-        file_path: Some(spec.drum_midi),
-        is_midi: true,
-        duration_secs: spec.duration_secs,
-        volume_lin: 0.85,
-        pan: 0.0,
-        color: 0x01FF_8844,
-        jsfx_inserts: Vec::new(),
-        sidechain_from_track: None,
-        stretch_markers: Vec::new(),
-        pitch_envelope: Vec::new(),
-    });
+    rpp.tracks.push(ReaperTrackSpec::midi(
+        "05 MIDI Chords & Sub-Bass",
+        spec.chords_midi,
+        spec.duration_secs,
+        0.85,
+        0x01FF_CC44,
+    ));
+    rpp.tracks.push(ReaperTrackSpec::midi(
+        "06 Drum MIDI Triggers",
+        spec.drum_midi,
+        spec.duration_secs,
+        0.85,
+        0x01FF_8844,
+    ));
     rpp
 }
 
@@ -1385,21 +1542,8 @@ fn tool_daw_inspect(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, F
     let project_path = path_arg(args, "project", sandbox)?;
     let (proj, cache, missing_clips) = load_sandboxed_daw_project(&project_path, sandbox, false)?;
     let engine = forge_engine::ObjectOrientedEngine::compile(&proj, &cache);
-    let total_objects: usize = proj.tracks.iter().map(|t| t.objects.len()).sum();
-    let total_midi_clips: usize = proj.tracks.iter().map(|t| t.midi_clips.len()).sum();
-    let summary = json!({
-        "name": proj.name,
-        "sample_rate": proj.sample_rate,
-        "bpm": proj.bpm,
-        "time_signature": format!("{}/{}", proj.time_sig_num, proj.time_sig_den),
-        "tracks": proj.tracks.len(),
-        "audio_objects": total_objects,
-        "midi_clips": total_midi_clips,
-        "aux_buses": proj.aux_buses.len(),
-        "master_inserts": proj.master_inserts.len(),
-        "total_pdc_samples": engine.total_pdc_samples(),
-        "missing_clips": missing_clips,
-    });
+    let summary =
+        serde_json::to_value(proj.inspect_summary(engine.total_pdc_samples(), missing_clips))?;
     Ok(summary.into())
 }
 
@@ -1445,7 +1589,6 @@ fn tool_daw_bounce(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, Fo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::f64::consts::PI;
     use std::path::Path;
 
     fn sandbox_in(dir: &Path) -> PathSandbox {
@@ -1454,23 +1597,7 @@ mod tests {
 
     /// 10 s stereo mix-like signal (two tones plus broadband hash), as in the delivery tests.
     fn write_test_mix(path: &Path, level: f64, sample_rate: u32) {
-        let n = sample_rate as usize * 10;
-        let mut seed = 0x2545_f491_u32;
-        let ch: Vec<f64> = (0..n)
-            .map(|i| {
-                let t = i as f64 / f64::from(sample_rate);
-                seed ^= seed << 13;
-                seed ^= seed >> 17;
-                seed ^= seed << 5;
-                let noise = (f64::from(seed) / f64::from(u32::MAX) - 0.5) * 0.2;
-                level
-                    * (0.6 * (2.0 * PI * 110.0 * t).sin()
-                        + 0.3 * (2.0 * PI * 3200.0 * t).sin()
-                        + noise)
-            })
-            .collect();
-        AudioBuffer::from_channels(vec![ch.clone(), ch], sample_rate)
-            .expect("valid buffer")
+        forge_dsp::delivery::synthetic_delivery_fixture(level, sample_rate)
             .save_wav(path, 24)
             .expect("write fixture");
     }
@@ -1605,38 +1732,36 @@ mod tests {
         assert!(text(&master).contains("ceiling_dbtp"), "{}", text(&master));
     }
 
-    #[test]
-    fn not_ready_delivery_reports_is_error() {
+    fn assert_delivery_ready(sample_rate: u32, output_rel: &str, expect_ready: bool) {
         let root = tempfile::tempdir().expect("tempdir");
         let sb = sandbox_in(root.path());
-        // 22.05 kHz fails the sample-rate check, so the delivery cannot be `ready`.
-        write_test_mix(&root.path().join("lofi.wav"), 0.05, 22_050);
+        write_test_mix(&root.path().join("input.wav"), 0.05, sample_rate);
 
         let result = call_tool(
             &sb,
             "forge_deliver",
-            json!({ "input": "lofi.wav", "output": "out/master.wav" }),
+            json!({ "input": "input.wav", "output": output_rel }),
         );
-        assert!(is_error(&result), "not-ready delivery reported success");
+        assert_eq!(
+            is_error(&result),
+            !expect_ready,
+            "ready={expect_ready}: {}",
+            text(&result)
+        );
         let body: Value = serde_json::from_str(text(&result)).expect("JSON body");
-        assert_eq!(body["report"]["ready"], json!(false));
-        assert!(root.path().join("out/master.wav").exists());
+        assert_eq!(body["report"]["ready"], json!(expect_ready));
+        assert!(root.path().join(output_rel).exists());
+    }
+
+    #[test]
+    fn not_ready_delivery_reports_is_error() {
+        // 22.05 kHz fails the sample-rate check, so the delivery cannot be `ready`.
+        assert_delivery_ready(22_050, "out/master.wav", false);
     }
 
     #[test]
     fn ready_delivery_reports_success() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let sb = sandbox_in(root.path());
-        write_test_mix(&root.path().join("mix.wav"), 0.05, 48_000);
-
-        let result = call_tool(
-            &sb,
-            "forge_deliver",
-            json!({ "input": "mix.wav", "output": "master.wav" }),
-        );
-        assert!(!is_error(&result), "{}", text(&result));
-        let body: Value = serde_json::from_str(text(&result)).expect("JSON body");
-        assert_eq!(body["report"]["ready"], json!(true));
+        assert_delivery_ready(48_000, "master.wav", true);
     }
 
     #[test]

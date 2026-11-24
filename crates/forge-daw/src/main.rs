@@ -150,6 +150,16 @@ impl ForgeDawApp {
                 format!("Audio output unavailable ({e}) — Offline mode | GPU: {gpu_backend_label}"),
             ),
         };
+        Self::from_parts(project, cache, audio, gpu_backend_label, status_line)
+    }
+
+    fn from_parts(
+        project: DawProject,
+        cache: ClipCache,
+        audio: Option<LiveAudioEngine>,
+        gpu_backend_label: String,
+        status_line: String,
+    ) -> Self {
         Self {
             project,
             undo: UndoStack::default(),
@@ -1618,35 +1628,14 @@ mod tests {
 
     #[test]
     fn gesture_coalesced_undo_records_single_snapshot_per_drag() {
-        let mut app = ForgeDawApp {
-            project: DawProject::default(),
-            undo: UndoStack::default(),
-            cache: ClipCache::default(),
-            audio: None,
-            recorder: None,
-            selected_track_idx: 0,
-            selected_object_id: None,
-            selected_midi_clip_id: None,
-            inspector_tab: InspectorTab::Object,
-            active_drag: None,
-            drag_anchor_samples: 0,
-            drag_anchor_x: 0.0,
-            snap_grid: SnapGrid::Quarter,
-            auto_crossfade: true,
-            pixels_per_sec: 120.0,
-            scroll_secs: 0.0,
-            import_path_buf: String::new(),
-            project_path_buf: "session.forgeproj".to_string(),
-            bounce_path_buf: "master_bounce.wav".to_string(),
-            gpu_backend_label: "Test".to_string(),
-            status_line: String::new(),
-            show_mixer: true,
-            pointer_down: true,
-            undo_gesture_active: false,
-            piano_roll_base_octave: 3,
-            piano_roll_bar: 0,
-            stem_split_rx: None,
-        };
+        let mut app = ForgeDawApp::from_parts(
+            DawProject::default(),
+            ClipCache::default(),
+            None,
+            "Test".to_string(),
+            String::new(),
+        );
+        app.pointer_down = true;
         let initial_gain = app.project.master_gain_db;
         // Simulate 60 frames of continuous slider drag
         for step in 1..=60 {

@@ -241,47 +241,26 @@ pub fn write_distrokid_metadata<P: AsRef<Path>>(
         .spawn()
         .map_err(|e| ForgeError::ReaperError(format!("FFmpeg metadata tagger failed: {e}")))?;
 
-    let stderr_pipe = child.stderr.take();
-    let stderr_handle = std::thread::spawn(move || {
-        use std::io::Read;
-        let mut buf = Vec::new();
-        if let Some(pipe) = stderr_pipe {
-            let _ = pipe.take(64 * 1024).read_to_end(&mut buf);
+    match forge_core::wait_child_bounded_stderr(
+        &mut child,
+        std::time::Duration::from_secs(60),
+        64 * 1024,
+    )
+    .map_err(|e| ForgeError::ReaperError(format!("FFmpeg metadata wait failed: {e}")))?
+    {
+        forge_core::BoundedChildExit::TimedOut => {
+            return Err(ForgeError::ReaperError(
+                "FFmpeg metadata write timed out after 60s".to_string(),
+            ));
         }
-        buf
-    });
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break st,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(ForgeError::ReaperError(
-                        "FFmpeg metadata write timed out after 60s".to_string(),
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                return Err(ForgeError::ReaperError(format!(
-                    "FFmpeg metadata wait failed: {e}"
-                )));
-            }
+        forge_core::BoundedChildExit::Exited { status, stderr } if !status.success() => {
+            return Err(ForgeError::ReaperError(format!(
+                "FFmpeg metadata write failed: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            )));
         }
-    };
-
-    if !status.success() {
-        let stderr_buf = stderr_handle.join().unwrap_or_default();
-        return Err(ForgeError::ReaperError(format!(
-            "FFmpeg metadata write failed: {}",
-            String::from_utf8_lossy(&stderr_buf).trim()
-        )));
+        forge_core::BoundedChildExit::Exited { .. } => {}
     }
-    let _ = stderr_handle.join();
     Ok(canonical_isrc)
 }
 
@@ -306,6 +285,63 @@ pub struct ReaperTrackSpec {
     pub stretch_markers: Vec<StretchMarker>,
     /// Optional vocal pitch correction envelope frames.
     pub pitch_envelope: Vec<PitchFrame>,
+}
+
+impl ReaperTrackSpec {
+    /// Creates an audio track specification with center pan and empty FX, markers, and pitch
+    /// envelope.
+    pub fn audio(
+        name: impl Into<String>,
+        file_path: Option<PathBuf>,
+        duration_secs: f64,
+        volume_lin: f64,
+        color: u32,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            file_path,
+            is_midi: false,
+            duration_secs,
+            volume_lin,
+            pan: 0.0,
+            color,
+            jsfx_inserts: Vec::new(),
+            sidechain_from_track: None,
+            stretch_markers: Vec::new(),
+            pitch_envelope: Vec::new(),
+        }
+    }
+
+    /// Creates a MIDI track specification with center pan and default routing.
+    pub fn midi(
+        name: impl Into<String>,
+        file_path: PathBuf,
+        duration_secs: f64,
+        volume_lin: f64,
+        color: u32,
+    ) -> Self {
+        let mut spec = Self::audio(name, Some(file_path), duration_secs, volume_lin, color);
+        spec.is_midi = true;
+        spec
+    }
+
+    /// Attaches JSFX insert filenames (`Forge_*.jsfx`) to this track.
+    pub fn with_jsfx(mut self, inserts: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.jsfx_inserts = inserts.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Attaches an optional 0-indexed sidechain source track (`Ch 3/4` receive).
+    pub fn with_sidechain(mut self, src_track: Option<usize>) -> Self {
+        self.sidechain_from_track = src_track;
+        self
+    }
+
+    /// Attaches vocal pitch correction envelope frames (`<PITCHENV>`).
+    pub fn with_pitch_envelope(mut self, frames: Vec<PitchFrame>) -> Self {
+        self.pitch_envelope = frames;
+        self
+    }
 }
 
 /// Section marker on the REAPER master timeline (e.g. `[Intro]`, `[Verse 1]`, `[Chorus]`).

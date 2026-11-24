@@ -27,9 +27,9 @@ pub use elite_dsp::{
 };
 pub use loudness_limiter::{
     Biquad, CytomicSvf, DitherMode, LIMITER_LOOKAHEAD_MS, LIMITER_RELEASE_MS, LimiterStyle,
-    MasteringLimiterConfig, SILENCE_RMS_DBFS, SILENT_BAND_DB, apply_dither, audit_audio,
-    compute_true_peak, flush_denormal_f64, normalize_and_limit, normalize_and_limit_with_config,
-    sanitize_param_f64, sanitize_sample_f32, sanitize_sample_f64,
+    MasteringLimiterConfig, SILENCE_RMS_DBFS, SILENT_BAND_DB, TRUE_PEAK_PHASES, apply_dither,
+    audit_audio, compute_true_peak, flush_denormal_f64, normalize_and_limit,
+    normalize_and_limit_with_config, sanitize_param_f64, sanitize_sample_f32, sanitize_sample_f64,
 };
 pub use phase_align::{PhaseAlignmentResult, align_phase_gcc_phat};
 pub use realtime::{
@@ -50,6 +50,29 @@ pub use spectrum::{
     publish_shared_spectrum, read_shared_spectrum, shared_spectrum_owner,
     shared_spectrum_slot_index, spectrum_band_center_hz, spectrum_band_edges_hz,
 };
+
+#[cfg(test)]
+pub(crate) mod test_utils {
+    use forge_core::AudioBuffer;
+
+    /// Deterministic xorshift noise vector in `-1.0..1.0` for repeatable DSP unit tests.
+    pub(crate) fn noise(len: usize, seed: u64) -> Vec<f64> {
+        let mut state = seed.max(1);
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 11) as f64 / (1_u64 << 53) as f64 * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// Wraps a mono slice as a single-channel `AudioBuffer`.
+    pub(crate) fn mono(samples: Vec<f64>, sr: u32) -> AudioBuffer {
+        AudioBuffer::from_channels(vec![samples], sr).expect("valid buffer")
+    }
+}
 
 #[cfg(test)]
 mod tests {

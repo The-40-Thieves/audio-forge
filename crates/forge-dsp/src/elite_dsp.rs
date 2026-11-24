@@ -39,19 +39,15 @@ impl AdaaTanh {
 
     #[inline]
     pub fn process(&mut self, x_in: f64, drive: f64) -> f64 {
-        let clean_in = sanitize_sample_f64(x_in);
-        let clean_drive = sanitize_param_f64(drive, 1.0, 0.1, 100.0);
-        let x = (clean_in * clean_drive).clamp(-12.0, 12.0);
-        let f1 = Self::antiderivative_tanh(x);
-        let dx = x - self.x_prev;
-        let y = if dx.abs() < 1e-5 {
-            (0.5 * (x + self.x_prev)).tanh()
-        } else {
-            (f1 - self.f1_prev) / dx
-        };
-        self.x_prev = flush_denormal_f64(x);
-        self.f1_prev = flush_denormal_f64(f1);
-        flush_denormal_f64(y).clamp(-1.0, 1.0)
+        adaa1_step(
+            &mut self.x_prev,
+            &mut self.f1_prev,
+            x_in,
+            drive,
+            12.0,
+            f64::tanh,
+            Self::antiderivative_tanh,
+        )
     }
 }
 
@@ -74,20 +70,41 @@ impl AdaaSin {
 
     #[inline]
     pub fn process(&mut self, x_in: f64, drive: f64) -> f64 {
-        let clean_in = sanitize_sample_f64(x_in);
-        let clean_drive = sanitize_param_f64(drive, 1.0, 0.1, 100.0);
-        let x = (clean_in * clean_drive).clamp(-1.55, 1.55);
-        let f1 = Self::antiderivative_sin(x);
-        let dx = x - self.x_prev;
-        let y = if dx.abs() < 1e-5 {
-            (Self::K * 0.5 * (x + self.x_prev)).sin()
-        } else {
-            (f1 - self.f1_prev) / dx
-        };
-        self.x_prev = flush_denormal_f64(x);
-        self.f1_prev = flush_denormal_f64(f1);
-        flush_denormal_f64(y).clamp(-1.0, 1.0)
+        adaa1_step(
+            &mut self.x_prev,
+            &mut self.f1_prev,
+            x_in,
+            drive,
+            1.55,
+            |u| (Self::K * u).sin(),
+            Self::antiderivative_sin,
+        )
     }
+}
+
+#[inline(always)]
+fn adaa1_step(
+    x_prev: &mut f64,
+    f1_prev: &mut f64,
+    x_in: f64,
+    drive: f64,
+    clamp_abs: f64,
+    f: impl FnOnce(f64) -> f64,
+    f1: impl FnOnce(f64) -> f64,
+) -> f64 {
+    let clean_in = sanitize_sample_f64(x_in);
+    let clean_drive = sanitize_param_f64(drive, 1.0, 0.1, 100.0);
+    let x = (clean_in * clean_drive).clamp(-clamp_abs, clamp_abs);
+    let f1_cur = f1(x);
+    let dx = x - *x_prev;
+    let y = if dx.abs() < 1e-5 {
+        f(0.5 * (x + *x_prev))
+    } else {
+        (f1_cur - *f1_prev) / dx
+    };
+    *x_prev = flush_denormal_f64(x);
+    *f1_prev = flush_denormal_f64(f1_cur);
+    flush_denormal_f64(y).clamp(-1.0, 1.0)
 }
 
 /// Zero-allocation 2x Polyphase Allpass Half-Band IIR Upsampler & Downsampler (4+4 HIIR
@@ -163,6 +180,36 @@ impl Oversampler4x {
 // 2. REAL-TIME STRUCTURAL TRANSIENT / TONAL SPLIT ENGINE (Eventide SplitEQ style)
 // ============================================================================
 
+#[derive(Debug, Clone)]
+struct StereoThreeBandSplit {
+    low_lp_l: Biquad,
+    low_lp_r: Biquad,
+    high_hp_l: Biquad,
+    high_hp_r: Biquad,
+}
+
+impl StereoThreeBandSplit {
+    fn new(sr: f64, low_hz: f64, high_hz: f64) -> Self {
+        Self {
+            low_lp_l: Biquad::lowpass(sr, low_hz, FRAC_1_SQRT_2),
+            low_lp_r: Biquad::lowpass(sr, low_hz, FRAC_1_SQRT_2),
+            high_hp_l: Biquad::highpass(sr, high_hz, FRAC_1_SQRT_2),
+            high_hp_r: Biquad::highpass(sr, high_hz, FRAC_1_SQRT_2),
+        }
+    }
+
+    #[inline]
+    fn split_sample(&mut self, in_l: f32, in_r: f32) -> ([f64; 3], [f64; 3]) {
+        let l = sanitize_sample_f32(in_l);
+        let r = sanitize_sample_f32(in_r);
+        let lo_l = self.low_lp_l.process_sample(l);
+        let lo_r = self.low_lp_r.process_sample(r);
+        let hi_l = self.high_hp_l.process_sample(l);
+        let hi_r = self.high_hp_r.process_sample(r);
+        ([lo_l, l - lo_l - hi_l, hi_l], [lo_r, r - lo_r - hi_r, hi_r])
+    }
+}
+
 /// Real-Time Structural **Transient vs. Tonal Splitter & 6-Band Shaper** (Eventide SplitEQ / oeksound Spiff equivalent).
 ///
 /// Decomposes incoming audio into Low (`<180 Hz`), Mid (`180–3200 Hz`), and High (`>3200 Hz`) bands,
@@ -170,10 +217,7 @@ impl Oversampler4x {
 /// components using dual-time-constant log-envelope differentiation, and allows independent EQ/gain shaping
 /// of Transients vs. Tonal sustain!
 pub struct RealtimeTransientTonalSplit {
-    low_lp_l: Biquad,
-    low_lp_r: Biquad,
-    high_hp_l: Biquad,
-    high_hp_r: Biquad,
+    split: StereoThreeBandSplit,
     fast_alphas: [f64; 3],
     slow_alphas: [f64; 3],
     fast_env: [f64; 3],
@@ -191,10 +235,7 @@ impl RealtimeTransientTonalSplit {
         let fast_alphas = Self::FAST_TAUS_SECS.map(|tau| (-1.0 / (sr * tau)).exp());
         let slow_alphas = Self::SLOW_TAUS_SECS.map(|tau| (-1.0 / (sr * tau)).exp());
         Self {
-            low_lp_l: Biquad::lowpass(sr, 180.0, FRAC_1_SQRT_2),
-            low_lp_r: Biquad::lowpass(sr, 180.0, FRAC_1_SQRT_2),
-            high_hp_l: Biquad::highpass(sr, 3200.0, FRAC_1_SQRT_2),
-            high_hp_r: Biquad::highpass(sr, 3200.0, FRAC_1_SQRT_2),
+            split: StereoThreeBandSplit::new(sr, 180.0, 3200.0),
             fast_alphas,
             slow_alphas,
             fast_env: [0.0; 3],
@@ -218,18 +259,7 @@ impl RealtimeTransientTonalSplit {
         separation_sharpness: f64,
         audition_mode: u8,
     ) -> (f32, f32) {
-        let l = sanitize_sample_f32(in_l);
-        let r = sanitize_sample_f32(in_r);
-
-        let lo_l = self.low_lp_l.process_sample(l);
-        let lo_r = self.low_lp_r.process_sample(r);
-        let hi_l = self.high_hp_l.process_sample(l);
-        let hi_r = self.high_hp_r.process_sample(r);
-        let mid_l = l - lo_l - hi_l;
-        let mid_r = r - lo_r - hi_r;
-
-        let bands_l = [lo_l, mid_l, hi_l];
-        let bands_r = [lo_r, mid_r, hi_r];
+        let (bands_l, bands_r) = self.split.split_sample(in_l, in_r);
 
         let sharp = sanitize_param_f64(separation_sharpness, 1.5, 0.5, 4.0);
 
@@ -276,10 +306,7 @@ impl RealtimeTransientTonalSplit {
 /// Real-Time **3-Band Upward "Density" Compressor & Anti-Aliased ADAA Soft Clipper**
 /// (iZotope Neutron 5 Density + Clipper / Xfer OTT / Kazrog KClip 3 equivalent).
 pub struct RealtimeDensityAndClipper {
-    low_lp_l: Biquad,
-    low_lp_r: Biquad,
-    high_hp_l: Biquad,
-    high_hp_r: Biquad,
+    split: StereoThreeBandSplit,
     rms_alpha: f64,
     rms_env: [f64; 3],
     adaa_l: [AdaaTanh; 3],
@@ -294,10 +321,7 @@ impl RealtimeDensityAndClipper {
         // Sample-rate-independent ~2.6 ms RMS envelope (matches 0.992/0.008 at 48 kHz)
         let rms_alpha = (-1.0 / (sr * 0.0026)).exp();
         Self {
-            low_lp_l: Biquad::lowpass(sr, 160.0, FRAC_1_SQRT_2),
-            low_lp_r: Biquad::lowpass(sr, 160.0, FRAC_1_SQRT_2),
-            high_hp_l: Biquad::highpass(sr, 2800.0, FRAC_1_SQRT_2),
-            high_hp_r: Biquad::highpass(sr, 2800.0, FRAC_1_SQRT_2),
+            split: StereoThreeBandSplit::new(sr, 160.0, 2800.0),
             rms_alpha,
             rms_env: [1e-4; 3],
             adaa_l: [AdaaTanh::default(); 3],
@@ -322,18 +346,7 @@ impl RealtimeDensityAndClipper {
         clip_drive_db: f64,
         clip_ceiling_db: f64,
     ) -> (f32, f32) {
-        let l = sanitize_sample_f32(in_l);
-        let r = sanitize_sample_f32(in_r);
-
-        let lo_l = self.low_lp_l.process_sample(l);
-        let lo_r = self.low_lp_r.process_sample(r);
-        let hi_l = self.high_hp_l.process_sample(l);
-        let hi_r = self.high_hp_r.process_sample(r);
-        let mid_l = l - lo_l - hi_l;
-        let mid_r = r - lo_r - hi_r;
-
-        let mut bands_l = [lo_l, mid_l, hi_l];
-        let mut bands_r = [lo_r, mid_r, hi_r];
+        let (mut bands_l, mut bands_r) = self.split.split_sample(in_l, in_r);
 
         let dens = sanitize_param_f64(density_amount, 0.35, 0.0, 1.0);
         let clean_drive_db = sanitize_param_f64(clip_drive_db, 0.0, 0.0, 15.0);

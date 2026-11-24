@@ -1,6 +1,19 @@
 //! Forge OpenSoothe De-Fizz & Forge OpenSpacer Unmask plugins.
 
+use crate::chassis::*;
 use crate::*;
+
+define_presets! {
+    const OPENSOOTHE_PRESETS {
+        "Vocal De-Harsh" => { "sens": 0.25, "depth": 0.35, "sharp": 0.25, "delta": 0.0, "submono": 0.0, "tape": 0.0, "limit": 0.0, "ceil": 0.85 };
+        "AI Fizz Rescue" => { "sens": 0.15, "depth": 0.60, "sharp": 0.35, "delta": 0.0, "submono": 1.0, "tape": 0.15, "limit": 1.0, "ceil": 0.85 };
+        "Gentle Master" => { "sens": 0.40, "depth": 0.20, "sharp": 0.50, "delta": 0.0, "submono": 0.0, "tape": 0.10, "limit": 1.0, "ceil": 0.85 };
+    }
+    const OPENSPACER_PRESETS {
+        "Vocal Pocket" => { "amt": 0.45, "maxcut": 0.35, "lowhz": 0.18, "highhz": 0.45, "kickmode": 0.0 };
+        "Kick -> Sub" => { "amt": 0.65, "maxcut": 0.50, "lowhz": 0.02, "highhz": 0.08, "kickmode": 1.0 };
+    }
+}
 // ============================================================================
 // 1. FORGE OPENSOOTHE DE-FIZZ (CLAP + VST3 Flagship)
 // ============================================================================
@@ -299,167 +312,38 @@ impl ForgeOpenSoothePlug {
 }
 
 impl Plugin for ForgeOpenSoothePlug {
-    const NAME: &'static str = "Forge OpenSoothe De-Fizz";
-    const VENDOR: &'static str = "The 40 Thieves (ForgeAudio)";
-    const URL: &'static str = "https://github.com/The-40-Thieves/audio-forge";
-    const EMAIL: &'static str = "audio@the40thieves.org";
-    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+    forge_plugin_common!("Forge OpenSoothe De-Fizz", crate::chassis::STEREO_LAYOUTS);
 
-    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
-        main_input_channels: NonZeroU32::new(2),
-        main_output_channels: NonZeroU32::new(2),
-        ..AudioIOLayout::const_default()
-    }];
-
-    const SAMPLE_ACCURATE_AUTOMATION: bool = true;
-    type SysExMessage = ();
-    type BackgroundTask = ();
-
-    fn params(&self) -> Arc<dyn Params> {
-        self.params.clone()
-    }
-
-    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        let params = self.params.clone();
-        let telemetry = self.telemetry.clone();
-        let initial_ab = AbBankState::load_from_persisted(&self.params.ab_state);
-        create_egui_editor(
-            self.params.editor_state.clone(),
-            initial_ab,
-            |_, _| {},
-            move |egui_ctx, setter, ab_state| {
-                egui::CentralPanel::default().show(egui_ctx, |ui| {
-                    let slot = shared_spectrum_slot_index(params.shared_bus_slot.value() as usize);
-                    draw_forge_studio_header_and_spectrum_interactive(
-                        ui,
-                        "FORGE OPENSOOTHE DE-FIZZ",
-                        "2048-pt OLA STFT Dynamic Spectral Resonance & AI Metallic Whistle Suppressor",
-                        &telemetry,
-                        slot,
-                        Some(setter),
-                        Some(CanvasDragHandle {
-                            label: "SENS",
-                            param: &params.sensitivity_db,
-                            color: egui::Color32::from_rgb(250, 204, 21),
-                        }),
-                    );
-                    let param_refs = [
-                        ("sens", ParamRef::Float(&params.sensitivity_db)),
-                        ("depth", ParamRef::Float(&params.max_depth_db)),
-                        ("sharp", ParamRef::Int(&params.sharpness_bins)),
-                        ("delta", ParamRef::Bool(&params.delta_listen)),
-                        ("submono", ParamRef::Bool(&params.enable_sub_tape)),
-                        ("tape", ParamRef::Float(&params.tape_drive)),
-                        ("limit", ParamRef::Bool(&params.enable_limiter)),
-                        ("ceil", ParamRef::Float(&params.ceiling_dbtp)),
-                        ("bus_slot", ParamRef::Int(&params.shared_bus_slot)),
-                        ("tilt", ParamRef::Float(&params.tilt_db_per_oct)),
-                        ("slink", ParamRef::Float(&params.stereo_link)),
-                        ("msbal", ParamRef::Float(&params.mid_side_balance)),
-                        ("lowlat", ParamRef::Bool(&params.low_latency_mode)),
-                        ("atk", ParamRef::Float(&params.attack_ms)),
-                        ("rel", ParamRef::Float(&params.release_ms)),
-                        ("hard", ParamRef::Bool(&params.hard_mode)),
-                        ("foc_lo", ParamRef::Float(&params.focus_low_db)),
-                        ("foc_mid", ParamRef::Float(&params.focus_mid_db)),
-                        ("foc_hi", ParamRef::Float(&params.focus_high_db)),
-                    ];
-                    draw_ab_and_presets_bar_persisted(
-                        ui,
-                        setter,
-                        &param_refs,
-                        ab_state,
-                        OPENSOOTHE_PRESETS,
-                        Some(&params.ab_state),
-                    );
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false; 2])
-                        .show(ui, |ui| {
-                            egui::Grid::new("opensoothe_grid")
-                                .num_columns(2)
-                                .spacing([16.0, 8.0])
-                                .show(ui, |ui| {
-                                    ui.label("Sensitivity (dB)");
-                                    ui.add(widgets::ParamSlider::for_param(&params.sensitivity_db, setter));
-                                    ui.end_row();
-
-                                    ui.label("Max Suppression (dB)");
-                                    ui.add(widgets::ParamSlider::for_param(&params.max_depth_db, setter));
-                                    ui.end_row();
-
-                                    ui.label("Sharpness Radius");
-                                    ui.add(widgets::ParamSlider::for_param(&params.sharpness_bins, setter));
-                                    ui.end_row();
-
-                                    ui.label("Delta Listen (Fizz Only)");
-                                    ui.add(widgets::ParamSlider::for_param(&params.delta_listen, setter));
-                                    ui.end_row();
-
-                                    ui.label("SubMono (<160 Hz) + Tape Bus");
-                                    ui.add(widgets::ParamSlider::for_param(&params.enable_sub_tape, setter));
-                                    ui.end_row();
-
-                                    ui.label("Console8 / ChowTape Drive");
-                                    ui.add(widgets::ParamSlider::for_param(&params.tape_drive, setter));
-                                    ui.end_row();
-
-                                    ui.label("True-Peak -1.0 dBTP Brickwall");
-                                    ui.add(widgets::ParamSlider::for_param(&params.enable_limiter, setter));
-                                    ui.end_row();
-
-                                    ui.label("Limiter Ceiling (dBTP)");
-                                    ui.add(widgets::ParamSlider::for_param(&params.ceiling_dbtp, setter));
-                                    ui.end_row();
-
-                                    ui.label("Cross-Instance Spectrum Slot");
-                                    ui.add(widgets::ParamSlider::for_param(&params.shared_bus_slot, setter));
-                                    ui.end_row();
-
-                                    ui.label("Spectral Tilt (dB/oct)");
-                                    ui.add(widgets::ParamSlider::for_param(&params.tilt_db_per_oct, setter));
-                                    ui.end_row();
-
-                                    ui.label("Stereo Link");
-                                    ui.add(widgets::ParamSlider::for_param(&params.stereo_link, setter));
-                                    ui.end_row();
-
-                                    ui.label("Mid/Side Focus (-1 M .. +1 S)");
-                                    ui.add(widgets::ParamSlider::for_param(&params.mid_side_balance, setter));
-                                    ui.end_row();
-
-                                    ui.label("Low-Latency Tracking (~5.3 ms)");
-                                    ui.add(widgets::ParamSlider::for_param(&params.low_latency_mode, setter));
-                                    ui.end_row();
-
-                                    ui.label("Attack (ms)");
-                                    ui.add(widgets::ParamSlider::for_param(&params.attack_ms, setter));
-                                    ui.end_row();
-
-                                    ui.label("Release (ms)");
-                                    ui.add(widgets::ParamSlider::for_param(&params.release_ms, setter));
-                                    ui.end_row();
-
-                                    ui.label("Hard Mode (Surgical vs Soft)");
-                                    ui.add(widgets::ParamSlider::for_param(&params.hard_mode, setter));
-                                    ui.end_row();
-
-                                    ui.label("Focus Low (<400 Hz)");
-                                    ui.add(widgets::ParamSlider::for_param(&params.focus_low_db, setter));
-                                    ui.end_row();
-
-                                    ui.label("Focus Mid (0.4-4 kHz)");
-                                    ui.add(widgets::ParamSlider::for_param(&params.focus_mid_db, setter));
-                                    ui.end_row();
-
-                                    ui.label("Focus High (>4 kHz)");
-                                    ui.add(widgets::ParamSlider::for_param(&params.focus_high_db, setter));
-                                    ui.end_row();
-                                });
-                        });
-                });
-            },
-        )
-    }
+    forge_ab_editor!(
+        persisted_scroll,
+        title: "FORGE OPENSOOTHE DE-FIZZ",
+        subtitle: "2048-pt OLA STFT Dynamic Spectral Resonance & AI Metallic Whistle Suppressor",
+        slot: (p => shared_spectrum_slot_index(p.shared_bus_slot.value() as usize)),
+        drag: ("SENS", sensitivity_db, egui::Color32::from_rgb(250, 204, 21)),
+        presets: OPENSOOTHE_PRESETS,
+        grid_id: "opensoothe_grid",
+        params: [
+            ("sens", Float, sensitivity_db, "Sensitivity (dB)"),
+            ("depth", Float, max_depth_db, "Max Suppression (dB)"),
+            ("sharp", Int, sharpness_bins, "Sharpness Radius"),
+            ("delta", Bool, delta_listen, "Delta Listen (Fizz Only)"),
+            ("submono", Bool, enable_sub_tape, "SubMono (<160 Hz) + Tape Bus"),
+            ("tape", Float, tape_drive, "Console8 / ChowTape Drive"),
+            ("limit", Bool, enable_limiter, "True-Peak -1.0 dBTP Brickwall"),
+            ("ceil", Float, ceiling_dbtp, "Limiter Ceiling (dBTP)"),
+            ("bus_slot", Int, shared_bus_slot, "Cross-Instance Spectrum Slot"),
+            ("tilt", Float, tilt_db_per_oct, "Spectral Tilt (dB/oct)"),
+            ("slink", Float, stereo_link, "Stereo Link"),
+            ("msbal", Float, mid_side_balance, "Mid/Side Focus (-1 M .. +1 S)"),
+            ("lowlat", Bool, low_latency_mode, "Low-Latency Tracking (~5.3 ms)"),
+            ("atk", Float, attack_ms, "Attack (ms)"),
+            ("rel", Float, release_ms, "Release (ms)"),
+            ("hard", Bool, hard_mode, "Hard Mode (Surgical vs Soft)"),
+            ("foc_lo", Float, focus_low_db, "Focus Low (<400 Hz)"),
+            ("foc_mid", Float, focus_mid_db, "Focus Mid (0.4-4 kHz)"),
+            ("foc_hi", Float, focus_high_db, "Focus High (>4 kHz)"),
+        ]
+    );
 
     fn initialize(
         &mut self,
@@ -526,8 +410,7 @@ impl Plugin for ForgeOpenSoothePlug {
             let depth = f64::from(self.params.max_depth_db.smoothed.next());
             let tape_drive = f64::from(self.params.tape_drive.smoothed.next());
 
-            let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
-            let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
+            let (in_l, in_r) = read_stereo(&mut channel_samples);
 
             let (mut out_l, mut out_r) = self
                 .dsp
@@ -546,19 +429,10 @@ impl Plugin for ForgeOpenSoothePlug {
                 self.limiter_dsp.process_delay_only(out_l, out_r)
             };
 
-            let gr_est = 20.0
-                * (out_l.abs().max(out_r.abs()) / in_l.abs().max(in_r.abs()).max(1e-5))
-                    .clamp(0.05, 1.0)
-                    .log10();
+            let gr_est = estimate_gr_db(in_l, in_r, out_l, out_r);
             self.telemetry
                 .update_peaks(in_l, in_r, out_l, out_r, gr_est);
-
-            if let Some(s0) = channel_samples.get_mut(0) {
-                *s0 = out_l;
-            }
-            if let Some(s1) = channel_samples.get_mut(1) {
-                *s1 = out_r;
-            }
+            write_stereo(&mut channel_samples, out_l, out_r);
         }
 
         // Publish true 2048-pt STFT 32-band spectral energy & dynamic GR curve to GUI & Cross-Instance Bus
@@ -571,29 +445,24 @@ impl Plugin for ForgeOpenSoothePlug {
     }
 }
 
-impl ClapPlugin for ForgeOpenSoothePlug {
-    const CLAP_ID: &'static str = "org.the40thieves.forge-audio.opensoothe-defizz";
-    const CLAP_DESCRIPTION: Option<&'static str> =
-        Some("Real-Time 2048-pt OLA STFT Dynamic Spectral Resonance & AI Metallic Fizz Suppressor");
-    const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_SUPPORT_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_FEATURES: &'static [ClapFeature] = &[
+impl_forge_formats!(
+    ForgeOpenSoothePlug,
+    clap_id: "org.the40thieves.forge-audio.opensoothe-defizz",
+    clap_desc: "Real-Time 2048-pt OLA STFT Dynamic Spectral Resonance & AI Metallic Fizz Suppressor",
+    clap_features: &[
         ClapFeature::AudioEffect,
         ClapFeature::Restoration,
         ClapFeature::Equalizer,
         ClapFeature::Mastering,
         ClapFeature::Stereo,
-    ];
-}
-
-impl Vst3Plugin for ForgeOpenSoothePlug {
-    const VST3_CLASS_ID: [u8; 16] = *b"ForgeOpenSoothe1";
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
+    ],
+    vst3_id: *b"ForgeOpenSoothe1",
+    vst3_cats: &[
         Vst3SubCategory::Fx,
         Vst3SubCategory::Restoration,
         Vst3SubCategory::Mastering,
-    ];
-}
+    ],
+);
 
 // ============================================================================
 // 2. FORGE OPENSPACER SIDECHAIN UNMASKER (4-Channel Sidechain CLAP Plugin)
@@ -685,115 +554,31 @@ impl Default for OpenSpacerParams {
     }
 }
 
-impl Default for ForgeOpenSpacerPlug {
-    fn default() -> Self {
-        Self {
-            params: Arc::new(OpenSpacerParams::default()),
-            telemetry: Arc::new(GuiTelemetry::default()),
-            analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
-            dsp: RealtimeOpenSpacer::new(48_000.0),
-            sample_rate: 48_000.0,
-        }
-    }
-}
+impl_standard_plugin_default!(ForgeOpenSpacerPlug, OpenSpacerParams, RealtimeOpenSpacer);
 
 impl Plugin for ForgeOpenSpacerPlug {
-    const NAME: &'static str = "Forge OpenSpacer Unmask";
-    const VENDOR: &'static str = "The 40 Thieves (ForgeAudio)";
-    const URL: &'static str = "https://github.com/The-40-Thieves/audio-forge";
-    const EMAIL: &'static str = "audio@the40thieves.org";
-    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+    forge_plugin_common!(
+        "Forge OpenSpacer Unmask",
+        crate::chassis::STEREO_SIDECHAIN_LAYOUTS
+    );
 
-    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
-        main_input_channels: NonZeroU32::new(2),
-        main_output_channels: NonZeroU32::new(2),
-        aux_input_ports: &[new_nonzero_u32(2)],
-        ..AudioIOLayout::const_default()
-    }];
+    forge_ab_editor!(
+        title: "FORGE OPENSPACER UNMASK",
+        subtitle: "4-Channel Sidechain Dynamic Spectral Unmasker (Vocal -> Music & Kick -> Sub-Bass)",
+        presets: OPENSPACER_PRESETS,
+        grid_id: "openspacer_grid",
+        params: [
+            ("amt", Float, amount, "Unmask Amount"),
+            ("maxcut", Float, max_cut_db, "Max Carve Depth (dB)"),
+            ("lowhz", Float, low_hz, "Low Crossover (Hz)"),
+            ("highhz", Float, high_hz, "High Crossover (Hz)"),
+            ("kickmode", Bool, kick_bass_mode, "Kick -> Sub-Bass Mode"),
+            ("delta", Bool, delta_listen, "Delta Listen (Carved Only)"),
+            ("msbal", Float, mid_side_balance, "Mid/Side Focus (-1 M .. +1 S)"),
+        ]
+    );
 
-    const SAMPLE_ACCURATE_AUTOMATION: bool = true;
-    type SysExMessage = ();
-    type BackgroundTask = ();
-
-    fn params(&self) -> Arc<dyn Params> {
-        self.params.clone()
-    }
-
-    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        let params = self.params.clone();
-        let telemetry = self.telemetry.clone();
-        create_egui_editor(
-            self.params.editor_state.clone(),
-            AbBankState::default(),
-            |_, _| {},
-            move |egui_ctx, setter, ab_state| {
-                egui::CentralPanel::default().show(egui_ctx, |ui| {
-                    draw_forge_studio_header_and_spectrum(
-                        ui,
-                        "FORGE OPENSPACER UNMASK",
-                        "4-Channel Sidechain Dynamic Spectral Unmasker (Vocal -> Music & Kick -> Sub-Bass)",
-                        &telemetry,
-                        None,
-                    );
-                    let param_refs = [
-                        ("amt", ParamRef::Float(&params.amount)),
-                        ("maxcut", ParamRef::Float(&params.max_cut_db)),
-                        ("lowhz", ParamRef::Float(&params.low_hz)),
-                        ("highhz", ParamRef::Float(&params.high_hz)),
-                        ("kickmode", ParamRef::Bool(&params.kick_bass_mode)),
-                        ("delta", ParamRef::Bool(&params.delta_listen)),
-                        ("msbal", ParamRef::Float(&params.mid_side_balance)),
-                    ];
-                    draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, OPENSPACER_PRESETS);
-                    egui::Grid::new("openspacer_grid")
-                        .num_columns(2)
-                        .spacing([16.0, 8.0])
-                        .show(ui, |ui| {
-                            ui.label("Unmask Amount");
-                            ui.add(widgets::ParamSlider::for_param(&params.amount, setter));
-                            ui.end_row();
-                            ui.label("Max Carve Depth (dB)");
-                            ui.add(widgets::ParamSlider::for_param(&params.max_cut_db, setter));
-                            ui.end_row();
-                            ui.label("Low Crossover (Hz)");
-                            ui.add(widgets::ParamSlider::for_param(&params.low_hz, setter));
-                            ui.end_row();
-                            ui.label("High Crossover (Hz)");
-                            ui.add(widgets::ParamSlider::for_param(&params.high_hz, setter));
-                            ui.end_row();
-                            ui.label("Kick -> Sub-Bass Mode");
-                            ui.add(widgets::ParamSlider::for_param(&params.kick_bass_mode, setter));
-                            ui.end_row();
-                            ui.label("Delta Listen (Carved Only)");
-                            ui.add(widgets::ParamSlider::for_param(&params.delta_listen, setter));
-                            ui.end_row();
-                            ui.label("Mid/Side Focus (-1 M .. +1 S)");
-                            ui.add(widgets::ParamSlider::for_param(&params.mid_side_balance, setter));
-                            ui.end_row();
-                        });
-                });
-            },
-        )
-    }
-
-    fn initialize(
-        &mut self,
-        _audio_io_layout: &AudioIOLayout,
-        buffer_config: &BufferConfig,
-        context: &mut impl InitContext<Self>,
-    ) -> bool {
-        let sr = f64::from(buffer_config.sample_rate);
-        self.sample_rate = sr;
-        self.dsp.reset(sr);
-        self.analyzer.reset(sr);
-        context.set_latency_samples(self.dsp.latency_samples());
-        true
-    }
-
-    fn reset(&mut self) {
-        self.dsp.reset(self.sample_rate);
-        self.analyzer.clear_state();
-    }
+    impl_standard_plugin_lifecycle!(latency);
 
     fn process(
         &mut self,
@@ -843,10 +628,7 @@ impl Plugin for ForgeOpenSpacerPlug {
                 .process_sample(tgt_l, tgt_r, sc_l, sc_r, low_hz, high_hz, amt, max_cut);
 
             self.analyzer.push_stereo_sample(out_l, out_r);
-            let gr_est = 20.0
-                * (out_l.abs().max(out_r.abs()) / tgt_l.abs().max(tgt_r.abs()).max(1e-5))
-                    .clamp(0.05, 1.0)
-                    .log10();
+            let gr_est = estimate_gr_db(tgt_l, tgt_r, out_l, out_r);
             self.telemetry
                 .update_peaks(tgt_l, tgt_r, out_l, out_r, gr_est);
 
@@ -866,25 +648,20 @@ impl Plugin for ForgeOpenSpacerPlug {
     }
 }
 
-impl ClapPlugin for ForgeOpenSpacerPlug {
-    const CLAP_ID: &'static str = "org.the40thieves.forge-audio.openspacer-unmask";
-    const CLAP_DESCRIPTION: Option<&'static str> =
-        Some("Sidechain Dynamic Spectral Unmasker (Vocal -> Music & Kick -> Bass)");
-    const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_SUPPORT_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_FEATURES: &'static [ClapFeature] = &[
+impl_forge_formats!(
+    ForgeOpenSpacerPlug,
+    clap_id: "org.the40thieves.forge-audio.openspacer-unmask",
+    clap_desc: "Sidechain Dynamic Spectral Unmasker (Vocal -> Music & Kick -> Bass)",
+    clap_features: &[
         ClapFeature::AudioEffect,
         ClapFeature::Equalizer,
         ClapFeature::Mixing,
         ClapFeature::Stereo,
-    ];
-}
-
-impl Vst3Plugin for ForgeOpenSpacerPlug {
-    const VST3_CLASS_ID: [u8; 16] = *b"ForgeOpenSpacer1";
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
+    ],
+    vst3_id: *b"ForgeOpenSpacer1",
+    vst3_cats: &[
         Vst3SubCategory::Fx,
         Vst3SubCategory::Eq,
         Vst3SubCategory::Dynamics,
-    ];
-}
+    ],
+);

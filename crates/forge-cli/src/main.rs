@@ -897,114 +897,81 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             rpp.add_default_song_structure_markers();
 
             // Track 0: Lead Vocal (with surgical strip + OpenSoothe + editable Take Pitch Envelope)
-            rpp.tracks.push(ReaperTrackSpec {
-                name: "01 Lead Vocal (Dry De-Fizzed)".to_string(),
-                file_path: bundle.vocals.clone(),
-                is_midi: false,
-                duration_secs,
-                volume_lin: 0.85,
-                pan: 0.0,
-                color: 0x0155_88FF,
-                jsfx_inserts: vec![
-                    "Forge_Vocal_Surgical.jsfx".to_string(),
-                    "Forge_OpenSoothe_DeFizz.jsfx".to_string(),
-                ],
-                sidechain_from_track: None,
-                stretch_markers: Vec::new(),
-                pitch_envelope: vocal_pitch_frames,
-            });
+            rpp.tracks.push(
+                ReaperTrackSpec::audio(
+                    "01 Lead Vocal (Dry De-Fizzed)",
+                    bundle.vocals.clone(),
+                    duration_secs,
+                    0.85,
+                    0x0155_88FF,
+                )
+                .with_jsfx(["Forge_Vocal_Surgical.jsfx", "Forge_OpenSoothe_DeFizz.jsfx"])
+                .with_pitch_envelope(vocal_pitch_frames),
+            );
 
             // Track 1: Drums Stem
-            rpp.tracks.push(ReaperTrackSpec {
-                name: "02 Drums Stem".to_string(),
-                file_path: bundle.drums.clone(),
-                is_midi: false,
+            rpp.tracks.push(ReaperTrackSpec::audio(
+                "02 Drums Stem",
+                bundle.drums.clone(),
                 duration_secs,
-                volume_lin: 0.80,
-                pan: 0.0,
-                color: 0x0144_CC44,
-                jsfx_inserts: Vec::new(),
-                sidechain_from_track: None,
-                stretch_markers: Vec::new(),
-                pitch_envelope: Vec::new(),
-            });
+                0.80,
+                0x0144_CC44,
+            ));
 
             // Track 2: Bass Stem (Sidechain Unmasked by Track 1 Drums + Sub-Bass Mono Reinforce)
-            rpp.tracks.push(ReaperTrackSpec {
-                name: "03 Bass Stem (Sidechain Unmasked + Mono Sub)".to_string(),
-                file_path: bundle.bass.clone(),
-                is_midi: false,
-                duration_secs,
-                volume_lin: 0.82,
-                pan: 0.0,
-                color: 0x01FF_8844,
-                jsfx_inserts: vec![
-                    "Forge_SubBass_Reinforce.jsfx".to_string(),
-                    "Forge_OpenSpacer_Unmask.jsfx".to_string(),
-                ],
-                sidechain_from_track: Some(1),
-                stretch_markers: Vec::new(),
-                pitch_envelope: Vec::new(),
-            });
+            rpp.tracks.push(
+                ReaperTrackSpec::audio(
+                    "03 Bass Stem (Sidechain Unmasked + Mono Sub)",
+                    bundle.bass.clone(),
+                    duration_secs,
+                    0.82,
+                    0x01FF_8844,
+                )
+                .with_jsfx([
+                    "Forge_SubBass_Reinforce.jsfx",
+                    "Forge_OpenSpacer_Unmask.jsfx",
+                ])
+                .with_sidechain(Some(1)),
+            );
 
             // Track 3: Instruments / Synths / Guitars (Sidechain Unmasked by Track 0 Lead Vocal)
-            rpp.tracks.push(ReaperTrackSpec {
-                name: "04 Instruments Bus (Vocal Unmasked + De-Fizzed)".to_string(),
-                file_path: bundle.other.clone(),
-                is_midi: false,
-                duration_secs,
-                volume_lin: 0.78,
-                pan: 0.0,
-                color: 0x01CC_66FF,
-                jsfx_inserts: vec![
-                    "Forge_OpenSoothe_DeFizz.jsfx".to_string(),
-                    "Forge_OpenSpacer_Unmask.jsfx".to_string(),
-                ],
-                sidechain_from_track: Some(0),
-                stretch_markers: Vec::new(),
-                pitch_envelope: Vec::new(),
-            });
+            rpp.tracks.push(
+                ReaperTrackSpec::audio(
+                    "04 Instruments Bus (Vocal Unmasked + De-Fizzed)",
+                    bundle.other.clone(),
+                    duration_secs,
+                    0.78,
+                    0x01CC_66FF,
+                )
+                .with_jsfx([
+                    "Forge_OpenSoothe_DeFizz.jsfx",
+                    "Forge_OpenSpacer_Unmask.jsfx",
+                ])
+                .with_sidechain(Some(0)),
+            );
 
             // Tracks 4-6: Aligned MIDI Tracks (Drum Triggers, Voiced Chords, Sub-Bass)
-            rpp.tracks.push(ReaperTrackSpec {
-                name: "05 MIDI Drum Triggers (Kick C1 / Snare D1 / Hat F#1)".to_string(),
-                file_path: Some(drum_midi_path),
-                is_midi: true,
+            rpp.tracks.push(ReaperTrackSpec::midi(
+                "05 MIDI Drum Triggers (Kick C1 / Snare D1 / Hat F#1)",
+                drum_midi_path,
                 duration_secs,
-                volume_lin: 0.90,
-                pan: 0.0,
-                color: 0x0144_FFAA,
-                jsfx_inserts: Vec::new(),
-                sidechain_from_track: None,
-                stretch_markers: Vec::new(),
-                pitch_envelope: Vec::new(),
-            });
-            rpp.tracks.push(ReaperTrackSpec {
-                name: "06 MIDI Voiced Chords (Neo-Soul Drop-2)".to_string(),
-                file_path: Some(chords_midi_path),
-                is_midi: true,
+                0.90,
+                0x0144_FFAA,
+            ));
+            rpp.tracks.push(ReaperTrackSpec::midi(
+                "06 MIDI Voiced Chords (Neo-Soul Drop-2)",
+                chords_midi_path,
                 duration_secs,
-                volume_lin: 0.85,
-                pan: 0.0,
-                color: 0x01FF_CC44,
-                jsfx_inserts: Vec::new(),
-                sidechain_from_track: None,
-                stretch_markers: Vec::new(),
-                pitch_envelope: Vec::new(),
-            });
-            rpp.tracks.push(ReaperTrackSpec {
-                name: "07 MIDI Phase-Pure Sub-Bass / 808".to_string(),
-                file_path: Some(bass_midi_path),
-                is_midi: true,
+                0.85,
+                0x01FF_CC44,
+            ));
+            rpp.tracks.push(ReaperTrackSpec::midi(
+                "07 MIDI Phase-Pure Sub-Bass / 808",
+                bass_midi_path,
                 duration_secs,
-                volume_lin: 0.88,
-                pan: 0.0,
-                color: 0x01FF_6644,
-                jsfx_inserts: Vec::new(),
-                sidechain_from_track: None,
-                stretch_markers: Vec::new(),
-                pitch_envelope: Vec::new(),
-            });
+                0.88,
+                0x01FF_6644,
+            ));
 
             let rpp_path = output_dir.join("ForgeAudio_Session.rpp");
             rpp.save_rpp(&rpp_path)?;
@@ -1163,39 +1130,27 @@ fn run_daw_cli(action: DawAction) -> anyhow::Result<()> {
                 }
             }
             let engine = ObjectOrientedEngine::compile(&proj, &cache);
-            let total_objects: usize = proj.tracks.iter().map(|t| t.objects.len()).sum();
-            let total_midi_clips: usize = proj.tracks.iter().map(|t| t.midi_clips.len()).sum();
-            let summary = serde_json::json!({
-                "name": proj.name,
-                "sample_rate": proj.sample_rate,
-                "bpm": proj.bpm,
-                "time_signature": format!("{}/{}", proj.time_sig_num, proj.time_sig_den),
-                "tracks": proj.tracks.len(),
-                "audio_objects": total_objects,
-                "midi_clips": total_midi_clips,
-                "aux_buses": proj.aux_buses.len(),
-                "master_inserts": proj.master_inserts.len(),
-                "total_pdc_samples": engine.total_pdc_samples(),
-                "missing_clips": missing_clips,
-            });
+            let summary = proj.inspect_summary(engine.total_pdc_samples(), missing_clips);
             if json {
                 println!("{}", serde_json::to_string_pretty(&summary)?);
             } else {
                 println!(
-                    "ForgeStudio Project '{}' | {} Hz | {:.1} BPM ({}/{}) | {} tracks ({} objects, {} MIDI clips) | {} aux buses | PDC: {} spl",
-                    proj.name,
-                    proj.sample_rate,
-                    proj.bpm,
-                    proj.time_sig_num,
-                    proj.time_sig_den,
-                    proj.tracks.len(),
-                    total_objects,
-                    total_midi_clips,
-                    proj.aux_buses.len(),
-                    engine.total_pdc_samples()
+                    "ForgeStudio Project '{}' | {} Hz | {:.1} BPM ({}) | {} tracks ({} objects, {} MIDI clips) | {} aux buses | PDC: {} spl",
+                    summary.name,
+                    summary.sample_rate,
+                    summary.bpm,
+                    summary.time_signature,
+                    summary.tracks,
+                    summary.audio_objects,
+                    summary.midi_clips,
+                    summary.aux_buses,
+                    summary.total_pdc_samples
                 );
-                if !missing_clips.is_empty() {
-                    eprintln!("Warning: {} clip(s) missing on disk", missing_clips.len());
+                if !summary.missing_clips.is_empty() {
+                    eprintln!(
+                        "Warning: {} clip(s) missing on disk",
+                        summary.missing_clips.len()
+                    );
                 }
             }
         }

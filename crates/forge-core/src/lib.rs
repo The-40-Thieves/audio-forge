@@ -37,6 +37,7 @@ pub enum ForgeError {
 pub type Result<T> = std::result::Result<T, ForgeError>;
 
 mod wav_io;
+pub use wav_io::{BoundedChildExit, wait_child_bounded_stderr};
 
 fn open_for_read(path: &Path) -> Result<std::fs::File> {
     std::fs::File::open(path).map_err(|e| ForgeError::AudioIo {
@@ -200,22 +201,20 @@ impl AudioBuffer {
     /// Creates `path` (and its parent directories) and delegates to
     /// [`AudioBuffer::save_wav_to_writer`].
     pub fn save_wav<P: AsRef<Path>>(&self, path: P, bits_per_sample: u16) -> Result<()> {
-        let path_ref = path.as_ref();
-        if let Some(parent) = path_ref.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let origin = path_ref.display().to_string();
-        let file = std::fs::File::create(path_ref).map_err(|e| ForgeError::AudioIo {
-            path: origin.clone(),
-            message: e.to_string(),
-        })?;
-        self.save_wav_to_writer(BufWriter::new(file), bits_per_sample, &origin)
+        self.save_wav_with_dither(path, bits_per_sample, true)
     }
 
     /// Writes an already-dithered `AudioBuffer` to `path` without adding a second TPDF dither stage.
     pub fn save_wav_no_dither<P: AsRef<Path>>(&self, path: P, bits_per_sample: u16) -> Result<()> {
+        self.save_wav_with_dither(path, bits_per_sample, false)
+    }
+
+    fn save_wav_with_dither<P: AsRef<Path>>(
+        &self,
+        path: P,
+        bits_per_sample: u16,
+        dither: bool,
+    ) -> Result<()> {
         let path_ref = path.as_ref();
         if let Some(parent) = path_ref.parent()
             && !parent.as_os_str().is_empty()
@@ -227,7 +226,11 @@ impl AudioBuffer {
             path: origin.clone(),
             message: e.to_string(),
         })?;
-        self.save_wav_no_dither_to_writer(BufWriter::new(file), bits_per_sample, &origin)
+        if dither {
+            self.save_wav_to_writer(BufWriter::new(file), bits_per_sample, &origin)
+        } else {
+            self.save_wav_no_dither_to_writer(BufWriter::new(file), bits_per_sample, &origin)
+        }
     }
 }
 

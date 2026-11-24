@@ -1,6 +1,22 @@
 //! Forge SplitEQ, Forge Density & Clipper & Forge SpaceVerb & Preamp plugins.
 
+use crate::chassis::*;
 use crate::*;
+
+define_presets! {
+    const SPLITEQ_PRESETS {
+        "Drum Punch" => { "tr_low": 0.62, "tr_mid": 0.55, "tr_high": 0.60, "tn_low": 0.48, "tn_mid": 0.45, "tn_high": 0.50 };
+        "Vocal Air" => { "tr_low": 0.50, "tr_mid": 0.45, "tr_high": 0.45, "tn_low": 0.50, "tn_mid": 0.54, "tn_high": 0.62 };
+    }
+    const DENSITY_CLIPPER_PRESETS {
+        "Glue Bus" => { "density": 0.25, "clip": 0.20, "ceil": 0.85 };
+        "Loud Master Clip" => { "density": 0.40, "clip": 0.45, "ceil": 0.90 };
+    }
+    const SPACEVERB_PRESETS {
+        "Vocal Hall" => { "model": 0.0, "pdrive": 0.25, "decay": 0.60, "damp": 0.45, "shimmer": 0.12, "duck": 0.60, "mix": 0.22 };
+        "Lush Shimmer" => { "model": 0.67, "pdrive": 0.35, "decay": 0.82, "damp": 0.30, "shimmer": 0.45, "duck": 0.40, "mix": 0.38 };
+    }
+}
 // ============================================================================
 // 8. FORGE SPLITEQ TRANSIENT & TONAL SHAPER (Eventide SplitEQ / Spiff Rival)
 // ============================================================================
@@ -58,127 +74,30 @@ impl Default for SplitEqParams {
     }
 }
 
-impl Default for ForgeSplitEqPlug {
-    fn default() -> Self {
-        Self {
-            params: Arc::new(SplitEqParams::default()),
-            telemetry: Arc::new(GuiTelemetry::default()),
-            analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
-            dsp: RealtimeTransientTonalSplit::new(48_000.0),
-            sample_rate: 48_000.0,
-        }
-    }
-}
+impl_standard_plugin_default!(ForgeSplitEqPlug, SplitEqParams, RealtimeTransientTonalSplit);
 
 impl Plugin for ForgeSplitEqPlug {
-    const NAME: &'static str = "Forge SplitEQ Transient & Tonal";
-    const VENDOR: &'static str = "The 40 Thieves (ForgeAudio)";
-    const URL: &'static str = "https://github.com/The-40-Thieves/audio-forge";
-    const EMAIL: &'static str = "audio@the40thieves.org";
-    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+    forge_plugin_common!(
+        "Forge SplitEQ Transient & Tonal",
+        crate::chassis::STEREO_LAYOUTS
+    );
 
-    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
-        main_input_channels: NonZeroU32::new(2),
-        main_output_channels: NonZeroU32::new(2),
-        ..AudioIOLayout::const_default()
-    }];
+    forge_ab_editor!(
+        title: "FORGE SPLITEQ — TRANSIENT vs. TONAL",
+        subtitle: "Structural 3-Band Transient Attack vs. Sustained Harmonic Body Shaper",
+        presets: SPLITEQ_PRESETS,
+        grid_id: "spliteq_grid",
+        params: [
+            ("tr_low", Float, trans_low_db, "Low Transient (<250 Hz)"),
+            ("tr_mid", Float, trans_mid_db, "Mid Transient (250-3.5kHz)"),
+            ("tr_high", Float, trans_high_db, "High Transient (>3.5kHz)"),
+            ("tn_low", Float, tonal_low_db, "Low Tonal Body (<250 Hz)"),
+            ("tn_mid", Float, tonal_mid_db, "Mid Tonal Sustain (250-3.5kHz)"),
+            ("tn_high", Float, tonal_high_db, "High Tonal Air (>3.5kHz)"),
+        ]
+    );
 
-    const SAMPLE_ACCURATE_AUTOMATION: bool = true;
-    type SysExMessage = ();
-    type BackgroundTask = ();
-
-    fn params(&self) -> Arc<dyn Params> {
-        self.params.clone()
-    }
-
-    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        let params = self.params.clone();
-        let telemetry = self.telemetry.clone();
-        create_egui_editor(
-            self.params.editor_state.clone(),
-            AbBankState::default(),
-            |_, _| {},
-            move |egui_ctx, setter, ab_state| {
-                egui::CentralPanel::default().show(egui_ctx, |ui| {
-                    draw_forge_studio_header_and_spectrum(
-                        ui,
-                        "FORGE SPLITEQ — TRANSIENT vs. TONAL",
-                        "Structural 3-Band Transient Attack vs. Sustained Harmonic Body Shaper",
-                        &telemetry,
-                        None,
-                    );
-                    let param_refs = [
-                        ("tr_low", ParamRef::Float(&params.trans_low_db)),
-                        ("tr_mid", ParamRef::Float(&params.trans_mid_db)),
-                        ("tr_high", ParamRef::Float(&params.trans_high_db)),
-                        ("tn_low", ParamRef::Float(&params.tonal_low_db)),
-                        ("tn_mid", ParamRef::Float(&params.tonal_mid_db)),
-                        ("tn_high", ParamRef::Float(&params.tonal_high_db)),
-                    ];
-                    draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, SPLITEQ_PRESETS);
-                    egui::Grid::new("spliteq_grid")
-                        .num_columns(2)
-                        .spacing([16.0, 8.0])
-                        .show(ui, |ui| {
-                            ui.label("Low Transient (<250 Hz)");
-                            ui.add(widgets::ParamSlider::for_param(
-                                &params.trans_low_db,
-                                setter,
-                            ));
-                            ui.end_row();
-                            ui.label("Mid Transient (250-3.5kHz)");
-                            ui.add(widgets::ParamSlider::for_param(
-                                &params.trans_mid_db,
-                                setter,
-                            ));
-                            ui.end_row();
-                            ui.label("High Transient (>3.5kHz)");
-                            ui.add(widgets::ParamSlider::for_param(
-                                &params.trans_high_db,
-                                setter,
-                            ));
-                            ui.end_row();
-                            ui.label("Low Tonal Body (<250 Hz)");
-                            ui.add(widgets::ParamSlider::for_param(
-                                &params.tonal_low_db,
-                                setter,
-                            ));
-                            ui.end_row();
-                            ui.label("Mid Tonal Sustain (250-3.5kHz)");
-                            ui.add(widgets::ParamSlider::for_param(
-                                &params.tonal_mid_db,
-                                setter,
-                            ));
-                            ui.end_row();
-                            ui.label("High Tonal Air (>3.5kHz)");
-                            ui.add(widgets::ParamSlider::for_param(
-                                &params.tonal_high_db,
-                                setter,
-                            ));
-                            ui.end_row();
-                        });
-                });
-            },
-        )
-    }
-
-    fn initialize(
-        &mut self,
-        _audio_io_layout: &AudioIOLayout,
-        buffer_config: &BufferConfig,
-        _context: &mut impl InitContext<Self>,
-    ) -> bool {
-        let sr = f64::from(buffer_config.sample_rate);
-        self.sample_rate = sr;
-        self.dsp.reset(sr);
-        self.analyzer.reset(sr);
-        true
-    }
-
-    fn reset(&mut self) {
-        self.dsp.reset(self.sample_rate);
-        self.analyzer.clear_state();
-    }
+    impl_standard_plugin_lifecycle!();
 
     fn process(
         &mut self,
@@ -201,17 +120,18 @@ impl Plugin for ForgeSplitEqPlug {
             ];
             last_tr = tr;
             last_tn = tn;
-            let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
-            let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
+            let (in_l, in_r) = read_stereo(&mut channel_samples);
             let (out_l, out_r) = self.dsp.process_stereo_sample(in_l, in_r, tr, tn, 1.5, 0);
-            self.analyzer.push_stereo_sample(out_l, out_r);
-            self.telemetry.update_peaks(in_l, in_r, out_l, out_r, 0.0);
-            if let Some(s0) = channel_samples.get_mut(0) {
-                *s0 = out_l;
-            }
-            if let Some(s1) = channel_samples.get_mut(1) {
-                *s1 = out_r;
-            }
+            finish_stereo_sample(
+                &mut self.analyzer,
+                &self.telemetry,
+                &mut channel_samples,
+                in_l,
+                in_r,
+                out_l,
+                out_r,
+                0.0,
+            );
         }
         let mut split_curve = [0.0_f32; 32];
         for (b, val) in split_curve.iter_mut().enumerate() {
@@ -230,28 +150,23 @@ impl Plugin for ForgeSplitEqPlug {
     }
 }
 
-impl ClapPlugin for ForgeSplitEqPlug {
-    const CLAP_ID: &'static str = "org.the40thieves.forge-audio.spliteq-transient-tonal";
-    const CLAP_DESCRIPTION: Option<&'static str> =
-        Some("Structural 3-Band Transient vs. Tonal Equalizer & Attack/Sustain Shaper");
-    const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_SUPPORT_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_FEATURES: &'static [ClapFeature] = &[
+impl_forge_formats!(
+    ForgeSplitEqPlug,
+    clap_id: "org.the40thieves.forge-audio.spliteq-transient-tonal",
+    clap_desc: "Structural 3-Band Transient vs. Tonal Equalizer & Attack/Sustain Shaper",
+    clap_features: &[
         ClapFeature::AudioEffect,
         ClapFeature::Equalizer,
         ClapFeature::TransientShaper,
         ClapFeature::Stereo,
-    ];
-}
-
-impl Vst3Plugin for ForgeSplitEqPlug {
-    const VST3_CLASS_ID: [u8; 16] = *b"ForgeSplitEq0001";
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
+    ],
+    vst3_id: *b"ForgeSplitEq0001",
+    vst3_cats: &[
         Vst3SubCategory::Fx,
         Vst3SubCategory::Eq,
         Vst3SubCategory::Dynamics,
-    ];
-}
+    ],
+);
 
 // ============================================================================
 // 9. FORGE DENSITY & 3-BAND ADAA CLIPPER (oeksound Bloom / Neutron 5 Rival)
@@ -313,103 +228,31 @@ impl Default for DensityClipperParams {
     }
 }
 
-impl Default for ForgeDensityClipperPlug {
-    fn default() -> Self {
-        Self {
-            params: Arc::new(DensityClipperParams::default()),
-            telemetry: Arc::new(GuiTelemetry::default()),
-            analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
-            dsp: RealtimeDensityAndClipper::new(48_000.0),
-            sample_rate: 48_000.0,
-        }
-    }
-}
+impl_standard_plugin_default!(
+    ForgeDensityClipperPlug,
+    DensityClipperParams,
+    RealtimeDensityAndClipper
+);
 
 impl Plugin for ForgeDensityClipperPlug {
-    const NAME: &'static str = "Forge Density & 3-Band ADAA Clipper";
-    const VENDOR: &'static str = "The 40 Thieves (ForgeAudio)";
-    const URL: &'static str = "https://github.com/The-40-Thieves/audio-forge";
-    const EMAIL: &'static str = "audio@the40thieves.org";
-    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+    forge_plugin_common!(
+        "Forge Density & 3-Band ADAA Clipper",
+        crate::chassis::STEREO_LAYOUTS
+    );
 
-    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
-        main_input_channels: NonZeroU32::new(2),
-        main_output_channels: NonZeroU32::new(2),
-        ..AudioIOLayout::const_default()
-    }];
+    forge_ab_editor!(
+        title: "FORGE DENSITY & 3-BAND ADAA CLIPPER",
+        subtitle: "Upward Low-Level Density Lifter + 2x Oversampled Anti-Derivative Anti-Aliased Soft Clipper",
+        presets: DENSITY_CLIPPER_PRESETS,
+        grid_id: "density_grid",
+        params: [
+            ("density", Float, upward_density, "Upward Density Amount"),
+            ("clip", Float, clip_drive_db, "3-Band ADAA Clip Drive"),
+            ("ceil", Float, ceiling_db, "Output Ceiling"),
+        ]
+    );
 
-    const SAMPLE_ACCURATE_AUTOMATION: bool = true;
-    type SysExMessage = ();
-    type BackgroundTask = ();
-
-    fn params(&self) -> Arc<dyn Params> {
-        self.params.clone()
-    }
-
-    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        let params = self.params.clone();
-        let telemetry = self.telemetry.clone();
-        create_egui_editor(
-            self.params.editor_state.clone(),
-            AbBankState::default(),
-            |_, _| {},
-            move |egui_ctx, setter, ab_state| {
-                egui::CentralPanel::default().show(egui_ctx, |ui| {
-                    draw_forge_studio_header_and_spectrum(
-                        ui,
-                        "FORGE DENSITY & 3-BAND ADAA CLIPPER",
-                        "Upward Low-Level Density Lifter + 2x Oversampled Anti-Derivative Anti-Aliased Soft Clipper",
-                        &telemetry,
-                        None,
-                    );
-                    let param_refs = [
-                        ("density", ParamRef::Float(&params.upward_density)),
-                        ("clip", ParamRef::Float(&params.clip_drive_db)),
-                        ("ceil", ParamRef::Float(&params.ceiling_db)),
-                    ];
-                    draw_ab_and_presets_bar(
-                        ui,
-                        setter,
-                        &param_refs,
-                        ab_state,
-                        DENSITY_CLIPPER_PRESETS,
-                    );
-                    egui::Grid::new("density_grid")
-                        .num_columns(2)
-                        .spacing([16.0, 8.0])
-                        .show(ui, |ui| {
-                            ui.label("Upward Density Amount");
-                            ui.add(widgets::ParamSlider::for_param(&params.upward_density, setter));
-                            ui.end_row();
-                            ui.label("3-Band ADAA Clip Drive");
-                            ui.add(widgets::ParamSlider::for_param(&params.clip_drive_db, setter));
-                            ui.end_row();
-                            ui.label("Output Ceiling");
-                            ui.add(widgets::ParamSlider::for_param(&params.ceiling_db, setter));
-                            ui.end_row();
-                        });
-                });
-            },
-        )
-    }
-
-    fn initialize(
-        &mut self,
-        _audio_io_layout: &AudioIOLayout,
-        buffer_config: &BufferConfig,
-        _context: &mut impl InitContext<Self>,
-    ) -> bool {
-        let sr = f64::from(buffer_config.sample_rate);
-        self.sample_rate = sr;
-        self.dsp = RealtimeDensityAndClipper::new(sr);
-        self.analyzer.reset(sr);
-        true
-    }
-
-    fn reset(&mut self) {
-        self.dsp.reset(self.sample_rate);
-        self.analyzer.clear_state();
-    }
+    impl_standard_plugin_lifecycle!(self, sr => RealtimeDensityAndClipper::new(sr));
 
     fn process(
         &mut self,
@@ -421,50 +264,45 @@ impl Plugin for ForgeDensityClipperPlug {
         for mut channel_samples in buffer.iter_samples() {
             let density = f64::from(self.params.upward_density.smoothed.next());
             let drive = f64::from(self.params.clip_drive_db.smoothed.next());
-            let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
-            let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
+            let (in_l, in_r) = read_stereo(&mut channel_samples);
             let (out_l, out_r) = self
                 .dsp
                 .process_stereo_sample(in_l, in_r, density, drive, ceil);
-            self.analyzer.push_stereo_sample(out_l, out_r);
-            self.telemetry.update_peaks(in_l, in_r, out_l, out_r, 0.0);
-            if let Some(s0) = channel_samples.get_mut(0) {
-                *s0 = out_l;
-            }
-            if let Some(s1) = channel_samples.get_mut(1) {
-                *s1 = out_r;
-            }
+            finish_stereo_sample(
+                &mut self.analyzer,
+                &self.telemetry,
+                &mut channel_samples,
+                in_l,
+                in_r,
+                out_l,
+                out_r,
+                0.0,
+            );
         }
-        self.telemetry
-            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &[0.0; 32]);
+        finish_block_spectrum(&self.analyzer, &self.telemetry);
         ProcessStatus::Normal
     }
 }
 
-impl ClapPlugin for ForgeDensityClipperPlug {
-    const CLAP_ID: &'static str = "org.the40thieves.forge-audio.density-adaa-clipper";
-    const CLAP_DESCRIPTION: Option<&'static str> =
-        Some("Upward Low-Level Density Compressor & 3-Band 2x-Oversampled ADAA Soft Clipper");
-    const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_SUPPORT_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_FEATURES: &'static [ClapFeature] = &[
+impl_forge_formats!(
+    ForgeDensityClipperPlug,
+    clap_id: "org.the40thieves.forge-audio.density-adaa-clipper",
+    clap_desc: "Upward Low-Level Density Compressor & 3-Band 2x-Oversampled ADAA Soft Clipper",
+    clap_features: &[
         ClapFeature::AudioEffect,
         ClapFeature::Compressor,
         ClapFeature::Distortion,
         ClapFeature::Mastering,
         ClapFeature::Stereo,
-    ];
-}
-
-impl Vst3Plugin for ForgeDensityClipperPlug {
-    const VST3_CLASS_ID: [u8; 16] = *b"ForgeDensClip001";
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
+    ],
+    vst3_id: *b"ForgeDensClip001",
+    vst3_cats: &[
         Vst3SubCategory::Fx,
         Vst3SubCategory::Dynamics,
         Vst3SubCategory::Distortion,
         Vst3SubCategory::Mastering,
-    ];
-}
+    ],
+);
 
 // ============================================================================
 // 10. FORGE SPACEVERB FDN & NEURAL PREAMP (Valhalla + Neural DSP / NAM Rival)
@@ -626,22 +464,12 @@ impl Default for SpaceVerbAndPreampParams {
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
             .with_value_to_string(formatters::v2s_f32_rounded(3)),
-            room_geometry: IntParam::new("Room Geometry", 1, IntRange::Linear { min: 0, max: 4 })
-                .with_value_to_string(Arc::new(|v| match v {
-                    0 => "Plate".to_string(),
-                    2 => "Chamber".to_string(),
-                    3 => "Room".to_string(),
-                    4 => "Ambient".to_string(),
-                    _ => "Hall".to_string(),
-                }))
-                .with_string_to_value(Arc::new(|s| match s.trim().to_ascii_lowercase().as_str() {
-                    "0" | "plate" => Some(0),
-                    "1" | "hall" => Some(1),
-                    "2" | "chamber" => Some(2),
-                    "3" | "room" => Some(3),
-                    "4" | "ambient" => Some(4),
-                    _ => None,
-                })),
+            room_geometry: enum_int_param(
+                "Room Geometry",
+                1,
+                &["Plate", "Hall", "Chamber", "Room", "Ambient"],
+                &[],
+            ),
             decay_low_mult: FloatParam::new(
                 "Low Decay EQ",
                 1.0,
@@ -687,110 +515,31 @@ impl Default for ForgeSpaceVerbAndPreampPlug {
 }
 
 impl Plugin for ForgeSpaceVerbAndPreampPlug {
-    const NAME: &'static str = "Forge SpaceVerb FDN & Neural Preamp";
-    const VENDOR: &'static str = "The 40 Thieves (ForgeAudio)";
-    const URL: &'static str = "https://github.com/The-40-Thieves/audio-forge";
-    const EMAIL: &'static str = "audio@the40thieves.org";
-    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+    forge_plugin_common!(
+        "Forge SpaceVerb FDN & Neural Preamp",
+        crate::chassis::STEREO_LAYOUTS
+    );
 
-    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
-        main_input_channels: NonZeroU32::new(2),
-        main_output_channels: NonZeroU32::new(2),
-        ..AudioIOLayout::const_default()
-    }];
-
-    const SAMPLE_ACCURATE_AUTOMATION: bool = true;
-    type SysExMessage = ();
-    type BackgroundTask = ();
-
-    fn params(&self) -> Arc<dyn Params> {
-        self.params.clone()
-    }
-
-    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        let params = self.params.clone();
-        let telemetry = self.telemetry.clone();
-        let initial_ab = AbBankState::load_from_persisted(&self.params.ab_state);
-        create_egui_editor(
-            self.params.editor_state.clone(),
-            initial_ab,
-            |_, _| {},
-            move |egui_ctx, setter, ab_state| {
-                egui::CentralPanel::default().show(egui_ctx, |ui| {
-                    draw_forge_studio_header_and_spectrum(
-                        ui,
-                        "FORGE SPACEVERB FDN & NEURAL WAVENET PREAMP",
-                        "Dilated Causal WaveNet Preamp (.nam Ready) + Moorer ER / Allpass Diffuser / 8x8 Hadamard FDN Reverb",
-                        &telemetry,
-                        None,
-                    );
-                    let param_refs = [
-                        ("model", ParamRef::Int(&params.neural_model_idx)),
-                        ("pdrive", ParamRef::Float(&params.preamp_drive)),
-                        ("decay", ParamRef::Float(&params.reverb_decay)),
-                        ("damp", ParamRef::Float(&params.reverb_damping)),
-                        ("shimmer", ParamRef::Float(&params.shimmer_amount)),
-                        ("duck", ParamRef::Float(&params.vocal_ducking)),
-                        ("mix", ParamRef::Float(&params.wet_mix)),
-                        ("room", ParamRef::Int(&params.room_geometry)),
-                        ("declo", ParamRef::Float(&params.decay_low_mult)),
-                        ("dechi", ParamRef::Float(&params.decay_high_mult)),
-                        ("moddep", ParamRef::Float(&params.mod_depth)),
-                    ];
-                    draw_ab_and_presets_bar_persisted(
-                        ui,
-                        setter,
-                        &param_refs,
-                        ab_state,
-                        SPACEVERB_PRESETS,
-                        Some(&params.ab_state),
-                    );
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false; 2])
-                        .show(ui, |ui| {
-                            egui::Grid::new("spaceverb_grid")
-                                .num_columns(2)
-                                .spacing([16.0, 8.0])
-                                .show(ui, |ui| {
-                                    ui.label("Neural Hardware Model (0..3)");
-                                    ui.add(widgets::ParamSlider::for_param(&params.neural_model_idx, setter));
-                                    ui.end_row();
-                                    ui.label("Neural WaveNet Drive");
-                                    ui.add(widgets::ParamSlider::for_param(&params.preamp_drive, setter));
-                                    ui.end_row();
-                                    ui.label("8x8 FDN Reverb Decay");
-                                    ui.add(widgets::ParamSlider::for_param(&params.reverb_decay, setter));
-                                    ui.end_row();
-                                    ui.label("High Damping");
-                                    ui.add(widgets::ParamSlider::for_param(&params.reverb_damping, setter));
-                                    ui.end_row();
-                                    ui.label("+12 st Octave Shimmer");
-                                    ui.add(widgets::ParamSlider::for_param(&params.shimmer_amount, setter));
-                                    ui.end_row();
-                                    ui.label("Vocal Auto-Ducking");
-                                    ui.add(widgets::ParamSlider::for_param(&params.vocal_ducking, setter));
-                                    ui.end_row();
-                                    ui.label("Reverb Wet Mix");
-                                    ui.add(widgets::ParamSlider::for_param(&params.wet_mix, setter));
-                                    ui.end_row();
-                                    ui.label("Room Geometry");
-                                    ui.add(widgets::ParamSlider::for_param(&params.room_geometry, setter));
-                                    ui.end_row();
-                                    ui.label("Low Decay Rate EQ (<350 Hz)");
-                                    ui.add(widgets::ParamSlider::for_param(&params.decay_low_mult, setter));
-                                    ui.end_row();
-                                    ui.label("High Decay Rate EQ (>4 kHz)");
-                                    ui.add(widgets::ParamSlider::for_param(&params.decay_high_mult, setter));
-                                    ui.end_row();
-                                    ui.label("Chorus Modulation Depth");
-                                    ui.add(widgets::ParamSlider::for_param(&params.mod_depth, setter));
-                                    ui.end_row();
-                                });
-                        });
-                });
-            },
-        )
-    }
+    forge_ab_editor!(
+        persisted_scroll,
+        title: "FORGE SPACEVERB FDN & NEURAL WAVENET PREAMP",
+        subtitle: "Dilated Causal WaveNet Preamp (.nam Ready) + Moorer ER / Allpass Diffuser / 8x8 Hadamard FDN Reverb",
+        presets: SPACEVERB_PRESETS,
+        grid_id: "spaceverb_grid",
+        params: [
+            ("model", Int, neural_model_idx, "Neural Hardware Model (0..3)"),
+            ("pdrive", Float, preamp_drive, "Neural WaveNet Drive"),
+            ("decay", Float, reverb_decay, "8x8 FDN Reverb Decay"),
+            ("damp", Float, reverb_damping, "High Damping"),
+            ("shimmer", Float, shimmer_amount, "+12 st Octave Shimmer"),
+            ("duck", Float, vocal_ducking, "Vocal Auto-Ducking"),
+            ("mix", Float, wet_mix, "Reverb Wet Mix"),
+            ("room", Int, room_geometry, "Room Geometry"),
+            ("declo", Float, decay_low_mult, "Low Decay Rate EQ (<350 Hz)"),
+            ("dechi", Float, decay_high_mult, "High Decay Rate EQ (>4 kHz)"),
+            ("moddep", Float, mod_depth, "Chorus Modulation Depth"),
+        ]
+    );
 
     fn initialize(
         &mut self,
@@ -848,49 +597,43 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
 
         for mut channel_samples in buffer.iter_samples() {
             let pdrive = f64::from(self.params.preamp_drive.smoothed.next());
-            let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
-            let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
+            let (in_l, in_r) = read_stereo(&mut channel_samples);
             let (pr_l, pr_r) =
                 self.preamp_dsp
                     .process_stereo_sample(in_l, in_r, pdrive * 12.0, 0.0);
             let (out_l, out_r) = self
                 .reverb_dsp
                 .process_stereo_sample(pr_l, pr_r, decay, damp, shimmer, duck, mix);
-            self.analyzer.push_stereo_sample(out_l, out_r);
-            self.telemetry.update_peaks(in_l, in_r, out_l, out_r, 0.0);
-            if let Some(s0) = channel_samples.get_mut(0) {
-                *s0 = out_l;
-            }
-            if let Some(s1) = channel_samples.get_mut(1) {
-                *s1 = out_r;
-            }
+            finish_stereo_sample(
+                &mut self.analyzer,
+                &self.telemetry,
+                &mut channel_samples,
+                in_l,
+                in_r,
+                out_l,
+                out_r,
+                0.0,
+            );
         }
-        self.telemetry
-            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &[0.0; 32]);
+        finish_block_spectrum(&self.analyzer, &self.telemetry);
         ProcessStatus::Normal
     }
 }
 
-impl ClapPlugin for ForgeSpaceVerbAndPreampPlug {
-    const CLAP_ID: &'static str = "org.the40thieves.forge-audio.spaceverb-neural-preamp";
-    const CLAP_DESCRIPTION: Option<&'static str> = Some(
-        "Dilated Causal WaveNet Preamp Modeler (1073/1176/V76/A800) & 8x8 Hadamard FDN Shimmer/Ducking Reverb",
-    );
-    const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_SUPPORT_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_FEATURES: &'static [ClapFeature] = &[
+impl_forge_formats!(
+    ForgeSpaceVerbAndPreampPlug,
+    clap_id: "org.the40thieves.forge-audio.spaceverb-neural-preamp",
+    clap_desc: "Dilated Causal WaveNet Preamp Modeler (1073/1176/V76/A800) & 8x8 Hadamard FDN Shimmer/Ducking Reverb",
+    clap_features: &[
         ClapFeature::AudioEffect,
         ClapFeature::Reverb,
         ClapFeature::Distortion,
         ClapFeature::Stereo,
-    ];
-}
-
-impl Vst3Plugin for ForgeSpaceVerbAndPreampPlug {
-    const VST3_CLASS_ID: [u8; 16] = *b"ForgeSpaceVerb01";
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
+    ],
+    vst3_id: *b"ForgeSpaceVerb01",
+    vst3_cats: &[
         Vst3SubCategory::Fx,
         Vst3SubCategory::Reverb,
         Vst3SubCategory::Distortion,
-    ];
-}
+    ],
+);

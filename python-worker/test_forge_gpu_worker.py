@@ -6,10 +6,12 @@ Run with ``python -m unittest discover -s python-worker``.
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import tempfile
 import time
 import types
+from collections.abc import Iterator, Mapping
 from concurrent.futures import Future
 from pathlib import Path
 from unittest import TestCase, main, mock
@@ -31,17 +33,20 @@ class FakeSeparator:
     def load_model(self, model_filename: str) -> None:
         self.model = Path(model_filename).stem
 
+    def write_stems(self, audio_file: str, stems: tuple[str, ...]) -> list[str]:
+        base = Path(audio_file).stem
+        names = [f"{base}_({stem})_{self.model}.wav" for stem in stems]
+        for name in names:
+            (self.output_dir / name).write_bytes(b"RIFF")
+        return names
+
     def separate(self, audio_file: str) -> list[str]:
         stems = (
             ("Reverb", "No Reverb")
             if self.model == DEVERB
             else ("Instrumental", "Vocals")
         )
-        base = Path(audio_file).stem
-        names = [f"{base}_({stem})_{self.model}.wav" for stem in stems]
-        for name in names:
-            (self.output_dir / name).write_bytes(b"RIFF")
-        return names
+        return self.write_stems(audio_file, stems)
 
 
 def fake_module(name: str, **attrs: object) -> types.ModuleType:
@@ -49,6 +54,35 @@ def fake_module(name: str, **attrs: object) -> types.ModuleType:
     for key, value in attrs.items():
         setattr(module, key, value)
     return module
+
+
+def separator_modules(
+    separator_cls: type[FakeSeparator],
+    **extra: types.ModuleType | None,
+) -> dict[str, types.ModuleType | None]:
+    return {
+        "audio_separator": fake_module("audio_separator"),
+        "audio_separator.separator": fake_module(
+            "audio_separator.separator", Separator=separator_cls
+        ),
+        **extra,
+    }
+
+
+@contextlib.contextmanager
+def patched_temp_audio(
+    modules: Mapping[str, types.ModuleType | None],
+    input_name: str | None = None,
+) -> Iterator[tuple[Path, Path]]:
+    with (
+        tempfile.TemporaryDirectory() as tmp,
+        mock.patch.dict(sys.modules, modules),
+    ):
+        out = Path(tmp)
+        inp = out / (input_name or "input.wav")
+        if input_name is not None:
+            inp.write_bytes(b"RIFF")
+        yield out, inp
 
 
 class StemTagTests(TestCase):
@@ -81,18 +115,10 @@ class StemTagTests(TestCase):
 
 class RunSeparateTests(TestCase):
     def run_separate(self, input_name: str, dereverb: bool) -> dict[str, str | None]:
-        separator = fake_module("audio_separator.separator", Separator=FakeSeparator)
-        modules = {
-            "audio_separator": fake_module("audio_separator"),
-            "audio_separator.separator": separator,
-        }
-        with (
-            tempfile.TemporaryDirectory() as tmp,
-            mock.patch.dict(sys.modules, modules),
+        with patched_temp_audio(separator_modules(FakeSeparator), input_name) as (
+            out,
+            inp,
         ):
-            out = Path(tmp)
-            inp = out / input_name
-            inp.write_bytes(b"RIFF")
             result = worker.run_separate(inp, out, dereverb=dereverb)
             return {k: (Path(v).name if v else None) for k, v in result.items()}
 
@@ -105,17 +131,7 @@ class RunSeparateTests(TestCase):
                 constructed = True
                 super().__init__(output_dir, output_format)
 
-        modules = {
-            "audio_separator": fake_module("audio_separator"),
-            "audio_separator.separator": fake_module(
-                "audio_separator.separator", Separator=GuardSeparator
-            ),
-        }
-        with (
-            tempfile.TemporaryDirectory() as tmp,
-            mock.patch.dict(sys.modules, modules),
-        ):
-            out = Path(tmp)
+        with patched_temp_audio(separator_modules(GuardSeparator)) as (out, _inp):
             with self.assertRaises(FileNotFoundError):
                 worker.run_separate(out / "does_not_exist.wav", out, dereverb=False)
         self.assertFalse(constructed)
@@ -222,13 +238,7 @@ class RunDenoiseTests(TestCase):
                 save_audio=save_audio,
             ),
         }
-        with (
-            tempfile.TemporaryDirectory() as tmp,
-            mock.patch.dict(sys.modules, modules),
-        ):
-            out = Path(tmp)
-            inp = out / "noisy_vox.wav"
-            inp.write_bytes(b"RIFF")
+        with patched_temp_audio(modules, "noisy_vox.wav") as (out, inp):
             res = worker.run_denoise(
                 inp, out, attenuation_limit_db=18.0, backend="auto"
             )
@@ -242,30 +252,10 @@ class RunDenoiseTests(TestCase):
     def test_auto_falls_back_to_roformer_when_deepfilternet_absent(self) -> None:
         class DenoiseSeparator(FakeSeparator):
             def separate(self, audio_file: str) -> list[str]:
-                base = Path(audio_file).stem
-                names = [
-                    f"{base}_(Noise)_{self.model}.wav",
-                    f"{base}_(Dry)_{self.model}.wav",
-                ]
-                for name in names:
-                    (self.output_dir / name).write_bytes(b"RIFF")
-                return names
+                return self.write_stems(audio_file, ("Noise", "Dry"))
 
-        modules = {
-            "df": None,
-            "df.enhance": None,
-            "audio_separator": fake_module("audio_separator"),
-            "audio_separator.separator": fake_module(
-                "audio_separator.separator", Separator=DenoiseSeparator
-            ),
-        }
-        with (
-            tempfile.TemporaryDirectory() as tmp,
-            mock.patch.dict(sys.modules, modules),
-        ):
-            out = Path(tmp)
-            inp = out / "room_vox.wav"
-            inp.write_bytes(b"RIFF")
+        modules = separator_modules(DenoiseSeparator, df=None, **{"df.enhance": None})
+        with patched_temp_audio(modules, "room_vox.wav") as (out, inp):
             res = worker.run_denoise(inp, out, backend="auto")
             self.assertEqual(res["backend"], "mel-band-roformer")
             self.assertIn("_(Dry)_", Path(res["denoised"]).name)
@@ -276,26 +266,13 @@ class SixStemAndTranscribeTests(TestCase):
     def test_six_stem_separation_populates_all_six_slots(self) -> None:
         class SixStemSeparator(FakeSeparator):
             def separate(self, audio_file: str) -> list[str]:
-                base = Path(audio_file).stem
-                stems = ("Vocals", "Drums", "Bass", "Guitar", "Piano", "Other")
-                names = [f"{base}_({stem})_{self.model}.wav" for stem in stems]
-                for name in names:
-                    (self.output_dir / name).write_bytes(b"RIFF")
-                return names
+                return self.write_stems(
+                    audio_file, ("Vocals", "Drums", "Bass", "Guitar", "Piano", "Other")
+                )
 
-        modules = {
-            "audio_separator": fake_module("audio_separator"),
-            "audio_separator.separator": fake_module(
-                "audio_separator.separator", Separator=SixStemSeparator
-            ),
-        }
-        with (
-            tempfile.TemporaryDirectory() as tmp,
-            mock.patch.dict(sys.modules, modules),
-        ):
-            out = Path(tmp)
-            inp = out / "full_mix.wav"
-            inp.write_bytes(b"RIFF")
+        with patched_temp_audio(
+            separator_modules(SixStemSeparator), "full_mix.wav"
+        ) as (out, inp):
             res = worker.run_separate(inp, out, dereverb=False, stems=6, quality="fast")
             expected = {
                 "vocals": "full_mix_(Vocals)_htdemucs_6s.wav",
@@ -318,7 +295,6 @@ class SixStemAndTranscribeTests(TestCase):
         class CascadeSeparator(FakeSeparator):
             def separate(self, audio_file: str) -> list[str]:
                 calls.append((self.model, Path(audio_file).name))
-                base = Path(audio_file).stem
                 stems: tuple[str, ...]
                 if self.model in {"BS-Roformer-SW", "htdemucs_6s"}:
                     stems = ("Vocals", "Drums", "Bass", "Guitar", "Piano", "Other")
@@ -330,24 +306,12 @@ class SixStemAndTranscribeTests(TestCase):
                     stems = ("Vocals", "Instrumental")
                 else:
                     stems = ("Instrumental", "Vocals")
-                names = [f"{base}_({stem})_{self.model}.wav" for stem in stems]
-                for name in names:
-                    (self.output_dir / name).write_bytes(b"RIFF")
-                return names
+                return self.write_stems(audio_file, stems)
 
-        modules = {
-            "audio_separator": fake_module("audio_separator"),
-            "audio_separator.separator": fake_module(
-                "audio_separator.separator", Separator=CascadeSeparator
-            ),
-        }
-        with (
-            tempfile.TemporaryDirectory() as tmp,
-            mock.patch.dict(sys.modules, modules),
+        with patched_temp_audio(separator_modules(CascadeSeparator), "song.wav") as (
+            out,
+            inp,
         ):
-            out = Path(tmp)
-            inp = out / "song.wav"
-            inp.write_bytes(b"RIFF")
             res = worker.run_separate(
                 inp,
                 out,
@@ -420,17 +384,7 @@ class SixStemAndTranscribeTests(TestCase):
                     write_pcm(self.output_dir / name)
                 return names
 
-        modules = {
-            "audio_separator": fake_module("audio_separator"),
-            "audio_separator.separator": fake_module(
-                "audio_separator.separator", Separator=FallbackSeparator
-            ),
-        }
-        with (
-            tempfile.TemporaryDirectory() as tmp,
-            mock.patch.dict(sys.modules, modules),
-        ):
-            out = Path(tmp)
+        with patched_temp_audio(separator_modules(FallbackSeparator)) as (out, _inp):
             inp = out / "master.wav"
             write_pcm(inp)
             res = worker.run_separate(
@@ -480,26 +434,11 @@ class SixStemAndTranscribeTests(TestCase):
 
         class FullCascadeSeparator(FakeSeparator):
             def separate(self, audio_file: str) -> list[str]:
-                base = Path(audio_file).stem
-                stems = model_outputs[self.model]
-                names = [f"{base}_({stem})_{self.model}.wav" for stem in stems]
-                for name in names:
-                    (self.output_dir / name).write_bytes(b"RIFF")
-                return names
+                return self.write_stems(audio_file, model_outputs[self.model])
 
-        modules = {
-            "audio_separator": fake_module("audio_separator"),
-            "audio_separator.separator": fake_module(
-                "audio_separator.separator", Separator=FullCascadeSeparator
-            ),
-        }
-        with (
-            tempfile.TemporaryDirectory() as tmp,
-            mock.patch.dict(sys.modules, modules),
-        ):
-            out = Path(tmp)
-            inp = out / "symphony.wav"
-            inp.write_bytes(b"RIFF")
+        with patched_temp_audio(
+            separator_modules(FullCascadeSeparator), "symphony.wav"
+        ) as (out, inp):
             res = worker.run_separate(
                 inp,
                 out,
@@ -568,17 +507,7 @@ class SixStemAndTranscribeTests(TestCase):
                     write_pcm(self.output_dir / name, val)
                 return names
 
-        modules = {
-            "audio_separator": fake_module("audio_separator"),
-            "audio_separator.separator": fake_module(
-                "audio_separator.separator", Separator=EnsembleSeparator
-            ),
-        }
-        with (
-            tempfile.TemporaryDirectory() as tmp,
-            mock.patch.dict(sys.modules, modules),
-        ):
-            out = Path(tmp)
+        with patched_temp_audio(separator_modules(EnsembleSeparator)) as (out, _inp):
             inp = out / "mix.wav"
             write_pcm(inp, 15_000)
             res = worker.run_separate(
@@ -603,19 +532,13 @@ class SixStemAndTranscribeTests(TestCase):
         def fake_predict(_audio: str) -> tuple[object, FakeMidi, list[object]]:
             return (None, FakeMidi(), [])
 
-        modules = {
+        modules: dict[str, types.ModuleType | None] = {
             "basic_pitch": fake_module("basic_pitch"),
             "basic_pitch.inference": fake_module(
                 "basic_pitch.inference", predict=fake_predict
             ),
         }
-        with (
-            tempfile.TemporaryDirectory() as tmp,
-            mock.patch.dict(sys.modules, modules),
-        ):
-            out = Path(tmp)
-            inp = out / "piano_solo.wav"
-            inp.write_bytes(b"RIFF")
+        with patched_temp_audio(modules, "piano_solo.wav") as (out, inp):
             res = worker.run_transcribe(inp, out)
             self.assertEqual(Path(res["midi"]).name, "piano_solo_basic_pitch.mid")
             self.assertTrue(Path(res["midi"]).is_file())

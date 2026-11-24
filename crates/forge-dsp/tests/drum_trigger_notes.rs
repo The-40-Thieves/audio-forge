@@ -117,15 +117,20 @@ fn audio_drum_hits_each_get_a_note_off_one_gate_later() {
     }
 }
 
-#[test]
-fn chord_is_released_when_expansion_is_switched_off_mid_note() {
+fn run_chord_expansion_toggle(start_on: bool, end_on: bool) -> Host {
     let mut notes = DrumTriggerNotes::new(SR);
     let mut host = Host::default();
     let emit = &mut |msg| host.receive(msg);
-    notes.set_chord_expansion(true);
+    notes.set_chord_expansion(start_on);
     notes.root_on(0, 0, 60, 0.9, None, emit);
-    notes.set_chord_expansion(false);
+    notes.set_chord_expansion(end_on);
     notes.root_off(10, 0, 60, None, emit);
+    host
+}
+
+#[test]
+fn chord_is_released_when_expansion_is_switched_off_mid_note() {
+    let host = run_chord_expansion_toggle(true, false);
     // The forwarded root and its chord tones.
     assert_eq!(host.ons, 1 + CHORD_INTERVALS.len());
     host.assert_all_released();
@@ -133,13 +138,7 @@ fn chord_is_released_when_expansion_is_switched_off_mid_note() {
 
 #[test]
 fn no_stray_note_offs_when_expansion_is_switched_on_mid_note() {
-    let mut notes = DrumTriggerNotes::new(SR);
-    let mut host = Host::default();
-    let emit = &mut |msg| host.receive(msg);
-    notes.set_chord_expansion(false);
-    notes.root_on(0, 0, 60, 0.9, None, emit);
-    notes.set_chord_expansion(true);
-    notes.root_off(10, 0, 60, None, emit);
+    let host = run_chord_expansion_toggle(false, true);
     // Only the forwarded root itself sounded and was released.
     assert_eq!(host.ons, 1);
     assert_eq!(host.released, [(60, 10)]);

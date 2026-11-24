@@ -14,18 +14,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::loudness_limiter::{sanitize_param_f64, sanitize_sample_f64};
 
-/// STFT frame length in samples.
-const FFT_SIZE: usize = 2048;
-/// STFT hop between frames in samples.
-const HOP: usize = 512;
-/// Number of non-redundant bins of a real `FFT_SIZE` transform.
-const HALF_BINS: usize = FFT_SIZE / 2 + 1;
+use crate::spectral_defizz::{BAND_SKIRT_OCTAVES, FFT_SIZE, HALF_BINS, HOP};
+
 /// Attack time constant in seconds for sidechain unmasking.
 const ATTACK_TAU_SECS: f64 = 0.009;
 /// Release time constant in seconds for sidechain unmasking.
 const RELEASE_TAU_SECS: f64 = 0.065;
-/// Raised-cosine skirt width in octaves at `low_cut_hz` and `high_cut_hz`.
-const BAND_SKIRT_OCTAVES: f64 = 1.0 / 3.0;
 
 /// Configuration for OpenSpacer Sidechain Spectral Unmasking.
 ///
