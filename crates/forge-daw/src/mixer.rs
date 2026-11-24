@@ -6,7 +6,7 @@ use forge_engine::{LiveAudioEngine, TrackSend};
 use crate::ForgeDawApp;
 
 impl ForgeDawApp {
-    pub(crate) fn draw_mixer_dock(&mut self, ctx: &egui::Context) {
+    pub(crate) fn draw_mixer_dock(&mut self, ui: &mut egui::Ui) {
         if !self.show_mixer {
             return;
         }
@@ -16,10 +16,10 @@ impl ForgeDawApp {
             .map(LiveAudioEngine::meters_snapshot)
             .unwrap_or_default();
 
-        egui::TopBottomPanel::bottom("mixer_dock")
-            .min_height(175.0)
-            .default_height(190.0)
-            .show(ctx, |ui| {
+        egui::Panel::bottom("mixer_dock")
+            .min_size(175.0)
+            .default_size(190.0)
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("MIXER & MASTER SPECTRUM")

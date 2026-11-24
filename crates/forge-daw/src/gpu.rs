@@ -3,19 +3,22 @@
 use eframe::egui;
 
 pub(crate) fn build_native_options(renderer: eframe::Renderer) -> eframe::NativeOptions {
-    let wgpu_setup = eframe::egui_wgpu::WgpuSetupCreateNew {
-        power_preference: eframe::wgpu::PowerPreference::HighPerformance,
-        instance_descriptor: eframe::wgpu::InstanceDescriptor {
-            backends: eframe::wgpu::Backends::PRIMARY,
-            ..Default::default()
+    let mut wgpu_setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    wgpu_setup.power_preference = eframe::wgpu::PowerPreference::HighPerformance;
+    wgpu_setup.instance_descriptor.backends = eframe::wgpu::Backends::PRIMARY;
+
+    let wgpu_options = eframe::egui_wgpu::WgpuConfiguration {
+        surface: eframe::egui_wgpu::SurfaceConfig {
+            present_mode: eframe::wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: Some(2),
         },
+        wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(wgpu_setup),
         ..Default::default()
     };
 
-    let wgpu_options = eframe::egui_wgpu::WgpuConfiguration {
-        present_mode: eframe::wgpu::PresentMode::AutoVsync,
-        desired_maximum_frame_latency: Some(2),
-        wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(wgpu_setup),
+    let glow_options = eframe::egui_glow::GlowConfiguration {
+        vsync: true,
+        hardware_acceleration: eframe::egui_glow::HardwareAcceleration::Preferred,
         ..Default::default()
     };
 
@@ -25,8 +28,7 @@ pub(crate) fn build_native_options(renderer: eframe::Renderer) -> eframe::Native
             .with_min_inner_size([960.0, 600.0])
             .with_title("ForgeStudio DAW — Object-Oriented Audio & Mastering"),
         renderer,
-        hardware_acceleration: eframe::HardwareAcceleration::Preferred,
-        vsync: true,
+        glow_options,
         multisampling: 4,
         wgpu_options,
         ..Default::default()

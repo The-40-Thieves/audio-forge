@@ -154,7 +154,7 @@ pub(crate) fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) ->
                 "Pentatonic Maj",
             ];
             ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt(ui.id().with("vt_root"))
+                egui::ComboBox::from_id_salt(ui.scope_id().with("vt_root"))
                     .width(46.0)
                     .selected_text(ROOTS[usize::from(*key_root % 12)])
                     .show_ui(ui, |ui| {
@@ -164,7 +164,7 @@ pub(crate) fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) ->
                             }
                         }
                     });
-                egui::ComboBox::from_id_salt(ui.id().with("vt_scale"))
+                egui::ComboBox::from_id_salt(ui.scope_id().with("vt_scale"))
                     .width(108.0)
                     .selected_text(SCALES[usize::from((*scale_mode).min(4))])
                     .show_ui(ui, |ui| {
