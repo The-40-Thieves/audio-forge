@@ -1,6 +1,23 @@
 //! Forge Vocal Surgical, Forge Drum Trigger & Forge Vocal Tune plugins.
 
+use crate::chassis::*;
 use crate::*;
+
+define_presets! {
+    const VOCAL_SURGICAL_PRESETS {
+        "Clean Lead" => { "declick": 0.40, "deplosive": 0.45, "deess": 0.55, "gate": 0.35 };
+        "Broadcast Dry" => { "declick": 0.60, "deplosive": 0.70, "deess": 0.45, "gate": 0.50 };
+    }
+    const DRUM_TRIGGER_PRESETS {
+        "Tight Kit" => { "thresh": 0.55, "neosoul": 0.0 };
+        "Neo-Soul Chords" => { "thresh": 0.50, "neosoul": 1.0 };
+    }
+    const VOCAL_TUNE_PRESETS {
+        "Natural Pop" => { "speed": 0.25, "amt": 0.78, "human": 0.30, "mix": 1.0 };
+        "Hard Trap Tune" => { "speed": 0.0, "amt": 1.0, "human": 0.0, "mix": 1.0 };
+        "Subtle Polish" => { "speed": 0.45, "amt": 0.55, "human": 0.45, "mix": 0.85 };
+    }
+}
 // ============================================================================
 // 3. FORGE VOCAL SURGICAL STRIP (Zero-Latency Vocal Restoration)
 // ============================================================================
@@ -94,107 +111,29 @@ pub(crate) fn next_vocal_surgical_controls(params: &VocalSurgicalParams) -> Voca
     }
 }
 
-impl Default for ForgeVocalSurgicalPlug {
-    fn default() -> Self {
-        Self {
-            params: Arc::new(VocalSurgicalParams::default()),
-            telemetry: Arc::new(GuiTelemetry::default()),
-            analyzer: RealtimeSpectrumAnalyzer32::new(48_000.0),
-            dsp: RealtimeVocalSurgical::new(48_000.0),
-            sample_rate: 48_000.0,
-        }
-    }
-}
+impl_standard_plugin_default!(
+    ForgeVocalSurgicalPlug,
+    VocalSurgicalParams,
+    RealtimeVocalSurgical
+);
 
 impl Plugin for ForgeVocalSurgicalPlug {
-    const NAME: &'static str = "Forge Vocal Surgical Strip";
-    const VENDOR: &'static str = "The 40 Thieves (ForgeAudio)";
-    const URL: &'static str = "https://github.com/The-40-Thieves/audio-forge";
-    const EMAIL: &'static str = "audio@the40thieves.org";
-    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+    forge_plugin_common!("Forge Vocal Surgical Strip", crate::chassis::STEREO_LAYOUTS);
 
-    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
-        main_input_channels: NonZeroU32::new(2),
-        main_output_channels: NonZeroU32::new(2),
-        ..AudioIOLayout::const_default()
-    }];
+    forge_ab_editor!(
+        title: "FORGE VOCAL SURGICAL STRIP",
+        subtitle: "Zero-Latency Mouth De-Click, Dynamic Plosive Suppressor, Split-Band De-Esser & Breath Gate",
+        presets: VOCAL_SURGICAL_PRESETS,
+        grid_id: "vocal_surgical_grid",
+        params: [
+            ("declick", Float, declick_sensitivity, "Mouth De-Click Sensitivity"),
+            ("deplosive", Float, deplosive_strength, "Plosive Duck (<115 Hz)"),
+            ("deess", Float, deess_threshold_db, "Split-Band De-Esser (dB)"),
+            ("gate", Float, breath_gate_db, "Breath Gate Threshold (dB)"),
+        ]
+    );
 
-    const SAMPLE_ACCURATE_AUTOMATION: bool = true;
-    type SysExMessage = ();
-    type BackgroundTask = ();
-
-    fn params(&self) -> Arc<dyn Params> {
-        self.params.clone()
-    }
-
-    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        let params = self.params.clone();
-        let telemetry = self.telemetry.clone();
-        create_egui_editor(
-            self.params.editor_state.clone(),
-            AbBankState::default(),
-            |_, _| {},
-            move |egui_ctx, setter, ab_state| {
-                egui::CentralPanel::default().show(egui_ctx, |ui| {
-                    draw_forge_studio_header_and_spectrum(
-                        ui,
-                        "FORGE VOCAL SURGICAL STRIP",
-                        "Zero-Latency Mouth De-Click, Dynamic Plosive Suppressor, Split-Band De-Esser & Breath Gate",
-                        &telemetry,
-                        None,
-                    );
-                    let param_refs = [
-                        ("declick", ParamRef::Float(&params.declick_sensitivity)),
-                        ("deplosive", ParamRef::Float(&params.deplosive_strength)),
-                        ("deess", ParamRef::Float(&params.deess_threshold_db)),
-                        ("gate", ParamRef::Float(&params.breath_gate_db)),
-                    ];
-                    draw_ab_and_presets_bar(
-                        ui,
-                        setter,
-                        &param_refs,
-                        ab_state,
-                        VOCAL_SURGICAL_PRESETS,
-                    );
-                    egui::Grid::new("vocal_surgical_grid")
-                        .num_columns(2)
-                        .spacing([16.0, 8.0])
-                        .show(ui, |ui| {
-                            ui.label("Mouth De-Click Sensitivity");
-                            ui.add(widgets::ParamSlider::for_param(&params.declick_sensitivity, setter));
-                            ui.end_row();
-                            ui.label("Plosive Duck (<115 Hz)");
-                            ui.add(widgets::ParamSlider::for_param(&params.deplosive_strength, setter));
-                            ui.end_row();
-                            ui.label("Split-Band De-Esser (dB)");
-                            ui.add(widgets::ParamSlider::for_param(&params.deess_threshold_db, setter));
-                            ui.end_row();
-                            ui.label("Breath Gate Threshold (dB)");
-                            ui.add(widgets::ParamSlider::for_param(&params.breath_gate_db, setter));
-                            ui.end_row();
-                        });
-                });
-            },
-        )
-    }
-
-    fn initialize(
-        &mut self,
-        _audio_io_layout: &AudioIOLayout,
-        buffer_config: &BufferConfig,
-        _context: &mut impl InitContext<Self>,
-    ) -> bool {
-        let sr = f64::from(buffer_config.sample_rate);
-        self.sample_rate = sr;
-        self.dsp.reset(sr);
-        self.analyzer.reset(sr);
-        true
-    }
-
-    fn reset(&mut self) {
-        self.dsp.reset(self.sample_rate);
-        self.analyzer.clear_state();
-    }
+    impl_standard_plugin_lifecycle!();
 
     fn process(
         &mut self,
@@ -204,8 +143,7 @@ impl Plugin for ForgeVocalSurgicalPlug {
     ) -> ProcessStatus {
         for mut channel_samples in buffer.iter_samples() {
             let ctl = next_vocal_surgical_controls(&self.params);
-            let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
-            let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
+            let (in_l, in_r) = read_stereo(&mut channel_samples);
             let (out_l, out_r) = self.dsp.process_stereo_sample(
                 in_l,
                 in_r,
@@ -214,49 +152,40 @@ impl Plugin for ForgeVocalSurgicalPlug {
                 ctl.deess_db,
                 ctl.gate_db,
             );
-            self.analyzer.push_stereo_sample(out_l, out_r);
-            let gr_est = 20.0
-                * (out_l.abs().max(out_r.abs()) / in_l.abs().max(in_r.abs()).max(1e-5))
-                    .clamp(0.05, 1.0)
-                    .log10();
-            self.telemetry
-                .update_peaks(in_l, in_r, out_l, out_r, gr_est);
-            if let Some(s0) = channel_samples.get_mut(0) {
-                *s0 = out_l;
-            }
-            if let Some(s1) = channel_samples.get_mut(1) {
-                *s1 = out_r;
-            }
+            let gr_est = estimate_gr_db(in_l, in_r, out_l, out_r);
+            finish_stereo_sample(
+                &mut self.analyzer,
+                &self.telemetry,
+                &mut channel_samples,
+                in_l,
+                in_r,
+                out_l,
+                out_r,
+                gr_est,
+            );
         }
-        self.telemetry
-            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &[0.0; 32]);
+        finish_block_spectrum(&self.analyzer, &self.telemetry);
         ProcessStatus::Normal
     }
 }
 
-impl ClapPlugin for ForgeVocalSurgicalPlug {
-    const CLAP_ID: &'static str = "org.the40thieves.forge-audio.vocal-surgical";
-    const CLAP_DESCRIPTION: Option<&'static str> = Some(
-        "Zero-Latency Vocal Mouth De-Click, Dynamic Plosive Suppressor, Split-Band De-Esser & Breath Gate",
-    );
-    const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_SUPPORT_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_FEATURES: &'static [ClapFeature] = &[
+impl_forge_formats!(
+    ForgeVocalSurgicalPlug,
+    clap_id: "org.the40thieves.forge-audio.vocal-surgical",
+    clap_desc: "Zero-Latency Vocal Mouth De-Click, Dynamic Plosive Suppressor, Split-Band De-Esser & Breath Gate",
+    clap_features: &[
         ClapFeature::AudioEffect,
         ClapFeature::Restoration,
         ClapFeature::Compressor,
         ClapFeature::Stereo,
-    ];
-}
-
-impl Vst3Plugin for ForgeVocalSurgicalPlug {
-    const VST3_CLASS_ID: [u8; 16] = *b"ForgeVocalSurg01";
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
+    ],
+    vst3_id: *b"ForgeVocalSurg01",
+    vst3_cats: &[
         Vst3SubCategory::Fx,
         Vst3SubCategory::Restoration,
         Vst3SubCategory::Dynamics,
-    ];
-}
+    ],
+);
 
 // ============================================================================
 // 6. FORGE DRUM TRIGGER & NEO-SOUL CHORD MIDI PROCESSOR
@@ -320,70 +249,23 @@ impl Default for ForgeDrumTriggerPlug {
 }
 
 impl Plugin for ForgeDrumTriggerPlug {
-    const NAME: &'static str = "Forge Drum Trigger & Theory MIDI";
-    const VENDOR: &'static str = "The 40 Thieves (ForgeAudio)";
-    const URL: &'static str = "https://github.com/The-40-Thieves/audio-forge";
-    const EMAIL: &'static str = "audio@the40thieves.org";
-    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+    forge_plugin_common!(
+        "Forge Drum Trigger & Theory MIDI",
+        crate::chassis::STEREO_LAYOUTS,
+        midi_in = MidiConfig::Basic,
+        midi_out = MidiConfig::Basic
+    );
 
-    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
-        main_input_channels: NonZeroU32::new(2),
-        main_output_channels: NonZeroU32::new(2),
-        ..AudioIOLayout::const_default()
-    }];
-
-    const MIDI_INPUT: MidiConfig = MidiConfig::Basic;
-    const MIDI_OUTPUT: MidiConfig = MidiConfig::Basic;
-    const SAMPLE_ACCURATE_AUTOMATION: bool = true;
-    type SysExMessage = ();
-    type BackgroundTask = ();
-
-    fn params(&self) -> Arc<dyn Params> {
-        self.params.clone()
-    }
-
-    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        let params = self.params.clone();
-        let telemetry = self.telemetry.clone();
-        create_egui_editor(
-            self.params.editor_state.clone(),
-            AbBankState::default(),
-            |_, _| {},
-            move |egui_ctx, setter, ab_state| {
-                egui::CentralPanel::default().show(egui_ctx, |ui| {
-                    draw_forge_studio_header_and_spectrum(
-                        ui,
-                        "FORGE DRUM TRIGGER & THEORY MIDI",
-                        "Real-Time Audio-to-MIDI 3-Band Drum Transient Replacer (C1/D1/F#1) & Neo-Soul Chord Voicer",
-                        &telemetry,
-                        None,
-                    );
-                    let param_refs = [
-                        ("thresh", ParamRef::Float(&params.threshold_db)),
-                        ("neosoul", ParamRef::Bool(&params.expand_midi_chords)),
-                    ];
-                    draw_ab_and_presets_bar(
-                        ui,
-                        setter,
-                        &param_refs,
-                        ab_state,
-                        DRUM_TRIGGER_PRESETS,
-                    );
-                    egui::Grid::new("drum_trigger_grid")
-                        .num_columns(2)
-                        .spacing([16.0, 8.0])
-                        .show(ui, |ui| {
-                            ui.label("Transient Trigger Threshold (dB)");
-                            ui.add(widgets::ParamSlider::for_param(&params.threshold_db, setter));
-                            ui.end_row();
-                            ui.label("1-Finger MIDI -> Neo-Soul 9th Voicing");
-                            ui.add(widgets::ParamSlider::for_param(&params.expand_midi_chords, setter));
-                            ui.end_row();
-                        });
-                });
-            },
-        )
-    }
+    forge_ab_editor!(
+        title: "FORGE DRUM TRIGGER & THEORY MIDI",
+        subtitle: "Real-Time Audio-to-MIDI 3-Band Drum Transient Replacer (C1/D1/F#1) & Neo-Soul Chord Voicer",
+        presets: DRUM_TRIGGER_PRESETS,
+        grid_id: "drum_trigger_grid",
+        params: [
+            ("thresh", Float, threshold_db, "Transient Trigger Threshold (dB)"),
+            ("neosoul", Bool, expand_midi_chords, "1-Finger MIDI -> Neo-Soul 9th Voicing"),
+        ]
+    );
 
     fn initialize(
         &mut self,
@@ -432,8 +314,7 @@ impl Plugin for ForgeDrumTriggerPlug {
                 pending = context.next_event();
             }
 
-            let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
-            let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
+            let (in_l, in_r) = read_stereo(&mut channel_samples);
             self.analyzer.push_stereo_sample(in_l, in_r);
             self.telemetry.update_peaks(in_l, in_r, in_l, in_r, 0.0);
             self.trigger_drums(context, sample_idx as u32, in_l, in_r, thresh);
@@ -443,8 +324,7 @@ impl Plugin for ForgeDrumTriggerPlug {
             self.forward_event(context, event);
             pending = context.next_event();
         }
-        self.telemetry
-            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &[0.0; 32]);
+        finish_block_spectrum(&self.analyzer, &self.telemetry);
 
         ProcessStatus::Normal
     }
@@ -554,30 +434,24 @@ impl ForgeDrumTriggerPlug {
     }
 }
 
-impl ClapPlugin for ForgeDrumTriggerPlug {
-    const CLAP_ID: &'static str = "org.the40thieves.forge-audio.drum-trigger-theory";
-    const CLAP_DESCRIPTION: Option<&'static str> = Some(
-        "Real-Time Audio-to-MIDI 3-Band Drum Transient Replacer (C1/D1/F#1) & Neo-Soul Chord Voicer",
-    );
-    const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_SUPPORT_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_FEATURES: &'static [ClapFeature] = &[
+impl_forge_formats!(
+    ForgeDrumTriggerPlug,
+    clap_id: "org.the40thieves.forge-audio.drum-trigger-theory",
+    clap_desc: "Real-Time Audio-to-MIDI 3-Band Drum Transient Replacer (C1/D1/F#1) & Neo-Soul Chord Voicer",
+    clap_features: &[
         ClapFeature::AudioEffect,
         ClapFeature::NoteEffect,
         ClapFeature::Drum,
         ClapFeature::Utility,
         ClapFeature::Stereo,
-    ];
-}
-
-impl Vst3Plugin for ForgeDrumTriggerPlug {
-    const VST3_CLASS_ID: [u8; 16] = *b"ForgeDrumTrig001";
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
+    ],
+    vst3_id: *b"ForgeDrumTrig001",
+    vst3_cats: &[
         Vst3SubCategory::Fx,
         Vst3SubCategory::Drum,
         Vst3SubCategory::Tools,
-    ];
-}
+    ],
+);
 
 // ============================================================================
 // 11. FORGE VOCAL TUNE (REAL-TIME LOW-LATENCY YIN + PSOLA PITCH CORRECTOR)
@@ -663,22 +537,18 @@ impl Default for VocalTuneParams {
                         .position(|k| k.eq_ignore_ascii_case(t))
                         .map(|i| i as i32)
                 })),
-            scale_mode: IntParam::new("Scale Mode", 0, IntRange::Linear { min: 0, max: 4 })
-                .with_value_to_string(Arc::new(|v| match v {
-                    1 => "Major".to_string(),
-                    2 => "Minor".to_string(),
-                    3 => "Pentatonic Minor".to_string(),
-                    4 => "Pentatonic Major".to_string(),
-                    _ => "Chromatic".to_string(),
-                }))
-                .with_string_to_value(Arc::new(|s| match s.trim().to_ascii_lowercase().as_str() {
-                    "0" | "chromatic" => Some(0),
-                    "1" | "major" => Some(1),
-                    "2" | "minor" => Some(2),
-                    "3" | "pentatonic minor" | "pentmin" => Some(3),
-                    "4" | "pentatonic major" | "pentmaj" => Some(4),
-                    _ => None,
-                })),
+            scale_mode: enum_int_param(
+                "Scale Mode",
+                0,
+                &[
+                    "Chromatic",
+                    "Major",
+                    "Minor",
+                    "Pentatonic Minor",
+                    "Pentatonic Major",
+                ],
+                &[("pentmin", 3), ("pentmaj", 4)],
+            ),
             retune_speed_ms: FloatParam::new(
                 "Retune Speed",
                 25.0,
@@ -734,132 +604,62 @@ impl Default for ForgeVocalTunePlug {
 }
 
 impl Plugin for ForgeVocalTunePlug {
-    const NAME: &'static str = "Forge Vocal Tune";
-    const VENDOR: &'static str = "The 40 Thieves (ForgeAudio)";
-    const URL: &'static str = "https://github.com/The-40-Thieves/audio-forge";
-    const EMAIL: &'static str = "audio@the40thieves.org";
-    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
-
-    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[
-        AudioIOLayout {
-            main_input_channels: NonZeroU32::new(2),
-            main_output_channels: NonZeroU32::new(2),
-            ..AudioIOLayout::const_default()
-        },
-        AudioIOLayout {
-            main_input_channels: NonZeroU32::new(1),
-            main_output_channels: NonZeroU32::new(1),
-            ..AudioIOLayout::const_default()
-        },
-    ];
-
-    const SAMPLE_ACCURATE_AUTOMATION: bool = true;
-    type SysExMessage = ();
-    type BackgroundTask = ();
-
-    fn params(&self) -> Arc<dyn Params> {
-        self.params.clone()
-    }
+    forge_plugin_common!("Forge Vocal Tune", crate::chassis::STEREO_OR_MONO_LAYOUTS);
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         let params = self.params.clone();
         let telemetry = self.telemetry.clone();
         let pitch_tel = self.pitch_telemetry.clone();
-        create_egui_editor(
+        forge_editor(
             self.params.editor_state.clone(),
             AbBankState::default(),
-            |_, _| {},
-            move |egui_ctx, setter, ab_state| {
-                egui::CentralPanel::default().show(egui_ctx, |ui| {
-                    draw_forge_studio_header_and_spectrum(
-                        ui,
-                        "FORGE VOCAL TUNE",
-                        "Low-Latency Streaming YIN F0 + Scale-Locked Dual-Grain PSOLA Pitch Corrector",
-                        &telemetry,
-                        None,
-                    );
-                    let (det_hz, tgt_hz, cents) = pitch_tel.snapshot();
-                    let pitch_text = if det_hz > 20.0 {
-                        format!(
-                            "LIVE PITCH   Detected: {:6.1} Hz  ->  Target: {:6.1} Hz  ({:+5.1} ct)",
-                            det_hz, tgt_hz, cents
-                        )
-                    } else {
-                        "LIVE PITCH   Unvoiced / Silence".to_string()
-                    };
-                    ui.label(
-                        egui::RichText::new(pitch_text)
-                            .monospace()
-                            .color(egui::Color32::from_rgb(56, 189, 248)),
-                    );
-                    ui.add_space(4.0);
-                    let param_refs = [
-                        ("key", ParamRef::Int(&params.key_root)),
-                        ("scale", ParamRef::Int(&params.scale_mode)),
-                        ("speed", ParamRef::Float(&params.retune_speed_ms)),
-                        ("amt", ParamRef::Float(&params.retune_amount)),
-                        ("human", ParamRef::Float(&params.humanize)),
-                        ("formant", ParamRef::Float(&params.formant_shift_st)),
-                        ("mix", ParamRef::Float(&params.wet_mix)),
-                    ];
-                    draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, VOCAL_TUNE_PRESETS);
-                    egui::Grid::new("vocal_tune_grid")
-                        .num_columns(2)
-                        .spacing([16.0, 8.0])
-                        .show(ui, |ui| {
-                            ui.label("Key Root");
-                            ui.add(widgets::ParamSlider::for_param(&params.key_root, setter));
-                            ui.end_row();
-                            ui.label("Scale Mode");
-                            ui.add(widgets::ParamSlider::for_param(&params.scale_mode, setter));
-                            ui.end_row();
-                            ui.label("Retune Speed (ms)");
-                            ui.add(widgets::ParamSlider::for_param(
-                                &params.retune_speed_ms,
-                                setter,
-                            ));
-                            ui.end_row();
-                            ui.label("Correction Amount");
-                            ui.add(widgets::ParamSlider::for_param(
-                                &params.retune_amount,
-                                setter,
-                            ));
-                            ui.end_row();
-                            ui.label("Humanize (Vibrato)");
-                            ui.add(widgets::ParamSlider::for_param(&params.humanize, setter));
-                            ui.end_row();
-                            ui.label("Formant Shift (st)");
-                            ui.add(widgets::ParamSlider::for_param(
-                                &params.formant_shift_st,
-                                setter,
-                            ));
-                            ui.end_row();
-                            ui.label("Wet Mix");
-                            ui.add(widgets::ParamSlider::for_param(&params.wet_mix, setter));
-                            ui.end_row();
-                        });
+            move |ui, setter, ab_state| {
+                draw_forge_studio_header_and_spectrum(
+                    ui,
+                    "FORGE VOCAL TUNE",
+                    "Low-Latency Streaming YIN F0 + Scale-Locked Dual-Grain PSOLA Pitch Corrector",
+                    &telemetry,
+                    None,
+                );
+                let (det_hz, tgt_hz, cents) = pitch_tel.snapshot();
+                let pitch_text = if det_hz > 20.0 {
+                    format!(
+                        "LIVE PITCH   Detected: {:6.1} Hz  ->  Target: {:6.1} Hz  ({:+5.1} ct)",
+                        det_hz, tgt_hz, cents
+                    )
+                } else {
+                    "LIVE PITCH   Unvoiced / Silence".to_string()
+                };
+                ui.label(
+                    egui::RichText::new(pitch_text)
+                        .monospace()
+                        .color(egui::Color32::from_rgb(56, 189, 248)),
+                );
+                ui.add_space(4.0);
+                let param_refs = [
+                    ("key", ParamRef::Int(&params.key_root)),
+                    ("scale", ParamRef::Int(&params.scale_mode)),
+                    ("speed", ParamRef::Float(&params.retune_speed_ms)),
+                    ("amt", ParamRef::Float(&params.retune_amount)),
+                    ("human", ParamRef::Float(&params.humanize)),
+                    ("formant", ParamRef::Float(&params.formant_shift_st)),
+                    ("mix", ParamRef::Float(&params.wet_mix)),
+                ];
+                draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, VOCAL_TUNE_PRESETS);
+                param_grid(ui, "vocal_tune_grid", |ui| {
+                    param_row(ui, setter, "Key Root", &params.key_root);
+                    param_row(ui, setter, "Scale Mode", &params.scale_mode);
+                    param_row(ui, setter, "Retune Speed (ms)", &params.retune_speed_ms);
+                    param_row(ui, setter, "Correction Amount", &params.retune_amount);
+                    param_row(ui, setter, "Humanize (Vibrato)", &params.humanize);
+                    param_row(ui, setter, "Formant Shift (st)", &params.formant_shift_st);
+                    param_row(ui, setter, "Wet Mix", &params.wet_mix);
                 });
             },
         )
     }
 
-    fn initialize(
-        &mut self,
-        _audio_io_layout: &AudioIOLayout,
-        buffer_config: &BufferConfig,
-        context: &mut impl InitContext<Self>,
-    ) -> bool {
-        self.sample_rate = f64::from(buffer_config.sample_rate);
-        self.dsp.reset(self.sample_rate);
-        self.analyzer.reset(self.sample_rate);
-        context.set_latency_samples(self.dsp.latency_samples());
-        true
-    }
-
-    fn reset(&mut self) {
-        self.dsp.reset(self.sample_rate);
-        self.analyzer.clear_state();
-    }
+    impl_standard_plugin_lifecycle!(latency);
 
     fn process(
         &mut self,
@@ -888,19 +688,19 @@ impl Plugin for ForgeVocalTunePlug {
                 .set_retune_amount(f64::from(self.params.retune_amount.smoothed.next()));
             self.dsp
                 .set_wet_mix(f64::from(self.params.wet_mix.smoothed.next()));
-            let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
-            let in_r = channel_samples.get_mut(1).map_or(in_l, |s| *s);
+            let (in_l, in_r) = read_stereo_or_mono(&mut channel_samples);
             let (out_l, out_r) = self.dsp.process_stereo_sample(in_l, in_r);
-            self.analyzer.push_stereo_sample(out_l, out_r);
             let corr_vis = (self.dsp.correction_cents() / 100.0) as f32;
-            self.telemetry
-                .update_peaks(in_l, in_r, out_l, out_r, corr_vis);
-            if let Some(s0) = channel_samples.get_mut(0) {
-                *s0 = out_l;
-            }
-            if let Some(s1) = channel_samples.get_mut(1) {
-                *s1 = out_r;
-            }
+            finish_stereo_sample(
+                &mut self.analyzer,
+                &self.telemetry,
+                &mut channel_samples,
+                in_l,
+                in_r,
+                out_l,
+                out_r,
+                corr_vis,
+            );
         }
         self.pitch_telemetry.update(
             self.dsp.detected_hz(),
@@ -914,25 +714,18 @@ impl Plugin for ForgeVocalTunePlug {
     }
 }
 
-impl ClapPlugin for ForgeVocalTunePlug {
-    const CLAP_ID: &'static str = "org.the40thieves.forge-audio.vocal-tune";
-    const CLAP_DESCRIPTION: Option<&'static str> = Some(
-        "Real-Time Low-Latency Streaming YIN F0 + Scale-Locked Dual-Grain PSOLA Vocal Pitch Corrector",
-    );
-    const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_SUPPORT_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_FEATURES: &'static [ClapFeature] = &[
+impl_forge_formats!(
+    ForgeVocalTunePlug,
+    clap_id: "org.the40thieves.forge-audio.vocal-tune",
+    clap_desc: "Real-Time Low-Latency Streaming YIN F0 + Scale-Locked Dual-Grain PSOLA Vocal Pitch Corrector",
+    clap_features: &[
         ClapFeature::AudioEffect,
         ClapFeature::PitchShifter,
         ClapFeature::Stereo,
-    ];
-}
-
-impl Vst3Plugin for ForgeVocalTunePlug {
-    const VST3_CLASS_ID: [u8; 16] = *b"ForgeVocalTune01";
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
-        &[Vst3SubCategory::Fx, Vst3SubCategory::PitchShift];
-}
+    ],
+    vst3_id: *b"ForgeVocalTune01",
+    vst3_cats: &[Vst3SubCategory::Fx, Vst3SubCategory::PitchShift],
+);
 
 // Export all 11 plugins into the all-in-one CLAP/VST3 bundle when `all-in-one-export` is enabled.
 // Individual standalone VST3/CLAP plugins live in `plugins/forge-*` and export one plugin per bundle.

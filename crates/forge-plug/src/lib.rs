@@ -17,6 +17,8 @@
 //! 9. **Forge Density & Clipper** (3-Band Upward Density Compressor & 2x ADAA Soft Clipper)
 //! 10. **Forge SpaceVerb & Preamp** (8x8 Hadamard FDN Reverb with Ducking/Shimmer + Neural WaveNet Preamp)
 
+#[macro_use]
+mod chassis;
 mod elite_fx;
 mod mastering;
 mod soothe_spacer;
@@ -28,7 +30,6 @@ pub use mastering::*;
 pub use soothe_spacer::*;
 pub use vocal_drums::*;
 
-use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -44,7 +45,7 @@ use forge_dsp::{
 };
 use forge_vocal::{RealtimeVocalTune, VocalTuneScaleMode};
 use nih_plug::prelude::*;
-use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
+use nih_plug_egui::{EguiState, egui};
 
 pub use ui::{
     AbBankState, FactoryPreset, GuiTelemetry, OutputLoudnessMeter, ParamRef, UserPreset,
@@ -54,248 +55,6 @@ use ui::{
     CanvasDragHandle, draw_ab_and_presets_bar, draw_ab_and_presets_bar_persisted,
     draw_forge_studio_header_and_spectrum, draw_forge_studio_header_and_spectrum_interactive,
 };
-
-const OPENSOOTHE_PRESETS: &[FactoryPreset] = &[
-    FactoryPreset {
-        name: "Vocal De-Harsh",
-        values: &[
-            ("sens", 0.25),
-            ("depth", 0.35),
-            ("sharp", 0.25),
-            ("delta", 0.0),
-            ("submono", 0.0),
-            ("tape", 0.0),
-            ("limit", 0.0),
-            ("ceil", 0.85),
-        ],
-    },
-    FactoryPreset {
-        name: "AI Fizz Rescue",
-        values: &[
-            ("sens", 0.15),
-            ("depth", 0.60),
-            ("sharp", 0.35),
-            ("delta", 0.0),
-            ("submono", 1.0),
-            ("tape", 0.15),
-            ("limit", 1.0),
-            ("ceil", 0.85),
-        ],
-    },
-    FactoryPreset {
-        name: "Gentle Master",
-        values: &[
-            ("sens", 0.40),
-            ("depth", 0.20),
-            ("sharp", 0.50),
-            ("delta", 0.0),
-            ("submono", 0.0),
-            ("tape", 0.10),
-            ("limit", 1.0),
-            ("ceil", 0.85),
-        ],
-    },
-];
-
-const OPENSPACER_PRESETS: &[FactoryPreset] = &[
-    FactoryPreset {
-        name: "Vocal Pocket",
-        values: &[
-            ("amt", 0.45),
-            ("maxcut", 0.35),
-            ("lowhz", 0.18),
-            ("highhz", 0.45),
-            ("kickmode", 0.0),
-        ],
-    },
-    FactoryPreset {
-        name: "Kick -> Sub",
-        values: &[
-            ("amt", 0.65),
-            ("maxcut", 0.50),
-            ("lowhz", 0.02),
-            ("highhz", 0.08),
-            ("kickmode", 1.0),
-        ],
-    },
-];
-
-const VOCAL_SURGICAL_PRESETS: &[FactoryPreset] = &[
-    FactoryPreset {
-        name: "Clean Lead",
-        values: &[
-            ("declick", 0.40),
-            ("deplosive", 0.45),
-            ("deess", 0.55),
-            ("gate", 0.35),
-        ],
-    },
-    FactoryPreset {
-        name: "Broadcast Dry",
-        values: &[
-            ("declick", 0.60),
-            ("deplosive", 0.70),
-            ("deess", 0.45),
-            ("gate", 0.50),
-        ],
-    },
-];
-
-const SUB_TAPE_PRESETS: &[FactoryPreset] = &[
-    FactoryPreset {
-        name: "Tight Club Sub",
-        values: &[
-            ("cutoff", 0.38),
-            ("sub", 0.35),
-            ("width", 0.55),
-            ("drive", 0.25),
-        ],
-    },
-    FactoryPreset {
-        name: "Warm 15 IPS",
-        values: &[
-            ("cutoff", 0.30),
-            ("sub", 0.20),
-            ("width", 0.50),
-            ("drive", 0.55),
-        ],
-    },
-];
-
-const LIMITER_PRESETS: &[FactoryPreset] = &[
-    FactoryPreset {
-        name: "Spotify -1 dBTP",
-        values: &[("drive", 0.45), ("ceil", 0.85), ("rel", 0.18)],
-    },
-    FactoryPreset {
-        name: "Club Loud",
-        values: &[("drive", 0.65), ("ceil", 0.90), ("rel", 0.08)],
-    },
-    FactoryPreset {
-        name: "Transparent Master",
-        values: &[("drive", 0.40), ("ceil", 0.85), ("rel", 0.35)],
-    },
-];
-
-const DRUM_TRIGGER_PRESETS: &[FactoryPreset] = &[
-    FactoryPreset {
-        name: "Tight Kit",
-        values: &[("thresh", 0.55), ("neosoul", 0.0)],
-    },
-    FactoryPreset {
-        name: "Neo-Soul Chords",
-        values: &[("thresh", 0.50), ("neosoul", 1.0)],
-    },
-];
-
-const PHASE_EQ_PRESETS: &[FactoryPreset] = &[
-    FactoryPreset {
-        name: "AI De-Harsh Flat",
-        values: &[
-            ("inv", 0.0),
-            ("eqamt", 0.50),
-            ("genre", 0.0),
-            ("autogain", 1.0),
-        ],
-    },
-    FactoryPreset {
-        name: "Modern Hip-Hop",
-        values: &[
-            ("inv", 0.0),
-            ("eqamt", 0.70),
-            ("genre", 0.25),
-            ("autogain", 1.0),
-        ],
-    },
-];
-
-const SPLITEQ_PRESETS: &[FactoryPreset] = &[
-    FactoryPreset {
-        name: "Drum Punch",
-        values: &[
-            ("tr_low", 0.62),
-            ("tr_mid", 0.55),
-            ("tr_high", 0.60),
-            ("tn_low", 0.48),
-            ("tn_mid", 0.45),
-            ("tn_high", 0.50),
-        ],
-    },
-    FactoryPreset {
-        name: "Vocal Air",
-        values: &[
-            ("tr_low", 0.50),
-            ("tr_mid", 0.45),
-            ("tr_high", 0.45),
-            ("tn_low", 0.50),
-            ("tn_mid", 0.54),
-            ("tn_high", 0.62),
-        ],
-    },
-];
-
-const DENSITY_CLIPPER_PRESETS: &[FactoryPreset] = &[
-    FactoryPreset {
-        name: "Glue Bus",
-        values: &[("density", 0.25), ("clip", 0.20), ("ceil", 0.85)],
-    },
-    FactoryPreset {
-        name: "Loud Master Clip",
-        values: &[("density", 0.40), ("clip", 0.45), ("ceil", 0.90)],
-    },
-];
-
-const SPACEVERB_PRESETS: &[FactoryPreset] = &[
-    FactoryPreset {
-        name: "Vocal Hall",
-        values: &[
-            ("model", 0.0),
-            ("pdrive", 0.25),
-            ("decay", 0.60),
-            ("damp", 0.45),
-            ("shimmer", 0.12),
-            ("duck", 0.60),
-            ("mix", 0.22),
-        ],
-    },
-    FactoryPreset {
-        name: "Lush Shimmer",
-        values: &[
-            ("model", 0.67),
-            ("pdrive", 0.35),
-            ("decay", 0.82),
-            ("damp", 0.30),
-            ("shimmer", 0.45),
-            ("duck", 0.40),
-            ("mix", 0.38),
-        ],
-    },
-];
-
-const VOCAL_TUNE_PRESETS: &[FactoryPreset] = &[
-    FactoryPreset {
-        name: "Natural Pop",
-        values: &[
-            ("speed", 0.25),
-            ("amt", 0.78),
-            ("human", 0.30),
-            ("mix", 1.0),
-        ],
-    },
-    FactoryPreset {
-        name: "Hard Trap Tune",
-        values: &[("speed", 0.0), ("amt", 1.0), ("human", 0.0), ("mix", 1.0)],
-    },
-    FactoryPreset {
-        name: "Subtle Polish",
-        values: &[
-            ("speed", 0.45),
-            ("amt", 0.55),
-            ("human", 0.45),
-            ("mix", 0.85),
-        ],
-    },
-];
 
 #[cfg(feature = "all-in-one-export")]
 nih_export_clap!(

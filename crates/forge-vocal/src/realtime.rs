@@ -536,27 +536,38 @@ impl RealtimeVocalTune {
 mod tests {
     use super::*;
 
-    #[test]
-    fn realtime_vocal_tune_snaps_sharp_pitch_to_scale_and_self_heals_nan() {
-        let sr = 48_000.0;
+    fn feed_sine_and_check_pitch(
+        sr: f64,
+        scale: VocalTuneScaleMode,
+        freq_hz: f64,
+        amp: f64,
+        frames: usize,
+        tol_hz: f64,
+    ) -> RealtimeVocalTune {
         let mut tuner = RealtimeVocalTune::new(sr);
-        tuner.set_key_and_scale(0, VocalTuneScaleMode::Major); // C Major
+        tuner.set_key_and_scale(0, scale);
         tuner.set_retune_speed_ms(5.0);
         tuner.set_retune_amount(1.0);
         tuner.set_humanize(0.0);
         tuner.set_wet_mix(1.0);
-
-        // Feed a 452 Hz sine (about +46.6 cents sharp of A4 = 440 Hz)
-        for i in 0..8192 {
-            let s = (0.4 * (2.0 * PI * 452.0 * (i as f64) / sr).sin()) as f32;
+        for i in 0..frames {
+            let s = (amp * (2.0 * PI * freq_hz * (i as f64) / sr).sin()) as f32;
             let (l, r) = tuner.process_stereo_sample(s, s);
             assert!(l.is_finite() && r.is_finite());
         }
         assert!(
-            (tuner.detected_hz() - 452.0).abs() < 4.0,
-            "detected_hz = {}",
+            (tuner.detected_hz() - freq_hz).abs() < tol_hz,
+            "sr={sr}: expected ~{freq_hz} Hz, got {}",
             tuner.detected_hz()
         );
+        tuner
+    }
+
+    #[test]
+    fn realtime_vocal_tune_snaps_sharp_pitch_to_scale_and_self_heals_nan() {
+        // Feed a 452 Hz sine (about +46.6 cents sharp of A4 = 440 Hz)
+        let mut tuner =
+            feed_sine_and_check_pitch(48_000.0, VocalTuneScaleMode::Major, 452.0, 0.4, 8192, 4.0);
         assert!(
             (tuner.target_hz() - 440.0).abs() < 2.0,
             "target_hz = {}",
@@ -576,25 +587,9 @@ mod tests {
     #[test]
     fn realtime_vocal_tune_detects_low_baritone_at_96k_and_192k() {
         for &sr in &[96_000.0_f64, 192_000.0_f64] {
-            let mut tuner = RealtimeVocalTune::new(sr);
-            tuner.set_key_and_scale(0, VocalTuneScaleMode::Chromatic);
-            tuner.set_retune_speed_ms(5.0);
-            tuner.set_retune_amount(1.0);
-            tuner.set_humanize(0.0);
-            tuner.set_wet_mix(1.0);
-
             // 85 Hz (baritone/bass vocal well below the old 93.75 / 187.5 Hz blind spot)
             let frames = (sr * 0.12) as usize;
-            for i in 0..frames {
-                let s = (0.45 * (2.0 * PI * 85.0 * (i as f64) / sr).sin()) as f32;
-                let (l, r) = tuner.process_stereo_sample(s, s);
-                assert!(l.is_finite() && r.is_finite());
-            }
-            assert!(
-                (tuner.detected_hz() - 85.0).abs() < 2.5,
-                "sr={sr}: expected ~85 Hz, got {}",
-                tuner.detected_hz()
-            );
+            feed_sine_and_check_pitch(sr, VocalTuneScaleMode::Chromatic, 85.0, 0.45, frames, 2.5);
         }
     }
 }

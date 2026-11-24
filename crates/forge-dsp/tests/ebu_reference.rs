@@ -69,72 +69,51 @@ fn assert_within(name: &str, measured: f64, expected: f64, tol: f64) {
 // EBU Tech 3341: Integrated loudness (cases 1-5)
 // ---------------------------------------------------------------------------------------------
 
+fn assert_integrated_segments(label: &str, segments: &[(f64, f64)], expected_lufs: f64) {
+    let r = audit_audio(&stereo_sine_segments(segments));
+    assert_within(label, r.integrated_lufs, expected_lufs, LOUDNESS_TOL_LU);
+}
+
 #[test]
 fn tech3341_case1_integrated_minus23() {
-    let r = audit_audio(&stereo_sine_segments(&[(-23.0, 20.0)]));
-    assert_within(
-        "3341 #1 integrated",
-        r.integrated_lufs,
-        -23.0,
-        LOUDNESS_TOL_LU,
-    );
+    assert_integrated_segments("3341 #1 integrated", &[(-23.0, 20.0)], -23.0);
 }
 
 #[test]
 fn tech3341_case2_integrated_minus33() {
-    let r = audit_audio(&stereo_sine_segments(&[(-33.0, 20.0)]));
-    assert_within(
-        "3341 #2 integrated",
-        r.integrated_lufs,
-        -33.0,
-        LOUDNESS_TOL_LU,
-    );
+    assert_integrated_segments("3341 #2 integrated", &[(-33.0, 20.0)], -33.0);
 }
 
 #[test]
 fn tech3341_case3_relative_gate() {
-    let r = audit_audio(&stereo_sine_segments(&[
-        (-36.0, 10.0),
-        (-23.0, 60.0),
-        (-36.0, 10.0),
-    ]));
-    assert_within(
+    assert_integrated_segments(
         "3341 #3 integrated",
-        r.integrated_lufs,
+        &[(-36.0, 10.0), (-23.0, 60.0), (-36.0, 10.0)],
         -23.0,
-        LOUDNESS_TOL_LU,
     );
 }
 
 #[test]
 fn tech3341_case4_absolute_and_relative_gate() {
-    let r = audit_audio(&stereo_sine_segments(&[
-        (-72.0, 10.0),
-        (-36.0, 10.0),
-        (-23.0, 60.0),
-        (-36.0, 10.0),
-        (-72.0, 10.0),
-    ]));
-    assert_within(
+    assert_integrated_segments(
         "3341 #4 integrated",
-        r.integrated_lufs,
+        &[
+            (-72.0, 10.0),
+            (-36.0, 10.0),
+            (-23.0, 60.0),
+            (-36.0, 10.0),
+            (-72.0, 10.0),
+        ],
         -23.0,
-        LOUDNESS_TOL_LU,
     );
 }
 
 #[test]
 fn tech3341_case5_level_steps() {
-    let r = audit_audio(&stereo_sine_segments(&[
-        (-26.0, 20.0),
-        (-20.0, 20.1),
-        (-26.0, 20.0),
-    ]));
-    assert_within(
+    assert_integrated_segments(
         "3341 #5 integrated",
-        r.integrated_lufs,
+        &[(-26.0, 20.0), (-20.0, 20.1), (-26.0, 20.0)],
         -23.0,
-        LOUDNESS_TOL_LU,
     );
 }
 

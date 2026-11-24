@@ -138,16 +138,12 @@ impl DeliveryTarget {
 
     /// Builds a custom target, validating the ranges the mastering stage accepts.
     pub fn custom(lufs: f64, ceiling_dbtp: f64) -> Result<Self> {
-        if !lufs.is_finite() || !(-40.0..=-4.0).contains(&lufs) {
-            return Err(ForgeError::InvalidParameter(format!(
-                "Custom target loudness ({lufs}) must be between -40.0 and -4.0 LUFS"
-            )));
-        }
-        if !ceiling_dbtp.is_finite() || !(-24.0..=0.0).contains(&ceiling_dbtp) {
-            return Err(ForgeError::InvalidParameter(format!(
-                "Custom true-peak ceiling ({ceiling_dbtp}) must be between -24.0 and 0.0 dBTP"
-            )));
-        }
+        crate::loudness_limiter::validate_lufs_and_ceiling(
+            lufs,
+            ceiling_dbtp,
+            "Custom target loudness",
+            "Custom true-peak ceiling",
+        )?;
         Ok(Self::Custom { lufs, ceiling_dbtp })
     }
 }
@@ -346,29 +342,34 @@ pub fn delivery_checks(audit: &AuditReport, target: DeliveryTarget) -> Vec<Deliv
     ]
 }
 
+/// Builds a deterministic 10 s stereo mix-like test fixture (`110 Hz + 3200 Hz + broadband hash`).
+#[doc(hidden)]
+pub fn synthetic_delivery_fixture(level: f64, sample_rate: u32) -> AudioBuffer {
+    let n = sample_rate as usize * 10;
+    let mut seed = 0x2545_f491_u32;
+    let ch: Vec<f64> = (0..n)
+        .map(|i| {
+            let t = i as f64 / f64::from(sample_rate);
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let noise = (f64::from(seed) / f64::from(u32::MAX) - 0.5) * 0.2;
+            level
+                * (0.6 * (2.0 * std::f64::consts::PI * 110.0 * t).sin()
+                    + 0.3 * (2.0 * std::f64::consts::PI * 3200.0 * t).sin()
+                    + noise)
+        })
+        .collect();
+    AudioBuffer::from_channels(vec![ch.clone(), ch], sample_rate).expect("valid buffer")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::f64::consts::PI;
 
     /// 10 s stereo mix-like signal: a 110 Hz tone, a 3.2 kHz tone and broadband hash.
     fn test_mix(level: f64, sample_rate: u32) -> AudioBuffer {
-        let n = sample_rate as usize * 10;
-        let mut seed = 0x2545_f491_u32;
-        let ch: Vec<f64> = (0..n)
-            .map(|i| {
-                let t = i as f64 / f64::from(sample_rate);
-                seed ^= seed << 13;
-                seed ^= seed >> 17;
-                seed ^= seed << 5;
-                let noise = (f64::from(seed) / f64::from(u32::MAX) - 0.5) * 0.2;
-                level
-                    * (0.6 * (2.0 * PI * 110.0 * t).sin()
-                        + 0.3 * (2.0 * PI * 3200.0 * t).sin()
-                        + noise)
-            })
-            .collect();
-        AudioBuffer::from_channels(vec![ch.clone(), ch], sample_rate).expect("valid buffer")
+        synthetic_delivery_fixture(level, sample_rate)
     }
 
     #[test]

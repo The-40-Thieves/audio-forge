@@ -66,6 +66,22 @@ pub fn resolve_worker_script(
     candidate.is_file().then_some(candidate)
 }
 
+fn worker_io_cmd(
+    worker: &LocalWorkerCommand,
+    subcmd: &str,
+    input_path: &Path,
+    output_dir: &Path,
+) -> Command {
+    let mut cmd = Command::new(&worker.program);
+    cmd.args(&worker.args)
+        .arg(subcmd)
+        .arg("--input")
+        .arg(input_path)
+        .arg("--output-dir")
+        .arg(output_dir);
+    cmd
+}
+
 /// Runs `separate` on the local worker and parses the `StemBundle` it prints.
 pub(crate) fn separate(
     worker: &LocalWorkerCommand,
@@ -74,14 +90,8 @@ pub(crate) fn separate(
     stems: u8,
     config: &crate::routing::SeparationConfig,
 ) -> Result<StemBundle> {
-    let mut cmd = Command::new(&worker.program);
-    cmd.args(&worker.args)
-        .arg("separate")
-        .arg("--input")
-        .arg(input_path)
-        .arg("--output-dir")
-        .arg(output_dir)
-        .arg("--stems")
+    let mut cmd = worker_io_cmd(worker, "separate", input_path, output_dir);
+    cmd.arg("--stems")
         .arg(stems.to_string())
         .arg("--quality")
         .arg(config.quality.as_str());
@@ -109,10 +119,19 @@ pub(crate) fn separate(
     if config.restore {
         cmd.arg("--restore");
     }
-    let out = run_with_timeout(cmd, config.local_timeout)?;
+    run_worker_json(cmd, config.local_timeout, "GPU worker", "stem")
+}
+
+fn run_worker_json<T: serde::de::DeserializeOwned>(
+    cmd: Command,
+    timeout: Duration,
+    exit_prefix: &str,
+    json_kind: &str,
+) -> Result<T> {
+    let out = run_with_timeout(cmd, timeout)?;
     if !out.status.success() {
         return Err(ForgeError::WorkerError(format!(
-            "GPU worker exited with {}: {}",
+            "{exit_prefix} exited with {}: {}",
             out.status,
             stderr_excerpt(&out.stderr)
         )));
@@ -125,7 +144,7 @@ pub(crate) fn separate(
         .unwrap_or("");
     serde_json::from_str(last_line).map_err(|e| {
         ForgeError::WorkerError(format!(
-            "GPU worker printed no stem JSON ({e}): {last_line}"
+            "GPU worker printed no {json_kind} JSON ({e}): {last_line}"
         ))
     })
 }
@@ -166,15 +185,8 @@ pub fn run_local_neural_denoise(
     attenuation_limit_db: Option<f64>,
     timeout: Duration,
 ) -> Result<NeuralDenoiseResult> {
-    let mut cmd = Command::new(&worker.program);
-    cmd.args(&worker.args)
-        .arg("denoise")
-        .arg("--input")
-        .arg(input_path)
-        .arg("--output-dir")
-        .arg(output_dir)
-        .arg("--backend")
-        .arg(backend);
+    let mut cmd = worker_io_cmd(worker, "denoise", input_path, output_dir);
+    cmd.arg("--backend").arg(backend);
     if let Some(lim) = attenuation_limit_db {
         if !lim.is_finite() || !(0.0..=100.0).contains(&lim) {
             return Err(ForgeError::InvalidParameter(format!(
@@ -183,25 +195,7 @@ pub fn run_local_neural_denoise(
         }
         cmd.arg("--attenuation-limit-db").arg(format!("{lim}"));
     }
-    let out = run_with_timeout(cmd, timeout)?;
-    if !out.status.success() {
-        return Err(ForgeError::WorkerError(format!(
-            "GPU worker denoise exited with {}: {}",
-            out.status,
-            stderr_excerpt(&out.stderr)
-        )));
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let last_line = stdout
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("");
-    serde_json::from_str(last_line).map_err(|e| {
-        ForgeError::WorkerError(format!(
-            "GPU worker printed no denoise JSON ({e}): {last_line}"
-        ))
-    })
+    run_worker_json(cmd, timeout, "GPU worker denoise", "denoise")
 }
 
 /// Runs polyphonic audio-to-MIDI transcription (`basic-pitch`) via the local Python GPU worker.
@@ -211,32 +205,8 @@ pub fn run_local_transcribe_midi(
     output_dir: &Path,
     timeout: Duration,
 ) -> Result<MidiTranscribeResult> {
-    let mut cmd = Command::new(&worker.program);
-    cmd.args(&worker.args)
-        .arg("transcribe")
-        .arg("--input")
-        .arg(input_path)
-        .arg("--output-dir")
-        .arg(output_dir);
-    let out = run_with_timeout(cmd, timeout)?;
-    if !out.status.success() {
-        return Err(ForgeError::WorkerError(format!(
-            "GPU worker transcribe exited with {}: {}",
-            out.status,
-            stderr_excerpt(&out.stderr)
-        )));
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let last_line = stdout
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("");
-    serde_json::from_str(last_line).map_err(|e| {
-        ForgeError::WorkerError(format!(
-            "GPU worker printed no transcribe JSON ({e}): {last_line}"
-        ))
-    })
+    let cmd = worker_io_cmd(worker, "transcribe", input_path, output_dir);
+    run_worker_json(cmd, timeout, "GPU worker transcribe", "transcribe")
 }
 
 /// Exit status and captured output of a finished worker process.

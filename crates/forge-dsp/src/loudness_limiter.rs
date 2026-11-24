@@ -288,9 +288,8 @@ impl CytomicSvf {
         self.ic2eq = 0.0;
     }
 
-    /// Configures the TPT SVF as a Low-Pass filter while preserving integrator state (`ic1eq`, `ic2eq`).
     #[inline]
-    pub fn set_lowpass(&mut self, sample_rate: f64, freq_hz: f64, q: f64) {
+    fn set_tpt_common(&mut self, sample_rate: f64, freq_hz: f64, q: f64) -> f64 {
         let sr = sanitize_param_f64(sample_rate, 48_000.0, 100.0, 768_000.0);
         let f0 = sanitize_param_f64(freq_hz, 1000.0, 5.0, (sr * 0.48).max(5.0));
         let clean_q = sanitize_param_f64(q, std::f64::consts::FRAC_1_SQRT_2, 0.1, 50.0);
@@ -299,6 +298,13 @@ impl CytomicSvf {
         self.a1 = 1.0 / (1.0 + g * (g + k));
         self.a2 = g * self.a1;
         self.a3 = g * self.a2;
+        k
+    }
+
+    /// Configures the TPT SVF as a Low-Pass filter while preserving integrator state (`ic1eq`, `ic2eq`).
+    #[inline]
+    pub fn set_lowpass(&mut self, sample_rate: f64, freq_hz: f64, q: f64) {
+        self.set_tpt_common(sample_rate, freq_hz, q);
         self.m0 = 0.0;
         self.m1 = 0.0;
         self.m2 = 1.0;
@@ -307,14 +313,7 @@ impl CytomicSvf {
     /// Configures the TPT SVF as a High-Pass filter while preserving integrator state.
     #[inline]
     pub fn set_highpass(&mut self, sample_rate: f64, freq_hz: f64, q: f64) {
-        let sr = sanitize_param_f64(sample_rate, 48_000.0, 100.0, 768_000.0);
-        let f0 = sanitize_param_f64(freq_hz, 1000.0, 5.0, (sr * 0.48).max(5.0));
-        let clean_q = sanitize_param_f64(q, std::f64::consts::FRAC_1_SQRT_2, 0.1, 50.0);
-        let g = (PI * f0 / sr).tan();
-        let k = 1.0 / clean_q;
-        self.a1 = 1.0 / (1.0 + g * (g + k));
-        self.a2 = g * self.a1;
-        self.a3 = g * self.a2;
+        let k = self.set_tpt_common(sample_rate, freq_hz, q);
         self.m0 = 1.0;
         self.m1 = -k;
         self.m2 = -1.0;
@@ -398,7 +397,7 @@ impl CytomicSvf {
 /// ITU-R BS.1770-4 Annex 2 4x oversampling interpolation filter: 48-tap FIR split into
 /// 4 polyphase sub-filters of 12 taps each.
 #[rustfmt::skip]
-pub(crate) const TRUE_PEAK_PHASES: [[f64; 12]; 4] = [
+pub const TRUE_PEAK_PHASES: [[f64; 12]; 4] = [
     [
         0.001_708_984_375_0, 0.010_986_328_125_0, -0.019_653_320_312_5, 0.033_203_125_000_0,
         -0.059_448_242_187_5, 0.137_329_101_562_5, 0.972_167_968_750_0, -0.102_294_921_875_0,
@@ -551,17 +550,28 @@ fn compute_integrated_lufs(channels: &[Vec<f64>], sample_rate: u32) -> f64 {
         .filter(|&e| e > abs_gate_e)
         .collect();
 
+    compute_relative_gated_lufs(&gated_abs)
+}
+
+fn compute_relative_gated_lufs(gated_abs: &[f64]) -> f64 {
     if gated_abs.is_empty() {
         return -70.0;
     }
     let mean_abs = gated_abs.iter().sum::<f64>() / (gated_abs.len() as f64);
     let rel_gate_lufs = -0.691 + 10.0 * mean_abs.log10() - 10.0;
     let rel_gate_e = 10.0_f64.powf((rel_gate_lufs + 0.691) / 10.0);
-    let gated_rel: Vec<f64> = gated_abs.into_iter().filter(|&e| e > rel_gate_e).collect();
-    if gated_rel.is_empty() {
+    let mut sum_rel = 0.0_f64;
+    let mut count_rel = 0_usize;
+    for &e in gated_abs {
+        if e > rel_gate_e {
+            sum_rel += e;
+            count_rel += 1;
+        }
+    }
+    if count_rel == 0 {
         -70.0
     } else {
-        let mean_rel = gated_rel.iter().sum::<f64>() / (gated_rel.len() as f64);
+        let mean_rel = sum_rel / (count_rel as f64);
         -0.691 + 10.0 * mean_rel.log10()
     }
 }
@@ -627,20 +637,7 @@ pub fn audit_audio(buffer: &AudioBuffer) -> AuditReport {
         .filter(|&e| e > abs_gate_e)
         .collect();
 
-    let integrated_lufs = if gated_abs.is_empty() {
-        -70.0
-    } else {
-        let mean_abs = gated_abs.iter().sum::<f64>() / (gated_abs.len() as f64);
-        let rel_gate_lufs = -0.691 + 10.0 * mean_abs.log10() - 10.0;
-        let rel_gate_e = 10.0_f64.powf((rel_gate_lufs + 0.691) / 10.0);
-        let gated_rel: Vec<f64> = gated_abs.into_iter().filter(|&e| e > rel_gate_e).collect();
-        if gated_rel.is_empty() {
-            -70.0
-        } else {
-            let mean_rel = gated_rel.iter().sum::<f64>() / (gated_rel.len() as f64);
-            -0.691 + 10.0 * mean_rel.log10()
-        }
-    };
+    let integrated_lufs = compute_relative_gated_lufs(&gated_abs);
 
     // Loudness Range (LRA = P95 - P10 of gated short-term blocks)
     let loudness_range_lu = if short_term_lufs_vec.len() >= 4 {
@@ -1173,6 +1170,25 @@ pub fn normalize_and_limit(
     )
 }
 
+pub(crate) fn validate_lufs_and_ceiling(
+    lufs: f64,
+    ceiling_dbtp: f64,
+    lufs_label: &str,
+    ceiling_label: &str,
+) -> Result<()> {
+    if !lufs.is_finite() || !(-40.0..=-4.0).contains(&lufs) {
+        return Err(ForgeError::InvalidParameter(format!(
+            "{lufs_label} ({lufs}) must be between -40.0 and -4.0 LUFS"
+        )));
+    }
+    if !ceiling_dbtp.is_finite() || !(-24.0..=0.0).contains(&ceiling_dbtp) {
+        return Err(ForgeError::InvalidParameter(format!(
+            "{ceiling_label} ({ceiling_dbtp}) must be between -24.0 and 0.0 dBTP"
+        )));
+    }
+    Ok(())
+}
+
 /// Masters an `AudioBuffer` with full control over limiter release topology ([`LimiterStyle`]),
 /// stereo channel linking (`0.0..=1.0`), and output dithering / psychoacoustic noise shaping
 /// ([`DitherMode`]).
@@ -1182,16 +1198,7 @@ pub fn normalize_and_limit_with_config(
 ) -> Result<AudioBuffer> {
     let target_lufs = config.target_lufs;
     let ceiling_dbtp = config.ceiling_dbtp;
-    if !target_lufs.is_finite() || !(-40.0..=-4.0).contains(&target_lufs) {
-        return Err(ForgeError::InvalidParameter(format!(
-            "target_lufs ({target_lufs}) must be between -40.0 and -4.0 LUFS"
-        )));
-    }
-    if !ceiling_dbtp.is_finite() || !(-24.0..=0.0).contains(&ceiling_dbtp) {
-        return Err(ForgeError::InvalidParameter(format!(
-            "ceiling_dbtp ({ceiling_dbtp}) must be between -24.0 and 0.0 dBTP"
-        )));
-    }
+    validate_lufs_and_ceiling(target_lufs, ceiling_dbtp, "target_lufs", "ceiling_dbtp")?;
     if config.dither != DitherMode::None && !(8..=24).contains(&config.dither_bits) {
         return Err(ForgeError::InvalidParameter(format!(
             "dither_bits ({}) must be between 8 and 24",
@@ -1337,7 +1344,7 @@ pub fn normalize_and_limit_with_config(
 
 /// Deterministic xorshift64* PRNG producing uniform `[-0.5, +0.5)` floats for audio dithering.
 #[inline]
-fn next_uniform_bipolar(state: &mut u64) -> f64 {
+pub(crate) fn next_uniform_bipolar(state: &mut u64) -> f64 {
     let mut x = *state;
     x ^= x >> 12;
     x ^= x << 25;

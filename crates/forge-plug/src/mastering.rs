@@ -1,6 +1,23 @@
 //! Forge SubMono & Tape, Forge Master Limiter & Forge Phase/Match EQ plugins.
 
+use crate::chassis::*;
 use crate::*;
+
+define_presets! {
+    const SUB_TAPE_PRESETS {
+        "Tight Club Sub" => { "cutoff": 0.38, "sub": 0.35, "width": 0.55, "drive": 0.25 };
+        "Warm 15 IPS" => { "cutoff": 0.30, "sub": 0.20, "width": 0.50, "drive": 0.55 };
+    }
+    const LIMITER_PRESETS {
+        "Spotify -1 dBTP" => { "drive": 0.45, "ceil": 0.85, "rel": 0.18 };
+        "Club Loud" => { "drive": 0.65, "ceil": 0.90, "rel": 0.08 };
+        "Transparent Master" => { "drive": 0.40, "ceil": 0.85, "rel": 0.35 };
+    }
+    const PHASE_EQ_PRESETS {
+        "AI De-Harsh Flat" => { "inv": 0.0, "eqamt": 0.50, "genre": 0.0, "autogain": 1.0 };
+        "Modern Hip-Hop" => { "inv": 0.0, "eqamt": 0.70, "genre": 0.25, "autogain": 1.0 };
+    }
+}
 // ============================================================================
 // 4. FORGE SUBMONO & CONSOLE TAPE BUS
 // ============================================================================
@@ -79,88 +96,28 @@ impl Default for ForgeSubAndTapePlug {
 }
 
 impl Plugin for ForgeSubAndTapePlug {
-    const NAME: &'static str = "Forge SubMono & Console Tape";
-    const VENDOR: &'static str = "The 40 Thieves (ForgeAudio)";
-    const URL: &'static str = "https://github.com/The-40-Thieves/audio-forge";
-    const EMAIL: &'static str = "audio@the40thieves.org";
-    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+    forge_plugin_common!(
+        "Forge SubMono & Console Tape",
+        crate::chassis::STEREO_LAYOUTS
+    );
 
-    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
-        main_input_channels: NonZeroU32::new(2),
-        main_output_channels: NonZeroU32::new(2),
-        ..AudioIOLayout::const_default()
-    }];
+    forge_ab_editor!(
+        title: "FORGE SUBMONO & CONSOLE TAPE (JILES-ATHERTON RK4)",
+        subtitle: "Linkwitz-Riley <160Hz Mono-Maker, Allpass Disperser, Jiles-Atherton RK4 Hysteresis & Head-Bump",
+        presets: SUB_TAPE_PRESETS,
+        grid_id: "subtape_grid",
+        params: [
+            ("cutoff", Float, mono_cutoff_hz, "Sub Mono Cutoff (Hz)"),
+            ("sub", Float, sub_reinforce, "Sub Harmonic + Disperser Reinforce"),
+            ("width", Float, stereo_width, "High Stereo Width"),
+            ("drive", Float, tape_drive, "Jiles-Atherton RK4 + Console8 Drive"),
+        ]
+    );
 
-    const SAMPLE_ACCURATE_AUTOMATION: bool = true;
-    type SysExMessage = ();
-    type BackgroundTask = ();
-
-    fn params(&self) -> Arc<dyn Params> {
-        self.params.clone()
-    }
-
-    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        let params = self.params.clone();
-        let telemetry = self.telemetry.clone();
-        create_egui_editor(
-            self.params.editor_state.clone(),
-            AbBankState::default(),
-            |_, _| {},
-            move |egui_ctx, setter, ab_state| {
-                egui::CentralPanel::default().show(egui_ctx, |ui| {
-                    draw_forge_studio_header_and_spectrum(
-                        ui,
-                        "FORGE SUBMONO & CONSOLE TAPE (JILES-ATHERTON RK4)",
-                        "Linkwitz-Riley <160Hz Mono-Maker, Allpass Disperser, Jiles-Atherton RK4 Hysteresis & Head-Bump",
-                        &telemetry,
-                        None,
-                    );
-                    let param_refs = [
-                        ("cutoff", ParamRef::Float(&params.mono_cutoff_hz)),
-                        ("sub", ParamRef::Float(&params.sub_reinforce)),
-                        ("width", ParamRef::Float(&params.stereo_width)),
-                        ("drive", ParamRef::Float(&params.tape_drive)),
-                    ];
-                    draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, SUB_TAPE_PRESETS);
-                    egui::Grid::new("subtape_grid")
-                        .num_columns(2)
-                        .spacing([16.0, 8.0])
-                        .show(ui, |ui| {
-                            ui.label("Sub Mono Cutoff (Hz)");
-                            ui.add(widgets::ParamSlider::for_param(&params.mono_cutoff_hz, setter));
-                            ui.end_row();
-                            ui.label("Sub Harmonic + Disperser Reinforce");
-                            ui.add(widgets::ParamSlider::for_param(&params.sub_reinforce, setter));
-                            ui.end_row();
-                            ui.label("High Stereo Width");
-                            ui.add(widgets::ParamSlider::for_param(&params.stereo_width, setter));
-                            ui.end_row();
-                            ui.label("Jiles-Atherton RK4 + Console8 Drive");
-                            ui.add(widgets::ParamSlider::for_param(&params.tape_drive, setter));
-                            ui.end_row();
-                        });
-                });
-            },
-        )
-    }
-
-    fn initialize(
-        &mut self,
-        _audio_io_layout: &AudioIOLayout,
-        buffer_config: &BufferConfig,
-        _context: &mut impl InitContext<Self>,
-    ) -> bool {
-        let sr = f64::from(buffer_config.sample_rate);
-        self.sample_rate = sr;
-        self.dsp = RealtimeSubAndTapeBus::new(sr, f64::from(self.params.mono_cutoff_hz.value()));
-        self.analyzer.reset(sr);
-        true
-    }
-
-    fn reset(&mut self) {
-        self.dsp.reset(self.sample_rate);
-        self.analyzer.clear_state();
-    }
+    impl_standard_plugin_lifecycle!(
+        self,
+        sr => RealtimeSubAndTapeBus::new(sr, f64::from(self.params.mono_cutoff_hz.value()))
+    );
 
     fn process(
         &mut self,
@@ -176,49 +133,43 @@ impl Plugin for ForgeSubAndTapePlug {
             let sub = f64::from(self.params.sub_reinforce.smoothed.next());
             let width = f64::from(self.params.stereo_width.smoothed.next());
             let drive = f64::from(self.params.tape_drive.smoothed.next());
-            let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
-            let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
+            let (in_l, in_r) = read_stereo(&mut channel_samples);
             let (out_l, out_r) = self
                 .dsp
                 .process_stereo_sample(in_l, in_r, sub, width, drive);
-            self.analyzer.push_stereo_sample(out_l, out_r);
-            self.telemetry.update_peaks(in_l, in_r, out_l, out_r, 0.0);
-            if let Some(s0) = channel_samples.get_mut(0) {
-                *s0 = out_l;
-            }
-            if let Some(s1) = channel_samples.get_mut(1) {
-                *s1 = out_r;
-            }
+            finish_stereo_sample(
+                &mut self.analyzer,
+                &self.telemetry,
+                &mut channel_samples,
+                in_l,
+                in_r,
+                out_l,
+                out_r,
+                0.0,
+            );
         }
-        self.telemetry
-            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &[0.0; 32]);
+        finish_block_spectrum(&self.analyzer, &self.telemetry);
         ProcessStatus::Normal
     }
 }
 
-impl ClapPlugin for ForgeSubAndTapePlug {
-    const CLAP_ID: &'static str = "org.the40thieves.forge-audio.submono-tape";
-    const CLAP_DESCRIPTION: Option<&'static str> = Some(
-        "Linkwitz-Riley <160Hz Sub Mono-Maker, Harmonic Bass Reinforcer & Console8/ChowTape Saturation",
-    );
-    const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_SUPPORT_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_FEATURES: &'static [ClapFeature] = &[
+impl_forge_formats!(
+    ForgeSubAndTapePlug,
+    clap_id: "org.the40thieves.forge-audio.submono-tape",
+    clap_desc: "Linkwitz-Riley <160Hz Sub Mono-Maker, Harmonic Bass Reinforcer & Console8/ChowTape Saturation",
+    clap_features: &[
         ClapFeature::AudioEffect,
         ClapFeature::Mastering,
         ClapFeature::Distortion,
         ClapFeature::Stereo,
-    ];
-}
-
-impl Vst3Plugin for ForgeSubAndTapePlug {
-    const VST3_CLASS_ID: [u8; 16] = *b"ForgeSubAndTape1";
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
+    ],
+    vst3_id: *b"ForgeSubAndTape1",
+    vst3_cats: &[
         Vst3SubCategory::Fx,
         Vst3SubCategory::Mastering,
         Vst3SubCategory::Distortion,
-    ];
-}
+    ],
+);
 
 // ============================================================================
 // 5. FORGE MASTER TRUE-PEAK LIMITER
@@ -293,20 +244,12 @@ impl Default for MasterLimiterParams {
             )
             .with_value_to_string(formatters::v2s_f32_rounded(2))
             .with_unit(" ms"),
-            limiter_style: IntParam::new("Limiter Style", 0, IntRange::Linear { min: 0, max: 3 })
-                .with_value_to_string(Arc::new(|v| match v {
-                    0 => "Transparent".to_string(),
-                    1 => "Punchy".to_string(),
-                    2 => "Dynamic".to_string(),
-                    _ => "Aggressive".to_string(),
-                }))
-                .with_string_to_value(Arc::new(|s| match s.trim().to_ascii_lowercase().as_str() {
-                    "0" | "transparent" => Some(0),
-                    "1" | "punchy" => Some(1),
-                    "2" | "dynamic" => Some(2),
-                    "3" | "aggressive" => Some(3),
-                    _ => None,
-                })),
+            limiter_style: enum_int_param(
+                "Limiter Style",
+                0,
+                &["Transparent", "Punchy", "Dynamic", "Aggressive"],
+                &[],
+            ),
             channel_link: FloatParam::new(
                 "Channel Link",
                 1.0,
@@ -314,18 +257,12 @@ impl Default for MasterLimiterParams {
             )
             .with_value_to_string(formatters::v2s_f32_percentage(0))
             .with_string_to_value(formatters::s2v_f32_percentage()),
-            dither_mode: IntParam::new("Output Dither", 0, IntRange::Linear { min: 0, max: 2 })
-                .with_value_to_string(Arc::new(|v| match v {
-                    0 => "Off".to_string(),
-                    1 => "TPDF 24-bit".to_string(),
-                    _ => "Noise-Shaped 16-bit".to_string(),
-                }))
-                .with_string_to_value(Arc::new(|s| match s.trim().to_ascii_lowercase().as_str() {
-                    "0" | "off" | "none" => Some(0),
-                    "1" | "tpdf" | "tpdf 24-bit" => Some(1),
-                    "2" | "noise-shaped" | "noise-shaped 16-bit" | "shaped" => Some(2),
-                    _ => None,
-                })),
+            dither_mode: enum_int_param(
+                "Output Dither",
+                0,
+                &["Off", "TPDF 24-bit", "Noise-Shaped 16-bit"],
+                &[("none", 0), ("tpdf", 1), ("noise-shaped", 2), ("shaped", 2)],
+            ),
             isp_8x: BoolParam::new("8x True-Peak Oversampling", false),
             unity_audition: BoolParam::new("1:1 Unity Gain Audition", false),
         }
@@ -346,104 +283,29 @@ impl Default for ForgeMasterLimiterPlug {
 }
 
 impl Plugin for ForgeMasterLimiterPlug {
-    const NAME: &'static str = "Forge Master True-Peak Limiter";
-    const VENDOR: &'static str = "The 40 Thieves (ForgeAudio)";
-    const URL: &'static str = "https://github.com/The-40-Thieves/audio-forge";
-    const EMAIL: &'static str = "audio@the40thieves.org";
-    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+    forge_plugin_common!(
+        "Forge Master True-Peak Limiter",
+        crate::chassis::STEREO_LAYOUTS
+    );
 
-    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
-        main_input_channels: NonZeroU32::new(2),
-        main_output_channels: NonZeroU32::new(2),
-        ..AudioIOLayout::const_default()
-    }];
-
-    const SAMPLE_ACCURATE_AUTOMATION: bool = true;
-    type SysExMessage = ();
-    type BackgroundTask = ();
-
-    fn params(&self) -> Arc<dyn Params> {
-        self.params.clone()
-    }
-
-    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        let params = self.params.clone();
-        let telemetry = self.telemetry.clone();
-        let initial_ab = AbBankState::load_from_persisted(&self.params.ab_state);
-        create_egui_editor(
-            self.params.editor_state.clone(),
-            initial_ab,
-            |_, _| {},
-            move |egui_ctx, setter, ab_state| {
-                egui::CentralPanel::default().show(egui_ctx, |ui| {
-                    draw_forge_studio_header_and_spectrum_interactive(
-                        ui,
-                        "FORGE MASTER TRUE-PEAK BRICKWALL LIMITER",
-                        "Lookahead 4x/8x Inter-Sample True-Peak Brickwall Limiter (-1.0 dBTP) & ITU-R BS.1770-4 Meter",
-                        &telemetry,
-                        None,
-                        Some(setter),
-                        Some(CanvasDragHandle {
-                            label: "CEIL",
-                            param: &params.ceiling_dbtp,
-                            color: egui::Color32::from_rgb(248, 113, 113),
-                        }),
-                    );
-                    let param_refs = [
-                        ("drive", ParamRef::Float(&params.drive_db)),
-                        ("ceil", ParamRef::Float(&params.ceiling_dbtp)),
-                        ("rel", ParamRef::Float(&params.release_ms)),
-                        ("style", ParamRef::Int(&params.limiter_style)),
-                        ("clink", ParamRef::Float(&params.channel_link)),
-                        ("dither", ParamRef::Int(&params.dither_mode)),
-                        ("isp8x", ParamRef::Bool(&params.isp_8x)),
-                        ("unity", ParamRef::Bool(&params.unity_audition)),
-                    ];
-                    draw_ab_and_presets_bar_persisted(
-                        ui,
-                        setter,
-                        &param_refs,
-                        ab_state,
-                        LIMITER_PRESETS,
-                        Some(&params.ab_state),
-                    );
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false; 2])
-                        .show(ui, |ui| {
-                            egui::Grid::new("limiter_grid")
-                                .num_columns(2)
-                                .spacing([16.0, 8.0])
-                                .show(ui, |ui| {
-                                    ui.label("Input Gain / Drive (dB)");
-                                    ui.add(widgets::ParamSlider::for_param(&params.drive_db, setter));
-                                    ui.end_row();
-                                    ui.label("True-Peak Ceiling (dBTP)");
-                                    ui.add(widgets::ParamSlider::for_param(&params.ceiling_dbtp, setter));
-                                    ui.end_row();
-                                    ui.label("Release Time (ms)");
-                                    ui.add(widgets::ParamSlider::for_param(&params.release_ms, setter));
-                                    ui.end_row();
-                                    ui.label("Limiter Style");
-                                    ui.add(widgets::ParamSlider::for_param(&params.limiter_style, setter));
-                                    ui.end_row();
-                                    ui.label("Channel Link");
-                                    ui.add(widgets::ParamSlider::for_param(&params.channel_link, setter));
-                                    ui.end_row();
-                                    ui.label("Output Dither");
-                                    ui.add(widgets::ParamSlider::for_param(&params.dither_mode, setter));
-                                    ui.end_row();
-                                    ui.label("8x ISP Oversampling");
-                                    ui.add(widgets::ParamSlider::for_param(&params.isp_8x, setter));
-                                    ui.end_row();
-                                    ui.label("1:1 Unity Gain Audition");
-                                    ui.add(widgets::ParamSlider::for_param(&params.unity_audition, setter));
-                                    ui.end_row();
-                                });
-                        });
-                });
-            },
-        )
-    }
+    forge_ab_editor!(
+        persisted_scroll,
+        title: "FORGE MASTER TRUE-PEAK BRICKWALL LIMITER",
+        subtitle: "Lookahead 4x/8x Inter-Sample True-Peak Brickwall Limiter (-1.0 dBTP) & ITU-R BS.1770-4 Meter",
+        drag: ("CEIL", ceiling_dbtp, egui::Color32::from_rgb(248, 113, 113)),
+        presets: LIMITER_PRESETS,
+        grid_id: "limiter_grid",
+        params: [
+            ("drive", Float, drive_db, "Input Gain / Drive (dB)"),
+            ("ceil", Float, ceiling_dbtp, "True-Peak Ceiling (dBTP)"),
+            ("rel", Float, release_ms, "Release Time (ms)"),
+            ("style", Int, limiter_style, "Limiter Style"),
+            ("clink", Float, channel_link, "Channel Link"),
+            ("dither", Int, dither_mode, "Output Dither"),
+            ("isp8x", Bool, isp_8x, "8x ISP Oversampling"),
+            ("unity", Bool, unity_audition, "1:1 Unity Gain Audition"),
+        ]
+    );
 
     fn initialize(
         &mut self,
@@ -499,8 +361,7 @@ impl Plugin for ForgeMasterLimiterPlug {
 
         for mut channel_samples in buffer.iter_samples() {
             let drive = f64::from(self.params.drive_db.smoothed.next());
-            let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
-            let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
+            let (in_l, in_r) = read_stereo(&mut channel_samples);
             let (mut out_l, mut out_r) =
                 self.dsp.process_stereo_sample(in_l, in_r, drive, ceil, rel);
             if unity_audition && drive.abs() > 0.01 {
@@ -508,16 +369,18 @@ impl Plugin for ForgeMasterLimiterPlug {
                 out_l *= comp;
                 out_r *= comp;
             }
-            self.analyzer.push_stereo_sample(out_l, out_r);
             self.loudness_meter.push_output_sample(out_l, out_r);
             let (_lufs, _dbtp, gr) = self.dsp.telemetry();
-            self.telemetry.update_peaks(in_l, in_r, out_l, out_r, -gr);
-            if let Some(s0) = channel_samples.get_mut(0) {
-                *s0 = out_l;
-            }
-            if let Some(s1) = channel_samples.get_mut(1) {
-                *s1 = out_r;
-            }
+            finish_stereo_sample(
+                &mut self.analyzer,
+                &self.telemetry,
+                &mut channel_samples,
+                in_l,
+                in_r,
+                out_l,
+                out_r,
+                -gr,
+            );
         }
         let (_lufs, _dbtp, gr) = self.dsp.telemetry();
         let (lufs_m, lufs_s, out_tp) = self.loudness_meter.snapshot();
@@ -529,29 +392,23 @@ impl Plugin for ForgeMasterLimiterPlug {
     }
 }
 
-impl ClapPlugin for ForgeMasterLimiterPlug {
-    const CLAP_ID: &'static str = "org.the40thieves.forge-audio.master-limiter";
-    const CLAP_DESCRIPTION: Option<&'static str> = Some(
-        "Lookahead 4x Inter-Sample True-Peak Brickwall Limiter (-1.0 dBTP) & ITU-R BS.1770-4 Meter",
-    );
-    const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_SUPPORT_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_FEATURES: &'static [ClapFeature] = &[
+impl_forge_formats!(
+    ForgeMasterLimiterPlug,
+    clap_id: "org.the40thieves.forge-audio.master-limiter",
+    clap_desc: "Lookahead 4x Inter-Sample True-Peak Brickwall Limiter (-1.0 dBTP) & ITU-R BS.1770-4 Meter",
+    clap_features: &[
         ClapFeature::AudioEffect,
         ClapFeature::Limiter,
         ClapFeature::Mastering,
         ClapFeature::Stereo,
-    ];
-}
-
-impl Vst3Plugin for ForgeMasterLimiterPlug {
-    const VST3_CLASS_ID: [u8; 16] = *b"ForgeMasterLim01";
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
+    ],
+    vst3_id: *b"ForgeMasterLim01",
+    vst3_cats: &[
         Vst3SubCategory::Fx,
         Vst3SubCategory::Mastering,
         Vst3SubCategory::Dynamics,
-    ];
-}
+    ],
+);
 
 // ============================================================================
 // 7. FORGE PHASE-ALIGN & 18-BAND MASTERING / MATCH EQ
@@ -623,74 +480,24 @@ impl Default for ForgePhaseAndMatchPlug {
 }
 
 impl Plugin for ForgePhaseAndMatchPlug {
-    const NAME: &'static str = "Forge PhaseAlign & 18-Band EQ";
-    const VENDOR: &'static str = "The 40 Thieves (ForgeAudio)";
-    const URL: &'static str = "https://github.com/The-40-Thieves/audio-forge";
-    const EMAIL: &'static str = "audio@the40thieves.org";
-    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+    forge_plugin_common!(
+        "Forge PhaseAlign & 18-Band EQ",
+        crate::chassis::STEREO_LAYOUTS
+    );
 
-    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
-        main_input_channels: NonZeroU32::new(2),
-        main_output_channels: NonZeroU32::new(2),
-        ..AudioIOLayout::const_default()
-    }];
-
-    const SAMPLE_ACCURATE_AUTOMATION: bool = true;
-    type SysExMessage = ();
-    type BackgroundTask = ();
-
-    fn params(&self) -> Arc<dyn Params> {
-        self.params.clone()
-    }
-
-    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        let params = self.params.clone();
-        let telemetry = self.telemetry.clone();
-        create_egui_editor(
-            self.params.editor_state.clone(),
-            AbBankState::default(),
-            |_, _| {},
-            move |egui_ctx, setter, ab_state| {
-                egui::CentralPanel::default().show(egui_ctx, |ui| {
-                    draw_forge_studio_header_and_spectrum(
-                        ui,
-                        "FORGE PHASE-ALIGN & 18-BAND MASTERING EQ",
-                        "Sample-Accurate Phase Aligner, Nyquist De-Cramped 18-Band AI De-Harsh EQ, Bode Overlay & Auto-Gain",
-                        &telemetry,
-                        None,
-                    );
-                    let param_refs = [
-                        ("delay", ParamRef::Int(&params.delay_samples)),
-                        ("inv", ParamRef::Bool(&params.invert_polarity)),
-                        ("eqamt", ParamRef::Float(&params.ai_warmth_eq_amount)),
-                        ("genre", ParamRef::Int(&params.genre_target_idx)),
-                        ("autogain", ParamRef::Bool(&params.auto_gain_comp)),
-                    ];
-                    draw_ab_and_presets_bar(ui, setter, &param_refs, ab_state, PHASE_EQ_PRESETS);
-                    egui::Grid::new("phase_eq_grid")
-                        .num_columns(2)
-                        .spacing([16.0, 8.0])
-                        .show(ui, |ui| {
-                            ui.label("Phase Delay Offset (spl)");
-                            ui.add(widgets::ParamSlider::for_param(&params.delay_samples, setter));
-                            ui.end_row();
-                            ui.label("Invert Polarity (180 deg)");
-                            ui.add(widgets::ParamSlider::for_param(&params.invert_polarity, setter));
-                            ui.end_row();
-                            ui.label("18-Band AI De-Harsh & Genre Amount");
-                            ui.add(widgets::ParamSlider::for_param(&params.ai_warmth_eq_amount, setter));
-                            ui.end_row();
-                            ui.label("Genre Target (0=Pop..5=Jazz)");
-                            ui.add(widgets::ParamSlider::for_param(&params.genre_target_idx, setter));
-                            ui.end_row();
-                            ui.label("Auto-Gain Compensation (AGC)");
-                            ui.add(widgets::ParamSlider::for_param(&params.auto_gain_comp, setter));
-                            ui.end_row();
-                        });
-                });
-            },
-        )
-    }
+    forge_ab_editor!(
+        title: "FORGE PHASE-ALIGN & 18-BAND MASTERING EQ",
+        subtitle: "Sample-Accurate Phase Aligner, Nyquist De-Cramped 18-Band AI De-Harsh EQ, Bode Overlay & Auto-Gain",
+        presets: PHASE_EQ_PRESETS,
+        grid_id: "phase_eq_grid",
+        params: [
+            ("delay", Int, delay_samples, "Phase Delay Offset (spl)"),
+            ("inv", Bool, invert_polarity, "Invert Polarity (180 deg)"),
+            ("eqamt", Float, ai_warmth_eq_amount, "18-Band AI De-Harsh & Genre Amount"),
+            ("genre", Int, genre_target_idx, "Genre Target (0=Pop..5=Jazz)"),
+            ("autogain", Bool, auto_gain_comp, "Auto-Gain Compensation (AGC)"),
+        ]
+    );
 
     fn initialize(
         &mut self,
@@ -747,21 +554,22 @@ impl Plugin for ForgePhaseAndMatchPlug {
         self.eq_dsp.set_gains(&combined, eq_amt);
 
         for mut channel_samples in buffer.iter_samples() {
-            let in_l = *channel_samples.get_mut(0).unwrap_or(&mut 0.0);
-            let in_r = *channel_samples.get_mut(1).unwrap_or(&mut 0.0);
+            let (in_l, in_r) = read_stereo(&mut channel_samples);
             let (al_l, al_r) = self.phase_dsp.process_stereo_sample(in_l, in_r);
             let (eq_l, eq_r) = self.eq_dsp.process_stereo_sample(al_l, al_r);
             let (out_l, out_r) = self
                 .auto_gain
                 .process_stereo(in_l, in_r, eq_l, eq_r, use_agc);
-            self.analyzer.push_stereo_sample(out_l, out_r);
-            self.telemetry.update_peaks(in_l, in_r, out_l, out_r, 0.0);
-            if let Some(s0) = channel_samples.get_mut(0) {
-                *s0 = out_l;
-            }
-            if let Some(s1) = channel_samples.get_mut(1) {
-                *s1 = out_r;
-            }
+            finish_stereo_sample(
+                &mut self.analyzer,
+                &self.telemetry,
+                &mut channel_samples,
+                in_l,
+                in_r,
+                out_l,
+                out_r,
+                0.0,
+            );
         }
 
         // Interpolate 18-band EQ Bode response across 32 GUI curve points
@@ -777,27 +585,21 @@ impl Plugin for ForgePhaseAndMatchPlug {
     }
 }
 
-impl ClapPlugin for ForgePhaseAndMatchPlug {
-    const CLAP_ID: &'static str = "org.the40thieves.forge-audio.phase-and-matcheq";
-    const CLAP_DESCRIPTION: Option<&'static str> = Some(
-        "Sample-Accurate Phase/Polarity Aligner, 18-Band AI De-Harsh EQ & Genre Tonal Balance Target",
-    );
-    const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_SUPPORT_URL: Option<&'static str> = Some(Self::URL);
-    const CLAP_FEATURES: &'static [ClapFeature] = &[
+impl_forge_formats!(
+    ForgePhaseAndMatchPlug,
+    clap_id: "org.the40thieves.forge-audio.phase-and-matcheq",
+    clap_desc: "Sample-Accurate Phase/Polarity Aligner, 18-Band AI De-Harsh EQ & Genre Tonal Balance Target",
+    clap_features: &[
         ClapFeature::AudioEffect,
         ClapFeature::Equalizer,
         ClapFeature::Mastering,
         ClapFeature::PhaseVocoder,
         ClapFeature::Stereo,
-    ];
-}
-
-impl Vst3Plugin for ForgePhaseAndMatchPlug {
-    const VST3_CLASS_ID: [u8; 16] = *b"ForgePhaseEq0001";
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
+    ],
+    vst3_id: *b"ForgePhaseEq0001",
+    vst3_cats: &[
         Vst3SubCategory::Fx,
         Vst3SubCategory::Eq,
         Vst3SubCategory::Mastering,
-    ];
-}
+    ],
+);

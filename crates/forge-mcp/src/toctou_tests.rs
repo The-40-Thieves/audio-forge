@@ -93,21 +93,22 @@ fn assert_nothing_outside(outside: &Path, names: &[&str], text: &str) {
     }
 }
 
-#[test]
-fn swapped_output_directory_cannot_redirect_a_midi_write() {
+fn assert_swapped_dir_blocks_write(
+    setup: impl FnOnce(&Path),
+    tool: &str,
+    args: Value,
+    expected_absent: &[&str],
+) {
     let root = tempfile::tempdir().expect("root");
     let outside = tempfile::tempdir().expect("outside");
     std::fs::create_dir(root.path().join("sub")).expect("mkdir sub");
+    setup(root.path());
     let sb = PathSandbox::new([root.path().to_path_buf()]).expect("sandbox");
     let (_guard, fired) = swap_once("sub", swap_dir_for_link(root.path(), outside.path()));
 
-    let (is_error, text) = call_tool(
-        &sb,
-        "forge_music_theory_midi",
-        json!({ "chords": "Dm9 G13", "output_midi": "sub/chords.mid" }),
-    );
+    let (is_error, text) = call_tool(&sb, tool, args);
     assert!(fired.get(), "the swap hook never ran");
-    assert_nothing_outside(outside.path(), &["chords.mid"], &text);
+    assert_nothing_outside(outside.path(), expected_absent, &text);
     assert!(
         is_error,
         "write through a swapped directory reported success: {text}"
@@ -115,28 +116,22 @@ fn swapped_output_directory_cannot_redirect_a_midi_write() {
 }
 
 #[test]
-fn swapped_output_directory_cannot_redirect_a_wav_and_report_write() {
-    let root = tempfile::tempdir().expect("root");
-    let outside = tempfile::tempdir().expect("outside");
-    std::fs::create_dir(root.path().join("sub")).expect("mkdir sub");
-    write_tone(&root.path().join("mix.wav"));
-    let sb = PathSandbox::new([root.path().to_path_buf()]).expect("sandbox");
-    let (_guard, fired) = swap_once("sub", swap_dir_for_link(root.path(), outside.path()));
+fn swapped_output_directory_cannot_redirect_a_midi_write() {
+    assert_swapped_dir_blocks_write(
+        |_| {},
+        "forge_music_theory_midi",
+        json!({ "chords": "Dm9 G13", "output_midi": "sub/chords.mid" }),
+        &["chords.mid"],
+    );
+}
 
-    let (is_error, text) = call_tool(
-        &sb,
+#[test]
+fn swapped_output_directory_cannot_redirect_a_wav_and_report_write() {
+    assert_swapped_dir_blocks_write(
+        |root| write_tone(&root.join("mix.wav")),
         "forge_deliver",
         json!({ "input": "mix.wav", "output": "sub/master.wav" }),
-    );
-    assert!(fired.get(), "the swap hook never ran");
-    assert_nothing_outside(
-        outside.path(),
         &["master.wav", "master.delivery.json"],
-        &text,
-    );
-    assert!(
-        is_error,
-        "write through a swapped directory reported success: {text}"
     );
 }
 

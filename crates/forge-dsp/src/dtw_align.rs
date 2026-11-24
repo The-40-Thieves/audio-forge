@@ -283,24 +283,8 @@ fn warped_source_pos(f: usize, step_map: &[f64], hop: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::{mono, noise};
     use std::f64::consts::PI;
-
-    /// Deterministic xorshift noise in `-1.0..1.0`.
-    fn noise(len: usize, seed: u64) -> Vec<f64> {
-        let mut state = seed.max(1);
-        (0..len)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                (state >> 11) as f64 / (1_u64 << 53) as f64 * 2.0 - 1.0
-            })
-            .collect()
-    }
-
-    fn mono(samples: Vec<f64>, sr: u32) -> AudioBuffer {
-        AudioBuffer::from_channels(vec![samples], sr).expect("valid buffer")
-    }
 
     /// `count` 120 ms test syllables as `(amplitude, tone Hz, length in samples)`.
     fn syllables(count: usize, seed: u64, sr: f64) -> Vec<(f64, f64, usize)> {

@@ -257,23 +257,7 @@ fn shift_target_fractional(target: &AudioBuffer, frac_lag: f64, sign: f64) -> Au
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Deterministic xorshift noise in `-1.0..1.0`.
-    fn noise(len: usize, seed: u64) -> Vec<f64> {
-        let mut state = seed.max(1);
-        (0..len)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                (state >> 11) as f64 / (1_u64 << 53) as f64 * 2.0 - 1.0
-            })
-            .collect()
-    }
-
-    fn mono(samples: Vec<f64>, sr: u32) -> AudioBuffer {
-        AudioBuffer::from_channels(vec![samples], sr).expect("valid buffer")
-    }
+    use crate::test_utils::{mono, noise};
 
     /// `signal` delayed by `delay` samples with its polarity flipped.
     fn delayed_inverted(signal: &[f64], delay: usize) -> Vec<f64> {

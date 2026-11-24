@@ -255,10 +255,9 @@ fn pure_rust_dsp_never_starts_a_worker() {
     assert!(started.elapsed() < Duration::from_secs(2));
 }
 
-#[test]
-fn hung_local_worker_is_killed_at_the_timeout() {
+fn assert_local_worker_times_out(make_worker: impl FnOnce(&Path) -> LocalWorkerCommand) {
     let dir = tempfile::tempdir().unwrap();
-    let worker = sleeping_worker(dir.path());
+    let worker = make_worker(dir.path());
     let started = Instant::now();
     let cfg = SeparationConfig {
         local_timeout: SHORT,
@@ -268,6 +267,11 @@ fn hung_local_worker_is_killed_at_the_timeout() {
     let elapsed = started.elapsed();
     assert!(err.to_string().contains("timed out after 0.3 s"), "{err}");
     assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+}
+
+#[test]
+fn hung_local_worker_is_killed_at_the_timeout() {
+    assert_local_worker_times_out(sleeping_worker);
 }
 
 #[test]
@@ -344,21 +348,13 @@ fn timeouts_outside_the_supported_range_are_rejected() {
 #[test]
 fn worker_whose_child_keeps_the_pipes_open_still_times_out() {
     // The worker exits at once but leaves a grandchild holding stdout for 5 s.
-    let dir = tempfile::tempdir().unwrap();
-    let worker = stub_worker(
-        dir.path(),
-        "sleep 5 & exit 0",
-        "start /b powershell -NoProfile -Command Start-Sleep -Seconds 5",
-    );
-    let started = Instant::now();
-    let cfg = SeparationConfig {
-        local_timeout: SHORT,
-        ..SeparationConfig::default()
-    };
-    let err = local_gpu::separate(&worker, Path::new("in.wav"), dir.path(), 2, &cfg).unwrap_err();
-    let elapsed = started.elapsed();
-    assert!(err.to_string().contains("timed out after 0.3 s"), "{err}");
-    assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+    assert_local_worker_times_out(|dir| {
+        stub_worker(
+            dir,
+            "sleep 5 & exit 0",
+            "start /b powershell -NoProfile -Command Start-Sleep -Seconds 5",
+        )
+    });
 }
 
 #[test]

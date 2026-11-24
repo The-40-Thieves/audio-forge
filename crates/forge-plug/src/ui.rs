@@ -4,7 +4,9 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use forge_dsp::{Biquad, flush_denormal_f64, read_shared_spectrum, sanitize_sample_f32};
+use forge_dsp::{
+    Biquad, TRUE_PEAK_PHASES, flush_denormal_f64, read_shared_spectrum, sanitize_sample_f32,
+};
 use nih_plug::prelude::{BoolParam, FloatParam, IntParam, Param, ParamSetter};
 use nih_plug_egui::egui;
 use serde::{Deserialize, Serialize};
@@ -519,31 +521,6 @@ pub struct OutputLoudnessMeter {
     sample_rate: f64,
 }
 
-/// ITU-R BS.1770-4 Annex 2 4x polyphase 48-tap (12 taps/phase) true-peak interpolation FIR.
-#[rustfmt::skip]
-const BS1770_TP_PHASES: [[f64; 12]; 4] = [
-    [
-        0.001_708_984_375_0, 0.010_986_328_125_0, -0.019_653_320_312_5, 0.033_203_125_000_0,
-        -0.059_448_242_187_5, 0.137_329_101_562_5, 0.972_167_968_750_0, -0.102_294_921_875_0,
-        0.047_607_421_875_0, -0.026_611_328_125_0, 0.014_892_578_125_0, -0.008_300_781_250_0,
-    ],
-    [
-        -0.029_174_804_687_5, 0.029_296_875_000_0, -0.051_757_812_500_0, 0.089_111_328_125_0,
-        -0.166_503_906_250_0, 0.465_087_890_625_0, 0.779_785_156_250_0, -0.200_317_382_812_5,
-        0.101_562_500_000_0, -0.058_227_539_062_5, 0.033_081_054_687_5, -0.018_920_898_437_5,
-    ],
-    [
-        -0.018_920_898_437_5, 0.033_081_054_687_5, -0.058_227_539_062_5, 0.101_562_500_000_0,
-        -0.200_317_382_812_5, 0.779_785_156_250_0, 0.465_087_890_625_0, -0.166_503_906_250_0,
-        0.089_111_328_125_0, -0.051_757_812_500_0, 0.029_296_875_000_0, -0.029_174_804_687_5,
-    ],
-    [
-        -0.008_300_781_250_0, 0.014_892_578_125_0, -0.026_611_328_125_0, 0.047_607_421_875_0,
-        -0.102_294_921_875_0, 0.972_167_968_750_0, 0.137_329_101_562_5, -0.059_448_242_187_5,
-        0.033_203_125_000_0, -0.019_653_320_312_5, 0.010_986_328_125_0, 0.001_708_984_375_0,
-    ],
-];
-
 impl OutputLoudnessMeter {
     pub fn new(sample_rate: f64) -> Self {
         let sr = if sample_rate.is_finite() {
@@ -585,7 +562,7 @@ impl OutputLoudnessMeter {
         hist.copy_within(0..11, 1);
         hist[0] = x;
         let mut peak = x.abs();
-        for coeffs in &BS1770_TP_PHASES {
+        for coeffs in &TRUE_PEAK_PHASES {
             let y: f64 = coeffs.iter().zip(hist.iter()).map(|(c, h)| c * h).sum();
             peak = peak.max(y.abs());
         }

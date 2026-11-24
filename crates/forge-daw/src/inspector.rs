@@ -196,53 +196,13 @@ impl ForgeDawApp {
                             .color(egui::Color32::from_rgb(56, 189, 248)),
                         );
 
-                        egui::ComboBox::from_id_salt("add_obj_fx")
-                            .selected_text("+ Add ForgeAudio FX...")
-                            .show_ui(ui, |ui| {
-                                type FxPreset = (&'static str, fn() -> FxSlotConfig);
-                                let presets: [FxPreset; 8] = [
-                                    ("Forge OpenSoothe De-Fizz", FxSlotConfig::default_open_soothe),
-                                    ("Forge Vocal Surgical", FxSlotConfig::default_vocal_surgical),
-                                    ("Forge Vocal Tune", FxSlotConfig::default_vocal_tune),
-                                    ("Forge SubMono & Tape", FxSlotConfig::default_sub_mono_tape),
-                                    ("Forge SplitEQ", FxSlotConfig::default_split_eq),
-                                    ("Forge Density & Clipper", FxSlotConfig::default_density_clipper),
-                                    ("Forge SpaceVerb FDN", FxSlotConfig::default_space_verb),
-                                    ("Forge Master Limiter", FxSlotConfig::default_master_limiter),
-                                ];
-                                for (label, make_fn) in presets {
-                                    if ui.selectable_label(false, label).clicked() {
-                                        obj.fx_chain.push(make_fn());
-                                        changed = true;
-                                    }
-                                }
-                            });
-
-                        let mut remove_idx = None;
-                        for (idx, fx) in obj.fx_chain.iter_mut().enumerate() {
-                            ui.group(|ui| {
-                                ui.horizontal(|ui| {
-                                    let mut active = !fx.is_bypassed();
-                                    if ui.checkbox(&mut active, fx.display_name()).changed() {
-                                        fx.set_bypass(!active);
-                                        changed = true;
-                                    }
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if ui.small_button("X").clicked() {
-                                                remove_idx = Some(idx);
-                                            }
-                                        },
-                                    );
-                                });
-                                changed |= draw_fx_slot_controls(ui, fx);
-                            });
-                        }
-                        if let Some(rm) = remove_idx {
-                            obj.fx_chain.remove(rm);
-                            changed = true;
-                        }
+                        changed |= draw_fx_insert_list(
+                            ui,
+                            "add_obj_fx",
+                            "+ Add ForgeAudio FX...",
+                            &mut obj.fx_chain,
+                            true,
+                        );
                     });
                 }
 
@@ -271,17 +231,13 @@ impl ForgeDawApp {
     }
 
     fn draw_piano_roll_inspector(&mut self, ui: &mut egui::Ui) {
-        ui.heading(
-            egui::RichText::new("MIDI PIANO ROLL & SYNTH")
-                .color(egui::Color32::from_rgb(192, 132, 252)),
-        );
-        if self.project.tracks.is_empty() {
-            ui.label("No tracks in project. Click '+ Track' to add one.");
+        let Some(tr_idx) = self.ensure_selected_track(
+            ui,
+            "MIDI PIANO ROLL & SYNTH",
+            egui::Color32::from_rgb(192, 132, 252),
+        ) else {
             return;
-        }
-        let tr_idx = self
-            .selected_track_idx
-            .min(self.project.tracks.len().saturating_sub(1));
+        };
         ui.label(
             egui::RichText::new(format!("Track: {}", self.project.tracks[tr_idx].name))
                 .small()
@@ -476,41 +432,107 @@ impl ForgeDawApp {
             self.commit_project_change(prev);
         }
     }
+}
 
-    fn draw_track_bus_fx_inspector(&mut self, ui: &mut egui::Ui) {
-        ui.heading(
-            egui::RichText::new("TRACK, AUX & MASTER FX")
-                .color(egui::Color32::from_rgb(56, 189, 248)),
-        );
+type FxPresetEntry = (&'static str, fn() -> FxSlotConfig);
+
+const FX_PRESETS: [FxPresetEntry; 8] = [
+    (
+        "Forge OpenSoothe De-Fizz",
+        FxSlotConfig::default_open_soothe,
+    ),
+    ("Forge Vocal Surgical", FxSlotConfig::default_vocal_surgical),
+    ("Forge Vocal Tune", FxSlotConfig::default_vocal_tune),
+    ("Forge SubMono & Tape", FxSlotConfig::default_sub_mono_tape),
+    ("Forge SplitEQ", FxSlotConfig::default_split_eq),
+    (
+        "Forge Density & Clipper",
+        FxSlotConfig::default_density_clipper,
+    ),
+    ("Forge SpaceVerb FDN", FxSlotConfig::default_space_verb),
+    ("Forge Master Limiter", FxSlotConfig::default_master_limiter),
+];
+
+fn draw_fx_insert_list(
+    ui: &mut egui::Ui,
+    combo_id: impl std::hash::Hash + std::fmt::Debug,
+    add_label: &str,
+    inserts: &mut Vec<FxSlotConfig>,
+    with_bypass: bool,
+) -> bool {
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(combo_id)
+        .selected_text(add_label)
+        .show_ui(ui, |ui| {
+            for (label, make_fn) in FX_PRESETS {
+                if ui.selectable_label(false, label).clicked() {
+                    inserts.push(make_fn());
+                    changed = true;
+                }
+            }
+        });
+    let mut remove_idx = None;
+    for (idx, fx) in inserts.iter_mut().enumerate() {
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                if with_bypass {
+                    let mut active = !fx.is_bypassed();
+                    if ui.checkbox(&mut active, fx.display_name()).changed() {
+                        fx.set_bypass(!active);
+                        changed = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("X").clicked() {
+                            remove_idx = Some(idx);
+                        }
+                    });
+                } else {
+                    ui.strong(fx.display_name());
+                    if ui.small_button("X").clicked() {
+                        remove_idx = Some(idx);
+                    }
+                }
+            });
+            changed |= draw_fx_slot_controls(ui, fx);
+        });
+    }
+    if let Some(rm) = remove_idx {
+        inserts.remove(rm);
+        changed = true;
+    }
+    changed
+}
+
+impl ForgeDawApp {
+    fn ensure_selected_track(
+        &self,
+        ui: &mut egui::Ui,
+        heading: &str,
+        color: egui::Color32,
+    ) -> Option<usize> {
+        ui.heading(egui::RichText::new(heading).color(color));
         if self.project.tracks.is_empty() {
             ui.label("No tracks in project. Click '+ Track' to add one.");
-            return;
+            return None;
         }
-        let tr_idx = self
-            .selected_track_idx
-            .min(self.project.tracks.len().saturating_sub(1));
+        Some(
+            self.selected_track_idx
+                .min(self.project.tracks.len().saturating_sub(1)),
+        )
+    }
+
+    fn draw_track_bus_fx_inspector(&mut self, ui: &mut egui::Ui) {
+        let Some(tr_idx) = self.ensure_selected_track(
+            ui,
+            "TRACK, AUX & MASTER FX",
+            egui::Color32::from_rgb(56, 189, 248),
+        ) else {
+            return;
+        };
         let prev = self.project.clone();
         let mut changed = false;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            type FxPreset = (&'static str, fn() -> FxSlotConfig);
-            let presets: [FxPreset; 8] = [
-                (
-                    "Forge OpenSoothe De-Fizz",
-                    FxSlotConfig::default_open_soothe,
-                ),
-                ("Forge Vocal Surgical", FxSlotConfig::default_vocal_surgical),
-                ("Forge Vocal Tune", FxSlotConfig::default_vocal_tune),
-                ("Forge SubMono & Tape", FxSlotConfig::default_sub_mono_tape),
-                ("Forge SplitEQ", FxSlotConfig::default_split_eq),
-                (
-                    "Forge Density & Clipper",
-                    FxSlotConfig::default_density_clipper,
-                ),
-                ("Forge SpaceVerb FDN", FxSlotConfig::default_space_verb),
-                ("Forge Master Limiter", FxSlotConfig::default_master_limiter),
-            ];
-
             let mut delete_track = false;
             ui.horizontal(|ui| {
                 ui.label("Track:");
@@ -548,32 +570,13 @@ impl ForgeDawApp {
                 ))
                 .strong(),
             );
-            egui::ComboBox::from_id_salt("add_track_fx")
-                .selected_text("+ Add Track Insert...")
-                .show_ui(ui, |ui| {
-                    for (label, make_fn) in presets {
-                        if ui.selectable_label(false, label).clicked() {
-                            self.project.tracks[tr_idx].inserts.push(make_fn());
-                            changed = true;
-                        }
-                    }
-                });
-            let mut rm_tr = None;
-            for (idx, fx) in self.project.tracks[tr_idx].inserts.iter_mut().enumerate() {
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.strong(fx.display_name());
-                        if ui.small_button("X").clicked() {
-                            rm_tr = Some(idx);
-                        }
-                    });
-                    changed |= draw_fx_slot_controls(ui, fx);
-                });
-            }
-            if let Some(rm) = rm_tr {
-                self.project.tracks[tr_idx].inserts.remove(rm);
-                changed = true;
-            }
+            changed |= draw_fx_insert_list(
+                ui,
+                "add_track_fx",
+                "+ Add Track Insert...",
+                &mut self.project.tracks[tr_idx].inserts,
+                false,
+            );
 
             ui.separator();
             ui.horizontal(|ui| {
@@ -591,62 +594,24 @@ impl ForgeDawApp {
                         .strong()
                         .color(egui::Color32::from_rgb(192, 132, 252)),
                 );
-                egui::ComboBox::from_id_salt(("add_aux_fx", bi))
-                    .selected_text("+ Add Aux Insert...")
-                    .show_ui(ui, |ui| {
-                        for (label, make_fn) in presets {
-                            if ui.selectable_label(false, label).clicked() {
-                                bus.inserts.push(make_fn());
-                                changed = true;
-                            }
-                        }
-                    });
-                let mut rm_aux = None;
-                for (idx, fx) in bus.inserts.iter_mut().enumerate() {
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.strong(fx.display_name());
-                            if ui.small_button("X").clicked() {
-                                rm_aux = Some(idx);
-                            }
-                        });
-                        changed |= draw_fx_slot_controls(ui, fx);
-                    });
-                }
-                if let Some(rm) = rm_aux {
-                    bus.inserts.remove(rm);
-                    changed = true;
-                }
+                changed |= draw_fx_insert_list(
+                    ui,
+                    ("add_aux_fx", bi),
+                    "+ Add Aux Insert...",
+                    &mut bus.inserts,
+                    false,
+                );
             }
 
             ui.separator();
             ui.label(egui::RichText::new("Master Bus Inserts").strong());
-            egui::ComboBox::from_id_salt("add_master_fx")
-                .selected_text("+ Add Master Insert...")
-                .show_ui(ui, |ui| {
-                    for (label, make_fn) in presets {
-                        if ui.selectable_label(false, label).clicked() {
-                            self.project.master_inserts.push(make_fn());
-                            changed = true;
-                        }
-                    }
-                });
-            let mut rm_m = None;
-            for (idx, fx) in self.project.master_inserts.iter_mut().enumerate() {
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.strong(fx.display_name());
-                        if ui.small_button("X").clicked() {
-                            rm_m = Some(idx);
-                        }
-                    });
-                    changed |= draw_fx_slot_controls(ui, fx);
-                });
-            }
-            if let Some(rm) = rm_m {
-                self.project.master_inserts.remove(rm);
-                changed = true;
-            }
+            changed |= draw_fx_insert_list(
+                ui,
+                "add_master_fx",
+                "+ Add Master Insert...",
+                &mut self.project.master_inserts,
+                false,
+            );
         });
 
         if changed {

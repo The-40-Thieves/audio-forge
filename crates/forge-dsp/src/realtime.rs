@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::elite_dsp::{AllpassDisperser, JilesAthertonHysteresis};
 use crate::loudness_limiter::{
     Biquad, CytomicSvf, DitherMode, LIMITER_LOOKAHEAD_MS, LimiterStyle, TRUE_PEAK_PHASES,
-    flush_denormal_f64, sanitize_param_f64, sanitize_sample_f32,
+    flush_denormal_f64, next_uniform_bipolar, sanitize_param_f64, sanitize_sample_f32,
 };
 use crate::restoration::{LowBandSplit, MASTERING_18_BANDS_HZ};
 use crate::spectrum::{
@@ -64,16 +64,14 @@ impl ParamSmoother {
     }
 }
 
-/// Internal pre-allocated OLA-STFT core for [`RealtimeOpenSoothe`] (instantiated at both
-/// 2048-pt Ultra resolution and 256-pt Low-Latency Tracking resolution).
-struct OpenSootheStftCore {
+/// Pre-allocated zero-allocation Stereo Overlap-Add STFT engine shared by spectral processors.
+struct StereoOlaStft {
     sample_rate: f64,
     fft_size: usize,
     hop_size: usize,
     half_bins: usize,
     window: Vec<f64>,
     spectrum_power_norm: f64,
-    band_weights: Vec<f64>,
     fft_fwd: Arc<dyn Fft<f64>>,
     fft_inv: Arc<dyn Fft<f64>>,
     in_ring_l: Vec<f64>,
@@ -83,10 +81,179 @@ struct OpenSootheStftCore {
     norm_ring: Vec<f64>,
     ring_pos: usize,
     hop_counter: usize,
-    spec_scratch: Vec<Complex<f64>>,
-    spec_scratch_r: Vec<Complex<f64>>,
+    spec_l: Vec<Complex<f64>>,
+    spec_r: Vec<Complex<f64>>,
     fft_scratch: Vec<Complex<f64>>,
     mags_scratch: Vec<f64>,
+}
+
+impl StereoOlaStft {
+    fn new(sample_rate: f64, fft_size: usize, hop_size: usize) -> Self {
+        let half_bins = fft_size / 2 + 1;
+        let mut planner = FftPlanner::<f64>::new();
+        let fft_fwd = planner.plan_fft_forward(fft_size);
+        let fft_inv = planner.plan_fft_inverse(fft_size);
+        let scratch_len = fft_fwd
+            .get_inplace_scratch_len()
+            .max(fft_inv.get_inplace_scratch_len());
+
+        let window: Vec<f64> = (0..fft_size)
+            .map(|i| 0.5 * (1.0 - (2.0 * PI * (i as f64) / (fft_size as f64)).cos()))
+            .collect();
+        let spectrum_power_norm = stft_band_power_norm(&window);
+
+        Self {
+            sample_rate: sample_rate.max(8000.0),
+            fft_size,
+            hop_size,
+            half_bins,
+            window,
+            spectrum_power_norm,
+            fft_fwd,
+            fft_inv,
+            in_ring_l: vec![0.0; fft_size],
+            in_ring_r: vec![0.0; fft_size],
+            out_ring_l: vec![0.0; fft_size * 2],
+            out_ring_r: vec![0.0; fft_size * 2],
+            norm_ring: vec![0.0; fft_size * 2],
+            ring_pos: 0,
+            hop_counter: 0,
+            spec_l: vec![Complex::new(0.0, 0.0); fft_size],
+            spec_r: vec![Complex::new(0.0, 0.0); fft_size],
+            fft_scratch: vec![Complex::new(0.0, 0.0); scratch_len],
+            mags_scratch: vec![0.0; half_bins],
+        }
+    }
+
+    fn reset(&mut self, sample_rate: f64) {
+        self.sample_rate = sample_rate.max(8000.0);
+        self.in_ring_l.fill(0.0);
+        self.in_ring_r.fill(0.0);
+        self.out_ring_l.fill(0.0);
+        self.out_ring_r.fill(0.0);
+        self.norm_ring.fill(0.0);
+        self.ring_pos = 0;
+        self.hop_counter = 0;
+    }
+
+    #[inline]
+    fn in_write_idx(&self) -> usize {
+        self.ring_pos & (self.fft_size - 1)
+    }
+
+    #[inline]
+    fn push_and_pop(&mut self, in_l: f32, in_r: f32) -> ((f32, f32), bool) {
+        let mask_in = self.fft_size - 1;
+        let mask_out = self.fft_size * 2 - 1;
+
+        self.in_ring_l[self.ring_pos & mask_in] = sanitize_sample_f32(in_l);
+        self.in_ring_r[self.ring_pos & mask_in] = sanitize_sample_f32(in_r);
+
+        let read_idx = self.ring_pos & mask_out;
+        let denom = self.norm_ring[read_idx].max(1e-9);
+        let out_l = flush_denormal_f64(self.out_ring_l[read_idx] / denom) as f32;
+        let out_r = flush_denormal_f64(self.out_ring_r[read_idx] / denom) as f32;
+
+        self.out_ring_l[read_idx] = 0.0;
+        self.out_ring_r[read_idx] = 0.0;
+        self.norm_ring[read_idx] = 0.0;
+
+        self.ring_pos = self.ring_pos.wrapping_add(1);
+        self.hop_counter += 1;
+
+        let hop_ready = self.hop_counter >= self.hop_size;
+        if hop_ready {
+            self.hop_counter = 0;
+        }
+        ((out_l, out_r), hop_ready)
+    }
+
+    fn analyze_stereo(&mut self, use_ms: bool) {
+        let mask_in = self.fft_size - 1;
+        let frame_start = self.ring_pos.wrapping_sub(self.fft_size);
+        for i in 0..self.fft_size {
+            let idx = frame_start.wrapping_add(i) & mask_in;
+            let w = self.window[i];
+            let l = self.in_ring_l[idx] * w;
+            let r = self.in_ring_r[idx] * w;
+            if use_ms {
+                self.spec_l[i] = Complex::new(0.5 * (l + r), 0.0);
+                self.spec_r[i] = Complex::new(0.5 * (l - r), 0.0);
+            } else {
+                self.spec_l[i] = Complex::new(l, 0.0);
+                self.spec_r[i] = Complex::new(r, 0.0);
+            }
+        }
+        self.fft_fwd
+            .process_with_scratch(&mut self.spec_l, &mut self.fft_scratch);
+        self.fft_fwd
+            .process_with_scratch(&mut self.spec_r, &mut self.fft_scratch);
+    }
+
+    fn fill_mags_and_accum(
+        &mut self,
+        is_right: bool,
+        bin_hz: f64,
+        spec_norm: f64,
+        band_pow: &mut [f64; SPECTRUM_BANDS],
+    ) {
+        let spec = if is_right { &self.spec_r } else { &self.spec_l };
+        for (mag, c) in self
+            .mags_scratch
+            .iter_mut()
+            .zip(spec.iter())
+            .take(self.half_bins)
+        {
+            *mag = c.norm().max(1e-12);
+        }
+        accumulate_stft_band_power(&self.mags_scratch, bin_hz, spec_norm, band_pow);
+    }
+
+    #[inline]
+    fn scale_bin_sym(&mut self, b: usize, eff_l: f64, eff_r: f64) {
+        self.spec_l[b] *= eff_l;
+        self.spec_l[self.fft_size - b] = self.spec_l[b].conj();
+        self.spec_r[b] *= eff_r;
+        self.spec_r[self.fft_size - b] = self.spec_r[b].conj();
+    }
+
+    fn synthesize_hop(&mut self, delta_listen: bool, use_ms: bool) {
+        if delta_listen {
+            self.spec_l[0] = Complex::new(0.0, 0.0);
+            self.spec_l[self.half_bins - 1] = Complex::new(0.0, 0.0);
+            self.spec_r[0] = Complex::new(0.0, 0.0);
+            self.spec_r[self.half_bins - 1] = Complex::new(0.0, 0.0);
+        }
+        self.fft_inv
+            .process_with_scratch(&mut self.spec_l, &mut self.fft_scratch);
+        self.fft_inv
+            .process_with_scratch(&mut self.spec_r, &mut self.fft_scratch);
+
+        let inv_n = 1.0 / (self.fft_size as f64);
+        let mask_out = self.fft_size * 2 - 1;
+        let out_base = self.ring_pos;
+        for i in 0..self.fft_size {
+            let w = self.window[i];
+            let val_l = self.spec_l[i].re * inv_n * w;
+            let val_r = self.spec_r[i].re * inv_n * w;
+            let idx = out_base.wrapping_add(i) & mask_out;
+            if use_ms {
+                self.out_ring_l[idx] += val_l + val_r;
+                self.out_ring_r[idx] += val_l - val_r;
+            } else {
+                self.out_ring_l[idx] += val_l;
+                self.out_ring_r[idx] += val_r;
+            }
+            self.norm_ring[idx] += w * w;
+        }
+    }
+}
+
+/// Internal pre-allocated OLA-STFT core for [`RealtimeOpenSoothe`] (instantiated at both
+/// 2048-pt Ultra resolution and 256-pt Low-Latency Tracking resolution).
+struct OpenSootheStftCore {
+    ola: StereoOlaStft,
+    band_weights: Vec<f64>,
     smoothed_gains_l: Vec<f64>,
     smoothed_gains_r: Vec<f64>,
     last_gr_db: f32,
@@ -107,40 +274,11 @@ struct OpenSootheControlState {
 
 impl OpenSootheStftCore {
     fn new(sample_rate: f64, fft_size: usize, hop_size: usize) -> Self {
-        let half_bins = fft_size / 2 + 1;
-        let mut planner = FftPlanner::<f64>::new();
-        let fft_fwd = planner.plan_fft_forward(fft_size);
-        let fft_inv = planner.plan_fft_inverse(fft_size);
-        let scratch_len = fft_fwd
-            .get_inplace_scratch_len()
-            .max(fft_inv.get_inplace_scratch_len());
-
-        let window: Vec<f64> = (0..fft_size)
-            .map(|i| 0.5 * (1.0 - (2.0 * PI * (i as f64) / (fft_size as f64)).cos()))
-            .collect();
-        let spectrum_power_norm = stft_band_power_norm(&window);
-
+        let ola = StereoOlaStft::new(sample_rate, fft_size, hop_size);
+        let half_bins = ola.half_bins;
         let mut core = Self {
-            sample_rate: sample_rate.max(8000.0),
-            fft_size,
-            hop_size,
-            half_bins,
-            window,
-            spectrum_power_norm,
+            ola,
             band_weights: vec![0.0; half_bins],
-            fft_fwd,
-            fft_inv,
-            in_ring_l: vec![0.0; fft_size],
-            in_ring_r: vec![0.0; fft_size],
-            out_ring_l: vec![0.0; fft_size * 2],
-            out_ring_r: vec![0.0; fft_size * 2],
-            norm_ring: vec![0.0; fft_size * 2],
-            ring_pos: 0,
-            hop_counter: 0,
-            spec_scratch: vec![Complex::new(0.0, 0.0); fft_size],
-            spec_scratch_r: vec![Complex::new(0.0, 0.0); fft_size],
-            fft_scratch: vec![Complex::new(0.0, 0.0); scratch_len],
-            mags_scratch: vec![0.0; half_bins],
             smoothed_gains_l: vec![1.0; half_bins],
             smoothed_gains_r: vec![1.0; half_bins],
             last_gr_db: 0.0,
@@ -152,16 +290,9 @@ impl OpenSootheStftCore {
     }
 
     fn reset(&mut self, sample_rate: f64) {
-        self.sample_rate = sample_rate.max(8000.0);
-        self.in_ring_l.fill(0.0);
-        self.in_ring_r.fill(0.0);
-        self.out_ring_l.fill(0.0);
-        self.out_ring_r.fill(0.0);
-        self.norm_ring.fill(0.0);
+        self.ola.reset(sample_rate);
         self.smoothed_gains_l.fill(1.0);
         self.smoothed_gains_r.fill(1.0);
-        self.ring_pos = 0;
-        self.hop_counter = 0;
         self.last_gr_db = 0.0;
         self.last_spectrum_db = [SPECTRUM_FLOOR_DB; SPECTRUM_BANDS];
         self.last_band_gr_db = [0.0; 32];
@@ -169,7 +300,7 @@ impl OpenSootheStftCore {
     }
 
     fn update_band_weights(&mut self, fizz_weight: f64, sibilance_weight: f64) {
-        let bin_hz = self.sample_rate / (self.fft_size as f64);
+        let bin_hz = self.ola.sample_rate / (self.ola.fft_size as f64);
         let clean_fizz = sanitize_param_f64(fizz_weight, 1.25, 0.0, 2.0);
         let clean_sib = sanitize_param_f64(sibilance_weight, 1.0, 0.0, 2.0);
         let skirt_mask = |f: f64, lo: f64, hi: f64| -> f64 {
@@ -230,32 +361,13 @@ impl OpenSootheStftCore {
         delta_listen: bool,
         ctrl: OpenSootheControlState,
     ) -> (f32, f32) {
-        let mask_in = self.fft_size - 1;
-        let mask_out = self.fft_size * 2 - 1;
-
-        self.in_ring_l[self.ring_pos & mask_in] = sanitize_sample_f32(in_l);
-        self.in_ring_r[self.ring_pos & mask_in] = sanitize_sample_f32(in_r);
-
-        let read_idx = self.ring_pos & mask_out;
-        let denom = self.norm_ring[read_idx].max(1e-9);
-        let out_l = flush_denormal_f64(self.out_ring_l[read_idx] / denom) as f32;
-        let out_r = flush_denormal_f64(self.out_ring_r[read_idx] / denom) as f32;
-
-        self.out_ring_l[read_idx] = 0.0;
-        self.out_ring_r[read_idx] = 0.0;
-        self.norm_ring[read_idx] = 0.0;
-
-        self.ring_pos = self.ring_pos.wrapping_add(1);
-        self.hop_counter += 1;
-
-        if self.hop_counter >= self.hop_size {
-            self.hop_counter = 0;
+        let (out, hop_ready) = self.ola.push_and_pop(in_l, in_r);
+        if hop_ready {
             let clean_sens = sanitize_param_f64(sensitivity_db, 3.5, 0.5, 24.0);
             let clean_depth = sanitize_param_f64(max_depth_db, 9.0, 0.5, 24.0);
             self.process_stft_hop(clean_sens, clean_depth, sharpness_bins, delta_listen, ctrl);
         }
-
-        (out_l, out_r)
+        out
     }
 
     fn process_stft_hop(
@@ -268,17 +380,15 @@ impl OpenSootheStftCore {
     ) {
         let thresh_ratio = 10.0_f64.powf(sensitivity_db.max(0.5) / 20.0);
         let min_gain = 10.0_f64.powf(-max_depth_db.clamp(0.5, 24.0) / 20.0);
-        let radius = if self.fft_size <= 256 {
+        let fft_size = self.ola.fft_size;
+        let half_bins = self.ola.half_bins;
+        let radius = if fft_size <= 256 {
             (sharpness_bins / 4).clamp(2, 8)
         } else {
             sharpness_bins.clamp(4, 24)
         };
-        let mask_in = self.fft_size - 1;
-        let mask_out = self.fft_size * 2 - 1;
-        let frame_start = self.ring_pos.wrapping_sub(self.fft_size);
-        let inv_n = 1.0 / (self.fft_size as f64);
-        let bin_hz = self.sample_rate / (self.fft_size as f64);
-        let hop_secs = (self.hop_size as f64) / self.sample_rate.max(1.0);
+        let bin_hz = self.ola.sample_rate / (fft_size as f64);
+        let hop_secs = (self.ola.hop_size as f64) / self.ola.sample_rate.max(1.0);
         let attack_alpha = (-hop_secs / (ctrl.attack_ms * 0.001)).exp();
         let release_alpha = (-hop_secs / (ctrl.release_ms * 0.001)).exp();
         let slope_exp = if ctrl.hard_mode { 0.95 } else { 0.65 };
@@ -291,48 +401,17 @@ impl OpenSootheStftCore {
             (1.0 + ctrl.mid_side_balance.min(0.0)).clamp(0.0, 1.0),
         ];
         let spec_norm = if use_ms {
-            self.spectrum_power_norm
+            self.ola.spectrum_power_norm
         } else {
-            0.5 * self.spectrum_power_norm
+            0.5 * self.ola.spectrum_power_norm
         };
+
+        self.ola.analyze_stereo(use_ms);
 
         for (ch_idx, &ms_f) in ms_focus.iter().enumerate() {
             let focus = if use_ms { ms_f } else { 1.0 };
-            let spec = if ch_idx == 0 {
-                &mut self.spec_scratch
-            } else {
-                &mut self.spec_scratch_r
-            };
-            for (i, slot) in spec.iter_mut().enumerate().take(self.fft_size) {
-                let idx = frame_start.wrapping_add(i) & mask_in;
-                let sample = if use_ms {
-                    let l = self.in_ring_l[idx];
-                    let r = self.in_ring_r[idx];
-                    if ch_idx == 0 {
-                        0.5 * (l + r)
-                    } else {
-                        0.5 * (l - r)
-                    }
-                } else if ch_idx == 0 {
-                    self.in_ring_l[idx]
-                } else {
-                    self.in_ring_r[idx]
-                };
-                *slot = Complex::new(sample * self.window[i], 0.0);
-            }
-
-            self.fft_fwd
-                .process_with_scratch(spec, &mut self.fft_scratch);
-
-            for (mag, c) in self
-                .mags_scratch
-                .iter_mut()
-                .zip(spec.iter())
-                .take(self.half_bins)
-            {
-                *mag = c.norm().max(1e-12);
-            }
-            accumulate_stft_band_power(&self.mags_scratch, bin_hz, spec_norm, &mut band_pow);
+            self.ola
+                .fill_mags_and_accum(ch_idx == 1, bin_hz, spec_norm, &mut band_pow);
 
             let smoothed = if ch_idx == 0 {
                 &mut self.smoothed_gains_l
@@ -340,12 +419,7 @@ impl OpenSootheStftCore {
                 &mut self.smoothed_gains_r
             };
 
-            for (b, smoothed_val) in smoothed
-                .iter_mut()
-                .enumerate()
-                .take(self.half_bins - 1)
-                .skip(1)
-            {
+            for (b, smoothed_val) in smoothed.iter_mut().enumerate().take(half_bins - 1).skip(1) {
                 let f = (b as f64) * bin_hz;
                 let base_w =
                     self.band_weights[b] * focus * Self::focus_eq_multiplier(f, ctrl.focus_eq_db);
@@ -366,10 +440,11 @@ impl OpenSootheStftCore {
                     continue;
                 }
                 let b_start = b.saturating_sub(radius).max(1);
-                let b_end = (b + radius).min(self.half_bins - 1);
+                let b_end = (b + radius).min(half_bins - 1);
                 let mut sum_neigh = 0.0_f64;
                 let mut count = 0_usize;
                 for (nb, &mag_val) in self
+                    .ola
                     .mags_scratch
                     .iter()
                     .enumerate()
@@ -384,10 +459,10 @@ impl OpenSootheStftCore {
                 let local_env = if count > 0 {
                     (sum_neigh / (count as f64)).max(1e-12)
                 } else {
-                    self.mags_scratch[b]
+                    self.ola.mags_scratch[b]
                 };
 
-                let excess = (self.mags_scratch[b] / local_env) / thresh_ratio;
+                let excess = (self.ola.mags_scratch[b] / local_env) / thresh_ratio;
                 let target_gain = if excess > 1.0 {
                     (1.0 / excess.powf(slope_exp * weight)).clamp(min_gain, 1.0)
                 } else {
@@ -403,25 +478,14 @@ impl OpenSootheStftCore {
             }
         }
 
-        for b in 1..(self.half_bins - 1) {
-            let lobe_l = {
-                let min_l = self.smoothed_gains_l[b - 1]
-                    .min(self.smoothed_gains_l[b])
-                    .min(self.smoothed_gains_l[b + 1]);
-                let avg_l = 0.25 * self.smoothed_gains_l[b - 1]
-                    + 0.50 * self.smoothed_gains_l[b]
-                    + 0.25 * self.smoothed_gains_l[b + 1];
-                0.65 * min_l + 0.35 * avg_l
-            };
-            let lobe_r = {
-                let min_r = self.smoothed_gains_r[b - 1]
-                    .min(self.smoothed_gains_r[b])
-                    .min(self.smoothed_gains_r[b + 1]);
-                let avg_r = 0.25 * self.smoothed_gains_r[b - 1]
-                    + 0.50 * self.smoothed_gains_r[b]
-                    + 0.25 * self.smoothed_gains_r[b + 1];
-                0.65 * min_r + 0.35 * avg_r
-            };
+        let smoothed_average_lobe = |gains: &[f64], b: usize| {
+            let min_g = gains[b - 1].min(gains[b]).min(gains[b + 1]);
+            let avg_g = 0.25 * gains[b - 1] + 0.50 * gains[b] + 0.25 * gains[b + 1];
+            0.65 * min_g + 0.35 * avg_g
+        };
+        for b in 1..(half_bins - 1) {
+            let lobe_l = smoothed_average_lobe(&self.smoothed_gains_l, b);
+            let lobe_r = smoothed_average_lobe(&self.smoothed_gains_r, b);
             let (gl, gr) = if !use_ms && ctrl.stereo_link > 1e-4 {
                 let g_link = lobe_l.min(lobe_r);
                 (
@@ -437,44 +501,15 @@ impl OpenSootheStftCore {
             }
             let eff_l = if delta_listen { 1.0 - gl } else { gl };
             let eff_r = if delta_listen { 1.0 - gr } else { gr };
-            self.spec_scratch[b] *= eff_l;
-            self.spec_scratch[self.fft_size - b] = self.spec_scratch[b].conj();
-            self.spec_scratch_r[b] *= eff_r;
-            self.spec_scratch_r[self.fft_size - b] = self.spec_scratch_r[b].conj();
+            self.ola.scale_bin_sym(b, eff_l, eff_r);
         }
 
-        if delta_listen {
-            self.spec_scratch[0] = Complex::new(0.0, 0.0);
-            self.spec_scratch[self.half_bins - 1] = Complex::new(0.0, 0.0);
-            self.spec_scratch_r[0] = Complex::new(0.0, 0.0);
-            self.spec_scratch_r[self.half_bins - 1] = Complex::new(0.0, 0.0);
-        }
-
-        self.fft_inv
-            .process_with_scratch(&mut self.spec_scratch, &mut self.fft_scratch);
-        self.fft_inv
-            .process_with_scratch(&mut self.spec_scratch_r, &mut self.fft_scratch);
-
-        let out_base = self.ring_pos;
-        for i in 0..self.fft_size {
-            let w = self.window[i];
-            let val_l = self.spec_scratch[i].re * inv_n * w;
-            let val_r = self.spec_scratch_r[i].re * inv_n * w;
-            let idx = out_base.wrapping_add(i) & mask_out;
-            if use_ms {
-                self.out_ring_l[idx] += val_l + val_r;
-                self.out_ring_r[idx] += val_l - val_r;
-            } else {
-                self.out_ring_l[idx] += val_l;
-                self.out_ring_r[idx] += val_r;
-            }
-            self.norm_ring[idx] += w * w;
-        }
+        self.ola.synthesize_hop(delta_listen, use_ms);
 
         self.last_gr_db = (-20.0 * min_g_seen.max(1e-6).log10()) as f32;
         self.last_spectrum_db = band_power_to_db(&band_pow);
         for band_idx in 0..SPECTRUM_BANDS {
-            let (b0, b1) = stft_band_bins(band_idx, bin_hz, self.half_bins);
+            let (b0, b1) = stft_band_bins(band_idx, bin_hz, half_bins);
             let mut min_band_g = 1.0_f64;
             for b in b0..=b1 {
                 let g_lr = 0.5 * (self.smoothed_gains_l[b] + self.smoothed_gains_r[b]);
@@ -538,7 +573,7 @@ impl RealtimeOpenSoothe {
     /// Delay from input to output: `256` samples in low-latency tracking mode (`5.33 ms` @ 48 kHz)
     /// or `2048` samples in Ultra mode (`42.67 ms` @ 48 kHz).
     pub fn latency_samples(&self) -> u32 {
-        self.active().fft_size as u32
+        self.active().ola.fft_size as u32
     }
 
     /// Switches between Ultra (2048-pt) and Low-Latency Tracking (256-pt) modes with zero allocations.
@@ -547,7 +582,7 @@ impl RealtimeOpenSoothe {
     pub fn set_low_latency(&mut self, low_latency: bool) {
         if low_latency != self.low_latency {
             self.low_latency = low_latency;
-            let sr = self.active().sample_rate;
+            let sr = self.active().ola.sample_rate;
             self.active_mut().reset(sr);
         }
     }
@@ -655,28 +690,9 @@ impl RealtimeOpenSoothe {
 /// Carves the exact spectral footprint of the sidechain input (Vocal or Kick) out of the
 /// target track (Instruments or Bass) in real time with zero heap allocations.
 pub struct RealtimeOpenSpacer {
-    sample_rate: f64,
-    fft_size: usize,
-    hop_size: usize,
-    half_bins: usize,
-    window: Vec<f64>,
-    fft_fwd: Arc<dyn Fft<f64>>,
-    fft_inv: Arc<dyn Fft<f64>>,
-    tgt_ring_l: Vec<f64>,
-    tgt_ring_r: Vec<f64>,
+    ola: StereoOlaStft,
     sc_ring: Vec<f64>,
-    out_ring_l: Vec<f64>,
-    out_ring_r: Vec<f64>,
-    norm_ring: Vec<f64>,
-    ring_pos: usize,
-    hop_counter: usize,
-    tgt_spec_l: Vec<Complex<f64>>,
-    tgt_spec_r: Vec<Complex<f64>>,
     sc_spec: Vec<Complex<f64>>,
-    /// Pre-allocated rustfft scratch, so `process_with_scratch` never allocates per hop.
-    fft_scratch: Vec<Complex<f64>>,
-    spectrum_power_norm: f64,
-    mags_scratch: Vec<f64>,
     smoothed_gains: Vec<f64>,
     delta_listen: bool,
     mid_side_balance: f64,
@@ -689,40 +705,13 @@ impl RealtimeOpenSpacer {
     pub fn new(sample_rate: f64) -> Self {
         let fft_size = 2048;
         let hop_size = 512;
-        let half_bins = fft_size / 2 + 1;
-        let mut planner = FftPlanner::<f64>::new();
-        let fft_fwd = planner.plan_fft_forward(fft_size);
-        let fft_inv = planner.plan_fft_inverse(fft_size);
-        let scratch_len = fft_fwd
-            .get_inplace_scratch_len()
-            .max(fft_inv.get_inplace_scratch_len());
-        let window: Vec<f64> = (0..fft_size)
-            .map(|i| 0.5 * (1.0 - (2.0 * PI * (i as f64) / (fft_size as f64)).cos()))
-            .collect();
-        let spectrum_power_norm = stft_band_power_norm(&window);
+        let ola = StereoOlaStft::new(sample_rate, fft_size, hop_size);
+        let half_bins = ola.half_bins;
 
         Self {
-            sample_rate: sample_rate.max(8000.0),
-            fft_size,
-            hop_size,
-            half_bins,
-            window,
-            fft_fwd,
-            fft_inv,
-            tgt_ring_l: vec![0.0; fft_size],
-            tgt_ring_r: vec![0.0; fft_size],
+            ola,
             sc_ring: vec![0.0; fft_size],
-            out_ring_l: vec![0.0; fft_size * 2],
-            out_ring_r: vec![0.0; fft_size * 2],
-            norm_ring: vec![0.0; fft_size * 2],
-            ring_pos: 0,
-            hop_counter: 0,
-            tgt_spec_l: vec![Complex::new(0.0, 0.0); fft_size],
-            tgt_spec_r: vec![Complex::new(0.0, 0.0); fft_size],
             sc_spec: vec![Complex::new(0.0, 0.0); fft_size],
-            fft_scratch: vec![Complex::new(0.0, 0.0); scratch_len],
-            spectrum_power_norm,
-            mags_scratch: vec![0.0; half_bins],
             smoothed_gains: vec![1.0; half_bins],
             delta_listen: false,
             mid_side_balance: 0.0,
@@ -735,20 +724,13 @@ impl RealtimeOpenSpacer {
     /// Delay from input to output: a sample written at ring position `k` is overlap-added
     /// into the output ring at `k + fft_size`, so the delay is the full frame, not `fft_size - hop`.
     pub fn latency_samples(&self) -> u32 {
-        self.fft_size as u32
+        self.ola.fft_size as u32
     }
 
     pub fn reset(&mut self, sample_rate: f64) {
-        self.sample_rate = sample_rate.max(8000.0);
-        self.tgt_ring_l.fill(0.0);
-        self.tgt_ring_r.fill(0.0);
+        self.ola.reset(sample_rate);
         self.sc_ring.fill(0.0);
-        self.out_ring_l.fill(0.0);
-        self.out_ring_r.fill(0.0);
-        self.norm_ring.fill(0.0);
         self.smoothed_gains.fill(1.0);
-        self.ring_pos = 0;
-        self.hop_counter = 0;
         self.last_carve_db = 0.0;
         self.last_spectrum_db = [SPECTRUM_FLOOR_DB; SPECTRUM_BANDS];
         self.last_carve_bands_db = [0.0; SPECTRUM_BANDS];
@@ -793,96 +775,60 @@ impl RealtimeOpenSpacer {
         amount: f64,
         max_cut_db: f64,
     ) -> (f32, f32) {
-        let mask_in = self.fft_size - 1;
-        let mask_out = self.fft_size * 2 - 1;
-
-        self.tgt_ring_l[self.ring_pos & mask_in] = sanitize_sample_f32(tgt_l);
-        self.tgt_ring_r[self.ring_pos & mask_in] = sanitize_sample_f32(tgt_r);
-        self.sc_ring[self.ring_pos & mask_in] =
-            0.5 * (sanitize_sample_f32(sc_l) + sanitize_sample_f32(sc_r));
-
-        let read_idx = self.ring_pos & mask_out;
-        let denom = self.norm_ring[read_idx].max(1e-9);
-        let out_l = flush_denormal_f64(self.out_ring_l[read_idx] / denom) as f32;
-        let out_r = flush_denormal_f64(self.out_ring_r[read_idx] / denom) as f32;
-
-        self.out_ring_l[read_idx] = 0.0;
-        self.out_ring_r[read_idx] = 0.0;
-        self.norm_ring[read_idx] = 0.0;
-
-        self.ring_pos = self.ring_pos.wrapping_add(1);
-        self.hop_counter += 1;
-
-        if self.hop_counter >= self.hop_size {
-            self.hop_counter = 0;
+        let sc_idx = self.ola.in_write_idx();
+        self.sc_ring[sc_idx] = 0.5 * (sanitize_sample_f32(sc_l) + sanitize_sample_f32(sc_r));
+        let (out, hop_ready) = self.ola.push_and_pop(tgt_l, tgt_r);
+        if hop_ready {
             let clean_low = sanitize_param_f64(low_hz, 180.0, 20.0, 20_000.0);
             let clean_high = sanitize_param_f64(high_hz, 8_000.0, clean_low + 10.0, 22_000.0);
             let clean_amt = sanitize_param_f64(amount, 0.5, 0.0, 1.0);
             let clean_cut = sanitize_param_f64(max_cut_db, 6.0, 0.5, 24.0);
             self.process_unmask_hop(clean_low, clean_high, clean_amt, clean_cut);
         }
-
-        (out_l, out_r)
+        out
     }
 
     fn process_unmask_hop(&mut self, low_hz: f64, high_hz: f64, amount: f64, max_cut_db: f64) {
-        let mask_in = self.fft_size - 1;
-        let mask_out = self.fft_size * 2 - 1;
-        let frame_start = self.ring_pos.wrapping_sub(self.fft_size);
-        let bin_hz = self.sample_rate / (self.fft_size as f64);
-        let inv_n = 1.0 / (self.fft_size as f64);
+        let fft_size = self.ola.fft_size;
+        let half_bins = self.ola.half_bins;
+        let mask_in = fft_size - 1;
+        let frame_start = self.ola.ring_pos.wrapping_sub(fft_size);
+        let bin_hz = self.ola.sample_rate / (fft_size as f64);
         let min_gain = 10.0_f64.powf(-max_cut_db.clamp(0.5, 24.0) / 20.0);
 
         let use_ms = self.mid_side_balance.abs() > 1e-4;
         let mid_scale = (1.0 - self.mid_side_balance.max(0.0)).clamp(0.0, 1.0);
         let side_scale = (1.0 + self.mid_side_balance.min(0.0)).clamp(0.0, 1.0);
 
-        for i in 0..self.fft_size {
+        self.ola.analyze_stereo(use_ms);
+        for i in 0..fft_size {
             let idx = frame_start.wrapping_add(i) & mask_in;
-            let w = self.window[i];
-            let l = self.tgt_ring_l[idx] * w;
-            let r = self.tgt_ring_r[idx] * w;
-            if use_ms {
-                self.tgt_spec_l[i] = Complex::new(0.5 * (l + r), 0.0);
-                self.tgt_spec_r[i] = Complex::new(0.5 * (l - r), 0.0);
-            } else {
-                self.tgt_spec_l[i] = Complex::new(l, 0.0);
-                self.tgt_spec_r[i] = Complex::new(r, 0.0);
-            }
-            self.sc_spec[i] = Complex::new(self.sc_ring[idx] * w, 0.0);
+            self.sc_spec[i] = Complex::new(self.sc_ring[idx] * self.ola.window[i], 0.0);
         }
-
-        self.fft_fwd
-            .process_with_scratch(&mut self.tgt_spec_l, &mut self.fft_scratch);
-        self.fft_fwd
-            .process_with_scratch(&mut self.tgt_spec_r, &mut self.fft_scratch);
-        self.fft_fwd
-            .process_with_scratch(&mut self.sc_spec, &mut self.fft_scratch);
+        self.ola
+            .fft_fwd
+            .process_with_scratch(&mut self.sc_spec, &mut self.ola.fft_scratch);
 
         let mut band_pow = [0.0_f64; SPECTRUM_BANDS];
         let spec_norm = if use_ms {
-            self.spectrum_power_norm
+            self.ola.spectrum_power_norm
         } else {
-            0.5 * self.spectrum_power_norm
+            0.5 * self.ola.spectrum_power_norm
         };
-        for b in 0..self.half_bins {
-            self.mags_scratch[b] = self.tgt_spec_l[b].norm().max(1e-12);
-        }
-        accumulate_stft_band_power(&self.mags_scratch, bin_hz, spec_norm, &mut band_pow);
-        for b in 0..self.half_bins {
-            self.mags_scratch[b] = self.tgt_spec_r[b].norm().max(1e-12);
-        }
-        accumulate_stft_band_power(&self.mags_scratch, bin_hz, spec_norm, &mut band_pow);
+        self.ola
+            .fill_mags_and_accum(false, bin_hz, spec_norm, &mut band_pow);
+        self.ola
+            .fill_mags_and_accum(true, bin_hz, spec_norm, &mut band_pow);
 
         let mut min_g_seen = 1.0_f64;
 
-        for b in 1..(self.half_bins - 1) {
+        for b in 1..(half_bins - 1) {
             let f = (b as f64) * bin_hz;
             if f < low_hz || f > high_hz {
                 self.smoothed_gains[b] = 1.0;
                 continue;
             }
-            let sc_mag = self.sc_spec[b].norm() / (self.fft_size as f64);
+            let sc_mag = self.sc_spec[b].norm() / (fft_size as f64);
             let sc_db = 20.0 * sc_mag.max(1e-9).log10();
             let over_db = (sc_db + 48.0).max(0.0);
             let cut_db = (over_db * 0.35 * amount.clamp(0.0, 1.0)).min(max_cut_db);
@@ -895,7 +841,7 @@ impl RealtimeOpenSpacer {
             }
         }
 
-        for b in 1..(self.half_bins - 1) {
+        for b in 1..(half_bins - 1) {
             let g_raw = 0.25 * self.smoothed_gains[b - 1]
                 + 0.50 * self.smoothed_gains[b]
                 + 0.25 * self.smoothed_gains[b + 1];
@@ -914,50 +860,15 @@ impl RealtimeOpenSpacer {
             } else {
                 (gl, gr)
             };
-            self.tgt_spec_l[b] *= egl;
-            self.tgt_spec_l[self.fft_size - b] = self.tgt_spec_l[b].conj();
-            self.tgt_spec_r[b] *= egr;
-            self.tgt_spec_r[self.fft_size - b] = self.tgt_spec_r[b].conj();
-        }
-        if self.delta_listen {
-            self.tgt_spec_l[0] = Complex::new(0.0, 0.0);
-            self.tgt_spec_l[self.half_bins - 1] = Complex::new(0.0, 0.0);
-            self.tgt_spec_r[0] = Complex::new(0.0, 0.0);
-            self.tgt_spec_r[self.half_bins - 1] = Complex::new(0.0, 0.0);
+            self.ola.scale_bin_sym(b, egl, egr);
         }
 
-        self.fft_inv
-            .process_with_scratch(&mut self.tgt_spec_l, &mut self.fft_scratch);
-        self.fft_inv
-            .process_with_scratch(&mut self.tgt_spec_r, &mut self.fft_scratch);
-
-        let out_base = self.ring_pos;
-        for i in 0..self.fft_size {
-            let w = self.window[i];
-            let idx = out_base.wrapping_add(i) & mask_out;
-            let a = self.tgt_spec_l[i].re * inv_n * w;
-            let b = self.tgt_spec_r[i].re * inv_n * w;
-            if use_ms {
-                self.out_ring_l[idx] += a + b;
-                self.out_ring_r[idx] += a - b;
-            } else {
-                self.out_ring_l[idx] += a;
-                self.out_ring_r[idx] += b;
-            }
-            self.norm_ring[idx] += w * w;
-        }
+        self.ola.synthesize_hop(self.delta_listen, use_ms);
 
         self.last_carve_db = (-20.0 * min_g_seen.max(1e-6).log10()) as f32;
-        for (band_idx, &p) in band_pow.iter().enumerate() {
-            let db = if p > 0.0 {
-                (10.0 * p.log10()) as f32
-            } else {
-                SPECTRUM_FLOOR_DB
-            };
-            self.last_spectrum_db[band_idx] = db.clamp(SPECTRUM_FLOOR_DB, 6.0);
-        }
+        self.last_spectrum_db = band_power_to_db(&band_pow);
         for band_idx in 0..SPECTRUM_BANDS {
-            let (b_lo, b_hi) = stft_band_bins(band_idx, bin_hz, self.half_bins);
+            let (b_lo, b_hi) = stft_band_bins(band_idx, bin_hz, half_bins);
             let mut min_band_g = 1.0_f64;
             for &g in &self.smoothed_gains[b_lo..=b_hi] {
                 if g < min_band_g {
@@ -1660,17 +1571,6 @@ impl RealtimeMasterLimiter {
     }
 
     #[inline]
-    fn next_dither_bipolar(state: &mut u64) -> f64 {
-        let mut x = *state;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        *state = x;
-        let bits = x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11;
-        (bits as f64) * (1.0 / ((1_u64 << 53) as f64)) - 0.5
-    }
-
-    #[inline]
     fn apply_rt_dither(
         mode: DitherMode,
         bits: u16,
@@ -1686,7 +1586,7 @@ impl RealtimeMasterLimiter {
         let max_code = full_scale - 1.0;
         let min_code = -full_scale;
         let scaled = x.clamp(-1.0, 1.0) * full_scale;
-        let tpdf = Self::next_dither_bipolar(rng) + Self::next_dither_bipolar(rng);
+        let tpdf = next_uniform_bipolar(rng) + next_uniform_bipolar(rng);
         let shaped = match mode {
             DitherMode::None | DitherMode::Tpdf => scaled,
             DitherMode::NoiseShapedHighPass => scaled + 1.623 * (*e1) - 0.692 * (*e2),

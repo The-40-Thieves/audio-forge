@@ -142,6 +142,22 @@ pub enum FxSlotConfig {
     },
 }
 
+macro_rules! match_fx_bypass {
+    ($self_expr:expr, $b:ident => $body:expr) => {
+        match $self_expr {
+            FxSlotConfig::GainTrim { bypass: $b, .. }
+            | FxSlotConfig::OpenSoothe { bypass: $b, .. }
+            | FxSlotConfig::VocalSurgical { bypass: $b, .. }
+            | FxSlotConfig::SubMonoTape { bypass: $b, .. }
+            | FxSlotConfig::MasterLimiter { bypass: $b, .. }
+            | FxSlotConfig::SplitEq { bypass: $b, .. }
+            | FxSlotConfig::DensityClipper { bypass: $b, .. }
+            | FxSlotConfig::SpaceVerb { bypass: $b, .. }
+            | FxSlotConfig::VocalTune { bypass: $b, .. } => $body,
+        }
+    };
+}
+
 impl FxSlotConfig {
     pub fn display_name(&self) -> &'static str {
         match self {
@@ -158,31 +174,11 @@ impl FxSlotConfig {
     }
 
     pub fn is_bypassed(&self) -> bool {
-        match self {
-            Self::GainTrim { bypass, .. }
-            | Self::OpenSoothe { bypass, .. }
-            | Self::VocalSurgical { bypass, .. }
-            | Self::SubMonoTape { bypass, .. }
-            | Self::MasterLimiter { bypass, .. }
-            | Self::SplitEq { bypass, .. }
-            | Self::DensityClipper { bypass, .. }
-            | Self::SpaceVerb { bypass, .. }
-            | Self::VocalTune { bypass, .. } => *bypass,
-        }
+        match_fx_bypass!(self, b => *b)
     }
 
     pub fn set_bypass(&mut self, value: bool) {
-        match self {
-            Self::GainTrim { bypass, .. }
-            | Self::OpenSoothe { bypass, .. }
-            | Self::VocalSurgical { bypass, .. }
-            | Self::SubMonoTape { bypass, .. }
-            | Self::MasterLimiter { bypass, .. }
-            | Self::SplitEq { bypass, .. }
-            | Self::DensityClipper { bypass, .. }
-            | Self::SpaceVerb { bypass, .. }
-            | Self::VocalTune { bypass, .. } => *bypass = value,
-        }
+        match_fx_bypass!(self, b => *b = value);
     }
 
     pub fn default_open_soothe() -> Self {
@@ -616,6 +612,22 @@ pub struct TimelineMarker {
     pub sample_pos: u64,
 }
 
+/// Concise summary of a loaded `.forgeproj` session produced by CLI and MCP inspect tools.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DawProjectSummary {
+    pub name: String,
+    pub sample_rate: u32,
+    pub bpm: f64,
+    pub time_signature: String,
+    pub tracks: usize,
+    pub audio_objects: usize,
+    pub midi_clips: usize,
+    pub aux_buses: usize,
+    pub master_inserts: usize,
+    pub total_pdc_samples: usize,
+    pub missing_clips: Vec<String>,
+}
+
 /// Complete ForgeStudio DAW project document (`.forgeproj`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DawProject {
@@ -737,6 +749,27 @@ impl DawProject {
         max_audio
             .max(max_midi)
             .max(u64::from(self.sample_rate) * 10)
+    }
+
+    /// Builds a structured summary of project counts, PDC latency, and missing clip warnings.
+    pub fn inspect_summary(
+        &self,
+        total_pdc_samples: usize,
+        missing_clips: Vec<String>,
+    ) -> DawProjectSummary {
+        DawProjectSummary {
+            name: self.name.clone(),
+            sample_rate: self.sample_rate,
+            bpm: self.bpm,
+            time_signature: format!("{}/{}", self.time_sig_num, self.time_sig_den),
+            tracks: self.tracks.len(),
+            audio_objects: self.tracks.iter().map(|t| t.objects.len()).sum(),
+            midi_clips: self.tracks.iter().map(|t| t.midi_clips.len()).sum(),
+            aux_buses: self.aux_buses.len(),
+            master_inserts: self.master_inserts.len(),
+            total_pdc_samples,
+            missing_clips,
+        }
     }
 
     /// Finds `(track_index, object_index)` by `object_id`.

@@ -20,9 +20,9 @@ pub use audio_io::{LiveAudioEngine, LiveRecorder};
 pub use fx::FxProcessor;
 pub use midi::{MidiClip, MidiNote, PolySynth, SynthPreset};
 pub use project::{
-    AudioObject, AutomationLane, AutomationPoint, AuxBus, DawProject, FadeCurve, FxSlotConfig,
-    MAX_PROJECT_JSON_BYTES, MAX_UNDO_DEPTH, ObjectEq3, PROJECT_SCHEMA_VERSION, TimelineMarker,
-    Track, TrackSend, UndoStack, WaveformPeaks,
+    AudioObject, AutomationLane, AutomationPoint, AuxBus, DawProject, DawProjectSummary, FadeCurve,
+    FxSlotConfig, MAX_PROJECT_JSON_BYTES, MAX_UNDO_DEPTH, ObjectEq3, PROJECT_SCHEMA_VERSION,
+    TimelineMarker, Track, TrackSend, UndoStack, WaveformPeaks,
 };
 pub use renderer::{ClipCache, EngineMeters, ObjectOrientedEngine, resample_buffer_linear};
 
@@ -315,6 +315,19 @@ mod tests {
         assert_eq!(tr.overlap_regions(), vec![(3600, 4800)]);
     }
 
+    fn assert_audible_bounce(
+        proj: &DawProject,
+        cache: &ClipCache,
+        frames: usize,
+        min_energy: f64,
+        msg: &str,
+    ) {
+        let out = ObjectOrientedEngine::bounce_offline(proj, cache, frames).unwrap();
+        let energy: f64 = out.channels[0].iter().map(|s| s * s).sum();
+        assert!(out.channels[0].iter().all(|s| s.is_finite()));
+        assert!(energy > min_energy, "{msg}, got {energy}");
+    }
+
     #[test]
     fn elastic_time_stretch_and_pitch_shift_work() {
         let sr = 48_000_u32;
@@ -330,12 +343,12 @@ mod tests {
         obj.pitch_semitones = 5.0;
         proj.tracks[0].objects.push(obj);
 
-        let out = ObjectOrientedEngine::bounce_offline(&proj, &cache, frames).unwrap();
-        let energy: f64 = out.channels[0].iter().map(|s| s * s).sum();
-        assert!(out.channels[0].iter().all(|s| s.is_finite()));
-        assert!(
-            energy > 10.0,
-            "elastic stretched+pitched audio should produce clean audible output, got {energy}"
+        assert_audible_bounce(
+            &proj,
+            &cache,
+            frames,
+            10.0,
+            "elastic stretched+pitched audio should produce clean audible output",
         );
     }
 
@@ -351,12 +364,12 @@ mod tests {
             .midi_clips
             .push(MidiClip::demo_am7_progression(cid, sr, 120.0));
 
-        let out = ObjectOrientedEngine::bounce_offline(&proj, &cache, 16_384).unwrap();
-        let energy: f64 = out.channels[0].iter().map(|s| s * s).sum();
-        assert!(out.channels[0].iter().all(|s| s.is_finite()));
-        assert!(
-            energy > 5.0,
-            "MIDI PolySynth chord progression should produce audible stereo energy, got {energy}"
+        assert_audible_bounce(
+            &proj,
+            &cache,
+            16_384,
+            5.0,
+            "MIDI PolySynth chord progression should produce audible stereo energy",
         );
     }
 

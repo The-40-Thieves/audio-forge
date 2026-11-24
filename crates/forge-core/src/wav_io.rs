@@ -14,6 +14,55 @@ use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 
 use crate::{AudioBuffer, ForgeError, Result};
 
+/// Exit outcome from [`wait_child_bounded_stderr`].
+pub enum BoundedChildExit {
+    Exited {
+        status: std::process::ExitStatus,
+        stderr: Vec<u8>,
+    },
+    TimedOut,
+}
+
+/// Waits up to `timeout` for `child` to exit while draining at most `stderr_cap_bytes` of its
+/// stderr pipe, killing and reaping the child if `timeout` elapses or polling fails.
+pub fn wait_child_bounded_stderr(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+    stderr_cap_bytes: u64,
+) -> io::Result<BoundedChildExit> {
+    let stderr_pipe = child.stderr.take();
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stderr_pipe {
+            let _ = pipe.take(stderr_cap_bytes).read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(BoundedChildExit::TimedOut);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        }
+    };
+
+    let stderr = stderr_handle.join().unwrap_or_default();
+    Ok(BoundedChildExit::Exited { status, stderr })
+}
+
 fn audio_io(origin: &str, message: impl std::fmt::Display) -> ForgeError {
     ForgeError::AudioIo {
         path: origin.to_string(),
@@ -94,30 +143,7 @@ impl AudioBuffer {
         bits_per_sample: u16,
         origin: &str,
     ) -> Result<()> {
-        if self.num_channels() == 0 || self.sample_rate == 0 {
-            return Err(audio_io(
-                origin,
-                "Cannot save WAV with 0 channels or 0 Hz sample rate",
-            ));
-        }
-        let (sample_format, bits) = match bits_per_sample {
-            32 => (SampleFormat::Float, 32),
-            16 => (SampleFormat::Int, 16),
-            _ => (SampleFormat::Int, 24),
-        };
-        let spec = WavSpec {
-            channels: self.num_channels() as u16,
-            sample_rate: self.sample_rate,
-            bits_per_sample: bits,
-            sample_format,
-        };
-        let mut writer = WavWriter::new(writer, spec).map_err(|e| audio_io(origin, e))?;
-        match (sample_format, bits) {
-            (SampleFormat::Float, _) => write_float(self, &mut writer, origin)?,
-            (SampleFormat::Int, 16) => write_dithered(self, &mut writer, INT16, origin)?,
-            (SampleFormat::Int, _) => write_dithered(self, &mut writer, INT24, origin)?,
-        }
-        writer.finalize().map_err(|e| audio_io(origin, e))
+        self.write_wav_to_writer(writer, bits_per_sample, origin, true)
     }
 
     /// Encodes an already-dithered buffer as WAV without adding a second TPDF dither stage.
@@ -128,6 +154,16 @@ impl AudioBuffer {
         writer: W,
         bits_per_sample: u16,
         origin: &str,
+    ) -> Result<()> {
+        self.write_wav_to_writer(writer, bits_per_sample, origin, false)
+    }
+
+    fn write_wav_to_writer<W: Write + Seek>(
+        &self,
+        writer: W,
+        bits_per_sample: u16,
+        origin: &str,
+        dither: bool,
     ) -> Result<()> {
         if self.num_channels() == 0 || self.sample_rate == 0 {
             return Err(audio_io(
@@ -147,10 +183,12 @@ impl AudioBuffer {
             sample_format,
         };
         let mut writer = WavWriter::new(writer, spec).map_err(|e| audio_io(origin, e))?;
-        match (sample_format, bits) {
-            (SampleFormat::Float, _) => write_float(self, &mut writer, origin)?,
-            (SampleFormat::Int, 16) => write_rounded(self, &mut writer, INT16, origin)?,
-            (SampleFormat::Int, _) => write_rounded(self, &mut writer, INT24, origin)?,
+        match (sample_format, bits, dither) {
+            (SampleFormat::Float, _, _) => write_float(self, &mut writer, origin)?,
+            (SampleFormat::Int, 16, true) => write_dithered(self, &mut writer, INT16, origin)?,
+            (SampleFormat::Int, _, true) => write_dithered(self, &mut writer, INT24, origin)?,
+            (SampleFormat::Int, 16, false) => write_rounded(self, &mut writer, INT16, origin)?,
+            (SampleFormat::Int, _, false) => write_rounded(self, &mut writer, INT24, origin)?,
         }
         writer.finalize().map_err(|e| audio_io(origin, e))
     }
@@ -242,48 +280,23 @@ fn decode_with_ffmpeg<R: Read>(reader: &mut R, name: &Path) -> Result<AudioBuffe
         .spawn()
         .map_err(|e| audio_io(&origin, format!("Failed to invoke ffmpeg decoder: {e}")))?;
 
-    let stderr_pipe = child.stderr.take();
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(pipe) = stderr_pipe {
-            let _ = pipe.take(64 * 1024).read_to_end(&mut buf);
+    match crate::wait_child_bounded_stderr(&mut child, FFMPEG_DECODE_TIMEOUT, 64 * 1024)
+        .map_err(|e| audio_io(&origin, format!("ffmpeg wait failed: {e}")))?
+    {
+        crate::BoundedChildExit::TimedOut => {
+            return Err(audio_io(
+                &origin,
+                format!(
+                    "ffmpeg decoder timed out after {}s",
+                    FFMPEG_DECODE_TIMEOUT.as_secs()
+                ),
+            ));
         }
-        buf
-    });
-
-    let deadline = std::time::Instant::now() + FFMPEG_DECODE_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break st,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(audio_io(
-                        &origin,
-                        format!(
-                            "ffmpeg decoder timed out after {}s",
-                            FFMPEG_DECODE_TIMEOUT.as_secs()
-                        ),
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                return Err(audio_io(&origin, format!("ffmpeg wait failed: {e}")));
-            }
+        crate::BoundedChildExit::Exited { status, stderr } if !status.success() => {
+            return Err(audio_io(&origin, String::from_utf8_lossy(&stderr).trim()));
         }
-    };
-
-    if !status.success() {
-        let stderr_buf = stderr_handle.join().unwrap_or_default();
-        return Err(audio_io(
-            &origin,
-            String::from_utf8_lossy(&stderr_buf).trim(),
-        ));
+        crate::BoundedChildExit::Exited { .. } => {}
     }
-    let _ = stderr_handle.join();
     AudioBuffer::load_wav(decoded.path())
 }
 
