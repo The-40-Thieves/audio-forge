@@ -265,7 +265,8 @@ impl LiveAudioEngine {
         };
 
         let device_name = device
-            .name()
+            .description()
+            .map(|desc| desc.name().to_string())
             .unwrap_or_else(|_| "Default Audio Output".to_string());
         let supported = device
             .default_output_config()
@@ -273,7 +274,7 @@ impl LiveAudioEngine {
                 path: device_name.clone(),
                 message: format!("Failed to query default audio output config: {e}"),
             })?;
-        let device_sr = supported.sample_rate().0;
+        let device_sr = supported.sample_rate();
         let channels = supported.channels() as usize;
         let sample_format = supported.sample_format();
 
@@ -341,7 +342,7 @@ impl LiveAudioEngine {
 
         let stream = match sample_format {
             cpal::SampleFormat::F32 => device.build_output_stream(
-                &stream_config,
+                stream_config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     render_f32(data);
                 },
@@ -349,7 +350,7 @@ impl LiveAudioEngine {
                 None,
             ),
             cpal::SampleFormat::I16 => device.build_output_stream(
-                &stream_config,
+                stream_config,
                 move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
                     render_converted_output(data, channels, &mut f32_buf, &mut render_f32);
                 },
@@ -357,7 +358,7 @@ impl LiveAudioEngine {
                 None,
             ),
             cpal::SampleFormat::U16 => device.build_output_stream(
-                &stream_config,
+                stream_config,
                 move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
                     render_converted_output(data, channels, &mut f32_buf, &mut render_f32);
                 },
@@ -365,7 +366,7 @@ impl LiveAudioEngine {
                 None,
             ),
             cpal::SampleFormat::I32 => device.build_output_stream(
-                &stream_config,
+                stream_config,
                 move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
                     render_converted_output(data, channels, &mut f32_buf, &mut render_f32);
                 },
@@ -578,7 +579,8 @@ impl LiveRecorder {
                 message: "No audio input device available for recording".to_string(),
             })?;
         let device_name = device
-            .name()
+            .description()
+            .map(|desc| desc.name().to_string())
             .unwrap_or_else(|_| "Default Audio Input".to_string());
         let supported = device
             .default_input_config()
@@ -586,7 +588,7 @@ impl LiveRecorder {
                 path: device_name.clone(),
                 message: format!("Failed to query input config: {e}"),
             })?;
-        let input_sr = supported.sample_rate().0;
+        let input_sr = supported.sample_rate();
         let channels = supported.channels() as usize;
         let sample_format = supported.sample_format();
 
@@ -626,7 +628,7 @@ impl LiveRecorder {
 
         let stream_res = match sample_format {
             cpal::SampleFormat::F32 => device.build_input_stream(
-                &stream_config,
+                stream_config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     capture_input_frames(data, channels, &ring_cb);
                 },
@@ -634,7 +636,7 @@ impl LiveRecorder {
                 None,
             ),
             cpal::SampleFormat::I16 => device.build_input_stream(
-                &stream_config,
+                stream_config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
                     capture_input_frames(data, channels, &ring_cb);
                 },
@@ -642,7 +644,7 @@ impl LiveRecorder {
                 None,
             ),
             cpal::SampleFormat::U16 => device.build_input_stream(
-                &stream_config,
+                stream_config,
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
                     capture_input_frames(data, channels, &ring_cb);
                 },
@@ -650,7 +652,7 @@ impl LiveRecorder {
                 None,
             ),
             cpal::SampleFormat::I32 => device.build_input_stream(
-                &stream_config,
+                stream_config,
                 move |data: &[i32], _: &cpal::InputCallbackInfo| {
                     capture_input_frames(data, channels, &ring_cb);
                 },
