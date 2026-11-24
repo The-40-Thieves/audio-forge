@@ -70,6 +70,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3.27"
 cap-std = "4.0"
 proptest = "1.12"
+hyper = { version = "1.13", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
+rmcp = { version = "3.11", features = ["server", "transport-io", "transport-async-rw", "schemars", "transport-streamable-http-server"] }
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_process_allocs"] }
 nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
 nih_plug_xtask = { git = "https://github.com/robbert-vdh/nih-plug.git" }
