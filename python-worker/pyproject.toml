@@ -7,6 +7,9 @@ requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 dependencies = [
     "audio-separator>=0.47.1",
+    # `audio-separator` 0.48 imports `audioread` unconditionally in `uvr_lib_v5/spec_utils.py`
+    # and `vr_separator.py`, while `librosa>=1.0` dropped it on Python >=3.12.
+    "audioread>=3.0.0",
     "basic-pitch>=0.4.0",
     "gradio_client>=2.7.2",
 ]
