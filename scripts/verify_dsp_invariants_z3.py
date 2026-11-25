@@ -319,8 +319,8 @@ def prove_repo_wide_vocal_theory_and_core_invariants() -> dict[str, str]:
     return results
 
 
-def prove_sinc_resampler_signed_bounds() -> dict[str, str]:
-    """Proves exact DC unity and |y| <= M * sum(|w|) / |sum(w)| for signed sinc weights, plus SAT overshoot witness."""
+def prove_sinc_resampler_dc_and_bound() -> dict[str, str]:
+    """Proves exact DC unity and |y| <= M * sum(|w|) / |sum(w)| for signed sinc weights."""
     results: dict[str, str] = {}
     s_sinc = z3.Solver()
     w0, w1, w2, w3 = z3.Reals("w0 w1 w2 w3")
@@ -350,7 +350,12 @@ def prove_sinc_resampler_signed_bounds() -> dict[str, str]:
     results["sinc_resampler_dc_unity_and_signed_gain_bound_proof"] = (
         "UNSAT (Proven normalized signed sinc weights preserve exact DC unity and |y| <= M * sum(|w|) / |sum(w)| for all |sum(w)| > 1e-12)"
     )
+    return results
 
+
+def prove_sinc_resampler_overshoot_witness() -> dict[str, str]:
+    """Proves negative sinc lobes attain overshoot witness for bounded inputs."""
+    results: dict[str, str] = {}
     s_sinc_overshoot = z3.Solver()
     ow0, ow1, ow2, ow3 = z3.Reals("ow0 ow1 ow2 ow3")
     ox0, ox1, ox2, ox3 = z3.Reals("ox0 ox1 ox2 ox3")
@@ -457,7 +462,8 @@ def main() -> int:
     report.update(prove_walsh_hadamard_8_orthogonality_and_involution())
     report.update(prove_fdn_lyapunov_stability_and_index_bounds())
     report.update(prove_repo_wide_vocal_theory_and_core_invariants())
-    report.update(prove_sinc_resampler_signed_bounds())
+    report.update(prove_sinc_resampler_dc_and_bound())
+    report.update(prove_sinc_resampler_overshoot_witness())
     report.update(prove_ultrasonic_lpf_nyquist_guard())
     report.update(prove_tempo_map_monotonic_inverse())
     report.update(prove_ms_high_mid_correlation_bounds())

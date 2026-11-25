@@ -145,6 +145,22 @@ mod tests {
     }
 
     #[test]
+    fn transient_sharpness_covers_tail_at_44_1khz() {
+        let frames = 529_200;
+        let mut mono = vec![0.0_f64; frames];
+        for sample in &mut mono[(frames - 1_323)..(frames - 1_235)] {
+            *sample = 0.8;
+        }
+        let buf = forge_core::AudioBuffer::from_channels(vec![mono], 44_100).expect("valid buffer");
+        let report = audit_audio(&buf);
+        assert!(
+            report.transient_sharpness_db > 6.0,
+            "expected tail transient burst at 44.1 kHz to be detected, got {} dB",
+            report.transient_sharpness_db
+        );
+    }
+
+    #[test]
     fn test_bs1770_loudness_and_brickwall_true_peak_limiter() {
         let sr = 48_000_u32;
         let frames = (sr as usize) * 2; // 2 seconds
