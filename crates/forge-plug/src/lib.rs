@@ -558,4 +558,125 @@ mod tests {
         let (tune_lat, _) = verify_plugin_lifecycle::<ForgeVocalTunePlug>();
         assert!(tune_lat > 0);
     }
+
+    #[test]
+    fn spaceverb_preamp_loads_persisted_wavenet_nam_json_across_reinitialize() {
+        let mut plug = ForgeSpaceVerbAndPreampPlug::default();
+        let wavenet_json = serde_json::json!({
+            "version": "0.5.4",
+            "architecture": "WaveNet",
+            "config": {
+                "layers": [{
+                    "input_size": 1,
+                    "condition_size": 1,
+                    "head_size": 1,
+                    "channels": 1,
+                    "kernel_size": 2,
+                    "dilations": [1, 2],
+                    "activation": "Tanh",
+                    "gated": false,
+                    "head_bias": true
+                }],
+                "head_scale": 0.5
+            },
+            "weights": vec![0.25_f64; 18]
+        })
+        .to_string();
+
+        plug.load_nam_profile_json(&wavenet_json)
+            .expect("valid WaveNet .nam JSON");
+        assert!(plug.is_nam_wavenet_loaded());
+
+        let layout = ForgeSpaceVerbAndPreampPlug::AUDIO_IO_LAYOUTS[0];
+        let cfg = BufferConfig {
+            sample_rate: 48_000.0,
+            min_buffer_size: Some(64),
+            max_buffer_size: 256,
+            process_mode: ProcessMode::Realtime,
+        };
+        let mut ctx = MockInitContext::new();
+        assert!(plug.initialize(&layout, &cfg, &mut ctx));
+        assert!(plug.is_nam_wavenet_loaded());
+
+        let mut left: Vec<f32> = (0..128).map(|i| 0.3 * (i as f32 * 0.08).sin()).collect();
+        let mut right = left.clone();
+        plug.process_slices(&mut [&mut left[..], &mut right[..]]);
+        assert!(left.iter().chain(&right).all(|s| s.is_finite()));
+        plug.reset();
+    }
+
+    #[test]
+    fn phase_and_match_auto_aligns_sidechain_delay_and_polarity() {
+        let mut plug = ForgePhaseAndMatchPlug::default();
+        let layout = ForgePhaseAndMatchPlug::AUDIO_IO_LAYOUTS[0];
+        let cfg = BufferConfig {
+            sample_rate: 48_000.0,
+            min_buffer_size: Some(64),
+            max_buffer_size: 2048,
+            process_mode: ProcessMode::Realtime,
+        };
+        let mut ctx = MockInitContext::new();
+        assert!(plug.initialize(&layout, &cfg, &mut ctx));
+
+        let ids: Vec<String> = plug
+            .params()
+            .param_map()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        assert!(ids.iter().any(|id| id == "autoal"), "missing autoal id");
+
+        let n = 2048_usize;
+        let delay = 24_usize;
+        let mut main_l: Vec<f32> = (0..n)
+            .map(|i| 0.45 * (2.0 * std::f32::consts::PI * 220.0 * (i as f32) / 48_000.0).sin())
+            .collect();
+        let mut main_r = main_l.clone();
+        let sc_l: Vec<f32> = (0..n)
+            .map(|i| if i >= delay { -main_l[i - delay] } else { 0.0 })
+            .collect();
+        let sc_r = sc_l.clone();
+
+        plug.process_slices(
+            n,
+            &mut [&mut main_l[..], &mut main_r[..]],
+            Some((&sc_l, &sc_r)),
+            true,
+        );
+        let (detected_delay, detected_invert) = plug.detected_sidechain_alignment();
+        assert_eq!(detected_delay, delay);
+        assert!(detected_invert, "expected inverted sidechain polarity");
+        assert!(main_l.iter().chain(&main_r).all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn mono_layout_process_succeeds_for_vocal_surgical_spliteq_and_clipper() {
+        let cfg = BufferConfig {
+            sample_rate: 48_000.0,
+            min_buffer_size: Some(32),
+            max_buffer_size: 128,
+            process_mode: ProcessMode::Realtime,
+        };
+        let mut ctx = MockInitContext::new();
+
+        let mut voc = ForgeVocalSurgicalPlug::default();
+        assert!(voc.initialize(&ForgeVocalSurgicalPlug::AUDIO_IO_LAYOUTS[1], &cfg, &mut ctx));
+        let mut mono = vec![0.25_f32; 64];
+        voc.process_slices(&mut [&mut mono[..]]);
+        assert!(mono.iter().all(|s| s.is_finite()));
+
+        let mut split = ForgeSplitEqPlug::default();
+        assert!(split.initialize(&ForgeSplitEqPlug::AUDIO_IO_LAYOUTS[1], &cfg, &mut ctx));
+        split.process_slices(&mut [&mut mono[..]]);
+        assert!(mono.iter().all(|s| s.is_finite()));
+
+        let mut clip = ForgeDensityClipperPlug::default();
+        assert!(clip.initialize(
+            &ForgeDensityClipperPlug::AUDIO_IO_LAYOUTS[1],
+            &cfg,
+            &mut ctx
+        ));
+        clip.process_slices(&mut [&mut mono[..]]);
+        assert!(mono.iter().all(|s| s.is_finite()));
+    }
 }

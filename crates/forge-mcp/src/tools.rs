@@ -183,6 +183,7 @@ fn req_str_tool(
 
 const DENOISE_BACKENDS: &[&str] = &[
     "auto",
+    "clearervoice",
     "deepfilternet",
     "deepfilternet3",
     "mel-band-roformer",
@@ -190,6 +191,7 @@ const DENOISE_BACKENDS: &[&str] = &[
 ];
 const RESTORE_BACKENDS: &[&str] = &[
     "auto",
+    "clearervoice",
     "apollo",
     "flowhigh",
     "audiosr",
@@ -206,7 +208,7 @@ const BEAT_BACKENDS: &[&str] = &[
     "pure_rust_onset",
 ];
 const EVAL_BACKENDS: &[&str] = &["auto", "audiobox", "singmos", "acoustic-proxy", "rust"];
-const F0_BACKENDS: &[&str] = &["auto", "rmvpe", "fcpe", "autocorr", "rust"];
+const F0_BACKENDS: &[&str] = &["auto", "swiftf0", "rmvpe", "fcpe", "autocorr", "rust"];
 
 struct WorkerToolSpec {
     meta: (&'static str, &'static str, &'static str, ToolKind),
@@ -926,5 +928,18 @@ pub(crate) fn build_tools() -> Vec<Tool> {
                 ("frames", "array"),
             ]),
         }),
+        req_str_tool(
+            "forge_spatial_qc",
+            "Spatial ADM BWF & BS.1770-5 Atmos QC",
+            "Audit multi-channel WAV/RF64 ADM BWF (ITU-R BS.2076) and ITU-R BS.1770-5 loudness/true-peak Dolby Atmos delivery readiness inside the MCP sandbox.",
+            ToolKind::ReadOnly,
+            &["input"],
+            vec![],
+            out_fields(&[
+                ("atmos_ready", "boolean"),
+                ("integrated_lkfs", "number"),
+                ("true_peak_dbtp", "number"),
+            ]),
+        ),
     ]
 }

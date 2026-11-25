@@ -74,12 +74,13 @@ fn models_payload() -> Value {
             "karaoke": "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
         },
         "backends": {
-            "neural_denoise": ["auto", "deepfilternet3", "mel-band-roformer"],
-            "neural_restore": ["auto", "apollo", "flowhigh", "audiosr", "sonicmaster", "exciter"],
+            "neural_denoise": ["auto", "clearervoice", "deepfilternet3", "mel-band-roformer"],
+            "neural_restore": ["auto", "clearervoice", "apollo", "flowhigh", "audiosr", "sonicmaster", "exciter"],
+            "transcribe": ["auto", "yourmt3", "basic-pitch"],
             "vocal_rescue": ["auto", "resemble-enhance", "seed-vc", "roformer-clean"],
             "beat_track": ["auto", "beat-this", "librosa", "energy", "rust"],
             "evaluate_quality": ["auto", "audiobox", "singmos", "acoustic-proxy", "rust"],
-            "f0_track": ["auto", "rmvpe", "fcpe", "autocorr"],
+            "f0_track": ["auto", "swiftf0", "fcpe", "rmvpe", "autocorr"],
         }
     })
 }

@@ -39,6 +39,9 @@ pub(crate) const STEREO_SIDECHAIN_LAYOUTS: &[AudioIOLayout] = &[AudioIOLayout {
     ..AudioIOLayout::const_default()
 }];
 
+pub(crate) const STEREO_SIDECHAIN_OR_STEREO_LAYOUTS: &[AudioIOLayout] =
+    &[STEREO_SIDECHAIN_LAYOUTS[0], STEREO_LAYOUTS[0]];
+
 /// Defines compact curated [`crate::ui::FactoryPreset`] slices without repeating multi-line
 /// struct boilerplate.
 macro_rules! define_presets {

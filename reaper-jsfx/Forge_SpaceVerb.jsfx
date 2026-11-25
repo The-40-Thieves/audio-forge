@@ -25,7 +25,9 @@ duck_a = exp(-1.0 / (srate_safe * 0.025));
 
 @slider
 rt60 = max(0.2, slider1);
-damp = min(0.90, max(0.05, slider2));
+damp = min(0.95, max(0.0, slider2));
+damp_fc = 18000.0 * (1.0 - damp) + 900.0;
+damp_g = exp(-2.0 * $pi * damp_fc / srate_safe);
 duck_amt = slider3;
 wet_mix = slider4;
 fb0 = min(0.985, 10 ^ (-3.0 * (len0 / srate_safe) / rt60));
@@ -52,11 +54,11 @@ h1 = 0.5 * (a1 + a3);
 h2 = 0.5 * (a0 - a2);
 h3 = 0.5 * (a1 - a3);
 
-// Damped loop write-back
-lp0 = (1.0 - damp) * h0 + damp * lp0;
-lp1 = (1.0 - damp) * h1 + damp * lp1;
-lp2 = (1.0 - damp) * h2 + damp * lp2;
-lp3 = (1.0 - damp) * h3 + damp * lp3;
+// Damped loop write-back (sample-rate-invariant 1-pole LPF)
+lp0 = (1.0 - damp_g) * h0 + damp_g * lp0;
+lp1 = (1.0 - damp_g) * h1 + damp_g * lp1;
+lp2 = (1.0 - damp_g) * h2 + damp_g * lp2;
+lp3 = (1.0 - damp_g) * h3 + damp_g * lp3;
 
 d0_base[p0] = dry_l * 0.35 + lp0 * fb0;
 d1_base[p1] = dry_r * 0.35 + lp1 * fb1;

@@ -76,10 +76,62 @@ impl Default for SplitEqParams {
 
 impl_standard_plugin_default!(ForgeSplitEqPlug, SplitEqParams, RealtimeTransientTonalSplit);
 
+impl ForgeSplitEqPlug {
+    pub(crate) fn process_slices(&mut self, main_slices: &mut [&mut [f32]]) {
+        let len = main_slices.first().map_or(0, |s| s.len());
+        let mut last_tr = [0.0_f64; 3];
+        let mut last_tn = [0.0_f64; 3];
+        for i in 0..len {
+            let tr = [
+                f64::from(self.params.trans_low_db.smoothed.next()),
+                f64::from(self.params.trans_mid_db.smoothed.next()),
+                f64::from(self.params.trans_high_db.smoothed.next()),
+            ];
+            let tn = [
+                f64::from(self.params.tonal_low_db.smoothed.next()),
+                f64::from(self.params.tonal_mid_db.smoothed.next()),
+                f64::from(self.params.tonal_high_db.smoothed.next()),
+            ];
+            last_tr = tr;
+            last_tn = tn;
+            let in_l = main_slices
+                .first()
+                .and_then(|c| c.get(i).copied())
+                .unwrap_or(0.0);
+            let in_r = main_slices
+                .get(1)
+                .and_then(|c| c.get(i).copied())
+                .unwrap_or(in_l);
+            let (out_l, out_r) = self.dsp.process_stereo_sample(in_l, in_r, tr, tn, 1.5, 0);
+            self.analyzer.push_stereo_sample(out_l, out_r);
+            self.telemetry.update_peaks(in_l, in_r, out_l, out_r, 0.0);
+            if let Some(c0) = main_slices.first_mut() {
+                c0[i] = out_l;
+            }
+            if let Some(c1) = main_slices.get_mut(1) {
+                c1[i] = out_r;
+            }
+        }
+        let mut split_curve = [0.0_f32; 32];
+        for (b, val) in split_curve.iter_mut().enumerate() {
+            let band_idx = if b < 10 {
+                0
+            } else if b < 22 {
+                1
+            } else {
+                2
+            };
+            *val = (0.5 * (last_tr[band_idx] + last_tn[band_idx])) as f32;
+        }
+        self.telemetry
+            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &split_curve);
+    }
+}
+
 impl Plugin for ForgeSplitEqPlug {
     forge_plugin_common!(
         "Forge SplitEQ Transient & Tonal",
-        crate::chassis::STEREO_LAYOUTS
+        crate::chassis::STEREO_OR_MONO_LAYOUTS
     );
 
     forge_ab_editor!(
@@ -105,47 +157,13 @@ impl Plugin for ForgeSplitEqPlug {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        let mut last_tr = [0.0_f64; 3];
-        let mut last_tn = [0.0_f64; 3];
-        for mut channel_samples in buffer.iter_samples() {
-            let tr = [
-                f64::from(self.params.trans_low_db.smoothed.next()),
-                f64::from(self.params.trans_mid_db.smoothed.next()),
-                f64::from(self.params.trans_high_db.smoothed.next()),
-            ];
-            let tn = [
-                f64::from(self.params.tonal_low_db.smoothed.next()),
-                f64::from(self.params.tonal_mid_db.smoothed.next()),
-                f64::from(self.params.tonal_high_db.smoothed.next()),
-            ];
-            last_tr = tr;
-            last_tn = tn;
-            let (in_l, in_r) = read_stereo(&mut channel_samples);
-            let (out_l, out_r) = self.dsp.process_stereo_sample(in_l, in_r, tr, tn, 1.5, 0);
-            finish_stereo_sample(
-                &mut self.analyzer,
-                &self.telemetry,
-                &mut channel_samples,
-                in_l,
-                in_r,
-                out_l,
-                out_r,
-                0.0,
-            );
+        let main_slices = buffer.as_slice();
+        let mut refs: [&mut [f32]; 2] = [&mut [], &mut []];
+        let count = main_slices.len().min(2);
+        for (dst, src) in refs.iter_mut().zip(main_slices.iter_mut()).take(count) {
+            *dst = src;
         }
-        let mut split_curve = [0.0_f32; 32];
-        for (b, val) in split_curve.iter_mut().enumerate() {
-            let band_idx = if b < 10 {
-                0
-            } else if b < 22 {
-                1
-            } else {
-                2
-            };
-            *val = (0.5 * (last_tr[band_idx] + last_tn[band_idx])) as f32;
-        }
-        self.telemetry
-            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &split_curve);
+        self.process_slices(&mut refs[..count]);
         ProcessStatus::Normal
     }
 }
@@ -234,10 +252,41 @@ impl_standard_plugin_default!(
     RealtimeDensityAndClipper
 );
 
+impl ForgeDensityClipperPlug {
+    pub(crate) fn process_slices(&mut self, main_slices: &mut [&mut [f32]]) {
+        let len = main_slices.first().map_or(0, |s| s.len());
+        let ceil = f64::from(self.params.ceiling_db.value());
+        for i in 0..len {
+            let density = f64::from(self.params.upward_density.smoothed.next());
+            let drive = f64::from(self.params.clip_drive_db.smoothed.next());
+            let in_l = main_slices
+                .first()
+                .and_then(|c| c.get(i).copied())
+                .unwrap_or(0.0);
+            let in_r = main_slices
+                .get(1)
+                .and_then(|c| c.get(i).copied())
+                .unwrap_or(in_l);
+            let (out_l, out_r) = self
+                .dsp
+                .process_stereo_sample(in_l, in_r, density, drive, ceil);
+            self.analyzer.push_stereo_sample(out_l, out_r);
+            self.telemetry.update_peaks(in_l, in_r, out_l, out_r, 0.0);
+            if let Some(c0) = main_slices.first_mut() {
+                c0[i] = out_l;
+            }
+            if let Some(c1) = main_slices.get_mut(1) {
+                c1[i] = out_r;
+            }
+        }
+        finish_block_spectrum(&self.analyzer, &self.telemetry);
+    }
+}
+
 impl Plugin for ForgeDensityClipperPlug {
     forge_plugin_common!(
         "Forge Density & 3-Band ADAA Clipper",
-        crate::chassis::STEREO_LAYOUTS
+        crate::chassis::STEREO_OR_MONO_LAYOUTS
     );
 
     forge_ab_editor!(
@@ -260,26 +309,13 @@ impl Plugin for ForgeDensityClipperPlug {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        let ceil = f64::from(self.params.ceiling_db.value());
-        for mut channel_samples in buffer.iter_samples() {
-            let density = f64::from(self.params.upward_density.smoothed.next());
-            let drive = f64::from(self.params.clip_drive_db.smoothed.next());
-            let (in_l, in_r) = read_stereo(&mut channel_samples);
-            let (out_l, out_r) = self
-                .dsp
-                .process_stereo_sample(in_l, in_r, density, drive, ceil);
-            finish_stereo_sample(
-                &mut self.analyzer,
-                &self.telemetry,
-                &mut channel_samples,
-                in_l,
-                in_r,
-                out_l,
-                out_r,
-                0.0,
-            );
+        let main_slices = buffer.as_slice();
+        let mut refs: [&mut [f32]; 2] = [&mut [], &mut []];
+        let count = main_slices.len().min(2);
+        for (dst, src) in refs.iter_mut().zip(main_slices.iter_mut()).take(count) {
+            *dst = src;
         }
-        finish_block_spectrum(&self.analyzer, &self.telemetry);
+        self.process_slices(&mut refs[..count]);
         ProcessStatus::Normal
     }
 }
@@ -344,6 +380,8 @@ pub struct SpaceVerbAndPreampParams {
     pub mod_depth: FloatParam,
     #[persist = "ab-state"]
     pub ab_state: Arc<Mutex<String>>,
+    #[persist = "nam_model_json"]
+    pub nam_model_json: Arc<Mutex<String>>,
 }
 
 /// Bottom of the stored `decay` knob range. The stored range is kept as it was so saved state
@@ -445,25 +483,29 @@ impl Default for SpaceVerbAndPreampParams {
                     max: 0.95,
                 },
             )
-            .with_value_to_string(formatters::v2s_f32_rounded(3)),
+            .with_value_to_string(formatters::v2s_f32_rounded(3))
+            .with_smoother(SmoothingStyle::Linear(15.0)),
             shimmer_amount: FloatParam::new(
                 "+12 st Octave Shimmer",
                 0.15,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
-            .with_value_to_string(formatters::v2s_f32_rounded(3)),
+            .with_value_to_string(formatters::v2s_f32_rounded(3))
+            .with_smoother(SmoothingStyle::Linear(15.0)),
             vocal_ducking: FloatParam::new(
                 "Vocal Sidechain Ducking",
                 0.55,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
-            .with_value_to_string(formatters::v2s_f32_rounded(3)),
+            .with_value_to_string(formatters::v2s_f32_rounded(3))
+            .with_smoother(SmoothingStyle::Linear(15.0)),
             wet_mix: FloatParam::new(
                 "Reverb Wet Mix",
                 0.22,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
-            .with_value_to_string(formatters::v2s_f32_rounded(3)),
+            .with_value_to_string(formatters::v2s_f32_rounded(3))
+            .with_smoother(SmoothingStyle::Linear(15.0)),
             room_geometry: enum_int_param(
                 "Room Geometry",
                 1,
@@ -498,7 +540,89 @@ impl Default for SpaceVerbAndPreampParams {
             .with_value_to_string(formatters::v2s_f32_percentage(0))
             .with_string_to_value(formatters::s2v_f32_percentage()),
             ab_state: Arc::new(Mutex::new(String::new())),
+            nam_model_json: Arc::new(Mutex::new(String::new())),
         }
+    }
+}
+
+impl ForgeSpaceVerbAndPreampPlug {
+    /// Loads and persists a full WaveNet or 5-tap `.nam` JSON profile into the neural preamp DSP.
+    pub fn load_nam_profile_json(&mut self, json_str: &str) -> forge_core::Result<()> {
+        self.preamp_dsp.load_nam_json(json_str)?;
+        if let Ok(mut guard) = self.params.nam_model_json.lock() {
+            *guard = json_str.to_string();
+        }
+        Ok(())
+    }
+
+    /// Returns `true` when a full multi-layer dilated WaveNet `.nam` profile is active.
+    pub fn is_nam_wavenet_loaded(&self) -> bool {
+        self.preamp_dsp.is_full_wavenet_loaded()
+    }
+
+    /// Clears any custom `.nam` profile and restores built-in hardware models.
+    pub fn clear_nam_profile(&mut self) {
+        self.preamp_dsp.clear_custom_nam();
+        if let Ok(mut guard) = self.params.nam_model_json.lock() {
+            guard.clear();
+        }
+    }
+
+    pub(crate) fn process_slices(&mut self, main_slices: &mut [&mut [f32]]) {
+        let len = main_slices.first().map_or(0, |s| s.len());
+        let model = match self.params.neural_model_idx.value() {
+            1 => AnalogHardwareModel::Fet1176AllButtons,
+            2 => AnalogHardwareModel::TubeV76Triode,
+            3 => AnalogHardwareModel::StuderA800Tape,
+            _ => AnalogHardwareModel::Neve1073ClassA,
+        };
+        self.preamp_dsp.set_model(model);
+        let room_geometry = match self.params.room_geometry.value() {
+            0 => ReverbRoomGeometry::Plate,
+            2 => ReverbRoomGeometry::Chamber,
+            3 => ReverbRoomGeometry::Room,
+            4 => ReverbRoomGeometry::Ambient,
+            _ => ReverbRoomGeometry::Hall,
+        };
+        self.reverb_dsp.set_room_geometry(room_geometry);
+        self.reverb_dsp.set_decay_eq(
+            f64::from(self.params.decay_low_mult.value()),
+            f64::from(self.params.decay_high_mult.value()),
+        );
+        self.reverb_dsp
+            .set_mod_depth(f64::from(self.params.mod_depth.value()));
+        let decay = reverb_decay_knob_to_rt60_secs(self.params.reverb_decay.value());
+
+        for i in 0..len {
+            let pdrive = f64::from(self.params.preamp_drive.smoothed.next());
+            let damp = f64::from(self.params.reverb_damping.smoothed.next());
+            let shimmer = f64::from(self.params.shimmer_amount.smoothed.next());
+            let duck = f64::from(self.params.vocal_ducking.smoothed.next());
+            let mix = f64::from(self.params.wet_mix.smoothed.next());
+            let in_l = main_slices
+                .first()
+                .and_then(|c| c.get(i).copied())
+                .unwrap_or(0.0);
+            let in_r = main_slices
+                .get(1)
+                .and_then(|c| c.get(i).copied())
+                .unwrap_or(in_l);
+            let (pr_l, pr_r) =
+                self.preamp_dsp
+                    .process_stereo_sample(in_l, in_r, pdrive * 12.0, 0.0);
+            let (out_l, out_r) = self
+                .reverb_dsp
+                .process_stereo_sample(pr_l, pr_r, decay, damp, shimmer, duck, mix);
+            self.analyzer.push_stereo_sample(out_l, out_r);
+            self.telemetry.update_peaks(in_l, in_r, out_l, out_r, 0.0);
+            if let Some(c0) = main_slices.first_mut() {
+                c0[i] = out_l;
+            }
+            if let Some(c1) = main_slices.get_mut(1) {
+                c1[i] = out_r;
+            }
+        }
+        finish_block_spectrum(&self.analyzer, &self.telemetry);
     }
 }
 
@@ -550,6 +674,12 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
         let sr = f64::from(buffer_config.sample_rate);
         self.preamp_dsp = RealtimeNeuralPreamp::new(AnalogHardwareModel::Neve1073ClassA);
         self.preamp_dsp.set_sample_rate(sr);
+        if let Ok(guard) = self.params.nam_model_json.lock() {
+            let saved = guard.trim();
+            if !saved.is_empty() {
+                let _ = self.preamp_dsp.load_nam_json(saved);
+            }
+        }
         self.reverb_dsp.reset(sr);
         self.analyzer.reset(sr);
         true
@@ -568,54 +698,13 @@ impl Plugin for ForgeSpaceVerbAndPreampPlug {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        let model = match self.params.neural_model_idx.value() {
-            1 => AnalogHardwareModel::Fet1176AllButtons,
-            2 => AnalogHardwareModel::TubeV76Triode,
-            3 => AnalogHardwareModel::StuderA800Tape,
-            _ => AnalogHardwareModel::Neve1073ClassA,
-        };
-        self.preamp_dsp.set_model(model);
-        let room_geometry = match self.params.room_geometry.value() {
-            0 => ReverbRoomGeometry::Plate,
-            2 => ReverbRoomGeometry::Chamber,
-            3 => ReverbRoomGeometry::Room,
-            4 => ReverbRoomGeometry::Ambient,
-            _ => ReverbRoomGeometry::Hall,
-        };
-        self.reverb_dsp.set_room_geometry(room_geometry);
-        self.reverb_dsp.set_decay_eq(
-            f64::from(self.params.decay_low_mult.value()),
-            f64::from(self.params.decay_high_mult.value()),
-        );
-        self.reverb_dsp
-            .set_mod_depth(f64::from(self.params.mod_depth.value()));
-        let decay = reverb_decay_knob_to_rt60_secs(self.params.reverb_decay.value());
-        let damp = f64::from(self.params.reverb_damping.value());
-        let shimmer = f64::from(self.params.shimmer_amount.value());
-        let duck = f64::from(self.params.vocal_ducking.value());
-        let mix = f64::from(self.params.wet_mix.value());
-
-        for mut channel_samples in buffer.iter_samples() {
-            let pdrive = f64::from(self.params.preamp_drive.smoothed.next());
-            let (in_l, in_r) = read_stereo(&mut channel_samples);
-            let (pr_l, pr_r) =
-                self.preamp_dsp
-                    .process_stereo_sample(in_l, in_r, pdrive * 12.0, 0.0);
-            let (out_l, out_r) = self
-                .reverb_dsp
-                .process_stereo_sample(pr_l, pr_r, decay, damp, shimmer, duck, mix);
-            finish_stereo_sample(
-                &mut self.analyzer,
-                &self.telemetry,
-                &mut channel_samples,
-                in_l,
-                in_r,
-                out_l,
-                out_r,
-                0.0,
-            );
+        let main_slices = buffer.as_slice();
+        let mut refs: [&mut [f32]; 2] = [&mut [], &mut []];
+        let count = main_slices.len().min(2);
+        for (dst, src) in refs.iter_mut().zip(main_slices.iter_mut()).take(count) {
+            *dst = src;
         }
-        finish_block_spectrum(&self.analyzer, &self.telemetry);
+        self.process_slices(&mut refs[..count]);
         ProcessStatus::Normal
     }
 }

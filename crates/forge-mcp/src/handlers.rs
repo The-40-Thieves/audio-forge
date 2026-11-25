@@ -7,8 +7,9 @@ use forge_dsp::{
     DeFizzConfig, DeliveryOptions, DeliveryTarget, DitherMode, GenreTonalTarget, LimiterStyle,
     RestorationConfig, ToneMatch, UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw,
     align_vocal_double_dtw_elastic, analyze_beat_grid, apply_18_band_eq, apply_spectral_defizz,
-    apply_spectral_unmask, audit_audio, clean_vocal_surgical, compute_reference_match_eq, deliver,
-    normalize_and_limit, quantize_to_constant_bpm, run_full_restoration_chain,
+    apply_spectral_unmask, audit_audio, audit_spatial_adm_bwf_reader, clean_vocal_surgical,
+    compute_reference_match_eq, deliver, normalize_and_limit, quantize_to_constant_bpm,
+    run_full_restoration_chain,
 };
 use forge_reaper::{
     ReaperProjectBuilder, ReaperTrackSpec, ReleaseMetadata, install_jsfx_plugins, jsfx_install_dir,
@@ -261,6 +262,7 @@ fn dispatch_tool(
         "forge_beat_track" => tool_beat_track,
         "forge_evaluate_quality" => tool_evaluate_quality,
         "forge_f0_track" => tool_f0_track,
+        "forge_spatial_qc" => tool_spatial_qc,
         _ => {
             return Err(ForgeError::InvalidParameter(format!(
                 "Unknown tool: {name}"
@@ -268,6 +270,13 @@ fn dispatch_tool(
         }
     };
     handler(args, sandbox)
+}
+
+fn tool_spatial_qc(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
+    let input = path_arg(args, "input", sandbox)?;
+    let mut file = sandbox.open_read(&input)?;
+    let report = audit_spatial_adm_bwf_reader(&mut file, &input)?;
+    Ok(serde_json::to_value(report)?.into())
 }
 
 fn tool_deliver(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
@@ -452,6 +461,7 @@ fn tool_neural_denoise(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput
         args,
         &[
             "auto",
+            "clearervoice",
             "deepfilternet",
             "deepfilternet3",
             "mel-band-roformer",
@@ -490,6 +500,7 @@ fn tool_neural_restore(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput
         args,
         &[
             "auto",
+            "clearervoice",
             "apollo",
             "flowhigh",
             "audiosr",
@@ -577,7 +588,10 @@ fn tool_evaluate_quality(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
 
 fn tool_f0_track(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
     let input = path_arg(args, "input", sandbox)?;
-    let backend = validate_backend_arg(args, &["auto", "rmvpe", "fcpe", "autocorr", "rust"])?;
+    let backend = validate_backend_arg(
+        args,
+        &["auto", "swiftf0", "rmvpe", "fcpe", "autocorr", "rust"],
+    )?;
     let hop_secs = bounded_f64_arg(args, "hop_secs", 0.01, 0.002, 0.2)?;
     let timeout = timeout_secs_arg(args)?;
     let res = external::f0_track_checked(sandbox, &input, backend, hop_secs, timeout)?;

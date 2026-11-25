@@ -36,7 +36,9 @@ pub enum ForgeError {
 
 pub type Result<T> = std::result::Result<T, ForgeError>;
 
+mod adm_bwf;
 mod wav_io;
+pub use adm_bwf::{AdmBwfInfo, parse_adm_bwf_file, parse_adm_bwf_reader};
 pub use wav_io::{BoundedChildExit, wait_child_bounded_stderr};
 
 fn open_for_read(path: &Path) -> Result<std::fs::File> {

@@ -421,6 +421,11 @@ pub struct ForgePhaseAndMatchPlug {
     auto_gain: AutoGainCompensator,
     phase_dsp: RealtimePhaseAligner,
     eq_dsp: RealtimeMasteringEq18,
+    main_cap: [f64; 4096],
+    sc_cap: [f64; 4096],
+    cap_pos: usize,
+    auto_delay: usize,
+    auto_invert: bool,
 }
 
 #[derive(Params)]
@@ -437,6 +442,8 @@ pub struct PhaseAndMatchParams {
     pub genre_target_idx: IntParam,
     #[id = "autogain"]
     pub auto_gain_comp: BoolParam,
+    #[id = "autoal"]
+    pub auto_align_sidechain: BoolParam,
 }
 
 impl Default for PhaseAndMatchParams {
@@ -455,13 +462,15 @@ impl Default for PhaseAndMatchParams {
                 0.50,
                 FloatRange::Linear { min: 0.0, max: 1.5 },
             )
-            .with_value_to_string(formatters::v2s_f32_rounded(3)),
+            .with_value_to_string(formatters::v2s_f32_rounded(3))
+            .with_smoother(SmoothingStyle::Linear(15.0)),
             genre_target_idx: IntParam::new(
                 "Genre Target (0=Pop,1=Trap,2=RnB,3=EDM,4=Rock,5=Jazz)",
                 0,
                 IntRange::Linear { min: 0, max: 5 },
             ),
             auto_gain_comp: BoolParam::new("ZLEqualizer Auto-Gain Compensation", true),
+            auto_align_sidechain: BoolParam::new("Auto-Align to Sidechain", false),
         }
     }
 }
@@ -475,14 +484,155 @@ impl Default for ForgePhaseAndMatchPlug {
             auto_gain: AutoGainCompensator::default(),
             phase_dsp: RealtimePhaseAligner::new(48_000.0),
             eq_dsp: RealtimeMasteringEq18::new(48_000.0),
+            main_cap: [0.0; 4096],
+            sc_cap: [0.0; 4096],
+            cap_pos: 0,
+            auto_delay: 0,
+            auto_invert: false,
         }
+    }
+}
+
+fn estimate_lag_and_polarity(
+    main_cap: &[f64; 4096],
+    sc_cap: &[f64; 4096],
+) -> Option<(usize, bool)> {
+    const WIN_START: usize = 512;
+    const WIN_END: usize = 2048;
+    let mut e_main = 0.0_f64;
+    let mut e_sc = 0.0_f64;
+    for t in (WIN_START..WIN_END).step_by(8) {
+        e_main += main_cap[t] * main_cap[t];
+        e_sc += sc_cap[t] * sc_cap[t];
+    }
+    let denom = (e_main * e_sc).sqrt();
+    if denom <= 1e-12 {
+        return None;
+    }
+    let mut best_delay = 0_usize;
+    let mut best_dot = 0.0_f64;
+    for d in 0..=512_usize {
+        let mut dot = 0.0_f64;
+        for t in (WIN_START..WIN_END).step_by(8) {
+            dot += sc_cap[t] * main_cap[t - d];
+        }
+        if dot.abs() > best_dot.abs() {
+            best_dot = dot;
+            best_delay = d;
+        }
+    }
+    (best_dot.abs() > 0.25 * denom).then_some((best_delay, best_dot < 0.0))
+}
+
+impl ForgePhaseAndMatchPlug {
+    /// Returns the currently measured `(delay_samples, invert_polarity)` from sidechain auto-align.
+    pub fn detected_sidechain_alignment(&self) -> (usize, bool) {
+        (self.auto_delay, self.auto_invert)
+    }
+
+    #[inline]
+    fn push_sidechain_align_sample(&mut self, main_m: f64, sc_m: f64) {
+        self.main_cap[self.cap_pos] = main_m;
+        self.sc_cap[self.cap_pos] = sc_m;
+        self.cap_pos += 1;
+        if self.cap_pos >= 2048 {
+            if let Some((d, inv)) = estimate_lag_and_polarity(&self.main_cap, &self.sc_cap) {
+                self.auto_delay = d;
+                self.auto_invert = inv;
+            }
+            self.cap_pos = 0;
+        }
+    }
+
+    fn build_combined_eq_and_bode(&mut self, eq_amt: f64) -> ([f64; 18], [f32; 32]) {
+        let genre = match self.params.genre_target_idx.value() {
+            1 => GenreTonalTarget::HipHopTrap,
+            2 => GenreTonalTarget::NeoSoulRnB,
+            3 => GenreTonalTarget::EdmClub,
+            4 => GenreTonalTarget::RockMetal,
+            5 => GenreTonalTarget::AcousticJazz,
+            _ => GenreTonalTarget::ModernPop,
+        };
+        let target_curve = genre.target_curve_18_db();
+        const AI_WARMTH_CURVE_18: [f64; 18] = [
+            0.4, 0.8, 1.1, 0.6, 0.0, -0.5, -0.8, -0.4, 0.0, -0.3, -1.2, -2.2, -2.5, -1.8, -0.6,
+            0.5, 1.1, 1.3,
+        ];
+        let mut combined = [0.0_f64; 18];
+        for i in 0..18 {
+            combined[i] = AI_WARMTH_CURVE_18[i] * 0.65 + target_curve[i] * 0.15;
+        }
+        let mut bode_32 = [0.0_f32; 32];
+        for (b, val) in bode_32.iter_mut().enumerate() {
+            *val = (combined[(b * 17) / 31] * eq_amt) as f32;
+        }
+        (combined, bode_32)
+    }
+
+    pub(crate) fn process_slices(
+        &mut self,
+        samples_len: usize,
+        main_slices: &mut [&mut [f32]],
+        sc_pair: Option<(&[f32], &[f32])>,
+        auto_align: bool,
+    ) {
+        let (delay, inv) = if auto_align && sc_pair.is_some() {
+            (self.auto_delay, self.auto_invert)
+        } else {
+            (
+                self.params.delay_samples.value().max(0) as usize,
+                self.params.invert_polarity.value(),
+            )
+        };
+        let eq_amt = f64::from(self.params.ai_warmth_eq_amount.smoothed.next());
+        for _ in 1..samples_len {
+            let _ = self.params.ai_warmth_eq_amount.smoothed.next();
+        }
+        let use_agc = self.params.auto_gain_comp.value();
+        let (combined, bode_32) = self.build_combined_eq_and_bode(eq_amt);
+        self.phase_dsp.set_alignment(delay, inv);
+        self.eq_dsp.set_gains(&combined, eq_amt);
+
+        for i in 0..samples_len {
+            let in_l = main_slices
+                .first()
+                .and_then(|c| c.get(i).copied())
+                .unwrap_or(0.0);
+            let in_r = main_slices
+                .get(1)
+                .and_then(|c| c.get(i).copied())
+                .unwrap_or(in_l);
+            if auto_align && let Some((sc_l_ch, sc_r_ch)) = sc_pair {
+                let sc_l = sc_l_ch.get(i).copied().unwrap_or(0.0);
+                let sc_r = sc_r_ch.get(i).copied().unwrap_or(sc_l);
+                self.push_sidechain_align_sample(
+                    0.5 * f64::from(in_l + in_r),
+                    0.5 * f64::from(sc_l + sc_r),
+                );
+            }
+            let (al_l, al_r) = self.phase_dsp.process_stereo_sample(in_l, in_r);
+            let (eq_l, eq_r) = self.eq_dsp.process_stereo_sample(al_l, al_r);
+            let (out_l, out_r) = self
+                .auto_gain
+                .process_stereo(in_l, in_r, eq_l, eq_r, use_agc);
+            self.analyzer.push_stereo_sample(out_l, out_r);
+            self.telemetry.update_peaks(in_l, in_r, out_l, out_r, 0.0);
+            if let Some(c0) = main_slices.first_mut() {
+                c0[i] = out_l;
+            }
+            if let Some(c1) = main_slices.get_mut(1) {
+                c1[i] = out_r;
+            }
+        }
+        self.telemetry
+            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &bode_32);
     }
 }
 
 impl Plugin for ForgePhaseAndMatchPlug {
     forge_plugin_common!(
         "Forge PhaseAlign & 18-Band EQ",
-        crate::chassis::STEREO_LAYOUTS
+        crate::chassis::STEREO_SIDECHAIN_OR_STEREO_LAYOUTS
     );
 
     forge_ab_editor!(
@@ -496,6 +646,7 @@ impl Plugin for ForgePhaseAndMatchPlug {
             ("eqamt", Float, ai_warmth_eq_amount, "18-Band AI De-Harsh & Genre Amount"),
             ("genre", Int, genre_target_idx, "Genre Target (0=Pop..5=Jazz)"),
             ("autogain", Bool, auto_gain_comp, "Auto-Gain Compensation (AGC)"),
+            ("autoal", Bool, auto_align_sidechain, "Auto-Align to Sidechain"),
         ]
     );
 
@@ -511,6 +662,11 @@ impl Plugin for ForgePhaseAndMatchPlug {
         self.analyzer.reset(sr);
         self.auto_gain.set_sample_rate(sr);
         self.auto_gain.reset();
+        self.main_cap.fill(0.0);
+        self.sc_cap.fill(0.0);
+        self.cap_pos = 0;
+        self.auto_delay = 0;
+        self.auto_invert = false;
         true
     }
 
@@ -519,68 +675,39 @@ impl Plugin for ForgePhaseAndMatchPlug {
         self.eq_dsp.reset();
         self.auto_gain.reset();
         self.analyzer.clear_state();
+        self.main_cap.fill(0.0);
+        self.sc_cap.fill(0.0);
+        self.cap_pos = 0;
+        self.auto_delay = 0;
+        self.auto_invert = false;
     }
 
     fn process(
         &mut self,
         buffer: &mut Buffer,
-        _aux: &mut AuxiliaryBuffers,
+        aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        let delay = self.params.delay_samples.value().max(0) as usize;
-        let inv = self.params.invert_polarity.value();
-        let eq_amt = f64::from(self.params.ai_warmth_eq_amount.value());
-        let use_agc = self.params.auto_gain_comp.value();
-        let genre = match self.params.genre_target_idx.value() {
-            1 => GenreTonalTarget::HipHopTrap,
-            2 => GenreTonalTarget::NeoSoulRnB,
-            3 => GenreTonalTarget::EdmClub,
-            4 => GenreTonalTarget::RockMetal,
-            5 => GenreTonalTarget::AcousticJazz,
-            _ => GenreTonalTarget::ModernPop,
-        };
-        let target_curve = genre.target_curve_18_db();
-
-        // Blend built-in Genre Tonal Balance Target with AI De-Harshing (3.5-5kHz fizz cut + 12.5-16kHz air)
-        const AI_WARMTH_CURVE_18: [f64; 18] = [
-            0.4, 0.8, 1.1, 0.6, 0.0, -0.5, -0.8, -0.4, 0.0, -0.3, -1.2, -2.2, -2.5, -1.8, -0.6,
-            0.5, 1.1, 1.3,
-        ];
-        let mut combined = [0.0_f64; 18];
-        for i in 0..18 {
-            combined[i] = AI_WARMTH_CURVE_18[i] * 0.65 + target_curve[i] * 0.15;
+        let samples_len = buffer.samples();
+        let sc_buf = aux.inputs.first_mut();
+        let sc_pair = sc_buf.as_ref().map(|b| {
+            let s = b.as_slice_immutable();
+            let l: &[f32] = s.first().map_or(&[], |c| &**c);
+            let r: &[f32] = s.get(1).map_or(l, |c| &**c);
+            (l, r)
+        });
+        let main_slices = buffer.as_slice();
+        let mut slice_refs: [&mut [f32]; 2] = [&mut [], &mut []];
+        let count = main_slices.len().min(2);
+        for (dst, src) in slice_refs
+            .iter_mut()
+            .zip(main_slices.iter_mut())
+            .take(count)
+        {
+            *dst = src;
         }
-        self.phase_dsp.set_alignment(delay, inv);
-        self.eq_dsp.set_gains(&combined, eq_amt);
-
-        for mut channel_samples in buffer.iter_samples() {
-            let (in_l, in_r) = read_stereo(&mut channel_samples);
-            let (al_l, al_r) = self.phase_dsp.process_stereo_sample(in_l, in_r);
-            let (eq_l, eq_r) = self.eq_dsp.process_stereo_sample(al_l, al_r);
-            let (out_l, out_r) = self
-                .auto_gain
-                .process_stereo(in_l, in_r, eq_l, eq_r, use_agc);
-            finish_stereo_sample(
-                &mut self.analyzer,
-                &self.telemetry,
-                &mut channel_samples,
-                in_l,
-                in_r,
-                out_l,
-                out_r,
-                0.0,
-            );
-        }
-
-        // Interpolate 18-band EQ Bode response across 32 GUI curve points
-        let mut bode_32 = [0.0_f32; 32];
-        for (b, val) in bode_32.iter_mut().enumerate() {
-            let idx = (b * 17) / 31;
-            *val = (combined[idx] * eq_amt) as f32;
-        }
-        self.telemetry
-            .update_spectrum_and_gr(&self.analyzer.snapshot_db(), &bode_32);
-
+        let auto_align = self.params.auto_align_sidechain.value();
+        self.process_slices(samples_len, &mut slice_refs[..count], sc_pair, auto_align);
         ProcessStatus::Normal
     }
 }

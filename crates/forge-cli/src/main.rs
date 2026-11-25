@@ -8,9 +8,9 @@ use forge_dsp::{
     DeFizzConfig, DeliveryOptions, DeliveryTarget, DitherMode, GenreTonalTarget, LimiterStyle,
     RestorationConfig, ToneMatch, UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw,
     align_vocal_double_dtw_elastic, analyze_beat_grid, apply_18_band_eq, apply_spectral_defizz,
-    apply_spectral_unmask, audit_audio, clean_vocal_surgical, compute_genre_tonal_balance_eq,
-    compute_reference_match_eq, deliver, normalize_and_limit, quantize_to_constant_bpm,
-    run_full_restoration_chain,
+    apply_spectral_unmask, audit_audio, audit_spatial_adm_bwf, clean_vocal_surgical,
+    compute_genre_tonal_balance_eq, compute_reference_match_eq, deliver, normalize_and_limit,
+    quantize_to_constant_bpm, run_full_restoration_chain,
 };
 use forge_engine::{ClipCache, DawProject, ObjectOrientedEngine};
 use forge_reaper::{
@@ -519,6 +519,15 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Audit a multi-channel WAV/RF64 ADM BWF file (ITU-R BS.1770-5 + Dolby Atmos QC)
+    SpatialQc {
+        /// Path to WAV/RF64 ADM BWF audio file
+        input: PathBuf,
+        /// Emit raw JSON output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -618,6 +627,7 @@ fn try_dispatch_restore(command: Commands) -> anyhow::Result<Option<Commands>> {
 fn dispatch_mix_cli(command: Commands) -> anyhow::Result<Option<Commands>> {
     match command {
         Commands::Audit { input, json } => run_audit_cli(&input, json)?,
+        Commands::SpatialQc { input, json } => run_spatial_qc_cli(&input, json)?,
         Commands::Unmask {
             target,
             sidechain,
@@ -668,6 +678,26 @@ fn dispatch_mix_cli(command: Commands) -> anyhow::Result<Option<Commands>> {
         other => return Ok(Some(other)),
     }
     Ok(None)
+}
+
+fn run_spatial_qc_cli(input: &std::path::Path, json: bool) -> anyhow::Result<()> {
+    let report = audit_spatial_adm_bwf(input)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    println!(
+        "Atmos Spatial QC ({:?}): {:.2} LKFS | {:.2} dBTP | {} Hz / {}-bit | ADM axml={} chna={} | Ready: {}",
+        report.layout,
+        report.integrated_lkfs,
+        report.true_peak_dbtp,
+        report.sample_rate,
+        report.bits_per_sample,
+        report.adm.has_axml,
+        report.adm.has_chna,
+        if report.atmos_ready { "YES" } else { "NO" }
+    );
+    Ok(())
 }
 
 fn run_audit_cli(input: &std::path::Path, json: bool) -> anyhow::Result<()> {
@@ -1267,6 +1297,7 @@ fn run_denoise_cli(
         "backend",
         &[
             "auto",
+            "clearervoice",
             "deepfilternet",
             "deepfilternet3",
             "mel-band-roformer",
@@ -1348,6 +1379,7 @@ fn run_neural_restore_cli(
         backend,
         &[
             "auto",
+            "clearervoice",
             "apollo",
             "flowhigh",
             "audiosr",
@@ -1665,7 +1697,7 @@ fn run_f0_track_cli(
     let backend = validate_choice(
         backend,
         "backend",
-        &["auto", "rmvpe", "fcpe", "autocorr", "rust"],
+        &["auto", "swiftf0", "rmvpe", "fcpe", "autocorr", "rust"],
     )?;
     let timeout = std::time::Duration::from_secs(timeout_secs);
     let res = if backend == "rust" {

@@ -1132,6 +1132,7 @@ mod tests {
         assert!(JSFX_MASTER_LIMITER.contains("pdc_top_ch = 2;"));
         assert!(JSFX_MASTER_LIMITER.contains("gain_env = min(gain_env, req_here);"));
         assert!(JSFX_DENSITY_CLIPPER.contains("safe_tanh("));
+        assert!(JSFX_SPACEVERB.contains("damp_g = exp(-2.0 * $pi * damp_fc / srate_safe);"));
     }
 
     #[test]

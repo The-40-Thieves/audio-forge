@@ -10,6 +10,7 @@ pub mod phase_align;
 pub mod realtime;
 pub mod resample;
 pub mod restoration;
+pub mod spatial_qc;
 pub mod spectral_defizz;
 pub mod spectral_unmask;
 pub mod spectrum;
@@ -31,10 +32,11 @@ pub use elite_dsp::{
     compute_genre_tonal_balance_eq,
 };
 pub use loudness_limiter::{
-    Biquad, CytomicSvf, DitherMode, LIMITER_LOOKAHEAD_MS, LIMITER_RELEASE_MS, LimiterStyle,
-    MasteringLimiterConfig, SILENCE_RMS_DBFS, SILENT_BAND_DB, TRUE_PEAK_PHASES, apply_dither,
-    audit_audio, compute_true_peak, flush_denormal_f64, normalize_and_limit,
-    normalize_and_limit_with_config, sanitize_param_f64, sanitize_sample_f32, sanitize_sample_f64,
+    Biquad, ChannelLayout, CytomicSvf, DitherMode, LIMITER_LOOKAHEAD_MS, LIMITER_RELEASE_MS,
+    LimiterStyle, MasteringLimiterConfig, SILENCE_RMS_DBFS, SILENT_BAND_DB, TRUE_PEAK_PHASES,
+    apply_dither, audit_audio, bs1770_5_channel_weights, compute_bs1770_5_loudness,
+    compute_true_peak, flush_denormal_f64, normalize_and_limit, normalize_and_limit_with_config,
+    sanitize_param_f64, sanitize_sample_f32, sanitize_sample_f64,
 };
 pub use phase_align::{PhaseAlignmentResult, align_phase_gcc_phat};
 pub use realtime::{
@@ -48,6 +50,9 @@ pub use restoration::{
     apply_hum_notch_cascade, apply_mid_side_spatial_cleanup, clean_vocal_surgical,
     compute_reference_match_eq, remove_dc_and_declip, run_full_restoration_chain,
     sum_audio_buffers,
+};
+pub use spatial_qc::{
+    SpatialQcCheck, SpatialQcReport, audit_spatial_adm_bwf, audit_spatial_adm_bwf_reader,
 };
 pub use spectral_defizz::{DeFizzConfig, apply_spectral_defizz};
 pub use spectral_unmask::{UnmaskConfig, apply_spectral_unmask};

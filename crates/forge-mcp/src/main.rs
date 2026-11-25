@@ -1368,7 +1368,7 @@ mod tests {
         )
         .await;
         let listed_tools = list["result"]["tools"].as_array().unwrap();
-        assert_eq!(listed_tools.len(), 19);
+        assert_eq!(listed_tools.len(), 20);
         assert!(listed_tools[0]["outputSchema"].is_object());
         assert!(listed_tools[0]["annotations"].is_object());
         assert!(list["result"]["ttlMs"].is_number());
@@ -1518,7 +1518,7 @@ mod tests {
             )
             .await;
             assert!(list["result"].get("resultType").is_none(), "{list}");
-            assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 19);
+            assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 20);
 
             let call = rpc_roundtrip(
                 &mut client_write,

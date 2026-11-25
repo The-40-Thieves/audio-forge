@@ -774,7 +774,9 @@ class NoDeadCheckpointsTests(TestCase):
             worker.VOCAL_REVIVE_MODEL,
             worker.DRUMSEP_MODEL,
             worker.KARAOKE_MODEL,
-            '"rmvpe", "fcpe", "autocorr"',
+            '"swiftf0", "fcpe", "rmvpe", "autocorr"',
+            '"yourmt3", "basic-pitch"',
+            '"clearervoice"',
         ):
             self.assertIn(expected, mcp_res)
         for bad_f0 in ("torchcrepe", "librosa-yin"):
@@ -1197,6 +1199,126 @@ class NewTasksTests(TestCase):
                 ):
                     worker._rescue_via_resemble(inp, out)
                 self.assertEqual(seen_devices, [expected_dev, expected_dev])
+
+
+class Frontier2026AndMainTests(TestCase):
+    def test_clearervoice_denoise_and_restore_respect_output_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inp = root / "noisy.wav"
+            out_dir = root / "out"
+            out_dir.mkdir()
+            NewTasksTests._write_click_wav(inp, secs=0.2)
+            tasks_seen: list[tuple[str, list[str]]] = []
+
+            class FakeClearVoice:
+                def __init__(self, task: str, model_names: list[str]) -> None:
+                    tasks_seen.append((task, model_names))
+
+                def __call__(
+                    self, input_path: str, online_write: bool = False
+                ) -> list[float]:
+                    _ = (input_path, online_write)
+                    return [0.0, 0.1]
+
+                def write(self, data: object, output_path: str) -> None:
+                    _ = data
+                    Path(output_path).write_bytes(b"RIFF\x00\x00\x00\x00WAVE")
+
+            fake_cv = types.ModuleType("clearvoice")
+            fake_cv.ClearVoice = FakeClearVoice  # type: ignore[attr-defined]
+            with mock.patch.dict(sys.modules, {"clearvoice": fake_cv}):
+                den = worker.run_denoise(inp, out_dir, backend="clearervoice")
+                self.assertEqual(den["backend"], "clearervoice")
+                den_path = Path(str(den["denoised"]))
+                self.assertTrue(den_path.resolve().is_relative_to(out_dir.resolve()))
+                self.assertTrue(den_path.is_file())
+
+                rst = worker.run_restore(inp, out_dir, backend="clearervoice")
+                self.assertEqual(rst["backend"], "clearervoice")
+                rst_path = Path(str(rst["restored"]))
+                self.assertTrue(rst_path.resolve().is_relative_to(out_dir.resolve()))
+                self.assertTrue(rst_path.is_file())
+            self.assertEqual(
+                tasks_seen,
+                [
+                    ("speech_enhancement", ["MossFormer2_SE_48K"]),
+                    ("speech_super_resolution", ["MossFormer2_SR_48K"]),
+                ],
+            )
+
+    def test_yourmt3_transcribe_and_swiftf0_track(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inp = root / "song.wav"
+            out_dir = root / "midi"
+            out_dir.mkdir()
+            NewTasksTests._write_click_wav(inp, secs=0.25)
+
+            fake_mt3 = types.ModuleType("yourmt3")
+
+            def _transcribe_file(_in_p: str, out_midi: str) -> None:
+                Path(out_midi).write_bytes(
+                    b"MThd\x00\x00\x00\x06\x00\x00\x00\x01\x01\xe0"
+                )
+
+            fake_mt3.transcribe_file = _transcribe_file  # type: ignore[attr-defined]
+            with mock.patch.dict(sys.modules, {"yourmt3": fake_mt3}):
+                res = worker.run_transcribe(inp, out_dir, backend="auto")
+            self.assertEqual(res["backend"], "yourmt3")
+            self.assertTrue(Path(str(res["midi"])).is_file())
+
+            class FakeSwiftResult:
+                pitch_hz = [220.0] * 13
+
+            class FakeSwiftF0:
+                def detect_from_array(self, mono: object, sr: int) -> FakeSwiftResult:
+                    _ = (mono, sr)
+                    return FakeSwiftResult()
+
+            fake_sf0 = types.ModuleType("swift_f0")
+            fake_sf0.SwiftF0 = FakeSwiftF0  # type: ignore[attr-defined]
+            with mock.patch.dict(sys.modules, {"swift_f0": fake_sf0}):
+                f0 = worker.run_f0_track(inp, backend="swiftf0", hop_secs=0.02)
+            self.assertEqual(f0["backend"], "swiftf0")
+            self.assertAlmostEqual(float(f0["median_f0_hz"]), 220.0)  # type: ignore[arg-type]
+
+    def test_main_cli_entrypoint_executes_subcommands(self) -> None:
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inp = root / "tone.wav"
+            NewTasksTests._write_click_wav(inp, secs=0.25)
+            for argv in (
+                ["forge_gpu_worker.py", "list-models", "--model-dir", str(root)],
+                [
+                    "forge_gpu_worker.py",
+                    "f0-track",
+                    "--input",
+                    str(inp),
+                    "--backend",
+                    "autocorr",
+                ],
+                [
+                    "forge_gpu_worker.py",
+                    "evaluate",
+                    "--input",
+                    str(inp),
+                    "--backend",
+                    "acoustic-proxy",
+                ],
+            ):
+                buf = io.StringIO()
+                with (
+                    mock.patch.object(sys, "argv", argv),
+                    contextlib.redirect_stdout(buf),
+                ):
+                    rc = worker.main()
+                self.assertEqual(rc, 0)
+                parsed = json.loads(buf.getvalue().strip())
+                self.assertIsInstance(parsed, dict)
 
 
 if __name__ == "__main__":

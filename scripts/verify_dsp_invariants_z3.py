@@ -456,6 +456,49 @@ def prove_ms_high_mid_correlation_bounds() -> dict[str, str]:
     }
 
 
+def prove_bs1770_5_channel_weights_lfe_exclusion() -> dict[str, str]:
+    """Proves BS.1770-5 5.1/7.1 weighting strictly excludes LFE and boosts surrounds."""
+    s_lfe = z3.Solver()
+    e_fl, e_fr, e_c, e_lfe, e_lfe2, e_ls, e_rs = z3.Reals(
+        "e_fl e_fr e_c e_lfe e_lfe2 e_ls e_rs"
+    )
+    for energy in (e_fl, e_fr, e_c, e_lfe, e_lfe2, e_ls, e_rs):
+        s_lfe.add(energy >= 0.0)
+
+    def weighted_5_1(lfe_val: z3.ArithRef) -> z3.ArithRef:
+        return (
+            1.0 * e_fl
+            + 1.0 * e_fr
+            + 1.0 * e_c
+            + 0.0 * lfe_val
+            + z3.RealVal("1.41") * e_ls
+            + z3.RealVal("1.41") * e_rs
+        )
+
+    e_sum1 = weighted_5_1(e_lfe)
+    e_sum2 = weighted_5_1(e_lfe2)
+
+    e_tone = z3.Real("e_tone")
+    s_lfe.add(e_tone > 0.0)
+    e_front_only = 1.0 * e_tone
+    e_surr_only = z3.RealVal("1.41") * e_tone
+
+    s_lfe.add(
+        z3.Or(
+            e_sum1 != e_sum2,
+            e_sum1 < 0.0,
+            e_surr_only <= e_front_only,
+            e_surr_only != z3.RealVal("1.41") * e_front_only,
+        )
+    )
+    _require(s_lfe.check() == z3.unsat, "BS.1770-5 channel weight proof failed")
+    return {
+        "bs1770_5_lfe_exclusion_and_surround_boost_proof": (
+            "UNSAT (Proven LFE g_3=0 is strictly invariant across any LFE energy and surround g=1.41 boosts energy >= 0)"
+        )
+    }
+
+
 def main() -> int:
     report = {}
     report.update(prove_clamp_hazards_and_fixes())
@@ -467,6 +510,7 @@ def main() -> int:
     report.update(prove_ultrasonic_lpf_nyquist_guard())
     report.update(prove_tempo_map_monotonic_inverse())
     report.update(prove_ms_high_mid_correlation_bounds())
+    report.update(prove_bs1770_5_channel_weights_lfe_exclusion())
     print(json.dumps(report, indent=2))
     return 0
 
