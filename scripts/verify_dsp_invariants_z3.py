@@ -21,6 +21,10 @@ def z3_clamp(val: z3.ArithRef, lo: z3.ArithRef, hi: z3.ArithRef) -> z3.ArithRef:
     return z3.If(val < lo, lo, z3.If(val > hi, hi, val))
 
 
+def z3_abs(val: z3.ArithRef) -> z3.ArithRef:
+    return z3.If(val < 0, -val, val)
+
+
 def prove_clamp_hazards_and_fixes() -> dict[str, str]:
     results: dict[str, str] = {}
 
@@ -311,22 +315,23 @@ def prove_repo_wide_vocal_theory_and_core_invariants() -> dict[str, str]:
 
 
 def prove_milestone3_sinc_ulpf_tempo_and_ms_invariants() -> dict[str, str]:
-    """Proves 4 Milestone-3 DSP & timeline invariants:
-    1. Sinc resampler normalized weights preserve exact DC unity and BIBO sample bounds [-M, M].
-    2. Ultrasonic LPF cutoff clamping stays strictly in [12 kHz, 0.45 * sr] < Nyquist for sr >= 44.1 kHz.
+    """Proves Milestone-3 DSP & timeline invariants:
+    1. Normalized signed windowed-sinc weights (|sum(w)| > 1e-12) preserve exact DC unity and
+       satisfy the signed-weight BIBO bound |y| <= M * sum(|w|) / |sum(w)|, plus a SAT sharpness
+       witness showing negative lobes produce |y| > M.
+    2. Ultrasonic LPF cutoff clamping stays strictly in [1 kHz, 0.48 * sr] < Nyquist for sr >= 8 kHz.
     3. Piecewise-constant tempo map beat<->seconds conversion is strictly monotonic and exact inverse.
     4. High-mid 2-12 kHz M/S Cauchy-Schwarz correlation + convex EMA stays strictly in [-1.0, 1.0].
     """
     results: dict[str, str] = {}
 
-    # 1. Normalized windowed-sinc FIR weights: exact DC unity and non-negative convex BIBO stability
+    # 1A. Normalized signed windowed-sinc FIR weights: exact DC unity & signed-weight BIBO bound
     s_sinc = z3.Solver()
     w0, w1, w2, w3 = z3.Reals("w0 w1 w2 w3")
     x0, x1, x2, x3 = z3.Reals("x0 x1 x2 x3")
     c_dc, m_bound = z3.Reals("c_dc m_bound")
-    s_sinc.add(w0 >= 0.0, w1 >= 0.0, w2 >= 0.0, w3 >= 0.0)
     w_sum = w0 + w1 + w2 + w3
-    s_sinc.add(w_sum > 0.0, m_bound > 0.0)
+    s_sinc.add(z3_abs(w_sum) > 1e-12, m_bound >= 0.0)
     s_sinc.add(
         x0 >= -m_bound,
         x0 <= m_bound,
@@ -339,11 +344,42 @@ def prove_milestone3_sinc_ulpf_tempo_and_ms_invariants() -> dict[str, str]:
     )
     wn0, wn1, wn2, wn3 = w0 / w_sum, w1 / w_sum, w2 / w_sum, w3 / w_sum
     dc_out = (wn0 + wn1 + wn2 + wn3) * c_dc
-    bibo_out = wn0 * x0 + wn1 * x1 + wn2 * x2 + wn3 * x3
-    s_sinc.add(z3.Or(dc_out != c_dc, bibo_out > m_bound, bibo_out < -m_bound))
+    y = wn0 * x0 + wn1 * x1 + wn2 * x2 + wn3 * x3
+    l1_gain = (z3_abs(w0) + z3_abs(w1) + z3_abs(w2) + z3_abs(w3)) / z3_abs(w_sum)
+    signed_bound = m_bound * l1_gain
+    s_sinc.add(
+        z3.Or(dc_out != c_dc, y > signed_bound, y < -signed_bound, l1_gain < 1.0)
+    )
     assert s_sinc.check() == z3.unsat
-    results["sinc_resampler_dc_unity_and_bounded_gain_proof"] = (
-        "UNSAT (Proven normalized non-negative sinc weights preserve exact DC unity and [-M, M] BIBO bounds)"
+    results["sinc_resampler_dc_unity_and_signed_gain_bound_proof"] = (
+        "UNSAT (Proven normalized signed sinc weights preserve exact DC unity and |y| <= M * sum(|w|) / |sum(w)| for all |sum(w)| > 1e-12)"
+    )
+
+    # 1B. Companion SAT witness: negative sinc lobes strictly attain |y| = M * sum(|w|)/|sum(w)| > M
+    s_sinc_overshoot = z3.Solver()
+    ow0, ow1, ow2, ow3 = z3.Reals("ow0 ow1 ow2 ow3")
+    ox0, ox1, ox2, ox3 = z3.Reals("ox0 ox1 ox2 ox3")
+    om_bound = z3.Real("om_bound")
+    ow_sum = ow0 + ow1 + ow2 + ow3
+    s_sinc_overshoot.add(ow_sum > 1e-12, ow0 < 0.0, om_bound > 0.0)
+    s_sinc_overshoot.add(
+        ox0 >= -om_bound,
+        ox0 <= om_bound,
+        ox1 >= -om_bound,
+        ox1 <= om_bound,
+        ox2 >= -om_bound,
+        ox2 <= om_bound,
+        ox3 >= -om_bound,
+        ox3 <= om_bound,
+    )
+    own0, own1, own2, own3 = ow0 / ow_sum, ow1 / ow_sum, ow2 / ow_sum, ow3 / ow_sum
+    oy = own0 * ox0 + own1 * ox1 + own2 * ox2 + own3 * ox3
+    o_l1_gain = (z3_abs(ow0) + z3_abs(ow1) + z3_abs(ow2) + z3_abs(ow3)) / z3_abs(ow_sum)
+    o_signed_bound = om_bound * o_l1_gain
+    s_sinc_overshoot.add(oy == o_signed_bound, oy > om_bound)
+    assert s_sinc_overshoot.check() == z3.sat
+    results["sinc_resampler_negative_lobe_overshoot_witness"] = (
+        "SAT (Proven negative sinc lobes strictly attain |y| = M * sum(|w|)/|sum(w)| > M for bounded inputs)"
     )
 
     # 2. Ultrasonic LPF Nyquist guard matching RealtimeOpenSoothe::set_ultrasonic_lpf_hz ([1 kHz, 0.48*sr] < 0.5*sr)

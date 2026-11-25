@@ -131,8 +131,8 @@ flowchart TD
   9. **`beat_grid.rs` & `resample.rs` — Onset/DP Beat Tracking, WSOLA Time-Warping & Kaiser-Sinc / Polyphase Resampling:**
       - Computes a 10 ms sub+broadband onset-flux envelope and Ellis-style DP beat/downbeat trajectory to measure `median_bpm`, `max_bpm_drift`, and per-bar `TempoPoint` nodes (`tempo_map`).
       - Provides zero-pitch-shift stereo-locked WSOLA time-warping for `quantize_to_constant_bpm` and `align_vocal_double_dtw_elastic`, plus `sum_audio_buffers` (`restoration.rs`) and AI-telemetry-driven `DeFizzConfig::{ai_mix_from_audit, ai_vocal}` / `RestorationConfig::from_audit`.
-      - `resample.rs` implements DC-normalized Kaiser-windowed sinc offline resampling (`resample_buffer_sinc`) and zero-allocation 64-phase 16-tap polyphase streaming resampling (`RealtimeSincResampler`), while `RealtimeOpenSoothe` adds `set_ultrasonic_lpf_hz` and live 2–12 kHz stereo correlation & Mid/Side fizz telemetry.
-      - All core safety bounds (clamp panics, Hadamard orthogonality, FDN Lyapunov contraction, Cytomic SVF stability, sinc DC unity/BIBO gain, ultrasonic LPF Nyquist guard, tempo-map bijective roundtrips, and M/S Cauchy-Schwarz correlation bounds) are verified across 16 Z3 SMT proofs (`scripts/verify_dsp_invariants_z3.py`).
+      - `resample.rs` implements DC-normalized Kaiser-windowed sinc offline resampling (`resample_buffer_sinc`) and zero-allocation 512-phase 32-tap polyphase streaming resampling (`RealtimeSincResampler`), while `RealtimeOpenSoothe` adds `set_ultrasonic_lpf_hz` and live 2–12 kHz stereo correlation & Mid/Side fizz telemetry.
+      - All core safety bounds (clamp panics, Hadamard orthogonality, FDN Lyapunov contraction, Cytomic SVF stability, sinc DC unity & signed-weight L1 gain bound (+ negative-lobe overshoot witness), ultrasonic LPF Nyquist guard, tempo-map bijective roundtrips, and M/S Cauchy-Schwarz correlation bounds) are verified across 17 Z3 SMT checks (`scripts/verify_dsp_invariants_z3.py`).
 
 ---
 

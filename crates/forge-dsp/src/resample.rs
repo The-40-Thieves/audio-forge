@@ -342,4 +342,209 @@ mod tests {
             "expected ~4800 output samples from 0.1s 44.1->48k, got {total}"
         );
     }
+
+    fn eval_offline_kernel(in_sr: u32, out_sr: u32, frac: f64) -> (Vec<f64>, f64, f64) {
+        let ratio = f64::from(out_sr) / f64::from(in_sr);
+        let cutoff = ratio.clamp(0.02, 1.0);
+        let half_taps = ((BASE_HALF_TAPS as f64) / cutoff)
+            .ceil()
+            .clamp(BASE_HALF_TAPS as f64, MAX_HALF_TAPS as f64) as usize;
+        let half_width = half_taps as f64;
+        let inv_i0_beta = 1.0 / bessel_i0(KAISER_BETA);
+        let k_start = -(half_taps as isize - 1);
+        let k_end = half_taps as isize;
+
+        let mut weights = Vec::with_capacity(half_taps * 2);
+        let mut w_sum = 0.0_f64;
+        let mut abs_sum = 0.0_f64;
+        for k in k_start..=k_end {
+            let d = (k as f64) - frac;
+            let w = kaiser_sinc_weight(d, cutoff, half_width, inv_i0_beta);
+            weights.push(w);
+            w_sum += w;
+            abs_sum += w.abs();
+        }
+        let l1_gain = abs_sum / w_sum.abs();
+        (weights, w_sum, l1_gain)
+    }
+
+    #[test]
+    fn offline_kaiser_sinc_kernels_have_dc_unity_negative_lobes_and_bounded_l1_gain() {
+        let rate_pairs = [
+            (44_100, 48_000),
+            (48_000, 96_000),
+            (44_100, 96_000),
+            (48_000, 44_100),
+            (96_000, 48_000),
+            (96_000, 44_100),
+            (192_000, 44_100),
+        ];
+        let phases = [0.0, 0.25, 0.5, 0.75, 1.0 / 3.0, 2.0 / 3.0];
+
+        for (in_sr, out_sr) in rate_pairs {
+            for frac in phases {
+                let (weights, w_sum, l1_gain) = eval_offline_kernel(in_sr, out_sr, frac);
+                assert!(
+                    w_sum > 0.5,
+                    "{in_sr}->{out_sr} frac={frac}: w_sum={w_sum} <= 0.5"
+                );
+                let norm_sum: f64 = weights.iter().map(|w| w / w_sum).sum();
+                assert!(
+                    (norm_sum - 1.0).abs() < 1e-12,
+                    "{in_sr}->{out_sr} frac={frac}: normalized DC sum={norm_sum}"
+                );
+                assert!(
+                    (1.0..=2.85).contains(&l1_gain),
+                    "{in_sr}->{out_sr} frac={frac}: l1_gain={l1_gain} outside [1.0, 2.85]"
+                );
+                if frac > 0.0 {
+                    let min_w = weights.iter().copied().fold(f64::INFINITY, f64::min);
+                    assert!(
+                        min_w < 0.0 && l1_gain > 1.0,
+                        "{in_sr}->{out_sr} frac={frac}: expected negative lobes, min_w={min_w}, l1_gain={l1_gain}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn offline_step_overshoot_matches_signed_l1_bound_and_exact_half_sample_peak() {
+        let step_len = 512;
+        let mut step = vec![0.0_f64; step_len];
+        step[step_len / 2..].fill(1.0);
+        let step_buf = AudioBuffer::from_channels(vec![step], 48_000).expect("step buf");
+        let up = resample_buffer_sinc(&step_buf, 96_000).expect("resample 48->96k");
+
+        let max_sample = up.channels[0]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let (_, _, l1_half) = eval_offline_kernel(48_000, 96_000, 0.5);
+        assert!(
+            (max_sample - 1.13587).abs() < 1e-4,
+            "expected ~1.13587 half-sample step overshoot, got {max_sample:.8} (l1_half={l1_half:.8})"
+        );
+        assert!(
+            max_sample <= l1_half + 1e-12,
+            "step peak {max_sample} exceeded signed L1 gain {l1_half}"
+        );
+
+        let (weights, w_sum, _) = eval_offline_kernel(48_000, 96_000, 0.5);
+        let k_start = -(BASE_HALF_TAPS as isize - 1);
+        let center = 200_isize;
+        let mut adv = vec![0.0_f64; 400];
+        for (idx_offset, &w) in weights.iter().enumerate() {
+            let idx = (center + k_start + idx_offset as isize) as usize;
+            adv[idx] = if w >= 0.0 { 0.8 } else { -0.8 };
+        }
+        let adv_buf = AudioBuffer::from_channels(vec![adv], 48_000).expect("adv buf");
+        let adv_up = resample_buffer_sinc(&adv_buf, 96_000).expect("resample adv");
+        // Out frame 2*center + 1 samples fractional pos (center + 0.5) => frac = 0.5
+        let y_adv = adv_up.channels[0][(center as usize) * 2 + 1];
+        let expected_adv = 0.8 * l1_half;
+        assert!(
+            (y_adv - expected_adv).abs() < 1e-12 && y_adv <= expected_adv + 1e-12,
+            "adversarial sign-matched peak {y_adv:.12} != 0.8*l1_half {expected_adv:.12} (w_sum={w_sum})"
+        );
+    }
+
+    #[test]
+    fn realtime_polyphase_table_validates_dc_unity_and_signed_l1_bounds() {
+        for (in_sr, out_sr) in [
+            (44_100.0, 48_000.0),
+            (48_000.0, 96_000.0),
+            (96_000.0, 48_000.0),
+            (48_000.0, 44_100.0),
+        ] {
+            let rt = RealtimeSincResampler::new(in_sr, out_sr);
+            let mut saw_negative = false;
+            let mut max_row_l1 = 0.0_f64;
+            for p in 0..RT_PHASES {
+                let row = &rt.table[p * RT_TAPS..(p + 1) * RT_TAPS];
+                assert!(row.iter().all(|w| w.is_finite()));
+                let row_sum: f64 = row.iter().sum();
+                let row_l1: f64 = row.iter().map(|w| w.abs()).sum();
+                assert!(
+                    (row_sum - 1.0).abs() < 1e-12,
+                    "{in_sr}->{out_sr} phase {p}: row_sum={row_sum}"
+                );
+                assert!(
+                    (1.0..=2.6).contains(&row_l1),
+                    "{in_sr}->{out_sr} phase {p}: row_l1={row_l1} outside [1.0, 2.6]"
+                );
+                max_row_l1 = max_row_l1.max(row_l1);
+                if row.iter().any(|&w| w < 0.0) && row_l1 > 1.0 {
+                    saw_negative = true;
+                }
+            }
+            assert!(
+                saw_negative,
+                "{in_sr}->{out_sr}: expected negative lobes in polyphase table"
+            );
+
+            if (in_sr - 48_000.0).abs() < 1e-6 && (out_sr - 96_000.0).abs() < 1e-6 {
+                let mut rt_step = RealtimeSincResampler::new(in_sr, out_sr);
+                let mut out_l = [0.0_f32; 4];
+                let mut out_r = [0.0_f32; 4];
+                let mut max_out = 0.0_f32;
+                for i in 0..256 {
+                    let s = if i < 128 { 0.0_f32 } else { 1.0_f32 };
+                    let n = rt_step.process_stereo_sample(s, s, &mut out_l, &mut out_r);
+                    for k in 0..n {
+                        assert!(out_l[k].is_finite() && out_r[k].is_finite());
+                        max_out = max_out.max(out_l[k].abs()).max(out_r[k].abs());
+                    }
+                }
+                assert!(
+                    f64::from(max_out) > 1.0 && f64::from(max_out) <= max_row_l1 + 1e-5,
+                    "48->96k RT step peak {max_out} out of (1.0, {max_row_l1}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sinc_resampling_true_peak_overshoot_and_delivery_ceiling_enforcement() {
+        let mut step = vec![0.0_f64; 512];
+        step[256..].fill(1.0);
+        let step_buf = AudioBuffer::from_channels(vec![step], 48_000).expect("step");
+        let up = resample_buffer_sinc(&step_buf, 96_000).expect("upsample");
+        let (_, tp_dbtp, _) = crate::loudness_limiter::compute_true_peak(&up);
+        let (_, _, l1_half) = eval_offline_kernel(48_000, 96_000, 0.5);
+        assert!(
+            tp_dbtp.is_finite() && tp_dbtp > 1.0 && tp_dbtp <= 20.0 * l1_half.log10() + 0.5,
+            "unexpected true peak on 48->96k step: {tp_dbtp} dBTP (l1_half={l1_half})"
+        );
+
+        let n_44k = 44_100 * 3;
+        let square_44k: Vec<f64> = (0..n_44k)
+            .map(|i| if (i / 48) % 2 == 0 { 0.95 } else { -0.95 })
+            .collect();
+        let stem_44k = AudioBuffer::from_channels(vec![square_44k.clone(), square_44k], 44_100)
+            .expect("44.1k hot stem");
+        let fallback_48k = AudioBuffer::new(2, 48_000 * 3, 48_000).expect("48k fallback");
+        let (_, report) = crate::delivery::resum_and_deliver_ai_stems(
+            &[&stem_44k],
+            &fallback_48k,
+            crate::delivery::DeliveryTarget::Spotify,
+        )
+        .expect("deliver resampled stem");
+        let tp_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "true_peak")
+            .expect("true_peak check present");
+        assert!(
+            tp_check.passed,
+            "true_peak delivery check failed: {:?}",
+            tp_check
+        );
+        assert!(
+            report.after.true_peak_dbtp
+                <= crate::delivery::DeliveryTarget::Spotify.ceiling_dbtp() + 0.1,
+            "true peak after delivery {} exceeded Spotify ceiling",
+            report.after.true_peak_dbtp
+        );
+    }
 }
