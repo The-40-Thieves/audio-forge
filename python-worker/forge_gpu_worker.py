@@ -30,6 +30,7 @@ import importlib
 import json
 import math
 import os
+import shutil
 import struct
 import sys
 from collections.abc import Mapping, Sequence
@@ -518,18 +519,25 @@ def _separate_multistem_with_fallback(
 
 
 def _restore_wav_bandwidth(src_path: Path, out_path: Path, drive: float = 0.12) -> Path:
-    """Phase-coherent spectral bandwidth restoration fallback for 16/24/32-bit PCM & float WAVs.
+    """Phase-coherent spectral bandwidth restoration fallback for WAV and non-WAV audio.
 
     Synthesizes gentle upper-band harmonic air from the first-order high-frequency difference
-    signal and blends it at ``drive`` (~ -18 dB). Falls back to ``src_path`` for stub/mock files.
+    signal and blends it at ``drive`` (~ -18 dB). Always writes/stages inside ``out_path``'s
+    directory so returned paths never escape ``output_dir``.
     """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     decoded = _read_wav_float(src_path)
     if decoded is None:
-        return src_path
+        try:
+            decoded = _read_audio_float(src_path)
+        except RuntimeError:
+            shutil.copy2(src_path, out_path)
+            return out_path
     channels, sr, sw, fmt = decoded
     nframes = len(channels[0]) if channels else 0
     if nframes <= 1:
-        return src_path
+        shutil.copy2(src_path, out_path)
+        return out_path
     out_channels: list[list[float]] = []
     for ch in channels:
         dst = list(ch)
@@ -1147,11 +1155,14 @@ def _rescue_via_resemble(input_path: Path, out_path: Path) -> Path:
     if hasattr(inf, "enhance_file"):
         inf.enhance_file(str(input_path), str(out_path))
         return out_path
+    torch = importlib.import_module("torch")
+    cuda = getattr(torch, "cuda", None)
+    device = "cuda" if cuda is not None and cuda.is_available() else "cpu"
     torchaudio = importlib.import_module("torchaudio")
     wav, sr = torchaudio.load(str(input_path))
     mono = wav.mean(dim=0)
-    denoised, _ = inf.denoise(mono, sr, "cpu")
-    enhanced, new_sr = inf.enhance(denoised, sr, "cpu")
+    denoised, _ = inf.denoise(mono, sr, device)
+    enhanced, new_sr = inf.enhance(denoised, sr, device)
     torchaudio.save(str(out_path), enhanced.unsqueeze(0), new_sr)
     return out_path
 
@@ -1206,6 +1217,14 @@ def _rescue_via_roformer_chain(
         warnings.append(f"vocals-revive failed ({exc}); using denoise-roformer")
         current = _denoise_with_roformer(current, output_dir)
         stages.append("denoise-roformer")
+    resolved_out = output_dir.resolve()
+    if current == input_path or not current.resolve().is_relative_to(resolved_out):
+        staged = _validated_output_path(
+            output_dir,
+            f"{_safe_stem(input_path)}_vocal_rescued{input_path.suffix or '.wav'}",
+        )
+        shutil.copy2(current, staged)
+        current = staged
     return current, stages
 
 
@@ -1660,7 +1679,7 @@ def _load_sha256_manifest() -> dict[str, str]:
     raw = os.environ.get("FORGE_MODEL_SHA256_MANIFEST", "").strip()
     if not raw:
         return {}
-    path = Path(raw).expanduser().resolve()
+    path = _validate_worker_path(Path(raw), must_exist_file=True)
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, Mapping):
         raise ValueError("FORGE_MODEL_SHA256_MANIFEST must contain a JSON object")

@@ -21,6 +21,7 @@ hist_r = 3088;
 tp_c1 = 3104;
 tp_c2 = 3120;
 tp_c3 = 3136;
+seg = 4096;
 tp_taps = 12;
 h_pos = 0;
 w_pos = 0;
@@ -28,6 +29,20 @@ gain_env = 1.0;
 rel_env = 1.0;
 att_a = exp(-1.0 / (srate_safe * 0.0005));
 pdc_delay = lookahead;
+pdc_bot_ch = 0;
+pdc_top_ch = 2;
+pdc_bot_ch = 0;
+pdc_top_ch = 2;
+
+function seg_set(idx, val) local(p) (
+  p = 1024 + idx;
+  seg[p] = val;
+  p = floor(p * 0.5);
+  while(p >= 1) (
+    seg[p] = max(seg[p + p], seg[p + p + 1]);
+    p = floor(p * 0.5);
+  );
+);
 
 // Precompute DC-normalized 12-tap 4x polyphase Hann-windowed sinc FIR coefficients
 function init_tp_phase(dst, frac) local(k, d, u, win, s, w, sum_w) (
@@ -62,6 +77,8 @@ rel_slow_a = exp(-1.0 / (srate_safe * (max(30.0, slider3 * 3.0) * 0.001)));
 unity_mode = slider4 > 0.5;
 comp_lin = unity_mode ? min(1.0, 1.0 / max(0.01, drive_lin)) : 1.0;
 pdc_delay = lookahead;
+pdc_bot_ch = 0;
+pdc_top_ch = 2;
 
 @sample
 in_l = spl0 * drive_lin;
@@ -92,19 +109,19 @@ tp_max = max(tp_max, max(abs(p1_l), abs(p1_r)));
 tp_max = max(tp_max, max(abs(p2_l), abs(p2_r)));
 tp_max = max(tp_max, max(abs(p3_l), abs(p3_r)));
 
-// Align centered true-peak measurement into the lookahead peak ring
+// Evict expiring slot from O(log N) sliding-window max tree and record raw + true-peak maxima
+exp_pos = (w_pos - lookahead - 1 + buf_size) % buf_size;
+seg_set(exp_pos, 0.0);
+cur_raw_pk = max(abs(in_l), abs(in_r));
 tp_pos = (w_pos - 6 + buf_size) % buf_size;
-peak_buf[w_pos] = max(abs(in_l), abs(in_r));
-peak_buf[tp_pos] = max(peak_buf[tp_pos], tp_max);
+peak_buf[w_pos] = cur_raw_pk;
+seg_set(w_pos, cur_raw_pk);
+tp_pk = max(peak_buf[tp_pos], tp_max);
+peak_buf[tp_pos] = tp_pk;
+seg_set(tp_pos, tp_pk);
 
-// Scan lookahead window so gain reduction leads peaks and enforces ceiling without flat-top clipping
-win_peak = 0.0;
-j = 0;
-loop(lookahead + 1,
-  p_idx = (w_pos - j + buf_size) % buf_size;
-  win_peak = max(win_peak, peak_buf[p_idx]);
-  j += 1;
-);
+// O(1) root query gives exact maximum across [w_pos - lookahead ..= w_pos]
+win_peak = seg[1];
 
 req_win = win_peak > ceil_lin ? (ceil_lin / max(1e-9, win_peak)) : 1.0;
 r_pos = (w_pos - lookahead + buf_size) % buf_size;

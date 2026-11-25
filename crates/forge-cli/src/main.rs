@@ -76,15 +76,15 @@ enum Commands {
         /// Stereo gain linking (0.0 = dual-mono, 1.0 = linked stereo)
         #[arg(long, default_value_t = 1.0, value_parser = parse_unit_interval)]
         stereo_link: f64,
-        /// Mid/Side focus (-1.0 = Mid only, 0.0 = balanced, +1.0 = Side only)
-        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true, value_parser = parse_mid_side)]
-        mid_side: f64,
+        /// Mid/Side focus (-1.0 = Mid only, 0.0 = balanced, +1.0 = Side only; default: auto with --ai-mode, else 0.0)
+        #[arg(long, allow_negative_numbers = true, value_parser = parse_mid_side)]
+        mid_side: Option<f64>,
         /// Fundamental hum frequency (50 or 60 Hz; 0 to disable; default: 60 or auto with --ai-mode)
         #[arg(long)]
         hum_hz: Option<f64>,
-        /// Airwindows Console8 / ChowTape analog warmth drive (0.0 to 1.0)
-        #[arg(long, default_value_t = 0.15, value_parser = parse_unit_interval)]
-        tape_drive: f64,
+        /// Airwindows Console8 / ChowTape analog warmth drive (0.0 to 1.0; default: auto with --ai-mode, else 0.15)
+        #[arg(long, value_parser = parse_unit_interval)]
+        tape_drive: Option<f64>,
         /// Enable steeper OpenSoothe suppression slope (0.95) for stubborn AI codec buzz
         #[arg(long)]
         hard_mode: bool,
@@ -615,7 +615,11 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             } else if !ai_mode {
                 rest_cfg.hum_fundamental_hz = Some(60.0);
             }
-            rest_cfg.analog_tape_drive = tape_drive;
+            if let Some(drive) = tape_drive {
+                rest_cfg.analog_tape_drive = drive;
+            } else if !ai_mode {
+                rest_cfg.analog_tape_drive = 0.15;
+            }
             let stage1 = run_full_restoration_chain(&buf, &rest_cfg)?;
             let mut defizz_cfg = if ai_mode {
                 DeFizzConfig::ai_mix_from_audit(&audit_audio(&stage1))
@@ -631,7 +635,11 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             defizz_cfg.delta_listen = delta_listen;
             defizz_cfg.tilt_db_per_oct = tilt;
             defizz_cfg.stereo_link = stereo_link;
-            defizz_cfg.mid_side_balance = mid_side;
+            if let Some(ms) = mid_side {
+                defizz_cfg.mid_side_balance = ms;
+            } else if !ai_mode {
+                defizz_cfg.mid_side_balance = 0.0;
+            }
             defizz_cfg.hard_mode |= hard_mode;
             if hpss_shimmer > 0.0 {
                 defizz_cfg.hpss_shimmer_suppress = hpss_shimmer;
@@ -1920,6 +1928,59 @@ mod tests {
                 Cli::try_parse_from(&bad_cmd).is_err(),
                 "{bad_cmd:?} must be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn restore_ai_mode_leaves_mid_side_and_tape_drive_unset_by_default() {
+        let ai_cli =
+            Cli::try_parse_from(["forge", "restore", "in.wav", "-o", "out.wav", "--ai-mode"])
+                .expect("parse ai-mode restore");
+        match ai_cli.command {
+            Commands::Restore {
+                mid_side,
+                tape_drive,
+                ai_mode,
+                ..
+            } => {
+                assert!(ai_mode);
+                assert_eq!(mid_side, None);
+                assert_eq!(tape_drive, None);
+            }
+            other => {
+                let _ = other;
+                panic!("unexpected command variant");
+            }
+        }
+
+        let explicit_cli = Cli::try_parse_from([
+            "forge",
+            "restore",
+            "in.wav",
+            "-o",
+            "out.wav",
+            "--ai-mode",
+            "--mid-side",
+            "0.4",
+            "--tape-drive",
+            "0.25",
+        ])
+        .expect("parse explicit restore overrides");
+        match explicit_cli.command {
+            Commands::Restore {
+                mid_side,
+                tape_drive,
+                ai_mode,
+                ..
+            } => {
+                assert!(ai_mode);
+                assert_eq!(mid_side, Some(0.4));
+                assert_eq!(tape_drive, Some(0.25));
+            }
+            other => {
+                let _ = other;
+                panic!("unexpected command variant");
+            }
         }
     }
 }

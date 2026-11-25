@@ -14,6 +14,15 @@ prev_u_l = 0.0; prev_f1_l = 0.0;
 prev_u_r = 0.0; prev_f1_r = 0.0;
 ln2 = log(2.0);
 
+function safe_tanh(x) local(ax, s, e) (
+  ax = abs(x);
+  s = x >= 0.0 ? 1.0 : -1.0;
+  ax >= 20.0 ? s : (
+    e = exp(-2.0 * ax);
+    s * (1.0 - e) / (1.0 + e)
+  );
+);
+
 @slider
 density_amt = slider1;
 drive_lin = 10 ^ (slider2 / 20);
@@ -37,7 +46,7 @@ au_l = abs(u_l);
 f1_l = au_l + log(1.0 + exp(-2.0 * au_l)) - ln2;
 du_l = u_l - prev_u_l;
 mid_l = 0.5 * (u_l + prev_u_l);
-y_l = abs(du_l) < 0.0001 ? ((exp(mid_l) - exp(-mid_l)) / (exp(mid_l) + exp(-mid_l))) : ((f1_l - prev_f1_l) / du_l);
+y_l = abs(du_l) < 0.0001 ? safe_tanh(mid_l) : ((f1_l - prev_f1_l) / du_l);
 prev_u_l = u_l;
 prev_f1_l = f1_l;
 
@@ -46,7 +55,7 @@ au_r = abs(u_r);
 f1_r = au_r + log(1.0 + exp(-2.0 * au_r)) - ln2;
 du_r = u_r - prev_u_r;
 mid_r = 0.5 * (u_r + prev_u_r);
-y_r = abs(du_r) < 0.0001 ? ((exp(mid_r) - exp(-mid_r)) / (exp(mid_r) + exp(-mid_r))) : ((f1_r - prev_f1_r) / du_r);
+y_r = abs(du_r) < 0.0001 ? safe_tanh(mid_r) : ((f1_r - prev_f1_r) / du_r);
 prev_u_r = u_r;
 prev_f1_r = f1_r;
 

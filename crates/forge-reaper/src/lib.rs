@@ -1127,7 +1127,10 @@ mod tests {
         assert!(JSFX_MASTER_LIMITER.contains("init_tp_phase(tp_c2, 0.50)"));
         assert!(JSFX_MASTER_LIMITER.contains("init_tp_phase(tp_c3, 0.75)"));
         assert!(JSFX_MASTER_LIMITER.contains("peak_buf["));
-        assert!(JSFX_MASTER_LIMITER.contains("loop(lookahead + 1,"));
+        assert!(JSFX_MASTER_LIMITER.contains("seg_set("));
+        assert!(JSFX_MASTER_LIMITER.contains("pdc_bot_ch = 0;"));
+        assert!(JSFX_MASTER_LIMITER.contains("pdc_top_ch = 2;"));
         assert!(JSFX_MASTER_LIMITER.contains("gain_env = min(gain_env, req_here);"));
+        assert!(JSFX_DENSITY_CLIPPER.contains("safe_tanh("));
     }
 }

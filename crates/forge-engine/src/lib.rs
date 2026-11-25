@@ -464,6 +464,17 @@ mod tests {
             );
         }
 
+        // Complete project JSON with unsupported schema_version (0 or > PROJECT_SCHEMA_VERSION) must error.
+        for bad_ver in [0_u32, 999_u32] {
+            let mut bad_schema =
+                serde_json::to_value(DawProject::new("BadVer", 48_000, 120.0)).unwrap();
+            bad_schema["schema_version"] = serde_json::json!(bad_ver);
+            assert!(
+                DawProject::from_json(&serde_json::to_string(&bad_schema).unwrap()).is_err(),
+                "schema_version {bad_ver} must be rejected"
+            );
+        }
+
         // Case 1: out-of-range sample rate, zero BPM, and zero time signature must clamp safely.
         let mut case1 = serde_json::to_value(DawProject::new("BadSR", 48_000, 120.0)).unwrap();
         case1["sample_rate"] = serde_json::json!(0);

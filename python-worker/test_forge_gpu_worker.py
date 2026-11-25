@@ -758,6 +758,28 @@ class NoDeadCheckpointsTests(TestCase):
             self.assertNotIn(bad, worker_src)
             self.assertNotIn(bad, nb_src)
 
+        # Ensure MCP forge://models resource stays in sync with forge_gpu_worker.py constants.
+        mcp_res = (
+            repo_root / "crates" / "forge-mcp" / "src" / "resources.rs"
+        ).read_text(encoding="utf-8")
+        for expected in (
+            worker.MEL_ROFORMER_VOCAL_MODEL,
+            worker.BS_ROFORMER_VOCAL_MODEL,
+            worker.BS_ROFORMER_SIX_STEM_MODEL,
+            worker.DEREVERB_MODEL,
+            worker.DEREVERB_ECHO_MODEL,
+            worker.DENOISE_ROFORMER_MODEL,
+            worker.DEBLEED_MODEL,
+            worker.ASPIRATION_MODEL,
+            worker.VOCAL_REVIVE_MODEL,
+            worker.DRUMSEP_MODEL,
+            worker.KARAOKE_MODEL,
+            '"rmvpe", "fcpe", "autocorr"',
+        ):
+            self.assertIn(expected, mcp_res)
+        for bad_f0 in ("torchcrepe", "librosa-yin"):
+            self.assertNotIn(bad_f0, mcp_res)
+
 
 class NewTasksTests(TestCase):
     @staticmethod
@@ -1079,6 +1101,102 @@ class NewTasksTests(TestCase):
                     0.24,
                     delta=0.001,
                 )
+
+    def test_restore_and_roformer_chain_never_escape_output_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inp_dir = root / "in"
+            out_dir = root / "out"
+            inp_dir.mkdir()
+            out_dir.mkdir()
+            fake_mp3 = inp_dir / "song.mp3"
+            fake_mp3.write_bytes(b"ID3not-a-real-mp3")
+            out_wav = out_dir / "restored.wav"
+
+            restored = worker._restore_wav_bandwidth(fake_mp3, out_wav)
+            self.assertTrue(restored.resolve().is_relative_to(out_dir.resolve()))
+            self.assertTrue(restored.is_file())
+
+            class NoOpSep:
+                def __init__(self, **_kw: object) -> None:
+                    pass
+
+                def load_model(self, model_filename: str = "") -> None:
+                    _ = model_filename
+
+                def separate(self, _inp: str) -> list[str]:
+                    return []
+
+            fake_sep_mod = types.ModuleType("audio_separator.separator")
+            fake_sep_mod.Separator = NoOpSep  # type: ignore[attr-defined]
+            fake_pkg = types.ModuleType("audio_separator")
+            warnings: list[str] = []
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "audio_separator": fake_pkg,
+                    "audio_separator.separator": fake_sep_mod,
+                },
+            ):
+                rescued, _stages = worker._rescue_via_roformer_chain(
+                    fake_mp3, out_dir, False, False, warnings
+                )
+            self.assertTrue(rescued.resolve().is_relative_to(out_dir.resolve()))
+            self.assertTrue(rescued.is_file())
+
+    def test_rescue_via_resemble_selects_cuda_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inp = root / "in.wav"
+            out = root / "out.wav"
+            NewTasksTests._write_click_wav(inp, secs=0.2)
+            seen_devices: list[str] = []
+
+            class FakeTensor:
+                def mean(self, dim: int = 0) -> FakeTensor:
+                    _ = dim
+                    return self
+
+                def unsqueeze(self, dim: int = 0) -> FakeTensor:
+                    _ = dim
+                    return self
+
+            fake_inf = types.ModuleType("resemble_enhance.enhancer.inference")
+
+            def _denoise(mono: object, sr: int, device: str) -> tuple[object, int]:
+                seen_devices.append(device)
+                return mono, sr
+
+            def _enhance(denoised: object, sr: int, device: str) -> tuple[object, int]:
+                seen_devices.append(device)
+                return denoised, sr
+
+            fake_inf.denoise = _denoise  # type: ignore[attr-defined]
+            fake_inf.enhance = _enhance  # type: ignore[attr-defined]
+            fake_resemble = types.ModuleType("resemble_enhance")
+            fake_resemble_enh = types.ModuleType("resemble_enhance.enhancer")
+            fake_ta = types.ModuleType("torchaudio")
+            fake_ta.load = lambda _p: (FakeTensor(), 48_000)  # type: ignore[attr-defined]
+            fake_ta.save = lambda p, _w, _sr: Path(p).write_bytes(b"RIFF")  # type: ignore[attr-defined]
+
+            for cuda_ok, expected_dev in ((True, "cuda"), (False, "cpu")):
+                seen_devices.clear()
+                fake_torch = types.ModuleType("torch")
+                fake_torch.cuda = types.SimpleNamespace(  # type: ignore[attr-defined]
+                    is_available=lambda ok=cuda_ok: ok
+                )
+                with mock.patch.dict(
+                    sys.modules,
+                    {
+                        "resemble_enhance": fake_resemble,
+                        "resemble_enhance.enhancer": fake_resemble_enh,
+                        "resemble_enhance.enhancer.inference": fake_inf,
+                        "torchaudio": fake_ta,
+                        "torch": fake_torch,
+                    },
+                ):
+                    worker._rescue_via_resemble(inp, out)
+                self.assertEqual(seen_devices, [expected_dev, expected_dev])
 
 
 if __name__ == "__main__":

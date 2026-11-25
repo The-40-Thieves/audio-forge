@@ -55,14 +55,16 @@ fn targets_payload() -> Value {
 fn models_payload() -> Value {
     json!({
         "stem_separation": {
-            "fast": "mel_band_roformer_vocals_fv4_gabox.ckpt",
+            "fast": "vocals_mel_band_roformer.ckpt",
             "studio": "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
-            "six_stem": "bs_roformer_sw_fixed.ckpt",
-            "dereverb": "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt",
+            "six_stem": "BS-Roformer-SW.ckpt",
+            "dereverb": "deverb_bs_roformer_8_384dim_10depth.ckpt",
             "dereverb_echo": "dereverb-echo_mel_band_roformer_sdr_13.4843_v2.ckpt",
+            "denoise": "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt",
             "debleed": "mel_band_roformer_bleed_suppressor_v1.ckpt",
-            "de_aspiration": "aspiration_mel_band_roformer_less_aggr_sdr_18.1201.ckpt",
-            "drumsep": "MDX23C-8KFFT-InstVoc_HQ_DrumSep_5stem.ckpt",
+            "de_aspiration": "aspiration_mel_band_roformer_sdr_18.9845.ckpt",
+            "vocal_revive": "bs_roformer_vocals_revive_v3e_unwa.ckpt",
+            "drumsep": "MDX23C-DrumSep-aufr33-jarredou.ckpt",
             "karaoke": "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
         },
         "backends": {
@@ -71,7 +73,7 @@ fn models_payload() -> Value {
             "vocal_rescue": ["auto", "resemble-enhance", "seed-vc", "roformer-clean"],
             "beat_track": ["auto", "beat-this", "librosa", "energy", "rust"],
             "evaluate_quality": ["auto", "audiobox", "singmos", "acoustic-proxy", "rust"],
-            "f0_track": ["auto", "rmvpe", "torchcrepe", "librosa-yin", "autocorr"],
+            "f0_track": ["auto", "rmvpe", "fcpe", "autocorr"],
         }
     })
 }

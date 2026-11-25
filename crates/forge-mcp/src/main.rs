@@ -17,7 +17,7 @@ mod toctou_tests;
 mod tools;
 
 use clap::Parser;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use hyper_util::service::TowerToHyperService;
 use rmcp::model::{
@@ -36,7 +36,9 @@ use sandbox::PathSandbox;
 use serde_json::Value;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::TcpListener;
+use std::time::Duration;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, watch};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TransportMode {
@@ -272,13 +274,142 @@ fn resolve_http_policy(
     Ok((disable_host_check, secret))
 }
 
+fn parse_authority_host(authority: &str) -> Option<&str> {
+    if authority.contains('/')
+        || authority.contains('@')
+        || authority.contains('?')
+        || authority.contains('#')
+    {
+        return None;
+    }
+    if let Some(after_open) = authority.strip_prefix('[') {
+        let (ip6, port_part) = after_open.split_once(']')?;
+        if !port_part.is_empty()
+            && port_part
+                .strip_prefix(':')
+                .is_none_or(|p| p.parse::<u16>().is_err())
+        {
+            return None;
+        }
+        return Some(ip6);
+    }
+    match authority.rsplit_once(':') {
+        Some((h, p)) if p.parse::<u16>().is_ok() => Some(h),
+        Some(_) => None,
+        None => Some(authority),
+    }
+}
+
+fn is_allowed_loopback_origin(headers: &hyper::HeaderMap) -> bool {
+    let Some(val) = headers.get(hyper::header::ORIGIN) else {
+        return true;
+    };
+    let Ok(origin) = val.to_str() else {
+        return false;
+    };
+    let Some(authority) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let Some(host) = parse_authority_host(authority) else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+fn static_http_response<B>(
+    status: hyper::StatusCode,
+    with_bearer_challenge: bool,
+    body: &'static [u8],
+) -> hyper::Response<AuthBody<B>> {
+    let mut builder = hyper::Response::builder().status(status);
+    if with_bearer_challenge {
+        builder = builder.header(hyper::header::WWW_AUTHENTICATE, "Bearer");
+    }
+    builder
+        .body(AuthBody::Unauthorized(body))
+        .expect("valid HTTP response")
+}
+
+fn preflight_http_request<B>(
+    headers: &hyper::HeaderMap,
+    auth_header: Option<&str>,
+    enforce_loopback_origin: bool,
+) -> Option<hyper::Response<AuthBody<B>>> {
+    if enforce_loopback_origin && !is_allowed_loopback_origin(headers) {
+        return Some(static_http_response(
+            hyper::StatusCode::FORBIDDEN,
+            false,
+            b"Forbidden origin\n",
+        ));
+    }
+    if let Some(expected) = auth_header
+        && !check_bearer_auth(headers, expected)
+    {
+        return Some(static_http_response(
+            hyper::StatusCode::UNAUTHORIZED,
+            true,
+            b"Unauthorized\n",
+        ));
+    }
+    None
+}
+
+async fn serve_http_connection(
+    stream: TcpStream,
+    svc: TowerToHyperService<StreamableHttpService<ForgeMcpServer, LocalSessionManager>>,
+    auth_header: Option<Arc<str>>,
+    enforce_loopback_origin: bool,
+    mut shutdown_rx: watch::Receiver<bool>,
+    _permit: OwnedSemaphorePermit,
+) {
+    let io = TokioIo::new(stream);
+    let hyper_svc =
+        hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+            let svc = svc.clone();
+            let auth_header = auth_header.clone();
+            async move {
+                if let Some(denied) = preflight_http_request(
+                    req.headers(),
+                    auth_header.as_deref(),
+                    enforce_loopback_origin,
+                ) {
+                    return Ok::<_, std::convert::Infallible>(denied);
+                }
+                let resp = hyper::service::Service::call(&svc, req)
+                    .await
+                    .expect("TowerToHyperService error is Infallible");
+                Ok::<_, std::convert::Infallible>(resp.map(AuthBody::Upstream))
+            }
+        });
+    let mut builder = AutoServerBuilder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(30));
+    let conn = builder.serve_connection(io, hyper_svc);
+    tokio::select! {
+        res = conn => {
+            if let Err(err) = res {
+                eprintln!("forge-mcp: HTTP connection error: {err}");
+            }
+        }
+        _ = shutdown_rx.wait_for(|&closed| closed) => {}
+    }
+}
+
 async fn run_http_on_listener(
     server: ForgeMcpServer,
     listener: TcpListener,
     mut config: StreamableHttpServerConfig,
     expected_secret: Option<Arc<str>>,
+    enforce_loopback_origin: bool,
 ) {
     let ct = config.cancellation_token.clone();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(64));
     let mcp_svc = TowerToHyperService::new(StreamableHttpService::new(
         move || Ok(server.clone()),
         Arc::new(LocalSessionManager::default()),
@@ -291,47 +422,22 @@ async fn run_http_on_listener(
                 let Ok((stream, _)) = accepted else {
                     break;
                 };
-                let svc = mcp_svc.clone();
-                let auth_header = expected_secret.clone();
-                let conn_ct = ct.child_token();
-                tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let hyper_svc = hyper::service::service_fn(
-                        move |req: hyper::Request<hyper::body::Incoming>| {
-                            let svc = svc.clone();
-                            let auth_header = auth_header.clone();
-                            async move {
-                                if let Some(ref expected) = auth_header
-                                    && !check_bearer_auth(req.headers(), expected)
-                                {
-                                    let resp = hyper::Response::builder()
-                                        .status(hyper::StatusCode::UNAUTHORIZED)
-                                        .header(hyper::header::WWW_AUTHENTICATE, "Bearer")
-                                        .body(AuthBody::Unauthorized(b"Unauthorized\n"))
-                                        .expect("valid 401 response");
-                                    return Ok::<_, std::convert::Infallible>(resp);
-                                }
-                                let resp = hyper::service::Service::call(&svc, req)
-                                    .await
-                                    .expect("TowerToHyperService error is Infallible");
-                                Ok::<_, std::convert::Infallible>(resp.map(AuthBody::Upstream))
-                            }
-                        },
-                    );
-                    let builder = AutoServerBuilder::new(TokioExecutor::new());
-                    let conn = builder.serve_connection(io, hyper_svc);
-                    tokio::select! {
-                        res = conn => {
-                            if let Err(err) = res {
-                                eprintln!("forge-mcp: HTTP connection error: {err}");
-                            }
-                        }
-                        _ = conn_ct.cancelled() => {}
-                    }
-                });
+                let Ok(permit) = conn_limit.clone().try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
+                tokio::spawn(serve_http_connection(
+                    stream,
+                    mcp_svc.clone(),
+                    expected_secret.clone(),
+                    enforce_loopback_origin,
+                    shutdown_rx.clone(),
+                    permit,
+                ));
             }
         }
     }
+    let _ = shutdown_tx.send(true);
 }
 
 async fn run_http(
@@ -355,7 +461,14 @@ async fn run_http(
         let _ = tokio::signal::ctrl_c().await;
         shutdown_ct.cancel();
     });
-    run_http_on_listener(server, listener, config, secret.map(Arc::<str>::from)).await;
+    run_http_on_listener(
+        server,
+        listener,
+        config,
+        secret.map(Arc::<str>::from),
+        !disable_host_check,
+    )
+    .await;
     Ok(())
 }
 
@@ -1287,7 +1400,7 @@ mod tests {
         let config = StreamableHttpServerConfig::default();
         let ct = config.cancellation_token.clone();
         let handle = tokio::spawn(async move {
-            run_http_on_listener(server, listener, config, Some(Arc::from("s3cr3t"))).await;
+            run_http_on_listener(server, listener, config, Some(Arc::from("s3cr3t")), true).await;
         });
 
         async fn send_http(addr: SocketAddr, req_head: &str) -> String {
@@ -1323,6 +1436,30 @@ mod tests {
         assert!(
             bad_host.starts_with("HTTP/1.1 403 ") || bad_host.starts_with("HTTP/1.1 421 "),
             "expected Host rejection on loopback, got: {bad_host}"
+        );
+
+        let bad_origin = send_http(
+            local_addr,
+            &format!(
+                "POST / HTTP/1.1\r\nHost: {local_addr}\r\nOrigin: https://evil.example\r\nConnection: close\r\nAuthorization: Bearer s3cr3t\r\nContent-Length: 0\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            bad_origin.starts_with("HTTP/1.1 403 "),
+            "expected Origin rejection on loopback, got: {bad_origin}"
+        );
+
+        let good_origin = send_http(
+            local_addr,
+            &format!(
+                "POST / HTTP/1.1\r\nHost: {local_addr}\r\nOrigin: http://127.0.0.1:3000\r\nConnection: close\r\nAuthorization: Bearer s3cr3t\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: 2\r\n\r\n{{}}"
+            ),
+        )
+        .await;
+        assert!(
+            !good_origin.starts_with("HTTP/1.1 401 ") && !good_origin.starts_with("HTTP/1.1 403 "),
+            "loopback Origin was unexpectedly rejected: {good_origin}"
         );
 
         let valid_auth = send_http(
@@ -1428,5 +1565,34 @@ mod tests {
             rpp.contains("LENGTH 2.0000"),
             "expected 2.0 s LENGTH even at 48k session SR: {rpp}"
         );
+    }
+
+    #[test]
+    fn daw_inspect_resolves_relative_clip_paths_from_project_dir_inside_sandbox() {
+        let (_root, sb) = setup_mix_sandbox(0.05, 48_000);
+        let sub_dir = _root.path().join("session");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let wav_buf = AudioBuffer::new(2, 4_800, 48_000).unwrap();
+        let rel_wav = Path::new("stems").join("clip.wav");
+        std::fs::create_dir_all(sub_dir.join("stems")).unwrap();
+        wav_buf.save_wav(sub_dir.join(&rel_wav), 24).unwrap();
+
+        let mut proj = forge_engine::DawProject::new("RelTest", 48_000, 120.0);
+        let obj_id = proj.alloc_id();
+        proj.tracks[0].objects.push(forge_engine::AudioObject::new(
+            obj_id, "Clip", rel_wav, 4_800,
+        ));
+        let proj_path = sub_dir.join("test.forgeproj");
+        proj.save_to_file(&proj_path).unwrap();
+
+        let out = call_tool(
+            &sb,
+            "forge_daw_inspect",
+            json!({ "project": proj_path.to_string_lossy() }),
+        );
+        assert!(!is_error(&out), "inspect failed: {}", text(&out));
+        let payload: Value = serde_json::from_str(text(&out)).expect("inspect JSON");
+        let missing = payload["missing_clips"].as_array().unwrap();
+        assert!(missing.is_empty(), "unexpected missing clips: {missing:?}");
     }
 }

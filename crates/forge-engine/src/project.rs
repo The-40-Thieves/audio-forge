@@ -904,6 +904,12 @@ impl DawProject {
             )));
         }
         let mut proj: Self = serde_json::from_str(raw)?;
+        if proj.schema_version == 0 || proj.schema_version > PROJECT_SCHEMA_VERSION {
+            return Err(ForgeError::InvalidParameter(format!(
+                "Unsupported project schema_version {} (supported: 1..={PROJECT_SCHEMA_VERSION})",
+                proj.schema_version
+            )));
+        }
         proj.sample_rate = proj.sample_rate.clamp(8_000, 384_000);
         if !proj.bpm.is_finite() {
             proj.bpm = 120.0;

@@ -144,6 +144,7 @@ pub struct RealtimeSincResampler {
     write_pos: usize,
     /// Flattened polyphase kernel table (`RT_PHASES * RT_TAPS`), pre-allocated in `new`.
     table: Vec<f64>,
+    table_valid: bool,
 }
 
 impl RealtimeSincResampler {
@@ -157,28 +158,45 @@ impl RealtimeSincResampler {
             hist_r: [0.0; RT_HIST_LEN],
             write_pos: 0,
             table: vec![0.0; RT_PHASES * RT_TAPS],
+            table_valid: false,
         };
         resampler.reset(in_sr, out_sr);
         resampler
     }
 
-    /// Resets circular buffers and rebuilds the polyphase filter table in place with zero allocations.
-    pub fn reset(&mut self, in_sr: f64, out_sr: f64) {
-        self.in_sr = if in_sr.is_finite() {
-            in_sr.clamp(8_000.0, 768_000.0)
-        } else {
-            48_000.0
-        };
-        self.out_sr = if out_sr.is_finite() {
-            out_sr.clamp(8_000.0, 768_000.0)
-        } else {
-            48_000.0
-        };
-        self.step = self.in_sr / self.out_sr;
+    /// Clears circular delay lines and fractional phase accumulator without recomputing the
+    /// polyphase filter table (strictly $O(\text{RT\_HIST\_LEN})$, RT-audio-thread safe).
+    pub fn clear_state(&mut self) {
         self.phase_pos = 0.0;
         self.hist_l.fill(0.0);
         self.hist_r.fill(0.0);
         self.write_pos = 0;
+    }
+
+    /// Resets circular buffers and rebuilds the polyphase filter table in place with zero
+    /// allocations when the sample-rate pair changed.
+    pub fn reset(&mut self, in_sr: f64, out_sr: f64) {
+        let new_in_sr = if in_sr.is_finite() {
+            in_sr.clamp(8_000.0, 768_000.0)
+        } else {
+            48_000.0
+        };
+        let new_out_sr = if out_sr.is_finite() {
+            out_sr.clamp(8_000.0, 768_000.0)
+        } else {
+            48_000.0
+        };
+        if self.table_valid
+            && (self.in_sr - new_in_sr).abs() < 1e-6
+            && (self.out_sr - new_out_sr).abs() < 1e-6
+        {
+            self.clear_state();
+            return;
+        }
+        self.in_sr = new_in_sr;
+        self.out_sr = new_out_sr;
+        self.step = self.in_sr / self.out_sr;
+        self.clear_state();
 
         let cutoff = (self.out_sr / self.in_sr).clamp(0.05, 1.0);
         let half_width = RT_HALF_TAPS as f64;
@@ -203,6 +221,7 @@ impl RealtimeSincResampler {
                 }
             }
         }
+        self.table_valid = true;
     }
 
     /// Feeds one stereo input sample and emits 0 or more resampled output frames into `out_l`/`out_r`.
@@ -546,5 +565,36 @@ mod tests {
             "true peak after delivery {} exceeded Spotify ceiling",
             report.after.true_peak_dbtp
         );
+    }
+
+    #[test]
+    fn clear_state_and_same_rate_reset_preserve_table_with_identical_output() {
+        let mut r1 = RealtimeSincResampler::new(48_000.0, 44_100.0);
+        let table_snapshot = r1.table.clone();
+        let mut out_l = [0.0_f32; 4];
+        let mut out_r = [0.0_f32; 4];
+        for i in 0..64 {
+            let s = ((i as f32) * 0.1).sin();
+            r1.process_stereo_sample(s, -s, &mut out_l, &mut out_r);
+        }
+
+        // Same-rate reset and clear_state must preserve polyphase weights and produce identical output.
+        r1.reset(48_000.0, 44_100.0);
+        assert_eq!(r1.table, table_snapshot);
+
+        let mut r2 = RealtimeSincResampler::new(48_000.0, 44_100.0);
+        r2.clear_state();
+        for i in 0..64 {
+            let s = ((i as f32) * 0.25).sin();
+            let mut l1 = [0.0_f32; 4];
+            let mut r_ch1 = [0.0_f32; 4];
+            let mut l2 = [0.0_f32; 4];
+            let mut r_ch2 = [0.0_f32; 4];
+            let n1 = r1.process_stereo_sample(s, -s, &mut l1, &mut r_ch1);
+            let n2 = r2.process_stereo_sample(s, -s, &mut l2, &mut r_ch2);
+            assert_eq!(n1, n2);
+            assert_eq!(l1[..n1], l2[..n2]);
+            assert_eq!(r_ch1[..n1], r_ch2[..n2]);
+        }
     }
 }

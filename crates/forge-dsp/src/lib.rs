@@ -145,6 +145,17 @@ mod tests {
     }
 
     #[test]
+    fn opensoothe_ultrasonic_lpf_bypasses_below_1000_hz() {
+        let mut soothe = RealtimeOpenSoothe::new(48_000.0);
+        soothe.set_ultrasonic_lpf_hz(500.0);
+        assert_eq!(soothe.ultrasonic_lpf_hz(), 0.0);
+        soothe.set_ultrasonic_lpf_hz(999.0);
+        assert_eq!(soothe.ultrasonic_lpf_hz(), 0.0);
+        soothe.set_ultrasonic_lpf_hz(16_000.0);
+        assert!((soothe.ultrasonic_lpf_hz() - 16_000.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn transient_sharpness_covers_tail_at_44_1khz() {
         let frames = 529_200;
         let mut mono = vec![0.0_f64; frames];

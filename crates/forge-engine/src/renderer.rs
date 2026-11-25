@@ -225,10 +225,10 @@ impl ClipCache {
     /// Loads a WAV/audio file from disk and resamples it to `target_sr` if its native rate differs,
     /// guaranteeing pitch, playback speed, and timeline object duration match the project clock.
     pub fn load_clip_for_rate(&mut self, path: &Path, target_sr: u32) -> Result<Arc<AudioBuffer>> {
-        if let Some(existing) = self.clips.get(path) {
-            if existing.sample_rate == target_sr {
-                return Ok(Arc::clone(existing));
-            }
+        if let Some(existing) = self.clips.get(path)
+            && existing.sample_rate == target_sr
+        {
+            return Ok(Arc::clone(existing));
         }
         let raw = AudioBuffer::load(path)?;
         let converted = forge_dsp::resample_buffer_sinc(&raw, target_sr)?;

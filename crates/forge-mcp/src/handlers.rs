@@ -1251,6 +1251,23 @@ fn tool_separate_stems(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput
     Ok(payload.into())
 }
 
+fn resolve_daw_clip_path(
+    source_path: &Path,
+    project_dir: Option<&Path>,
+    sandbox: &PathSandbox,
+) -> Result<std::path::PathBuf, ForgeError> {
+    if !source_path.is_relative() {
+        return sandbox.check(source_path);
+    }
+    if let Some(dir) = project_dir
+        && let Ok(candidate) = sandbox.check(&dir.join(source_path))
+        && candidate.is_file()
+    {
+        return Ok(candidate);
+    }
+    sandbox.resolve(&source_path.to_string_lossy())
+}
+
 fn load_sandboxed_daw_project(
     project_path: &Path,
     sandbox: &PathSandbox,
@@ -1276,9 +1293,10 @@ fn load_sandboxed_daw_project(
     let proj = forge_engine::DawProject::from_json(&raw)?;
     let mut cache = forge_engine::ClipCache::default();
     let mut missing_clips = Vec::new();
+    let proj_dir = project_path.parent();
     for tr in &proj.tracks {
         for obj in &tr.objects {
-            let safe_clip = sandbox.check(&obj.source_path)?;
+            let safe_clip = resolve_daw_clip_path(&obj.source_path, proj_dir, sandbox)?;
             match sandbox.load_audio(&safe_clip) {
                 Ok(buf) => {
                     cache.insert_memory_clip(obj.source_path.clone(), buf);
