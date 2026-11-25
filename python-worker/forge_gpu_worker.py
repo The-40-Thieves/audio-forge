@@ -1410,15 +1410,9 @@ def run_beat_track(
     raise RuntimeError("All beat-tracking backends failed")
 
 
-def _read_audio_float(path: Path) -> tuple[list[list[float]], int, int, int]:
-    """Decode WAV natively or non-WAV formats via soundfile/librosa/audioread. Raises on failure."""
-    safe_path = _validate_worker_path(path, must_exist_file=True)
-    wav = _read_wav_float(safe_path)
-    if wav is not None:
-        return wav
-
-    decode_errors: list[str] = []
-
+def _decode_with_soundfile(
+    safe_path: Path, decode_errors: list[str]
+) -> tuple[list[list[float]], int, int, int] | None:
     try:
         sf = importlib.import_module("soundfile")
         data, sr_sf = sf.read(str(safe_path), always_2d=True, dtype="float64")
@@ -1429,7 +1423,12 @@ def _read_audio_float(path: Path) -> tuple[list[list[float]], int, int, int]:
             return chans, int(sr_sf), 2, 1
     except (ImportError, RuntimeError, OSError, ValueError) as exc:
         decode_errors.append(f"soundfile: {exc}")
+    return None
 
+
+def _decode_with_librosa(
+    safe_path: Path, decode_errors: list[str]
+) -> tuple[list[list[float]], int, int, int] | None:
     try:
         librosa = importlib.import_module("librosa")
         y, sr_lb = librosa.load(str(safe_path), sr=None, mono=False)
@@ -1441,7 +1440,12 @@ def _read_audio_float(path: Path) -> tuple[list[list[float]], int, int, int]:
             return chans, int(sr_lb), 2, 1
     except (ImportError, RuntimeError, OSError, ValueError) as exc:
         decode_errors.append(f"librosa: {exc}")
+    return None
 
+
+def _decode_with_audioread(
+    safe_path: Path, decode_errors: list[str]
+) -> tuple[list[list[float]], int, int, int] | None:
     try:
         ar = importlib.import_module("audioread")
         with ar.audio_open(str(safe_path)) as af:
@@ -1459,6 +1463,25 @@ def _read_audio_float(path: Path) -> tuple[list[list[float]], int, int, int]:
                     return chans_ar, ar_sr, 2, 1
     except (ImportError, RuntimeError, OSError, ValueError) as exc:
         decode_errors.append(f"audioread: {exc}")
+    return None
+
+
+def _read_audio_float(path: Path) -> tuple[list[list[float]], int, int, int]:
+    """Decode WAV natively or non-WAV formats via soundfile/librosa/audioread. Raises on failure."""
+    safe_path = _validate_worker_path(path, must_exist_file=True)
+    wav = _read_wav_float(safe_path)
+    if wav is not None:
+        return wav
+
+    decode_errors: list[str] = []
+    for decoder in (
+        _decode_with_soundfile,
+        _decode_with_librosa,
+        _decode_with_audioread,
+    ):
+        decoded = decoder(safe_path, decode_errors)
+        if decoded is not None:
+            return decoded
 
     detail = f" ({'; '.join(decode_errors)})" if decode_errors else ""
     raise RuntimeError(f"Unable to decode audio file for analysis: {safe_path}{detail}")

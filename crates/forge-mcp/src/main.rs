@@ -16,6 +16,7 @@ mod sandbox;
 mod toctou_tests;
 mod tools;
 
+use clap::Parser;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use hyper_util::service::TowerToHyperService;
@@ -46,47 +47,41 @@ enum TransportMode {
     },
 }
 
-fn parse_cli_args(args: &[String]) -> Result<TransportMode, String> {
-    let mut http_addr: Option<SocketAddr> = None;
-    let mut allow_non_loopback = false;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--http" => {
-                let raw = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--http requires a <host:port> socket address".to_string())?;
-                let parsed: SocketAddr = raw
-                    .parse()
-                    .map_err(|e| format!("Invalid --http address '{raw}': {e}"))?;
-                http_addr = Some(parsed);
-                i += 2;
-            }
-            "--allow-non-loopback" => {
-                allow_non_loopback = true;
-                i += 1;
-            }
-            other => {
-                return Err(format!(
-                    "Unknown argument '{other}'. Usage: forge-mcp [--http <ip:port> [--allow-non-loopback]]"
-                ));
-            }
-        }
-    }
-    match http_addr {
+#[derive(Debug, Clone, Parser)]
+#[command(name = "forge-mcp", version, about = "ForgeAudio Studio MCP Server")]
+struct McpCli {
+    /// Serve Streamable HTTP MCP transport on <host:port> instead of stdio.
+    #[arg(long, value_name = "HOST:PORT")]
+    http: Option<SocketAddr>,
+
+    /// Allow binding Streamable HTTP to non-loopback addresses (requires FORGE_MCP_HTTP_TOKEN).
+    #[arg(long)]
+    allow_non_loopback: bool,
+}
+
+fn cli_to_transport_mode(cli: McpCli) -> Result<TransportMode, String> {
+    match cli.http {
         None => Ok(TransportMode::Stdio),
         Some(addr) => {
-            if !addr.ip().is_loopback() && !allow_non_loopback {
+            if !addr.ip().is_loopback() && !cli.allow_non_loopback {
                 return Err(format!(
                     "Refusing non-loopback HTTP bind address '{addr}' without --allow-non-loopback"
                 ));
             }
             Ok(TransportMode::Http {
                 addr,
-                allow_non_loopback,
+                allow_non_loopback: cli.allow_non_loopback,
             })
         }
     }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_cli_args(args: &[String]) -> Result<TransportMode, String> {
+    let cli =
+        McpCli::try_parse_from(std::iter::once("forge-mcp").chain(args.iter().map(String::as_str)))
+            .map_err(|e| e.to_string())?;
+    cli_to_transport_mode(cli)
 }
 
 #[derive(Clone)]
@@ -254,7 +249,7 @@ fn check_bearer_auth(headers: &hyper::HeaderMap, expected: &str) -> bool {
 fn resolve_http_policy(
     addr: SocketAddr,
     allow_non_loopback: bool,
-    raw_token: Option<&str>,
+    raw_secret: Option<&str>,
 ) -> Result<(bool, Option<String>), String> {
     let is_loopback = addr.ip().is_loopback();
     if !is_loopback && !allow_non_loopback {
@@ -262,11 +257,11 @@ fn resolve_http_policy(
             "Refusing non-loopback HTTP bind address '{addr}' without --allow-non-loopback"
         ));
     }
-    let token = raw_token
+    let secret = raw_secret
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string);
-    if !is_loopback && token.is_none() {
+    if !is_loopback && secret.is_none() {
         return Err(
             "Refusing non-loopback HTTP bind without a non-empty FORGE_MCP_HTTP_TOKEN bearer secret"
                 .to_string(),
@@ -274,14 +269,14 @@ fn resolve_http_policy(
     }
     // Never disable Host-header checks on loopback addresses even if --allow-non-loopback is passed.
     let disable_host_check = !is_loopback && allow_non_loopback;
-    Ok((disable_host_check, token))
+    Ok((disable_host_check, secret))
 }
 
 async fn run_http_on_listener(
     server: ForgeMcpServer,
     listener: TcpListener,
     mut config: StreamableHttpServerConfig,
-    bearer_token: Option<Arc<str>>,
+    expected_secret: Option<Arc<str>>,
 ) {
     let ct = config.cancellation_token.clone();
     let mcp_svc = TowerToHyperService::new(StreamableHttpService::new(
@@ -297,16 +292,16 @@ async fn run_http_on_listener(
                     break;
                 };
                 let svc = mcp_svc.clone();
-                let token = bearer_token.clone();
+                let auth_header = expected_secret.clone();
                 let conn_ct = ct.child_token();
                 tokio::spawn(async move {
                     let io = TokioIo::new(stream);
                     let hyper_svc = hyper::service::service_fn(
                         move |req: hyper::Request<hyper::body::Incoming>| {
                             let svc = svc.clone();
-                            let token = token.clone();
+                            let auth_header = auth_header.clone();
                             async move {
-                                if let Some(ref expected) = token
+                                if let Some(ref expected) = auth_header
                                     && !check_bearer_auth(req.headers(), expected)
                                 {
                                     let resp = hyper::Response::builder()
@@ -344,9 +339,9 @@ async fn run_http(
     addr: SocketAddr,
     allow_non_loopback: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let raw_token = std::env::var("FORGE_MCP_HTTP_TOKEN").ok();
-    let (disable_host_check, token) =
-        resolve_http_policy(addr, allow_non_loopback, raw_token.as_deref())
+    let raw_secret = std::env::var("FORGE_MCP_HTTP_TOKEN").ok();
+    let (disable_host_check, secret) =
+        resolve_http_policy(addr, allow_non_loopback, raw_secret.as_deref())
             .map_err(std::io::Error::other)?;
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
@@ -360,7 +355,7 @@ async fn run_http(
         let _ = tokio::signal::ctrl_c().await;
         shutdown_ct.cancel();
     });
-    run_http_on_listener(server, listener, config, token.map(Arc::<str>::from)).await;
+    run_http_on_listener(server, listener, config, secret.map(Arc::<str>::from)).await;
     Ok(())
 }
 
@@ -373,8 +368,8 @@ async fn main() {
         .with_env_filter(env_filter)
         .try_init();
 
-    let cli_args: Vec<String> = std::env::args().skip(1).collect();
-    let mode = match parse_cli_args(&cli_args) {
+    let cli = McpCli::parse();
+    let mode = match cli_to_transport_mode(cli) {
         Ok(m) => m,
         Err(msg) => {
             eprintln!("forge-mcp: {msg}");
