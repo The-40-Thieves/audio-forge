@@ -855,4 +855,160 @@ mod tests {
             rms(&m_active)
         );
     }
+
+    #[test]
+    fn open_spacer_aux_and_master_sidechain_keys_align_with_track_and_aux_pdc() {
+        let frames = 30_000_usize;
+        let mut cache = ClipCache::default();
+        let bed_path = PathBuf::from("mem://sc_pdc_bed.wav");
+        let key_path = PathBuf::from("mem://sc_pdc_key.wav");
+
+        cache.insert_memory_clip(bed_path.clone(), sine_clip(48_000, frames, 1_000.0, 0.5));
+
+        let mut key_ch = vec![0.0_f64; frames];
+        for (i, sample) in key_ch.iter_mut().enumerate().skip(16_000) {
+            *sample = 0.7 * (2.0 * PI * 1_000.0 * (i as f64) / 48_000.0).sin();
+        }
+        cache.insert_memory_clip(
+            key_path.clone(),
+            AudioBuffer::from_channels(vec![key_ch.clone(), key_ch], 48_000).expect("key clip"),
+        );
+
+        let zero_depth_soothe = FxSlotConfig::OpenSoothe {
+            bypass: false,
+            sensitivity_db: 0.0,
+            max_depth_db: 0.0,
+            sharpness_bins: 10,
+            low_latency: false,
+            tilt_db_per_oct: 0.0,
+            ultrasonic_lpf_hz: 0.0,
+            mid_side_balance: 0.0,
+            stereo_link: 1.0,
+            hard_mode: false,
+        };
+
+        let window_rms = |buf: &forge_core::AudioBuffer, start: usize, end: usize| -> f64 {
+            let slice = &buf.channels[0][start..end];
+            (slice.iter().map(|s| s * s).sum::<f64>() / (slice.len() as f64)).sqrt()
+        };
+
+        // 1. Aux-bus OpenSpacer aligns with 4096-sample track PDC (two OpenSoothe inserts on Bed)
+        let mut aux_proj = DawProject::new("AuxScPdcAlign", 48_000, 120.0);
+        aux_proj.master_inserts.clear();
+        aux_proj.aux_buses.clear();
+        let sc_track_id = aux_proj.tracks[1].id;
+        let bus_id = aux_proj.add_aux_bus("SpacerReturn");
+        aux_proj.tracks[0].objects.push(AudioObject::new(
+            20,
+            "Bed",
+            bed_path.clone(),
+            frames as u64,
+        ));
+        aux_proj.tracks[0].inserts.push(zero_depth_soothe.clone());
+        aux_proj.tracks[0].inserts.push(zero_depth_soothe.clone());
+        aux_proj.tracks[0].gain_db = -60.0;
+        aux_proj.tracks[0].sends.push(TrackSend {
+            bus_id,
+            gain_db: 0.0,
+            pre_fader: true,
+            mute: false,
+        });
+        aux_proj.aux_buses[0]
+            .inserts
+            .push(FxSlotConfig::OpenSpacer {
+                bypass: false,
+                amount: 1.0,
+                max_cut_db: 18.0,
+                low_hz: 200.0,
+                high_hz: 8_000.0,
+                mid_side_balance: 0.0,
+                delta_listen: false,
+                sidechain_track_id: Some(sc_track_id),
+            });
+        aux_proj.tracks[1].objects.push(AudioObject::new(
+            21,
+            "Key",
+            key_path.clone(),
+            frames as u64,
+        ));
+        aux_proj.tracks[1].gain_db = -60.0;
+
+        aux_proj.tracks[1].mute = true;
+        let aux_muted =
+            ObjectOrientedEngine::bounce_offline(&aux_proj, &cache, frames).expect("aux muted");
+        aux_proj.tracks[1].mute = false;
+        let aux_active =
+            ObjectOrientedEngine::bounce_offline(&aux_proj, &cache, frames).expect("aux active");
+
+        let aux_pre_muted = window_rms(&aux_muted, 12_500, 13_800);
+        let aux_pre_active = window_rms(&aux_active, 12_500, 13_800);
+        assert!(
+            aux_pre_active >= aux_pre_muted * 0.98,
+            "aux OpenSpacer ducked prematurely before burst: pre_muted={aux_pre_muted}, pre_active={aux_pre_active}"
+        );
+        let aux_post_muted = window_rms(&aux_muted, 20_000, 26_000);
+        let aux_post_active = window_rms(&aux_active, 20_000, 26_000);
+        assert!(
+            aux_post_active < aux_post_muted * 0.85,
+            "expected aux OpenSpacer ducking after burst: post_muted={aux_post_muted}, post_active={aux_post_active}"
+        );
+
+        // 2. Master-bus OpenSpacer aligns with max_track_latency (2048) + max_aux_latency (2048)
+        let mut master_proj = DawProject::new("MasterScPdcAlign", 48_000, 120.0);
+        master_proj.master_inserts.clear();
+        master_proj.aux_buses.clear();
+        let master_sc_id = master_proj.tracks[1].id;
+        let master_bus_id = master_proj.add_aux_bus("AuxPdc");
+        master_proj.aux_buses[0]
+            .inserts
+            .push(zero_depth_soothe.clone());
+        master_proj.tracks[0]
+            .objects
+            .push(AudioObject::new(22, "Bed", bed_path, frames as u64));
+        master_proj.tracks[0].inserts.push(zero_depth_soothe);
+        master_proj.tracks[0].sends.push(TrackSend {
+            bus_id: master_bus_id,
+            gain_db: -60.0,
+            pre_fader: false,
+            mute: false,
+        });
+        master_proj.master_inserts.push(FxSlotConfig::OpenSpacer {
+            bypass: false,
+            amount: 1.0,
+            max_cut_db: 18.0,
+            low_hz: 200.0,
+            high_hz: 8_000.0,
+            mid_side_balance: 0.0,
+            delta_listen: false,
+            sidechain_track_id: Some(master_sc_id),
+        });
+        master_proj.tracks[1]
+            .objects
+            .push(AudioObject::new(23, "Key", key_path, frames as u64));
+        master_proj.tracks[1].gain_db = -60.0;
+        assert_eq!(
+            ObjectOrientedEngine::compile(&master_proj, &cache).total_pdc_samples(),
+            6_144
+        );
+
+        master_proj.tracks[1].mute = true;
+        let m_muted =
+            ObjectOrientedEngine::bounce_offline(&master_proj, &cache, frames).expect("m muted");
+        master_proj.tracks[1].mute = false;
+        let m_active =
+            ObjectOrientedEngine::bounce_offline(&master_proj, &cache, frames).expect("m active");
+
+        let m_pre_muted = window_rms(&m_muted, 12_500, 13_800);
+        let m_pre_active = window_rms(&m_active, 12_500, 13_800);
+        assert!(
+            m_pre_active >= m_pre_muted * 0.98,
+            "master OpenSpacer ducked prematurely before burst: pre_muted={m_pre_muted}, pre_active={m_pre_active}"
+        );
+        let m_post_muted = window_rms(&m_muted, 20_000, 26_000);
+        let m_post_active = window_rms(&m_active, 20_000, 26_000);
+        assert!(
+            m_post_active < m_post_muted * 0.85,
+            "expected master OpenSpacer ducking after burst: post_muted={m_post_muted}, post_active={m_post_active}"
+        );
+    }
 }

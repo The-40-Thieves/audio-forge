@@ -1417,6 +1417,8 @@ def _read_audio_float(path: Path) -> tuple[list[list[float]], int, int, int]:
     if wav is not None:
         return wav
 
+    decode_errors: list[str] = []
+
     try:
         sf = importlib.import_module("soundfile")
         data, sr_sf = sf.read(str(safe_path), always_2d=True, dtype="float64")
@@ -1425,8 +1427,8 @@ def _read_audio_float(path: Path) -> tuple[list[list[float]], int, int, int]:
         if n_ch > 0 and int(sr_sf) > 0:
             chans = [[float(data[f][c]) for f in range(n_frames)] for c in range(n_ch)]
             return chans, int(sr_sf), 2, 1
-    except (ImportError, RuntimeError, OSError, ValueError):
-        pass
+    except (ImportError, RuntimeError, OSError, ValueError) as exc:
+        decode_errors.append(f"soundfile: {exc}")
 
     try:
         librosa = importlib.import_module("librosa")
@@ -1437,8 +1439,8 @@ def _read_audio_float(path: Path) -> tuple[list[list[float]], int, int, int]:
             chans = [[float(v) for v in row] for row in y.tolist()]
         if chans and chans[0] and int(sr_lb) > 0:
             return chans, int(sr_lb), 2, 1
-    except (ImportError, RuntimeError, OSError, ValueError):
-        pass
+    except (ImportError, RuntimeError, OSError, ValueError) as exc:
+        decode_errors.append(f"librosa: {exc}")
 
     try:
         ar = importlib.import_module("audioread")
@@ -1455,10 +1457,11 @@ def _read_audio_float(path: Path) -> tuple[list[list[float]], int, int, int]:
                             chans_ar[c_idx].append(pcm[i + c_idx] / 32768.0)
                 if chans_ar[0]:
                     return chans_ar, ar_sr, 2, 1
-    except (ImportError, RuntimeError, OSError, ValueError):
-        pass
+    except (ImportError, RuntimeError, OSError, ValueError) as exc:
+        decode_errors.append(f"audioread: {exc}")
 
-    raise RuntimeError(f"Unable to decode audio file for analysis: {safe_path}")
+    detail = f" ({'; '.join(decode_errors)})" if decode_errors else ""
+    raise RuntimeError(f"Unable to decode audio file for analysis: {safe_path}{detail}")
 
 
 def _acoustic_proxy_metrics(path: Path) -> dict[str, float | None]:
@@ -1548,8 +1551,8 @@ def _evaluate_single_file(
         aux = _acoustic_proxy_metrics(path)
         for key in ("crest_factor_db", "hf_ratio_db", "clipping_ratio"):
             metrics[key] = aux[key]
-    except (RuntimeError, OSError):
-        pass
+    except (RuntimeError, OSError) as exc:
+        warnings.append(f"acoustic proxy supplemental metrics skipped ({exc})")
     return metrics, "+".join(used_parts)
 
 
@@ -1941,7 +1944,9 @@ def _neural_f0_track(
             if torch_mod.cuda.is_available():
                 device = "cuda"
         except ImportError:
-            pass
+            device = (
+                "cpu"  # Fall back to CPU when optional PyTorch CUDA runtime is absent.
+            )
         model_cls = getattr(rmvpe_mod, "RMVPE", None)
         if model_cls is not None:
             model_path = os.environ.get("FORGE_RMVPE_MODEL", "").strip()

@@ -282,6 +282,11 @@ pub struct ObjectOrientedEngine {
     track_pre_r: Vec<f32>,
     track_prev_l: Vec<f32>,
     track_prev_r: Vec<f32>,
+    track_post_pdc_l: Vec<f32>,
+    track_post_pdc_r: Vec<f32>,
+    track_master_sc_pdc: Vec<PdcDelayLine>,
+    track_master_sc_l: Vec<f32>,
+    track_master_sc_r: Vec<f32>,
 }
 
 fn resolve_sidechain_sample(
@@ -438,6 +443,13 @@ impl ObjectOrientedEngine {
             track_pre_r: vec![0.0_f32; num_tracks],
             track_prev_l: vec![0.0_f32; num_tracks],
             track_prev_r: vec![0.0_f32; num_tracks],
+            track_post_pdc_l: vec![0.0_f32; num_tracks],
+            track_post_pdc_r: vec![0.0_f32; num_tracks],
+            track_master_sc_pdc: (0..num_tracks)
+                .map(|_| PdcDelayLine::new(max_aux_latency))
+                .collect(),
+            track_master_sc_l: vec![0.0_f32; num_tracks],
+            track_master_sc_r: vec![0.0_f32; num_tracks],
         }
     }
 
@@ -702,6 +714,13 @@ impl ObjectOrientedEngine {
         self.track_pre_r.fill(0.0);
         self.track_prev_l.fill(0.0);
         self.track_prev_r.fill(0.0);
+        self.track_post_pdc_l.fill(0.0);
+        self.track_post_pdc_r.fill(0.0);
+        self.track_master_sc_l.fill(0.0);
+        self.track_master_sc_r.fill(0.0);
+        for pdc in &mut self.track_master_sc_pdc {
+            pdc.reset();
+        }
     }
 
     #[inline]
@@ -932,6 +951,8 @@ impl ObjectOrientedEngine {
                     !tr.config.mute
                 };
                 if !audible {
+                    self.track_post_pdc_l[tr_idx] = 0.0;
+                    self.track_post_pdc_r[tr_idx] = 0.0;
                     continue;
                 }
 
@@ -953,6 +974,8 @@ impl ObjectOrientedEngine {
 
                 let pre_l = tr_l;
                 let pre_r = tr_r;
+                self.track_post_pdc_l[tr_idx] = pre_l;
+                self.track_post_pdc_r[tr_idx] = pre_r;
 
                 let gain_db = tr.config.volume_auto.evaluate(pos, tr.config.gain_db);
                 let pan = tr.config.pan_auto.evaluate(pos, tr.config.pan);
@@ -995,6 +1018,12 @@ impl ObjectOrientedEngine {
             }
             self.track_prev_l.copy_from_slice(&self.track_pre_l);
             self.track_prev_r.copy_from_slice(&self.track_pre_r);
+            for (tr_idx, pdc) in self.track_master_sc_pdc.iter_mut().enumerate() {
+                let (ml, mr) =
+                    pdc.process(self.track_post_pdc_l[tr_idx], self.track_post_pdc_r[tr_idx]);
+                self.track_master_sc_l[tr_idx] = ml;
+                self.track_master_sc_r[tr_idx] = mr;
+            }
 
             // Align Main Mix bus with parallel Aux bus PDC, then sum processed Aux returns
             (mix_l, mix_r) = self.main_bus_pdc.process(mix_l, mix_r);
@@ -1008,8 +1037,8 @@ impl ObjectOrientedEngine {
                     let sc = resolve_sidechain_sample(
                         &self.track_ids,
                         None,
-                        &self.track_pre_l,
-                        &self.track_pre_r,
+                        &self.track_post_pdc_l,
+                        &self.track_post_pdc_r,
                         cfg,
                     );
                     (bl, br) = proc_fx.process_stereo_with_sidechain(cfg, bl, br, sc);
@@ -1026,8 +1055,8 @@ impl ObjectOrientedEngine {
                 let sc = resolve_sidechain_sample(
                     &self.track_ids,
                     None,
-                    &self.track_pre_l,
-                    &self.track_pre_r,
+                    &self.track_master_sc_l,
+                    &self.track_master_sc_r,
                     cfg,
                 );
                 (mix_l, mix_r) = proc_fx.process_stereo_with_sidechain(cfg, mix_l, mix_r, sc);
