@@ -1007,8 +1007,6 @@ def run_denoise(
 
 
 def _restore_via_apollo(input_path: Path, out_path: Path, chunk_secs: float) -> Path:
-    import importlib
-
     model_id = os.environ.get("FORGE_APOLLO_MODEL", "JusperLee/Apollo")
     try:
         mod = importlib.import_module("apollo_restore")
@@ -1029,8 +1027,6 @@ def _restore_via_apollo(input_path: Path, out_path: Path, chunk_secs: float) -> 
 
 
 def _restore_via_flowhigh(input_path: Path, out_path: Path) -> Path:
-    import importlib
-
     mod = importlib.import_module("flowhigh")
     if hasattr(mod, "enhance_file"):
         mod.enhance_file(str(input_path), str(out_path))
@@ -1041,8 +1037,6 @@ def _restore_via_flowhigh(input_path: Path, out_path: Path) -> Path:
 
 
 def _restore_via_audiosr(input_path: Path, out_path: Path) -> Path:
-    import importlib
-
     audiosr = importlib.import_module("audiosr")
     model = audiosr.build_model(
         model_name=os.environ.get("FORGE_AUDIOSR_MODEL", "basic")
@@ -1061,8 +1055,6 @@ def _restore_via_audiosr(input_path: Path, out_path: Path) -> Path:
 def _restore_via_sonicmaster(
     input_path: Path, out_path: Path, prompt: str | None
 ) -> Path:
-    import importlib
-
     mod = importlib.import_module("sonicmaster")
     instruction = (
         prompt
@@ -1151,8 +1143,6 @@ def run_restore(
 
 
 def _rescue_via_resemble(input_path: Path, out_path: Path) -> Path:
-    import importlib
-
     inf = importlib.import_module("resemble_enhance.enhancer.inference")
     if hasattr(inf, "enhance_file"):
         inf.enhance_file(str(input_path), str(out_path))
@@ -1167,8 +1157,6 @@ def _rescue_via_resemble(input_path: Path, out_path: Path) -> Path:
 
 
 def _rescue_via_seedvc(input_path: Path, out_path: Path, reference_voice: Path) -> Path:
-    import importlib
-
     mod = importlib.import_module("seed_vc")
     if hasattr(mod, "convert_voice"):
         mod.convert_voice(str(input_path), str(reference_voice), str(out_path))
@@ -1353,7 +1341,7 @@ def _energy_beat_tracker(input_path: Path) -> tuple[list[float], list[float]]:
     flux.insert(0, 0.0)
     step_s = hop / sr
     min_lag = max(4, round((60.0 / 200.0) / step_s))
-    max_lag = max(min_lag + 1, round((60.0 / 60.0) / step_s))
+    max_lag = max(min_lag + 1, round(1.0 / step_s))  # 60 BPM = 1.0 s/beat
     best_lag = min_lag
     best_corr = -1.0
     for lag in range(min_lag, min(max_lag + 1, len(flux) // 2)):
@@ -1387,16 +1375,12 @@ def run_beat_track(
     for cand in order:
         try:
             if cand == "beat-this":
-                import importlib
-
                 mod = importlib.import_module("beat_this.inference")
                 file2beats = mod.File2Beats(checkpoint_path="final0")
                 raw_beats, raw_downbeats = file2beats(str(resolved_input))
                 beats = [round(float(t), 5) for t in raw_beats]
                 downbeats = [round(float(t), 5) for t in raw_downbeats]
             elif cand == "librosa":
-                import importlib
-
                 librosa = importlib.import_module("librosa")
                 y, sr = librosa.load(str(resolved_input), sr=None, mono=True)
                 _tempo, frames = librosa.beat.beat_track(y=y, sr=sr)
@@ -1528,8 +1512,6 @@ def _evaluate_single_file(
     used_parts: list[str] = []
     if backend in {"auto", "audiobox"}:
         try:
-            import importlib
-
             ab = importlib.import_module("audiobox_aesthetics.infer")
             pred = ab.initialize_predictor()
             scores = pred.forward([{"path": str(path)}])[0]
@@ -1547,8 +1529,6 @@ def _evaluate_single_file(
 
     if vocal and backend in {"auto", "singmos"}:
         try:
-            import importlib
-
             sm = importlib.import_module("singmos")
             score_val = float(sm.predict(str(path)))
             metrics["singmos"] = round(score_val, 4)
@@ -1899,15 +1879,28 @@ def _extract_f0_hz_sequence(raw: object) -> list[float]:
     return out
 
 
+def _resample_f0_sequence(hz_seq: Sequence[float], target_len: int) -> list[float]:
+    if not hz_seq or target_len <= 0:
+        return []
+    src_len = len(hz_seq)
+    if src_len == target_len:
+        return [float(v) for v in hz_seq]
+    return [
+        float(hz_seq[min(src_len - 1, (idx * src_len) // target_len)])
+        for idx in range(target_len)
+    ]
+
+
 def _neural_f0_track(
     mono: list[float],
     sr: int,
     hop_secs: float,
     backend: str,
 ) -> list[dict[str, object]]:
-    import importlib
-
+    if not mono:
+        return []
     hop_samples = max(1, int(round(sr * hop_secs)))
+    target_len = max(1, (len(mono) + hop_samples - 1) // hop_samples)
     if backend == "fcpe":
         fcpe_mod = importlib.import_module("torchfcpe")
         torch_mod = importlib.import_module("torch")
@@ -1916,15 +1909,29 @@ def _neural_f0_track(
         tensor = torch_mod.tensor(mono, dtype=torch_mod.float32, device=device)
         if tensor.ndim == 1:
             tensor = tensor.unsqueeze(0).unsqueeze(-1)
-        f0_raw = model.infer(
-            tensor,
-            sr=sr,
-            decoder_mode="local_argmax",
-            threshold=0.006,
-            f0_min=50.0,
-            f0_max=1100.0,
-            interp_uv=False,
-        )
+        try:
+            f0_raw = model.infer(
+                tensor,
+                sr=sr,
+                decoder_mode="local_argmax",
+                threshold=0.006,
+                f0_min=50.0,
+                f0_max=1100.0,
+                interp_uv=False,
+                output_interp_target_length=target_len,
+            )
+        except TypeError as exc:
+            if "output_interp_target_length" not in str(exc):
+                raise
+            f0_raw = model.infer(
+                tensor,
+                sr=sr,
+                decoder_mode="local_argmax",
+                threshold=0.006,
+                f0_min=50.0,
+                f0_max=1100.0,
+                interp_uv=False,
+            )
         hz_seq = _extract_f0_hz_sequence(f0_raw)
     elif backend == "rmvpe":
         rmvpe_mod = importlib.import_module("rmvpe")
@@ -1954,6 +1961,7 @@ def _neural_f0_track(
     else:
         raise ValueError(f"Unsupported neural F0 backend '{backend}'")
 
+    hz_seq = _resample_f0_sequence(hz_seq, target_len)
     frames: list[dict[str, object]] = []
     for idx, f0_val in enumerate(hz_seq):
         time_secs = round((idx * hop_samples) / sr, 6)

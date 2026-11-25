@@ -988,14 +988,20 @@ class NewTasksTests(TestCase):
                     return FakeTensor(vals)
 
             class FakeFcpeModel:
-                def infer(self, _t: object, **_kw: object) -> list[float]:
+                def __init__(self) -> None:
+                    self.seen_kwargs: dict[str, object] = {}
+
+                def infer(self, _t: object, **kw: object) -> list[float]:
+                    self.seen_kwargs = dict(kw)
                     return [220.0, 220.0, 0.0, 221.5]
+
+            fake_model = FakeFcpeModel()
 
             class FakeFcpeMod:
                 @staticmethod
                 def spawn_bundled_infer_model(device: str = "cpu") -> FakeFcpeModel:
                     _ = device
-                    return FakeFcpeModel()
+                    return fake_model
 
             with mock.patch.dict(
                 sys.modules, {"torchfcpe": FakeFcpeMod(), "torch": FakeTorch()}
@@ -1003,6 +1009,76 @@ class NewTasksTests(TestCase):
                 fcpe_res = worker.run_f0_track(wav_path, backend="fcpe", hop_secs=0.02)
                 self.assertEqual(fcpe_res["backend"], "fcpe")
                 self.assertEqual(fcpe_res["median_f0_hz"], 220.0)
+                self.assertEqual(
+                    fake_model.seen_kwargs.get("output_interp_target_length"), 13
+                )
+                fcpe_frames = fcpe_res["frames"]
+                assert isinstance(fcpe_frames, list)
+                self.assertEqual(len(fcpe_frames), 13)
+                self.assertLessEqual(float(fcpe_frames[-1]["time_secs"]), 0.25)  # type: ignore[arg-type]
+
+            class LegacyFcpeModel:
+                def infer(
+                    self,
+                    _t: object,
+                    *,
+                    sr: int,
+                    decoder_mode: str,
+                    threshold: float,
+                    f0_min: float,
+                    f0_max: float,
+                    interp_uv: bool,
+                ) -> list[float]:
+                    _ = (sr, decoder_mode, threshold, f0_min, f0_max, interp_uv)
+                    return [220.0] * 25
+
+            class LegacyFcpeMod:
+                @staticmethod
+                def spawn_bundled_infer_model(device: str = "cpu") -> LegacyFcpeModel:
+                    _ = device
+                    return LegacyFcpeModel()
+
+            with mock.patch.dict(
+                sys.modules, {"torchfcpe": LegacyFcpeMod(), "torch": FakeTorch()}
+            ):
+                legacy_res = worker.run_f0_track(
+                    wav_path, backend="fcpe", hop_secs=0.02
+                )
+                legacy_frames = legacy_res["frames"]
+                assert isinstance(legacy_frames, list)
+                self.assertEqual(len(legacy_frames), 13)
+                self.assertLessEqual(float(legacy_frames[-1]["time_secs"]), 0.25)  # type: ignore[arg-type]
+
+            class FakeRmvpeModel:
+                def __init__(self, *_a: object, **_kw: object) -> None:
+                    pass
+
+                def infer_from_audio(
+                    self, _mono: object, thred: float = 0.03
+                ) -> list[float]:
+                    _ = thred
+                    # Simulate native 10 ms hop (25 frames for 0.25 s audio)
+                    return [220.0] * 12 + [440.0] * 13
+
+            fake_rmvpe_mod = types.ModuleType("rmvpe")
+            fake_rmvpe_mod.RMVPE = FakeRmvpeModel  # type: ignore[attr-defined]
+            with mock.patch.dict(
+                sys.modules, {"rmvpe": fake_rmvpe_mod, "torch": FakeTorch()}
+            ):
+                rmvpe_res = worker.run_f0_track(
+                    wav_path, backend="rmvpe", hop_secs=0.02
+                )
+                self.assertEqual(rmvpe_res["backend"], "rmvpe")
+                rmvpe_frames = rmvpe_res["frames"]
+                assert isinstance(rmvpe_frames, list)
+                self.assertEqual(len(rmvpe_frames), 13)
+                self.assertAlmostEqual(float(rmvpe_frames[0]["f0_hz"]), 220.0)  # type: ignore[arg-type]
+                self.assertAlmostEqual(float(rmvpe_frames[-1]["f0_hz"]), 440.0)  # type: ignore[arg-type]
+                self.assertAlmostEqual(
+                    float(rmvpe_frames[-1]["time_secs"]),  # type: ignore[arg-type]
+                    0.24,
+                    delta=0.001,
+                )
 
 
 if __name__ == "__main__":

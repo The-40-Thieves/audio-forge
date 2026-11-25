@@ -37,6 +37,27 @@ fn apply_three_band_curve(eq: &mut RealtimeMasteringEq18, low_db: f32, mid_db: f
     eq.set_gains(&gains, 1.0);
 }
 
+/// Returns `true` iff `cfg` is a non-bypassed `OpenSpacer` whose configured
+/// `sidechain_track_id` resolves to a non-self track index in `track_ids`.
+#[inline]
+pub fn open_spacer_sidechain_active(
+    cfg: &FxSlotConfig,
+    self_track_idx: Option<usize>,
+    track_ids: &[u64],
+) -> bool {
+    matches!(
+        cfg,
+        FxSlotConfig::OpenSpacer {
+            bypass: false,
+            sidechain_track_id: Some(sc_id),
+            ..
+        } if track_ids
+            .iter()
+            .enumerate()
+            .any(|(idx, &id)| self_track_idx != Some(idx) && id == *sc_id)
+    )
+}
+
 /// Live zero-alloc DSP runtime corresponding to one [`FxSlotConfig`].
 pub enum FxProcessor {
     GainTrim,
@@ -160,6 +181,30 @@ impl FxProcessor {
                 _ => d.latency_samples() as usize,
             },
             _ => 0,
+        }
+    }
+
+    /// Algorithmic latency in samples reported for Plugin Delay Compensation (PDC),
+    /// validating any external `OpenSpacer` sidechain route against `track_ids`.
+    #[inline]
+    pub fn latency_samples_for(
+        &self,
+        cfg: &FxSlotConfig,
+        self_track_idx: Option<usize>,
+        track_ids: &[u64],
+    ) -> usize {
+        if cfg.is_bypassed() {
+            return 0;
+        }
+        match self {
+            Self::OpenSpacer(d) => {
+                if open_spacer_sidechain_active(cfg, self_track_idx, track_ids) {
+                    d.latency_samples() as usize
+                } else {
+                    0
+                }
+            }
+            _ => self.latency_samples(cfg),
         }
     }
 
