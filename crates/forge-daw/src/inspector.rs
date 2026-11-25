@@ -72,6 +72,17 @@ impl ForgeDawApp {
                 let splitting_now = self.stem_split_rx.is_some();
                 let prev_snapshot = self.project.clone();
                 let sr = f64::from(self.project.sample_rate.max(1));
+                let obj_track_id = self
+                    .project
+                    .find_object(obj_id)
+                    .map(|(ti, _)| self.project.tracks[ti].id);
+                let sidechain_tracks: Vec<(u64, String)> = self
+                    .project
+                    .tracks
+                    .iter()
+                    .filter(|t| Some(t.id) != obj_track_id)
+                    .map(|t| (t.id, t.name.clone()))
+                    .collect();
 
                 if let Some(obj) = self.project.object_mut(obj_id) {
                     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -210,6 +221,7 @@ impl ForgeDawApp {
                             "add_obj_fx",
                             "+ Add ForgeAudio FX...",
                             &mut obj.fx_chain,
+                            &sidechain_tracks,
                             true,
                         );
                     });
@@ -474,6 +486,7 @@ fn draw_fx_insert_list(
     combo_id: impl std::hash::Hash + std::fmt::Debug,
     add_label: &str,
     inserts: &mut Vec<FxSlotConfig>,
+    sidechain_tracks: &[(u64, String)],
     with_bypass: bool,
 ) -> bool {
     let mut changed = false;
@@ -489,27 +502,29 @@ fn draw_fx_insert_list(
         });
     let mut remove_idx = None;
     for (idx, fx) in inserts.iter_mut().enumerate() {
-        ui.group(|ui| {
-            ui.horizontal(|ui| {
-                if with_bypass {
-                    let mut active = !fx.is_bypassed();
-                    if ui.checkbox(&mut active, fx.display_name()).changed() {
-                        fx.set_bypass(!active);
-                        changed = true;
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.push_id(idx, |ui| {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    if with_bypass {
+                        let mut active = !fx.is_bypassed();
+                        if ui.checkbox(&mut active, fx.display_name()).changed() {
+                            fx.set_bypass(!active);
+                            changed = true;
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("X").clicked() {
+                                remove_idx = Some(idx);
+                            }
+                        });
+                    } else {
+                        ui.strong(fx.display_name());
                         if ui.small_button("X").clicked() {
                             remove_idx = Some(idx);
                         }
-                    });
-                } else {
-                    ui.strong(fx.display_name());
-                    if ui.small_button("X").clicked() {
-                        remove_idx = Some(idx);
                     }
-                }
+                });
+                changed |= draw_fx_slot_controls(ui, fx, sidechain_tracks);
             });
-            changed |= draw_fx_slot_controls(ui, fx);
         });
     }
     if let Some(rm) = remove_idx {
@@ -586,11 +601,26 @@ impl ForgeDawApp {
                 ))
                 .strong(),
             );
+            let current_track_id = self.project.tracks[tr_idx].id;
+            let track_sc_choices: Vec<(u64, String)> = self
+                .project
+                .tracks
+                .iter()
+                .filter(|t| t.id != current_track_id)
+                .map(|t| (t.id, t.name.clone()))
+                .collect();
+            let all_sc_choices: Vec<(u64, String)> = self
+                .project
+                .tracks
+                .iter()
+                .map(|t| (t.id, t.name.clone()))
+                .collect();
             changed |= draw_fx_insert_list(
                 ui,
                 "add_track_fx",
                 "+ Add Track Insert...",
                 &mut self.project.tracks[tr_idx].inserts,
+                &track_sc_choices,
                 false,
             );
 
@@ -615,6 +645,7 @@ impl ForgeDawApp {
                     ("add_aux_fx", bi),
                     "+ Add Aux Insert...",
                     &mut bus.inserts,
+                    &all_sc_choices,
                     false,
                 );
             }
@@ -626,6 +657,7 @@ impl ForgeDawApp {
                 "add_master_fx",
                 "+ Add Master Insert...",
                 &mut self.project.master_inserts,
+                &all_sc_choices,
                 false,
             );
         });
@@ -712,6 +744,9 @@ impl ForgeDawApp {
                         obj_name: format!("Denoised ({})", r.backend),
                         path: r.denoised,
                         start_samples: st,
+                        length_samples: 0,
+                        time_stretch: 1.0,
+                        pitch_semitones: 0.0,
                         summary: format!("Neural denoise complete ({})", r.backend),
                     })
                 });
@@ -732,6 +767,9 @@ impl ForgeDawApp {
                         obj_name: format!("Restored ({})", r.backend),
                         path: r.restored,
                         start_samples: st,
+                        length_samples: 0,
+                        time_stretch: 1.0,
+                        pitch_semitones: 0.0,
                         summary: format!("Neural restore complete ({})", r.backend),
                     })
                 });
@@ -753,6 +791,9 @@ impl ForgeDawApp {
                         obj_name: format!("Rescued ({})", r.backend),
                         path: r.rescued,
                         start_samples: st,
+                        length_samples: 0,
+                        time_stretch: 1.0,
+                        pitch_semitones: 0.0,
                         summary: format!("Vocal rescue complete ({})", r.backend),
                     })
                 });

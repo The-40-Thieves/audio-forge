@@ -282,3 +282,49 @@ fn test_elastic_dtw_aligns_vocal_double() {
     assert!(!markers.is_empty());
     assert!(aligned.channels.iter().flatten().all(|x| x.is_finite()));
 }
+
+#[test]
+fn test_defizz_ultrasonic_lpf_low_sample_rates_never_panic() {
+    for (sr, lpf) in [(8_000_u32, 3_000.0), (1_500_u32, 500.0)] {
+        let len = sr as usize;
+        let ch: Vec<f64> = (0..len)
+            .map(|i| 0.25 * (2.0 * PI * 300.0 * (i as f64) / f64::from(sr)).sin())
+            .collect();
+        let buf = AudioBuffer::from_channels(vec![ch.clone(), ch], sr).expect("low sr buf");
+        let cfg = DeFizzConfig {
+            ultrasonic_lpf_hz: Some(lpf),
+            ..Default::default()
+        };
+        let out = apply_spectral_defizz(&buf, &cfg).expect("defizz low sr");
+        assert_eq!(out.num_frames(), len);
+        assert!(out.channels.iter().flatten().all(|s| s.is_finite()));
+    }
+}
+
+#[test]
+fn test_wsola_identity_map_preserves_non_silent_tail_without_replay() {
+    let frames = 3072_usize;
+    let sr = 48_000_u32;
+    let mut ch = vec![0.0_f64; frames];
+    for (i, s) in ch.iter_mut().enumerate() {
+        *s = if i < 1536 {
+            0.35 * (2.0 * PI * 220.0 * (i as f64) / f64::from(sr)).sin()
+        } else {
+            // Distinct unique non-silent tail ramp + high tone so any earlier replay is caught
+            0.55 * (2.0 * PI * 880.0 * (i as f64) / f64::from(sr)).sin()
+                * ((i - 1536) as f64 / 1536.0)
+        };
+    }
+    let buf = AudioBuffer::from_channels(vec![ch.clone(), ch], sr).expect("tail buf");
+    let warped = warp_buffer_wsola(&buf, |f| f as f64, frames);
+    assert_eq!(warped.num_frames(), frames);
+    let max_tail_err = warped.channels[0][1536..frames]
+        .iter()
+        .zip(&buf.channels[0][1536..frames])
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_tail_err < 1e-5,
+        "WSOLA identity mapping corrupted audio tail: max_tail_err={max_tail_err}"
+    );
+}

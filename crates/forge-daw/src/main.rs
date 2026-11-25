@@ -125,8 +125,50 @@ pub(crate) enum AiJobOutcome {
         obj_name: String,
         path: PathBuf,
         start_samples: u64,
+        length_samples: u64,
+        time_stretch: f32,
+        pitch_semitones: f32,
         summary: String,
     },
+}
+
+pub(crate) fn stage_selected_object_wav(
+    src_path: &std::path::Path,
+    out_dir: &std::path::Path,
+    project_sr: u32,
+    source_offset_samples: u64,
+    length_samples: u64,
+    time_stretch: f32,
+) -> Result<PathBuf, String> {
+    let raw = AudioBuffer::load(src_path).map_err(|e| format!("Failed to read audio: {e}"))?;
+    let full_frames = raw.num_frames();
+    let sr_ratio = f64::from(raw.sample_rate.max(1)) / f64::from(project_sr.max(8_000));
+    let stretch = f64::from(time_stretch.clamp(0.5, 2.0));
+    let start_src = ((source_offset_samples as f64) * sr_ratio).round().max(0.0) as usize;
+    let needed_src = ((length_samples.max(1) as f64) * stretch * sr_ratio)
+        .round()
+        .max(1.0) as usize;
+    if source_offset_samples == 0 && needed_src >= full_frames {
+        return Ok(src_path.to_path_buf());
+    }
+    let clamped_start = start_src.min(full_frames);
+    let end_src = clamped_start.saturating_add(needed_src).min(full_frames);
+    if end_src <= clamped_start {
+        return Err("Selected audio object slice has zero source frames".to_string());
+    }
+    let sliced_ch: Vec<Vec<f64>> = raw
+        .channels
+        .iter()
+        .map(|ch| ch[clamped_start..end_src].to_vec())
+        .collect();
+    let sliced = AudioBuffer::from_channels(sliced_ch, raw.sample_rate)
+        .map_err(|e| format!("Failed to slice audio object: {e}"))?;
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("Failed to create AI dir: {e}"))?;
+    let staged_path = out_dir.join("staged_selection.wav");
+    sliced
+        .save_wav(&staged_path, 24)
+        .map_err(|e| format!("Failed to save staged slice: {e}"))?;
+    Ok(staged_path)
 }
 
 struct ForgeDawApp {
@@ -538,19 +580,52 @@ impl ForgeDawApp {
             .iter()
             .flat_map(|t| t.objects.iter())
             .find(|o| o.id == obj_id)
-            .map(|o| (o.source_path.clone(), o.timeline_start_samples))
+            .map(|o| {
+                (
+                    o.source_path.clone(),
+                    o.timeline_start_samples,
+                    o.source_offset_samples,
+                    o.length_samples,
+                    o.time_stretch,
+                    o.pitch_semitones,
+                )
+            })
         else {
             return;
         };
-        let (src_path, start_smp) = found;
+        let (src_path, start_smp, src_offset, obj_len, time_stretch, pitch_st) = found;
         let out_dir = self.project_media_dir().join(format!("ai_studio_{obj_id}"));
         let bpm_hint = self.project.bpm;
+        let proj_sr = self.project.sample_rate;
         let (tx, rx) = std::sync::mpsc::channel();
         self.ai_job_rx = Some(rx);
         self.ai_job_label = job_label.to_string();
         self.status_line = format!("Running AI Studio: {job_label}...");
         std::thread::spawn(move || {
-            let _ = tx.send(work(src_path, out_dir, start_smp, bpm_hint));
+            let outcome = stage_selected_object_wav(
+                &src_path,
+                &out_dir,
+                proj_sr,
+                src_offset,
+                obj_len,
+                time_stretch,
+            )
+            .and_then(|staged| work(staged, out_dir, start_smp, bpm_hint))
+            .map(|mut res| {
+                if let AiJobOutcome::ProducedStem {
+                    length_samples,
+                    time_stretch: ts,
+                    pitch_semitones: ps,
+                    ..
+                } = &mut res
+                {
+                    *length_samples = obj_len;
+                    *ts = time_stretch;
+                    *ps = pitch_st;
+                }
+                res
+            });
+            let _ = tx.send(outcome);
         });
     }
 
@@ -631,6 +706,9 @@ impl ForgeDawApp {
                         obj_name,
                         path,
                         start_samples,
+                        length_samples,
+                        time_stretch,
+                        pitch_semitones,
                         summary,
                     } => {
                         let target_sr = self.project.sample_rate;
@@ -640,9 +718,16 @@ impl ForgeDawApp {
                                 let tr_idx = self.project.tracks.len();
                                 self.project.add_track(track_title);
                                 let id = self.project.alloc_id();
-                                let mut obj =
-                                    AudioObject::new(id, obj_name, path, buf.num_frames() as u64);
+                                let eff_stretch = f64::from(time_stretch.clamp(0.5, 2.0));
+                                let max_timeline =
+                                    ((buf.num_frames() as f64) / eff_stretch).round().max(1.0)
+                                        as u64;
+                                let bounded_len = length_samples.max(1).min(max_timeline);
+                                let mut obj = AudioObject::new(id, obj_name, path, bounded_len);
                                 obj.timeline_start_samples = start_samples;
+                                obj.source_offset_samples = 0;
+                                obj.time_stretch = time_stretch;
+                                obj.pitch_semitones = pitch_semitones;
                                 self.project.tracks[tr_idx].objects.push(obj);
                                 self.selected_track_idx = tr_idx;
                                 self.selected_object_id = Some(id);
@@ -1905,5 +1990,29 @@ mod tests {
         // At 2.0s (4 beats @ 120 BPM) + 1.0s @ 60 BPM = beat 5 at 3.0s (144,000 samples).
         let snapped = SnapGrid::Quarter.snap_samples_for_project(146_000, &proj);
         assert_eq!(snapped, 144_000);
+    }
+
+    #[test]
+    fn stage_selected_object_wav_slices_split_bounds_without_leaking_prefix() {
+        let dir = std::env::temp_dir().join(format!("forge_daw_stage_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp test dir");
+        let src_path = dir.join("full.wav");
+        // Left half: silence (0.0); right half: 0.4 amplitude DC-ish pulse
+        let mut ch = vec![0.0_f64; 4_800];
+        ch.extend(std::iter::repeat_n(0.4_f64, 4_800));
+        AudioBuffer::from_channels(vec![ch.clone(), ch], 48_000)
+            .expect("buf")
+            .save_wav(&src_path, 24)
+            .expect("save");
+
+        let out_dir = dir.join("ai_obj");
+        let staged = stage_selected_object_wav(&src_path, &out_dir, 48_000, 4_800, 2_400, 1.0)
+            .expect("stage split");
+        assert_ne!(staged, src_path);
+        let loaded = AudioBuffer::load(&staged).expect("load staged");
+        assert_eq!(loaded.num_frames(), 2_400);
+        assert!((loaded.channels[0][0] - 0.4).abs() < 1e-4);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

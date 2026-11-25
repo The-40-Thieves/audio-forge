@@ -307,42 +307,47 @@ pub fn warp_buffer_wsola(
             continue;
         }
         let nominal = src_center.round().max(0.0) as usize;
-        let src_start = if out_pos == 0 || prev_natural_next >= max_src_start {
-            nominal.min(max_src_start)
-        } else {
-            // Find candidate grain start within nominal ± tol maximizing waveform correlation
-            // against the natural continuation `mono[prev_natural_next .. prev_natural_next + hop]`.
-            let ref_slice = &mono[prev_natural_next..(prev_natural_next + hop).min(in_frames)];
-            let ref_len = ref_slice.len();
-            let lo = nominal.saturating_sub(tol).min(max_src_start);
-            let hi = (nominal + tol).min(max_src_start);
-            let mut best_pos = nominal.min(max_src_start);
-            let mut best_sim = f64::NEG_INFINITY;
-            let ref_e: f64 = ref_slice.iter().map(|&x| x * x).sum();
+        if nominal >= in_frames {
+            out_pos += hop;
+            continue;
+        }
+        let src_start =
+            if out_pos == 0 || nominal >= max_src_start || prev_natural_next >= max_src_start {
+                nominal
+            } else {
+                // Find candidate grain start within nominal ± tol maximizing waveform correlation
+                // against the natural continuation `mono[prev_natural_next .. prev_natural_next + hop]`.
+                let ref_slice = &mono[prev_natural_next..(prev_natural_next + hop).min(in_frames)];
+                let ref_len = ref_slice.len();
+                let lo = nominal.saturating_sub(tol).min(max_src_start);
+                let hi = (nominal + tol).min(max_src_start);
+                let mut best_pos = nominal;
+                let mut best_sim = f64::NEG_INFINITY;
+                let ref_e: f64 = ref_slice.iter().map(|&x| x * x).sum();
 
-            for cand in lo..=hi {
-                let cand_slice = &mono[cand..cand + ref_len];
-                let mut dot = 0.0_f64;
-                let mut cand_e = 0.0_f64;
-                for (&a, &b) in ref_slice.iter().zip(cand_slice.iter()) {
-                    dot += a * b;
-                    cand_e += b * b;
+                for cand in lo..=hi {
+                    let cand_slice = &mono[cand..cand + ref_len];
+                    let mut dot = 0.0_f64;
+                    let mut cand_e = 0.0_f64;
+                    for (&a, &b) in ref_slice.iter().zip(cand_slice.iter()) {
+                        dot += a * b;
+                        cand_e += b * b;
+                    }
+                    let denom = (ref_e * cand_e).sqrt();
+                    let sim = if denom > 1e-12 {
+                        dot / denom
+                    } else if cand == nominal {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    if sim > best_sim {
+                        best_sim = sim;
+                        best_pos = cand;
+                    }
                 }
-                let denom = (ref_e * cand_e).sqrt();
-                let sim = if denom > 1e-12 {
-                    dot / denom
-                } else if cand == nominal.min(max_src_start) {
-                    1.0
-                } else {
-                    0.0
-                };
-                if sim > best_sim {
-                    best_sim = sim;
-                    best_pos = cand;
-                }
-            }
-            best_pos
-        };
+                best_pos
+            };
 
         let copy_len = win_len.min(out_frames - out_pos).min(in_frames - src_start);
         for (dst, src) in out_ch.iter_mut().zip(buffer.channels.iter()) {
@@ -354,7 +359,7 @@ pub fn warp_buffer_wsola(
             norm[out_pos + i] += w;
         }
 
-        prev_natural_next = (src_start + hop).min(max_src_start);
+        prev_natural_next = (src_start + hop).min(in_frames);
         out_pos += hop;
     }
 

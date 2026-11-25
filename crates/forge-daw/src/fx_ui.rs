@@ -12,7 +12,11 @@ fn slider(
     ui.add(egui::Slider::new(val, range).text(text)).changed()
 }
 
-pub(crate) fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) -> bool {
+pub(crate) fn draw_fx_slot_controls(
+    ui: &mut egui::Ui,
+    fx: &mut FxSlotConfig,
+    sidechain_tracks: &[(u64, String)],
+) -> bool {
     let mut changed = false;
     match fx {
         FxSlotConfig::GainTrim { gain_db, .. } => {
@@ -211,8 +215,44 @@ pub(crate) fn draw_fx_slot_controls(ui: &mut egui::Ui, fx: &mut FxSlotConfig) ->
             high_hz,
             mid_side_balance,
             delta_listen,
+            sidechain_track_id,
             ..
         } => {
+            let selected_label = sidechain_track_id
+                .and_then(|id| {
+                    sidechain_tracks
+                        .iter()
+                        .find(|(tid, _)| *tid == id)
+                        .map(|(tid, name)| format!("#{tid}: {name}"))
+                        .or_else(|| Some(format!("#{id} (Missing)")))
+                })
+                .unwrap_or_else(|| "Off (Bypassed)".to_string());
+            ui.horizontal(|ui| {
+                ui.label("Sidechain:");
+                egui::ComboBox::from_id_salt(ui.scope_id().with("spacer_sc"))
+                    .width(150.0)
+                    .selected_text(selected_label)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_value(sidechain_track_id, None, "Off (Bypassed)")
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        for (tid, tname) in sidechain_tracks {
+                            if ui
+                                .selectable_value(
+                                    sidechain_track_id,
+                                    Some(*tid),
+                                    format!("#{tid}: {tname}"),
+                                )
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                        }
+                    });
+            });
             changed |= slider(ui, amount, 0.0..=1.0, "Unmask Amt");
             changed |= slider(ui, max_cut_db, 0.5..=24.0, "Max Cut (dB)");
             changed |= slider(ui, low_hz, 20.0..=4_000.0, "Low Hz");

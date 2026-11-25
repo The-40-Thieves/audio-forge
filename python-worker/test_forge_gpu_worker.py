@@ -458,13 +458,13 @@ class SixStemAndTranscribeTests(TestCase):
             other_str = res["other"]
             self.assertIsInstance(other_str, str)
             assert isinstance(other_str, str)
-            samples, sr, ch, afmt = worker._read_wav_float(Path(other_str)) or (
+            samples, sr, sampwidth, afmt = worker._read_wav_float(Path(other_str)) or (
                 [],
                 0,
                 0,
                 0,
             )
-            self.assertEqual((sr, ch, afmt), (48_000, 2, 1))
+            self.assertEqual((len(samples), sr, sampwidth, afmt), (2, 48_000, 2, 1))
             # Guitar (1000) + Piano (2000) + Other (500) = 3500
             self.assertAlmostEqual(samples[0][0] * 32768.0, 3500.0, delta=2.0)
 
@@ -901,6 +901,108 @@ class NewTasksTests(TestCase):
                 worker.run_f0_track(wav_path, backend="bogus-f0", hop_secs=0.02)
             with self.assertRaises(ValueError):
                 worker.run_f0_track(wav_path, backend="autocorr", hop_secs=0.0)
+
+    def test_worker_path_traversal_and_root_containment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            allowed = root / "workspace"
+            allowed.mkdir()
+            wav_ok = allowed / "ok.wav"
+            self._write_click_wav(wav_ok, secs=0.2)
+            outside = root / "outside.wav"
+            self._write_click_wav(outside, secs=0.2)
+
+            with self.assertRaises(ValueError):
+                worker._validate_worker_path(allowed / ".." / "outside.wav")
+
+            prev_root = os.environ.get("FORGE_WORKER_ROOT")
+            os.environ["FORGE_WORKER_ROOT"] = str(allowed)
+            try:
+                self.assertEqual(
+                    worker._validate_worker_path(wav_ok, must_exist_file=True),
+                    wav_ok.resolve(),
+                )
+                with self.assertRaises(PermissionError):
+                    worker._validate_worker_path(outside, must_exist_file=True)
+            finally:
+                if prev_root is None:
+                    os.environ.pop("FORGE_WORKER_ROOT", None)
+                else:
+                    os.environ["FORGE_WORKER_ROOT"] = prev_root
+
+    def test_evaluate_undecodable_non_wav_raises_instead_of_fabricating_score(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_mp3 = Path(tmp) / "corrupt.mp3"
+            bad_mp3.write_bytes(b"not-valid-audio-stream")
+            with (
+                mock.patch.dict(
+                    sys.modules,
+                    {"soundfile": None, "librosa": None, "audioread": None},
+                ),
+                self.assertRaises(RuntimeError),
+            ):
+                worker.run_evaluate(bad_mp3, backend="acoustic-proxy")
+
+    def test_f0_explicit_neural_backends_invoke_model_or_fail_cleanly(self) -> None:
+        sr = 48_000
+        dur = int(sr * 0.25)
+        tone = [0.4 * math.sin(2.0 * math.pi * 220.0 * i / sr) for i in range(dur)]
+        with tempfile.TemporaryDirectory() as tmp:
+            wav_path = Path(tmp) / "a3.wav"
+            worker._write_wav_float(wav_path, [tone], sr)
+
+            with (
+                mock.patch.dict(sys.modules, {"torchfcpe": None, "rmvpe": None}),
+            ):
+                with self.assertRaises(RuntimeError):
+                    worker.run_f0_track(wav_path, backend="fcpe", hop_secs=0.02)
+                with self.assertRaises(RuntimeError):
+                    worker.run_f0_track(wav_path, backend="rmvpe", hop_secs=0.02)
+                auto_res = worker.run_f0_track(wav_path, backend="auto", hop_secs=0.02)
+                self.assertEqual(auto_res["backend"], "autocorr")
+                self.assertTrue(auto_res["warnings"])
+
+            class FakeTensor:
+                def __init__(self, vals: list[float]) -> None:
+                    self._vals = vals
+                    self.ndim = 1
+
+                def unsqueeze(self, _dim: int) -> FakeTensor:
+                    return self
+
+                def tolist(self) -> list[float]:
+                    return list(self._vals)
+
+            class FakeTorch:
+                float32 = "float32"
+
+                class cuda:
+                    @staticmethod
+                    def is_available() -> bool:
+                        return False
+
+                @staticmethod
+                def tensor(vals: list[float], **_kw: object) -> FakeTensor:
+                    return FakeTensor(vals)
+
+            class FakeFcpeModel:
+                def infer(self, _t: object, **_kw: object) -> list[float]:
+                    return [220.0, 220.0, 0.0, 221.5]
+
+            class FakeFcpeMod:
+                @staticmethod
+                def spawn_bundled_infer_model(device: str = "cpu") -> FakeFcpeModel:
+                    _ = device
+                    return FakeFcpeModel()
+
+            with mock.patch.dict(
+                sys.modules, {"torchfcpe": FakeFcpeMod(), "torch": FakeTorch()}
+            ):
+                fcpe_res = worker.run_f0_track(wav_path, backend="fcpe", hop_secs=0.02)
+                self.assertEqual(fcpe_res["backend"], "fcpe")
+                self.assertEqual(fcpe_res["median_f0_hz"], 220.0)
 
 
 if __name__ == "__main__":

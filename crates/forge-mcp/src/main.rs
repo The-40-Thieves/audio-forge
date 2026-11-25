@@ -185,38 +185,146 @@ impl ServerHandler for ForgeMcpServer {
     }
 }
 
-async fn run_http(
-    server: ForgeMcpServer,
+enum AuthBody<B> {
+    Upstream(B),
+    Unauthorized(&'static [u8]),
+}
+
+impl<B: hyper::body::Body + Unpin> hyper::body::Body for AuthBody<B>
+where
+    B::Data: From<&'static [u8]>,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        match &mut *self {
+            Self::Upstream(inner) => std::pin::Pin::new(inner).poll_frame(cx),
+            Self::Unauthorized(msg) => {
+                if msg.is_empty() {
+                    std::task::Poll::Ready(None)
+                } else {
+                    let slice = std::mem::take(msg);
+                    std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(slice.into()))))
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            Self::Upstream(inner) => inner.is_end_stream(),
+            Self::Unauthorized(msg) => msg.is_empty(),
+        }
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        match self {
+            Self::Upstream(inner) => inner.size_hint(),
+            Self::Unauthorized(msg) => hyper::body::SizeHint::with_exact(msg.len() as u64),
+        }
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= usize::from(x ^ y);
+    }
+    diff == 0
+}
+
+fn check_bearer_auth(headers: &hyper::HeaderMap, expected: &str) -> bool {
+    let Some(raw) = headers
+        .get(hyper::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let Some((scheme, token)) = raw.trim().split_once(' ') else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("bearer")
+        && constant_time_eq(token.trim().as_bytes(), expected.as_bytes())
+}
+
+fn resolve_http_policy(
     addr: SocketAddr,
     allow_non_loopback: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = StreamableHttpServerConfig::default();
-    let ct = config.cancellation_token.clone();
-    if allow_non_loopback {
-        config = config.disable_allowed_hosts();
+    raw_token: Option<&str>,
+) -> Result<(bool, Option<String>), String> {
+    let is_loopback = addr.ip().is_loopback();
+    if !is_loopback && !allow_non_loopback {
+        return Err(format!(
+            "Refusing non-loopback HTTP bind address '{addr}' without --allow-non-loopback"
+        ));
     }
-    let service = TowerToHyperService::new(StreamableHttpService::new(
+    let token = raw_token
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    if !is_loopback && token.is_none() {
+        return Err(
+            "Refusing non-loopback HTTP bind without a non-empty FORGE_MCP_HTTP_TOKEN bearer secret"
+                .to_string(),
+        );
+    }
+    // Never disable Host-header checks on loopback addresses even if --allow-non-loopback is passed.
+    let disable_host_check = !is_loopback && allow_non_loopback;
+    Ok((disable_host_check, token))
+}
+
+async fn run_http_on_listener(
+    server: ForgeMcpServer,
+    listener: TcpListener,
+    mut config: StreamableHttpServerConfig,
+    bearer_token: Option<Arc<str>>,
+) {
+    let ct = config.cancellation_token.clone();
+    let mcp_svc = TowerToHyperService::new(StreamableHttpService::new(
         move || Ok(server.clone()),
         Arc::new(LocalSessionManager::default()),
-        config,
+        std::mem::take(&mut config),
     ));
-    let listener = TcpListener::bind(addr).await?;
-    let local_addr = listener.local_addr()?;
-    eprintln!("forge-mcp: Streamable HTTP listening on http://{local_addr}");
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                ct.cancel();
-                break;
-            }
+            _ = ct.cancelled() => break,
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                let svc = service.clone();
+                let Ok((stream, _)) = accepted else {
+                    break;
+                };
+                let svc = mcp_svc.clone();
+                let token = bearer_token.clone();
                 let conn_ct = ct.child_token();
                 tokio::spawn(async move {
                     let io = TokioIo::new(stream);
+                    let hyper_svc = hyper::service::service_fn(
+                        move |req: hyper::Request<hyper::body::Incoming>| {
+                            let svc = svc.clone();
+                            let token = token.clone();
+                            async move {
+                                if let Some(ref expected) = token
+                                    && !check_bearer_auth(req.headers(), expected)
+                                {
+                                    let resp = hyper::Response::builder()
+                                        .status(hyper::StatusCode::UNAUTHORIZED)
+                                        .header(hyper::header::WWW_AUTHENTICATE, "Bearer")
+                                        .body(AuthBody::Unauthorized(b"Unauthorized\n"))
+                                        .expect("valid 401 response");
+                                    return Ok::<_, std::convert::Infallible>(resp);
+                                }
+                                let resp = hyper::service::Service::call(&svc, req)
+                                    .await
+                                    .expect("TowerToHyperService error is Infallible");
+                                Ok::<_, std::convert::Infallible>(resp.map(AuthBody::Upstream))
+                            }
+                        },
+                    );
                     let builder = AutoServerBuilder::new(TokioExecutor::new());
-                    let conn = builder.serve_connection(io, svc);
+                    let conn = builder.serve_connection(io, hyper_svc);
                     tokio::select! {
                         res = conn => {
                             if let Err(err) = res {
@@ -229,6 +337,30 @@ async fn run_http(
             }
         }
     }
+}
+
+async fn run_http(
+    server: ForgeMcpServer,
+    addr: SocketAddr,
+    allow_non_loopback: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let raw_token = std::env::var("FORGE_MCP_HTTP_TOKEN").ok();
+    let (disable_host_check, token) =
+        resolve_http_policy(addr, allow_non_loopback, raw_token.as_deref())
+            .map_err(std::io::Error::other)?;
+    let listener = TcpListener::bind(addr).await?;
+    let local_addr = listener.local_addr()?;
+    eprintln!("forge-mcp: Streamable HTTP listening on http://{local_addr}");
+    let mut config = StreamableHttpServerConfig::default();
+    if disable_host_check {
+        config = config.disable_allowed_hosts();
+    }
+    let shutdown_ct = config.cancellation_token.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        shutdown_ct.cancel();
+    });
+    run_http_on_listener(server, listener, config, token.map(Arc::<str>::from)).await;
     Ok(())
 }
 
@@ -608,6 +740,12 @@ mod tests {
             bpm: 120.0,
             sample_rate: 48_000,
             duration_secs: 10.0,
+            vocal_duration_secs: 10.0,
+            drums_duration_secs: 10.0,
+            bass_duration_secs: 10.0,
+            other_duration_secs: 10.0,
+            guitar_duration_secs: 10.0,
+            keys_duration_secs: 10.0,
             vocal: Some(resource.path().join("vocals.wav")),
             drums: None,
             bass: None,
@@ -1124,5 +1262,176 @@ mod tests {
             drop(lines);
             server_task.await.expect("server shutdown");
         }
+    }
+
+    #[test]
+    fn http_policy_enforces_token_on_non_loopback_and_keeps_loopback_host_check() {
+        let loop_addr: SocketAddr = "127.0.0.1:8787".parse().unwrap();
+        let any_addr: SocketAddr = "0.0.0.0:8787".parse().unwrap();
+
+        let (disable_host, tok) = resolve_http_policy(loop_addr, true, None).unwrap();
+        assert!(!disable_host, "loopback must keep Host-header validation");
+        assert!(tok.is_none());
+
+        assert!(resolve_http_policy(any_addr, false, Some("secret")).is_err());
+        assert!(resolve_http_policy(any_addr, true, None).is_err());
+        assert!(resolve_http_policy(any_addr, true, Some("   ")).is_err());
+
+        let (disable_host, tok) = resolve_http_policy(any_addr, true, Some("my-secret")).unwrap();
+        assert!(disable_host);
+        assert_eq!(tok.as_deref(), Some("my-secret"));
+    }
+
+    #[tokio::test]
+    async fn http_bearer_auth_and_loopback_host_check_enforce_access_control() {
+        use tokio::io::AsyncReadExt;
+        let (_root, sb) = setup_mix_sandbox(0.05, 48_000);
+        let server = ForgeMcpServer::new(Arc::new(sb));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let config = StreamableHttpServerConfig::default();
+        let ct = config.cancellation_token.clone();
+        let handle = tokio::spawn(async move {
+            run_http_on_listener(server, listener, config, Some(Arc::from("s3cr3t"))).await;
+        });
+
+        async fn send_http(addr: SocketAddr, req_head: &str) -> String {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream.write_all(req_head.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+
+        let no_auth = send_http(
+            local_addr,
+            &format!("POST / HTTP/1.1\r\nHost: {local_addr}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"),
+        )
+        .await;
+        assert!(no_auth.starts_with("HTTP/1.1 401 "), "{no_auth}");
+
+        let wrong_auth = send_http(
+            local_addr,
+            &format!(
+                "POST / HTTP/1.1\r\nHost: {local_addr}\r\nConnection: close\r\nAuthorization: Bearer wrong\r\nContent-Length: 0\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(wrong_auth.starts_with("HTTP/1.1 401 "), "{wrong_auth}");
+
+        let bad_host = send_http(
+            local_addr,
+            "POST / HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\nAuthorization: Bearer s3cr3t\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(
+            bad_host.starts_with("HTTP/1.1 403 ") || bad_host.starts_with("HTTP/1.1 421 "),
+            "expected Host rejection on loopback, got: {bad_host}"
+        );
+
+        let valid_auth = send_http(
+            local_addr,
+            &format!(
+                "POST / HTTP/1.1\r\nHost: {local_addr}\r\nConnection: close\r\nAuthorization: Bearer s3cr3t\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: 2\r\n\r\n{{}}"
+            ),
+        )
+        .await;
+        assert!(
+            !valid_auth.starts_with("HTTP/1.1 401 ") && !valid_auth.starts_with("HTTP/1.1 403 "),
+            "valid auth+host was unexpectedly rejected: {valid_auth}"
+        );
+
+        ct.cancel();
+        let _ = handle.await;
+    }
+
+    #[test]
+    fn quantize_stems_syncs_assets_and_session_uses_per_stem_sample_rate_duration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 44.1 kHz vocal & drum stems lasting exactly 2.0 seconds (88,200 frames)
+        let sr = 44_100_u32;
+        let frames = (sr as usize) * 2;
+        let mut voc = vec![0.0_f64; frames];
+        let mut drm = vec![0.0_f64; frames];
+        for (i, s) in voc.iter_mut().enumerate() {
+            let t = (i as f64) / f64::from(sr);
+            if (1.15..=1.65).contains(&t) {
+                *s = 0.45 * (2.0 * std::f64::consts::PI * 220.0 * t).sin();
+            }
+        }
+        // Place a clear drum hit at t = 1.25 s (delayed beat 2 before quantize onto 120 BPM)
+        let hit_smp = (1.25 * f64::from(sr)) as usize;
+        for k in 0..400 {
+            if hit_smp + k < frames {
+                drm[hit_smp + k] = 0.85 * (-(k as f64) / 80.0).exp();
+            }
+        }
+        let voc_buf = AudioBuffer::from_channels(vec![voc.clone(), voc], sr).expect("voc");
+        let drm_buf = AudioBuffer::from_channels(vec![drm.clone(), drm], sr).expect("drm");
+        assert!((handlers::buffer_duration_secs(&voc_buf) - 2.0).abs() < 1e-6);
+
+        let scale = forge_vocal::VocalScale::parse("C major").expect("scale");
+        let unquant_drum = forge_theory::extract_drum_midi_triggers(&drm_buf, 120.0, 480);
+        let beats = [0.0, 0.55, 1.25, 1.85];
+        let mut stems = vec![
+            (dir.path().join("voc.wav"), voc_buf),
+            (dir.path().join("drm.wav"), drm_buf),
+        ];
+        let (q_pitch, q_drums) = handlers::quantize_stems_and_sync_assets(
+            &mut stems,
+            Some(0),
+            Some(1),
+            &beats,
+            120.0,
+            &scale,
+        )
+        .expect("quantize");
+        assert!(!q_pitch.is_empty());
+        let (k_q, s_q, h_q) = q_drums.expect("drum midi present");
+        let orig_ticks: Vec<u32> = unquant_drum
+            .0
+            .iter()
+            .chain(&unquant_drum.1)
+            .chain(&unquant_drum.2)
+            .map(|n| n.start_tick)
+            .collect();
+        let quant_ticks: Vec<u32> = k_q
+            .iter()
+            .chain(&s_q)
+            .chain(&h_q)
+            .map(|n| n.start_tick)
+            .collect();
+        assert_ne!(
+            orig_ticks, quant_ticks,
+            "expected quantized MIDI ticks to shift"
+        );
+
+        let spec = SessionSpec {
+            bpm: 120.0,
+            sample_rate: 48_000,
+            duration_secs: 2.0,
+            vocal_duration_secs: 2.0,
+            drums_duration_secs: 2.0,
+            bass_duration_secs: 2.0,
+            other_duration_secs: 2.0,
+            guitar_duration_secs: 2.0,
+            keys_duration_secs: 2.0,
+            vocal: Some(dir.path().join("voc.wav")),
+            drums: None,
+            bass: None,
+            other: None,
+            guitar: None,
+            keys: None,
+            vocal_pitch_frames: q_pitch,
+            tempo_map: Vec::new(),
+            chords_midi: dir.path().join("chords.mid"),
+            drum_midi: dir.path().join("drums.mid"),
+        };
+        let rpp = build_session(spec).build_rpp_string();
+        assert!(
+            rpp.contains("LENGTH 2.0000"),
+            "expected 2.0 s LENGTH even at 48k session SR: {rpp}"
+        );
     }
 }

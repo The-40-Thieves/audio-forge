@@ -158,6 +158,8 @@ pub enum FxSlotConfig {
         high_hz: f32,
         mid_side_balance: f32,
         delta_listen: bool,
+        #[serde(default)]
+        sidechain_track_id: Option<u64>,
     },
     PhaseMatchEq {
         bypass: bool,
@@ -325,6 +327,7 @@ impl FxSlotConfig {
             high_hz: 8_000.0,
             mid_side_balance: 0.0,
             delta_listen: false,
+            sidechain_track_id: None,
         }
     }
 

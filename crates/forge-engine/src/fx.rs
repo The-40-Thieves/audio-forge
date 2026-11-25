@@ -152,7 +152,13 @@ impl FxProcessor {
             Self::OpenSoothe(d) => d.latency_samples() as usize,
             Self::MasterLimiter(d) => d.latency_samples() as usize,
             Self::VocalTune(d) => d.latency_samples() as usize,
-            Self::OpenSpacer(d) => d.latency_samples() as usize,
+            Self::OpenSpacer(d) => match cfg {
+                FxSlotConfig::OpenSpacer {
+                    sidechain_track_id: None,
+                    ..
+                } => 0,
+                _ => d.latency_samples() as usize,
+            },
             _ => 0,
         }
     }
@@ -185,6 +191,19 @@ impl FxProcessor {
     /// Processes one stereo sample with zero heap allocations.
     #[inline]
     pub fn process_stereo(&mut self, cfg: &FxSlotConfig, in_l: f32, in_r: f32) -> (f32, f32) {
+        self.process_stereo_with_sidechain(cfg, in_l, in_r, None)
+    }
+
+    /// Processes one stereo sample with an optional external stereo sidechain feed (zero allocs).
+    #[inline]
+    pub fn process_stereo_with_sidechain(
+        &mut self,
+        cfg: &FxSlotConfig,
+        in_l: f32,
+        in_r: f32,
+        sidechain: Option<(f32, f32)>,
+    ) -> (f32, f32) {
+        let _ = sidechain;
         if cfg.is_bypassed() {
             return (in_l, in_r);
         }
@@ -383,13 +402,16 @@ impl FxProcessor {
                     ..
                 },
             ) => {
+                let Some((sc_l, sc_r)) = sidechain else {
+                    return (in_l, in_r);
+                };
                 d.set_mid_side_balance(f64::from(*mid_side_balance));
                 d.set_delta_listen(*delta_listen);
                 d.process_sample(
                     in_l,
                     in_r,
-                    in_l,
-                    in_r,
+                    sc_l,
+                    sc_r,
                     f64::from(*low_hz),
                     f64::from(*high_hz),
                     f64::from(*amount),

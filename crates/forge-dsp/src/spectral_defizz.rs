@@ -601,12 +601,15 @@ pub fn apply_spectral_defizz(buffer: &AudioBuffer, config: &DeFizzConfig) -> Res
         })
         .collect();
 
+    let max_cutoff = (sr * 0.47).min(22_000.0);
     if !config.delta_listen
         && let Some(raw_lpf) = config.ultrasonic_lpf_hz
         && raw_lpf.is_finite()
+        && raw_lpf > 0.0
         && raw_lpf < sr * 0.48
+        && max_cutoff >= 1_000.0
     {
-        let cutoff = raw_lpf.clamp(4_000.0, (sr * 0.47).min(22_000.0));
+        let cutoff = raw_lpf.clamp(1_000.0, max_cutoff);
         for ch in &mut processed_channels {
             let mut lp = Biquad::lowpass(sr, cutoff, std::f64::consts::FRAC_1_SQRT_2);
             for s in ch.iter_mut() {

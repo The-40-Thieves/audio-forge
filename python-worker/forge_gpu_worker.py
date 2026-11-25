@@ -26,7 +26,7 @@ from __future__ import annotations
 import argparse
 import array
 import hashlib
-import importlib.util
+import importlib
 import json
 import math
 import os
@@ -226,6 +226,36 @@ def _instantiate_separator(
     return separator_cls(**kwargs)
 
 
+def _configured_worker_roots() -> list[Path]:
+    raw_roots = (
+        os.environ.get("FORGE_WORKER_ROOT", "").strip()
+        or os.environ.get("FORGE_MCP_ROOT", "").strip()
+    )
+    if not raw_roots:
+        return []
+    return [
+        Path(part).expanduser().resolve()
+        for part in raw_roots.split(os.pathsep)
+        if part.strip()
+    ]
+
+
+def _validate_worker_path(raw: Path, *, must_exist_file: bool = False) -> Path:
+    """Reject traversal segments and enforce configured FORGE_WORKER_ROOT/FORGE_MCP_ROOT bounds."""
+    raw_str = os.fspath(raw)
+    if "\x00" in raw_str:
+        raise ValueError("Path contains null byte")
+    if ".." in raw.parts:
+        raise ValueError(f"Parent directory traversal ('..') is rejected: {raw}")
+    resolved = raw.expanduser().resolve(strict=must_exist_file)
+    roots = _configured_worker_roots()
+    if roots and not any(resolved.is_relative_to(root) for root in roots):
+        raise PermissionError(f"Path escapes configured worker root: {resolved}")
+    if must_exist_file and not resolved.is_file():
+        raise FileNotFoundError(f"Input audio file not found: {resolved}")
+    return resolved
+
+
 def _read_wav_float(
     path: Path,
 ) -> tuple[list[list[float]], int, int, int] | None:
@@ -233,8 +263,9 @@ def _read_wav_float(
 
     Returns ``(channels, sample_rate, sampwidth, audio_format)`` or ``None`` for tiny/stub files.
     """
+    safe_path = _validate_worker_path(path, must_exist_file=False)
     try:
-        raw = path.read_bytes()
+        raw = safe_path.read_bytes()
     except OSError:
         return None
     if len(raw) < 44 or raw[:4] != b"RIFF" or raw[8:12] != b"WAVE":
@@ -857,15 +888,12 @@ def run_separate(
 
 
 def _resolve_input_file(input_path: Path) -> Path:
-    resolved_input = input_path.resolve()
-    if not resolved_input.is_file():
-        raise FileNotFoundError(f"Input audio file not found: {resolved_input}")
-    return resolved_input
+    return _validate_worker_path(input_path, must_exist_file=True)
 
 
 def _resolve_io_paths(input_path: Path, output_dir: Path) -> tuple[Path, Path]:
     resolved_input = _resolve_input_file(input_path)
-    resolved_output = output_dir.resolve()
+    resolved_output = _validate_worker_path(output_dir, must_exist_file=False)
     resolved_output.mkdir(parents=True, exist_ok=True)
     return resolved_input, resolved_output
 
@@ -1210,9 +1238,7 @@ def run_vocal_rescue(
     resolved_input, resolved_output = _resolve_io_paths(input_path, output_dir)
     resolved_ref: Path | None = None
     if reference_voice is not None:
-        resolved_ref = reference_voice.resolve()
-        if not resolved_ref.is_file():
-            raise FileNotFoundError(f"Reference voice file not found: {resolved_ref}")
+        resolved_ref = _resolve_input_file(reference_voice)
     elif backend == "seed-vc":
         raise ValueError("seed-vc vocal rescue requires --reference-voice")
 
@@ -1400,35 +1426,63 @@ def run_beat_track(
     raise RuntimeError("All beat-tracking backends failed")
 
 
+def _read_audio_float(path: Path) -> tuple[list[list[float]], int, int, int]:
+    """Decode WAV natively or non-WAV formats via soundfile/librosa/audioread. Raises on failure."""
+    safe_path = _validate_worker_path(path, must_exist_file=True)
+    wav = _read_wav_float(safe_path)
+    if wav is not None:
+        return wav
+
+    try:
+        sf = importlib.import_module("soundfile")
+        data, sr_sf = sf.read(str(safe_path), always_2d=True, dtype="float64")
+        n_frames = len(data)
+        n_ch = int(data.shape[1]) if n_frames > 0 else 0
+        if n_ch > 0 and int(sr_sf) > 0:
+            chans = [[float(data[f][c]) for f in range(n_frames)] for c in range(n_ch)]
+            return chans, int(sr_sf), 2, 1
+    except (ImportError, RuntimeError, OSError, ValueError):
+        pass
+
+    try:
+        librosa = importlib.import_module("librosa")
+        y, sr_lb = librosa.load(str(safe_path), sr=None, mono=False)
+        if getattr(y, "ndim", 1) == 1:
+            chans = [[float(v) for v in y.tolist()]]
+        else:
+            chans = [[float(v) for v in row] for row in y.tolist()]
+        if chans and chans[0] and int(sr_lb) > 0:
+            return chans, int(sr_lb), 2, 1
+    except (ImportError, RuntimeError, OSError, ValueError):
+        pass
+
+    try:
+        ar = importlib.import_module("audioread")
+        with ar.audio_open(str(safe_path)) as af:
+            ar_ch = int(af.channels)
+            ar_sr = int(af.samplerate)
+            if ar_ch > 0 and ar_sr > 0:
+                chans_ar: list[list[float]] = [[] for _ in range(ar_ch)]
+                for block in af:
+                    pcm = array.array("h")
+                    pcm.frombytes(block)
+                    for i in range(0, len(pcm) - (len(pcm) % ar_ch), ar_ch):
+                        for c_idx in range(ar_ch):
+                            chans_ar[c_idx].append(pcm[i + c_idx] / 32768.0)
+                if chans_ar[0]:
+                    return chans_ar, ar_sr, 2, 1
+    except (ImportError, RuntimeError, OSError, ValueError):
+        pass
+
+    raise RuntimeError(f"Unable to decode audio file for analysis: {safe_path}")
+
+
 def _acoustic_proxy_metrics(path: Path) -> dict[str, float | None]:
-    decoded = _read_wav_float(path)
-    if decoded is None:
-        return {
-            "production_quality": 5.0,
-            "production_complexity": None,
-            "content_enjoyment": None,
-            "content_usefulness": None,
-            "singmos": None,
-            "crest_factor_db": 0.0,
-            "hf_ratio_db": -20.0,
-            "clipping_ratio": 0.0,
-            "composite_score": 5.0,
-        }
-    channels, _, _, _ = decoded
+    channels, _, _, _ = _read_audio_float(path)
     nch = len(channels)
     nframes = len(channels[0]) if channels else 0
     if nframes == 0:
-        return {
-            "production_quality": 1.0,
-            "production_complexity": None,
-            "content_enjoyment": None,
-            "content_usefulness": None,
-            "singmos": None,
-            "crest_factor_db": 0.0,
-            "hf_ratio_db": -40.0,
-            "clipping_ratio": 0.0,
-            "composite_score": 1.0,
-        }
+        raise RuntimeError(f"Decoded audio file contains zero sample frames: {path}")
     mono = [sum(channels[c][i] for c in range(nch)) / nch for i in range(nframes)]
     peak = max(abs(x) for x in mono)
     rms = math.sqrt(sum(x * x for x in mono) / nframes)
@@ -1460,7 +1514,17 @@ def _acoustic_proxy_metrics(path: Path) -> dict[str, float | None]:
 def _evaluate_single_file(
     path: Path, vocal: bool, backend: str, warnings: list[str]
 ) -> tuple[dict[str, float | None], str]:
-    metrics = _acoustic_proxy_metrics(path)
+    metrics: dict[str, float | None] = {
+        "production_quality": None,
+        "production_complexity": None,
+        "content_enjoyment": None,
+        "content_usefulness": None,
+        "singmos": None,
+        "crest_factor_db": None,
+        "hf_ratio_db": None,
+        "clipping_ratio": None,
+        "composite_score": None,
+    }
     used_parts: list[str] = []
     if backend in {"auto", "audiobox"}:
         try:
@@ -1496,8 +1560,17 @@ def _evaluate_single_file(
                 raise RuntimeError(f"SingMOS failed: {exc}") from exc
             warnings.append(f"singmos skipped ({exc})")
 
-    label = "+".join(used_parts) if used_parts else "acoustic-proxy"
-    return metrics, label
+    if backend == "acoustic-proxy" or not used_parts:
+        metrics = _acoustic_proxy_metrics(path)
+        return metrics, "acoustic-proxy"
+
+    try:
+        aux = _acoustic_proxy_metrics(path)
+        for key in ("crest_factor_db", "hf_ratio_db", "clipping_ratio"):
+            metrics[key] = aux[key]
+    except (RuntimeError, OSError):
+        pass
+    return metrics, "+".join(used_parts)
 
 
 def run_evaluate(
@@ -1620,10 +1693,10 @@ def _select_models_for_profile(profile: str) -> list[tuple[str, str, str]]:
 
 def _default_model_dir(model_dir: Path | None) -> Path:
     if model_dir is not None:
-        return model_dir.expanduser().resolve()
+        return _validate_worker_path(model_dir, must_exist_file=False)
     env_dir = os.environ.get("AUDIO_SEPARATOR_MODEL_DIR", "").strip()
     if env_dir:
-        return Path(env_dir).expanduser().resolve()
+        return _validate_worker_path(Path(env_dir), must_exist_file=False)
     return (Path.home() / ".cache" / "audio-separator-models").resolve()
 
 
@@ -1812,6 +1885,90 @@ def _autocorr_f0_track(
     return frames
 
 
+def _extract_f0_hz_sequence(raw: object) -> list[float]:
+    if hasattr(raw, "squeeze"):
+        raw = raw.squeeze()  # type: ignore[union-attr]
+    if hasattr(raw, "tolist"):
+        raw = raw.tolist()  # type: ignore[union-attr]
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        raise RuntimeError(f"Unexpected neural F0 output type: {type(raw).__name__}")
+    out: list[float] = []
+    for item in raw:
+        val = item[0] if isinstance(item, Sequence) and item else item
+        out.append(float(val))
+    return out
+
+
+def _neural_f0_track(
+    mono: list[float],
+    sr: int,
+    hop_secs: float,
+    backend: str,
+) -> list[dict[str, object]]:
+    import importlib
+
+    hop_samples = max(1, int(round(sr * hop_secs)))
+    if backend == "fcpe":
+        fcpe_mod = importlib.import_module("torchfcpe")
+        torch_mod = importlib.import_module("torch")
+        device = "cuda" if torch_mod.cuda.is_available() else "cpu"
+        model = fcpe_mod.spawn_bundled_infer_model(device=device)
+        tensor = torch_mod.tensor(mono, dtype=torch_mod.float32, device=device)
+        if tensor.ndim == 1:
+            tensor = tensor.unsqueeze(0).unsqueeze(-1)
+        f0_raw = model.infer(
+            tensor,
+            sr=sr,
+            decoder_mode="local_argmax",
+            threshold=0.006,
+            f0_min=50.0,
+            f0_max=1100.0,
+            interp_uv=False,
+        )
+        hz_seq = _extract_f0_hz_sequence(f0_raw)
+    elif backend == "rmvpe":
+        rmvpe_mod = importlib.import_module("rmvpe")
+        device = "cpu"
+        try:
+            torch_mod = importlib.import_module("torch")
+            if torch_mod.cuda.is_available():
+                device = "cuda"
+        except ImportError:
+            pass
+        model_cls = getattr(rmvpe_mod, "RMVPE", None)
+        if model_cls is not None:
+            model_path = os.environ.get("FORGE_RMVPE_MODEL", "").strip()
+            model = (
+                model_cls(model_path, is_half=(device == "cuda"), device=device)
+                if model_path
+                else model_cls(device=device)
+            )
+            f0_raw = model.infer_from_audio(mono, thred=0.03)
+        elif hasattr(rmvpe_mod, "infer_from_audio"):
+            f0_raw = rmvpe_mod.infer_from_audio(mono, sr=sr, hop_secs=hop_secs)
+        else:
+            raise RuntimeError(
+                "Installed 'rmvpe' module does not expose RMVPE inference API"
+            )
+        hz_seq = _extract_f0_hz_sequence(f0_raw)
+    else:
+        raise ValueError(f"Unsupported neural F0 backend '{backend}'")
+
+    frames: list[dict[str, object]] = []
+    for idx, f0_val in enumerate(hz_seq):
+        time_secs = round((idx * hop_samples) / sr, 6)
+        voiced = math.isfinite(f0_val) and 40.0 <= f0_val <= 1600.0
+        frames.append(
+            {
+                "time_secs": time_secs,
+                "f0_hz": round(f0_val, 3) if voiced else 0.0,
+                "voiced": voiced,
+                "confidence": 0.95 if voiced else 0.0,
+            }
+        )
+    return frames
+
+
 def run_f0_track(
     input_path: Path,
     backend: str = "auto",
@@ -1822,33 +1979,37 @@ def run_f0_track(
         raise ValueError(f"Unsupported f0-track backend '{backend}'")
     if not math.isfinite(hop_secs) or not (0.002 <= hop_secs <= 0.25):
         raise ValueError(f"hop_secs ({hop_secs}) must be finite and in [0.002, 0.25]")
-    wav = _read_wav_float(input_path)
-    if wav is None:
-        raise RuntimeError(f"Unable to read WAV audio from {input_path}")
-    channels, sr, _sw, _fmt = wav
+    resolved_input = _resolve_input_file(input_path)
+    channels, sr, _sw, _fmt = _read_audio_float(resolved_input)
     nframes = min((len(ch) for ch in channels), default=0)
     mono = [sum(ch[i] for ch in channels) / len(channels) for i in range(nframes)]
     warnings: list[str] = []
+
+    candidates = (
+        ["fcpe", "rmvpe"]
+        if backend == "auto"
+        else [backend]
+        if backend in {"fcpe", "rmvpe"}
+        else []
+    )
+    frames: list[dict[str, object]] | None = None
     used_backend = "autocorr"
+    for cand in candidates:
+        try:
+            frames = _neural_f0_track(mono, sr, hop_secs, cand)
+            used_backend = cand
+            break
+        except (ImportError, AttributeError, RuntimeError, ValueError, OSError) as exc:
+            if backend != "auto":
+                raise RuntimeError(
+                    f"Requested F0 backend '{cand}' failed: {exc}"
+                ) from exc
+            warnings.append(f"{cand} skipped ({exc})")
 
-    if backend in {"auto", "fcpe", "rmvpe"} and backend != "autocorr":
-        # Check whether optional neural F0 packages exist; fall back cleanly in auto mode.
-        pkg_name = "torchfcpe" if backend in {"auto", "fcpe"} else "rmvpe"
-        spec = importlib.util.find_spec(pkg_name)
-        if spec is None and backend in {"fcpe", "rmvpe"}:
-            raise RuntimeError(
-                f"Requested F0 backend '{backend}' is not installed in this Python environment"
-            )
-        if spec is None:
-            warnings.append(
-                "Neural F0 model package (torchfcpe/rmvpe) not installed; used autocorrelation fallback."
-            )
-        else:
-            warnings.append(
-                f"Package '{pkg_name}' detected; using normalized autocorrelation tracker for deterministic output."
-            )
+    if frames is None:
+        frames = _autocorr_f0_track(mono, sr, hop_secs)
+        used_backend = "autocorr"
 
-    frames = _autocorr_f0_track(mono, sr, hop_secs)
     voiced_f0s = sorted(float(f["f0_hz"]) for f in frames if bool(f["voiced"]))  # type: ignore[arg-type]
     voiced_ratio = (len(voiced_f0s) / len(frames)) if frames else 0.0
     median_f0_hz = round(voiced_f0s[len(voiced_f0s) // 2], 3) if voiced_f0s else None

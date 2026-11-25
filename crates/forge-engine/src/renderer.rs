@@ -277,6 +277,32 @@ pub struct ObjectOrientedEngine {
     analyzer: RealtimeSpectrumAnalyzer32,
     total_pdc_samples: usize,
     meters: EngineMeters,
+    track_ids: Vec<u64>,
+    track_pre_l: Vec<f32>,
+    track_pre_r: Vec<f32>,
+    track_prev_l: Vec<f32>,
+    track_prev_r: Vec<f32>,
+}
+
+fn resolve_sidechain_sample(
+    track_ids: &[u64],
+    self_idx: usize,
+    buf_l: &[f32],
+    buf_r: &[f32],
+    cfg: &crate::project::FxSlotConfig,
+) -> Option<(f32, f32)> {
+    let crate::project::FxSlotConfig::OpenSpacer {
+        sidechain_track_id: Some(sc_id),
+        ..
+    } = cfg
+    else {
+        return None;
+    };
+    track_ids
+        .iter()
+        .enumerate()
+        .find(|&(idx, &id)| idx != self_idx && id == *sc_id)
+        .map(|(idx, _)| (buf_l[idx], buf_r[idx]))
 }
 
 fn compile_fx_chain(slots: &[crate::project::FxSlotConfig], sr: f64) -> (Vec<FxProcessor>, usize) {
@@ -375,7 +401,9 @@ impl ObjectOrientedEngine {
         let (master_inserts, master_lat) = compile_fx_chain(&project.master_inserts, sr);
         let total_pdc_samples = max_track_latency + max_aux_latency + master_lat;
 
-        let track_peaks_db = vec![-90.0; tracks.len()];
+        let track_ids: Vec<u64> = tracks.iter().map(|t| t.config.id).collect();
+        let num_tracks = tracks.len();
+        let track_peaks_db = vec![-90.0; num_tracks];
         let master_gain_lin = 10.0_f32.powf(project.master_gain_db.clamp(-48.0, 12.0) / 20.0);
         Self {
             sample_rate: sr,
@@ -397,6 +425,11 @@ impl ObjectOrientedEngine {
                 total_pdc_samples,
                 ..EngineMeters::default()
             },
+            track_ids,
+            track_pre_l: vec![0.0_f32; num_tracks],
+            track_pre_r: vec![0.0_f32; num_tracks],
+            track_prev_l: vec![0.0_f32; num_tracks],
+            track_prev_r: vec![0.0_f32; num_tracks],
         }
     }
 
@@ -448,6 +481,18 @@ impl ObjectOrientedEngine {
                 crate::project::FxSlotConfig::MasterLimiter { isp_8x: ia, .. },
                 crate::project::FxSlotConfig::MasterLimiter { isp_8x: ib, .. },
             ) if ia != ib
+        ) || matches!(
+            (a, b),
+            (
+                crate::project::FxSlotConfig::OpenSpacer {
+                    sidechain_track_id: sa,
+                    ..
+                },
+                crate::project::FxSlotConfig::OpenSpacer {
+                    sidechain_track_id: sb,
+                    ..
+                },
+            ) if sa.is_some() != sb.is_some()
         )
     }
 
@@ -609,6 +654,10 @@ impl ObjectOrientedEngine {
             ins.reset(sr);
         }
         self.analyzer.reset(sr);
+        self.track_pre_l.fill(0.0);
+        self.track_pre_r.fill(0.0);
+        self.track_prev_l.fill(0.0);
+        self.track_prev_r.fill(0.0);
     }
 
     #[inline]
@@ -732,13 +781,15 @@ impl ObjectOrientedEngine {
                 bus.acc_r = 0.0;
             }
 
-            for tr in &mut self.tracks {
+            for (tr_idx, tr) in self.tracks.iter_mut().enumerate() {
                 let audible = if any_solo {
                     tr.config.solo
                 } else {
                     !tr.config.mute
                 };
                 if !audible {
+                    self.track_pre_l[tr_idx] = 0.0;
+                    self.track_pre_r[tr_idx] = 0.0;
                     continue;
                 }
 
@@ -800,7 +851,14 @@ impl ObjectOrientedEngine {
                     // Run per-object 3-band EQ & per-object FX chain + intra-track PDC
                     (ol, or_) = obj.eq.process(ol, or_);
                     for (proc_fx, cfg) in obj.fx.iter_mut().zip(&obj.config.fx_chain) {
-                        (ol, or_) = proc_fx.process_stereo(cfg, ol, or_);
+                        let sc = resolve_sidechain_sample(
+                            &self.track_ids,
+                            tr_idx,
+                            &self.track_prev_l,
+                            &self.track_prev_r,
+                            cfg,
+                        );
+                        (ol, or_) = proc_fx.process_stereo_with_sidechain(cfg, ol, or_, sc);
                     }
                     (ol, or_) = obj.pdc.process(ol, or_);
 
@@ -819,9 +877,33 @@ impl ObjectOrientedEngine {
                     tr_r += mr;
                 }
 
+                self.track_pre_l[tr_idx] = tr_l;
+                self.track_pre_r[tr_idx] = tr_r;
+            }
+
+            for (tr_idx, tr) in self.tracks.iter_mut().enumerate() {
+                let audible = if any_solo {
+                    tr.config.solo
+                } else {
+                    !tr.config.mute
+                };
+                if !audible {
+                    continue;
+                }
+
+                let mut tr_l = self.track_pre_l[tr_idx];
+                let mut tr_r = self.track_pre_r[tr_idx];
+
                 // Track-level FX inserts + track fader/pan/automation/polarity + inter-track PDC
                 for (proc_fx, cfg) in tr.inserts.iter_mut().zip(&tr.config.inserts) {
-                    (tr_l, tr_r) = proc_fx.process_stereo(cfg, tr_l, tr_r);
+                    let sc = resolve_sidechain_sample(
+                        &self.track_ids,
+                        tr_idx,
+                        &self.track_pre_l,
+                        &self.track_pre_r,
+                        cfg,
+                    );
+                    (tr_l, tr_r) = proc_fx.process_stereo_with_sidechain(cfg, tr_l, tr_r, sc);
                 }
                 (tr_l, tr_r) = tr.pdc.process(tr_l, tr_r);
 
@@ -867,6 +949,8 @@ impl ObjectOrientedEngine {
                 mix_l += tr_l;
                 mix_r += tr_r;
             }
+            self.track_prev_l.copy_from_slice(&self.track_pre_l);
+            self.track_prev_r.copy_from_slice(&self.track_pre_r);
 
             // Align Main Mix bus with parallel Aux bus PDC, then sum processed Aux returns
             (mix_l, mix_r) = self.main_bus_pdc.process(mix_l, mix_r);

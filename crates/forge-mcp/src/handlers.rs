@@ -793,9 +793,11 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
     )?;
 
     let mut primary_stems: Vec<(PathBuf, AudioBuffer)> = Vec::new();
-    let (vocal_pitch_frames, cleaned_vocal) =
+    let (mut vocal_pitch_frames, cleaned_vocal) =
         ingest_vocal_frames(sandbox, bundle.vocals.as_deref(), &scale)?;
+    let mut vocal_stem_idx: Option<usize> = None;
     if let (Some(voc_path), Some(voc_buf)) = (&bundle.vocals, &cleaned_vocal) {
+        vocal_stem_idx = Some(primary_stems.len());
         primary_stems.push((sandbox.check(voc_path)?, voc_buf.clone()));
     }
 
@@ -807,8 +809,7 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
 
     let mut drum_buf =
         sandbox.load_audio(&sandbox.check(bundle.drums.as_ref().unwrap_or(&input))?)?;
-    let (kick_notes, snare_notes, hat_notes) =
-        write_ingest_midi(sandbox, &paths, &drum_buf, bpm, chords)?;
+    let (kick_notes, snare_notes, hat_notes) = extract_drum_midi_triggers(&drum_buf, bpm, 480);
 
     let mut drum_hits_layered = 0_usize;
     if let Some(ref samples_dir) = drum_samples_dir {
@@ -843,7 +844,9 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
         bundle.drums = Some(out_drum);
         drum_buf = layered;
     }
+    let mut drum_stem_idx: Option<usize> = None;
     if let Some(ref drums_path) = bundle.drums {
+        drum_stem_idx = Some(primary_stems.len());
         primary_stems.push((sandbox.check(drums_path)?, drum_buf));
     }
 
@@ -857,25 +860,54 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
     }
 
     let mut quantized_applied = false;
+    let mut drum_for_midi = if let Some(d_idx) = drum_stem_idx {
+        primary_stems[d_idx].1.clone()
+    } else {
+        full_mix.clone()
+    };
     if quantize_grid && beat_grid.beats_secs.len() >= 2 {
-        for (path, buf) in &mut primary_stems {
-            let (warped, _) = quantize_to_constant_bpm(buf, &beat_grid.beats_secs, bpm)?;
-            sandbox.save_wav(&warped, path, 24)?;
-            *buf = warped;
+        let (synced_pitch, synced_drums) = quantize_stems_and_sync_assets(
+            &mut primary_stems,
+            vocal_stem_idx,
+            drum_stem_idx,
+            &beat_grid.beats_secs,
+            bpm,
+            &scale,
+        )?;
+        for (path, buf) in &primary_stems {
+            sandbox.save_wav(buf, path, 24)?;
         }
+        if vocal_stem_idx.is_some() {
+            vocal_pitch_frames = synced_pitch;
+        }
+        drum_for_midi = match synced_drums {
+            Some(_) => primary_stems[drum_stem_idx.expect("idx checked")].1.clone(),
+            None => quantize_to_constant_bpm(&full_mix, &beat_grid.beats_secs, bpm)?.0,
+        };
         quantized_applied = true;
     }
+    let _ = write_ingest_midi(sandbox, &paths, &drum_for_midi, bpm, chords)?;
 
-    let target_frames = primary_stems
-        .iter()
-        .map(|(_, b)| b.num_frames())
-        .max()
-        .unwrap_or_else(|| full_mix.num_frames());
-    let duration_secs = (target_frames as f64) / f64::from(full_mix.sample_rate.max(1));
     let refs: Vec<&AudioBuffer> = primary_stems.iter().map(|(_, b)| b).collect();
     let (mastered, delivery) = forge_dsp::resum_and_deliver_ai_stems(&refs, &full_mix, target)?;
     sandbox.save_wav(&mastered, &paths.master, 24)?;
     sandbox.write_json(&paths.delivery, &delivery)?;
+
+    let duration_secs = primary_stems
+        .iter()
+        .map(|(_, b)| buffer_duration_secs(b))
+        .chain(std::iter::once(buffer_duration_secs(&mastered)))
+        .fold(0.0_f64, f64::max)
+        .max(buffer_duration_secs(&full_mix));
+    let stem_duration = |path: Option<&PathBuf>| -> f64 {
+        path.and_then(|p| {
+            primary_stems
+                .iter()
+                .find(|(sp, _)| sp == p)
+                .map(|(_, b)| buffer_duration_secs(b))
+        })
+        .unwrap_or(duration_secs)
+    };
 
     let tempo_map = if !quantized_applied && beat_grid.max_bpm_drift >= 1.5 {
         beat_grid.tempo_map.clone()
@@ -886,6 +918,12 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
         bpm,
         sample_rate: full_mix.sample_rate,
         duration_secs,
+        vocal_duration_secs: stem_duration(bundle.vocals.as_ref()),
+        drums_duration_secs: stem_duration(bundle.drums.as_ref()),
+        bass_duration_secs: stem_duration(bundle.bass.as_ref()),
+        other_duration_secs: stem_duration(bundle.other.as_ref()),
+        guitar_duration_secs: stem_duration(bundle.guitar.as_ref()),
+        keys_duration_secs: stem_duration(bundle.keys.as_ref()),
         vocal: bundle.vocals,
         drums: bundle.drums,
         bass: bundle.bass,
@@ -1041,10 +1079,39 @@ fn clean_ingested_other(
     Ok(other_clean)
 }
 
+pub(crate) fn buffer_duration_secs(buf: &AudioBuffer) -> f64 {
+    (buf.num_frames() as f64) / f64::from(buf.sample_rate.max(1))
+}
+
+pub(crate) fn quantize_stems_and_sync_assets(
+    primary_stems: &mut [(PathBuf, AudioBuffer)],
+    vocal_idx: Option<usize>,
+    drum_idx: Option<usize>,
+    beats_secs: &[f64],
+    bpm: f64,
+    scale: &VocalScale,
+) -> Result<(Vec<PitchFrame>, Option<DrumTriggerMidi>), ForgeError> {
+    for (_, buf) in primary_stems.iter_mut() {
+        let (warped, _) = quantize_to_constant_bpm(buf, beats_secs, bpm)?;
+        *buf = warped;
+    }
+    let pitch_frames = vocal_idx
+        .map(|idx| track_vocal_pitch(&primary_stems[idx].1, scale, 0.85))
+        .unwrap_or_default();
+    let drum_midi = drum_idx.map(|idx| extract_drum_midi_triggers(&primary_stems[idx].1, bpm, 480));
+    Ok((pitch_frames, drum_midi))
+}
+
 pub(crate) struct SessionSpec {
     pub(crate) bpm: f64,
     pub(crate) sample_rate: u32,
     pub(crate) duration_secs: f64,
+    pub(crate) vocal_duration_secs: f64,
+    pub(crate) drums_duration_secs: f64,
+    pub(crate) bass_duration_secs: f64,
+    pub(crate) other_duration_secs: f64,
+    pub(crate) guitar_duration_secs: f64,
+    pub(crate) keys_duration_secs: f64,
     pub(crate) vocal: Option<PathBuf>,
     pub(crate) drums: Option<PathBuf>,
     pub(crate) bass: Option<PathBuf>,
@@ -1066,7 +1133,7 @@ pub(crate) fn build_session(spec: SessionSpec) -> ReaperProjectBuilder {
         ReaperTrackSpec::audio(
             "01 Lead Vocal",
             spec.vocal,
-            spec.duration_secs,
+            spec.vocal_duration_secs,
             0.85,
             0x0155_88FF,
         )
@@ -1078,16 +1145,22 @@ pub(crate) fn build_session(spec: SessionSpec) -> ReaperProjectBuilder {
         rpp.tracks.push(ReaperTrackSpec::audio(
             "02 Drums",
             Some(drums),
-            spec.duration_secs,
+            spec.drums_duration_secs,
             0.90,
             0x01FF_5555,
         ));
     }
     if let Some(bass) = spec.bass {
         rpp.tracks.push(
-            ReaperTrackSpec::audio("03 Bass", Some(bass), spec.duration_secs, 0.88, 0x01AA_66FF)
-                .with_jsfx(["Forge_OpenSpacer_Unmask.jsfx"])
-                .with_sidechain(if has_drums { Some(1) } else { None }),
+            ReaperTrackSpec::audio(
+                "03 Bass",
+                Some(bass),
+                spec.bass_duration_secs,
+                0.88,
+                0x01AA_66FF,
+            )
+            .with_jsfx(["Forge_OpenSpacer_Unmask.jsfx"])
+            .with_sidechain(if has_drums { Some(1) } else { None }),
         );
     }
     if let Some(other) = spec.other {
@@ -1095,7 +1168,7 @@ pub(crate) fn build_session(spec: SessionSpec) -> ReaperProjectBuilder {
             ReaperTrackSpec::audio(
                 "04 Instruments / Other",
                 Some(other),
-                spec.duration_secs,
+                spec.other_duration_secs,
                 0.82,
                 0x0144_DD88,
             )
@@ -1121,7 +1194,7 @@ pub(crate) fn build_session(spec: SessionSpec) -> ReaperProjectBuilder {
         rpp.tracks.push(ReaperTrackSpec::audio(
             "07 Guitar",
             Some(guitar),
-            spec.duration_secs,
+            spec.guitar_duration_secs,
             0.80,
             0x0144_AAFF,
         ));
@@ -1130,7 +1203,7 @@ pub(crate) fn build_session(spec: SessionSpec) -> ReaperProjectBuilder {
         rpp.tracks.push(ReaperTrackSpec::audio(
             "08 Keys / Piano",
             Some(keys),
-            spec.duration_secs,
+            spec.keys_duration_secs,
             0.80,
             0x01AA_FF44,
         ));

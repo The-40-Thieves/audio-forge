@@ -590,4 +590,77 @@ mod tests {
         assert_eq!(bounced.num_frames(), 4_800);
         assert!(bounced.channels.iter().flatten().all(|s| s.is_finite()));
     }
+
+    #[test]
+    fn open_spacer_bypasses_when_unconnected_and_ducks_from_sidechain_track() {
+        let frames = 16_000;
+        let mut cache = ClipCache::default();
+        let clip_target = PathBuf::from("mem://spacer_target.wav");
+        let clip_sc = PathBuf::from("mem://spacer_sc.wav");
+        cache.insert_memory_clip(clip_target.clone(), sine_clip(48_000, frames, 1_000.0, 0.5));
+        cache.insert_memory_clip(clip_sc.clone(), sine_clip(48_000, frames, 1_000.0, 0.6));
+
+        // 1. Isolated target with unconnected OpenSpacer (sidechain_track_id: None) -> full bypass
+        let mut isolated = DawProject::new("SpacerBypass", 48_000, 120.0);
+        isolated.tracks[0].objects.push(AudioObject::new(
+            10,
+            "Bed",
+            clip_target.clone(),
+            frames as u64,
+        ));
+        let dry = ObjectOrientedEngine::bounce_offline(&isolated, &cache, frames).expect("dry");
+        isolated.tracks[0]
+            .inserts
+            .push(FxSlotConfig::default_open_spacer());
+        let bypassed =
+            ObjectOrientedEngine::bounce_offline(&isolated, &cache, frames).expect("bypassed");
+        let max_diff = dry.channels[0]
+            .iter()
+            .zip(&bypassed.channels[0])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_diff < 1e-6,
+            "unconnected OpenSpacer attenuated isolated target: max_diff={max_diff}"
+        );
+
+        // 2. Routed sidechain track ducks target when unmuted and stays clean when sidechain muted
+        let mut routed = DawProject::new("SpacerRouted", 48_000, 120.0);
+        let sc_track_id = routed.tracks[1].id;
+        routed.tracks[0]
+            .objects
+            .push(AudioObject::new(11, "Bed", clip_target, frames as u64));
+        routed.tracks[0].inserts.push(FxSlotConfig::OpenSpacer {
+            bypass: false,
+            amount: 1.0,
+            max_cut_db: 18.0,
+            low_hz: 200.0,
+            high_hz: 8_000.0,
+            mid_side_balance: 0.0,
+            delta_listen: false,
+            sidechain_track_id: Some(sc_track_id),
+        });
+        routed.tracks[1]
+            .objects
+            .push(AudioObject::new(12, "Key", clip_sc, frames as u64));
+        routed.tracks[1].gain_db = -60.0; // silence key track's mix bleed while keeping pre-insert sidechain hot
+
+        routed.tracks[1].mute = true;
+        let sc_muted =
+            ObjectOrientedEngine::bounce_offline(&routed, &cache, frames).expect("sc muted");
+        routed.tracks[1].mute = false;
+        let sc_active =
+            ObjectOrientedEngine::bounce_offline(&routed, &cache, frames).expect("sc active");
+
+        let rms = |buf: &forge_core::AudioBuffer| -> f64 {
+            let tail = &buf.channels[0][frames / 2..];
+            (tail.iter().map(|s| s * s).sum::<f64>() / (tail.len() as f64)).sqrt()
+        };
+        let rms_muted = rms(&sc_muted);
+        let rms_active = rms(&sc_active);
+        assert!(
+            rms_active < rms_muted * 0.85,
+            "expected routed OpenSpacer sidechain to duck target: rms_muted={rms_muted}, rms_active={rms_active}"
+        );
+    }
 }

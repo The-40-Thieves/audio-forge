@@ -1269,6 +1269,8 @@ fn run_ingest_cli(args: IngestCliArgs) -> anyhow::Result<()> {
     let mut vocal_pitch_frames = Vec::new();
     let mut cleaned_vocal: Option<AudioBuffer> = None;
 
+    let mut vocal_stem_idx: Option<usize> = None;
+
     // 2. Clean & Spectral De-Fizz Lead Vocal (ai_vocal preset)
     if let Some(ref voc_path) = bundle.vocals {
         let voc_buf = AudioBuffer::load(voc_path)?;
@@ -1277,6 +1279,7 @@ fn run_ingest_cli(args: IngestCliArgs) -> anyhow::Result<()> {
         vocal_pitch_frames = track_vocal_pitch(&voc_defizz, &parsed_scale, 0.85);
         voc_defizz.save_wav(voc_path, 24)?;
         cleaned_vocal = Some(voc_defizz.clone());
+        vocal_stem_idx = Some(primary_stems.len());
         primary_stems.push((voc_path.clone(), voc_defizz));
     }
 
@@ -1302,16 +1305,6 @@ fn run_ingest_cli(args: IngestCliArgs) -> anyhow::Result<()> {
     let (kick_notes, snare_notes, hat_notes) = extract_drum_midi_triggers(&drum_buf, args.bpm, 480);
 
     let drum_midi_path = midi_dir.join("01_Drum_Triggers.mid");
-    write_midi_file(
-        &drum_midi_path,
-        args.bpm,
-        480,
-        &[
-            ("Kick_Trigger_C1", &kick_notes),
-            ("Snare_Trigger_D1", &snare_notes),
-            ("HiHat_Trigger_F#1", &hat_notes),
-        ],
-    )?;
 
     let mut drum_hits_layered = 0_usize;
     if let Some(ref samples_dir) = args.replace_drums {
@@ -1347,7 +1340,9 @@ fn run_ingest_cli(args: IngestCliArgs) -> anyhow::Result<()> {
         bundle.drums = Some(out_drum);
         drum_buf = layered;
     }
+    let mut drum_stem_idx: Option<usize> = None;
     if let Some(ref drums_path) = bundle.drums {
+        drum_stem_idx = Some(primary_stems.len());
         primary_stems.push((drums_path.clone(), drum_buf));
     }
 
@@ -1367,8 +1362,31 @@ fn run_ingest_cli(args: IngestCliArgs) -> anyhow::Result<()> {
             warped.save_wav(path, 24)?;
             *buf = warped;
         }
+        if let Some(v_idx) = vocal_stem_idx {
+            vocal_pitch_frames = track_vocal_pitch(&primary_stems[v_idx].1, &parsed_scale, 0.85);
+        }
         quantized_applied = true;
     }
+
+    let drum_for_midi = if let Some(d_idx) = drum_stem_idx {
+        primary_stems[d_idx].1.clone()
+    } else if quantized_applied {
+        quantize_to_constant_bpm(&full_mix, &beat_grid.beats_secs, args.bpm)?.0
+    } else {
+        full_mix.clone()
+    };
+    let (kick_notes, snare_notes, hat_notes) =
+        extract_drum_midi_triggers(&drum_for_midi, args.bpm, 480);
+    write_midi_file(
+        &drum_midi_path,
+        args.bpm,
+        480,
+        &[
+            ("Kick_Trigger_C1", &kick_notes),
+            ("Snare_Trigger_D1", &snare_notes),
+            ("HiHat_Trigger_F#1", &hat_notes),
+        ],
+    )?;
 
     // 7. Solve Voice-Led Chords & Phase-Locked Sub-Bass MIDI
     let raw_chords: Vec<String> = args
@@ -1407,12 +1425,6 @@ fn run_ingest_cli(args: IngestCliArgs) -> anyhow::Result<()> {
     )?;
 
     // 8. Re-sum cleaned stems and render telemetry-driven AI-aware DistroKid Master
-    let target_frames = primary_stems
-        .iter()
-        .map(|(_, b)| b.num_frames())
-        .max()
-        .unwrap_or_else(|| full_mix.num_frames());
-    let duration_secs = (target_frames as f64) / f64::from(full_mix.sample_rate.max(1));
     let refs: Vec<&AudioBuffer> = primary_stems.iter().map(|(_, b)| b).collect();
     let (mastered, delivery) =
         forge_dsp::resum_and_deliver_ai_stems(&refs, &full_mix, DeliveryTarget::Spotify)?;
@@ -1422,6 +1434,24 @@ fn run_ingest_cli(args: IngestCliArgs) -> anyhow::Result<()> {
         master_path.with_extension("delivery.json"),
         serde_json::to_string_pretty(&delivery)?,
     )?;
+
+    let buf_duration_secs =
+        |b: &AudioBuffer| (b.num_frames() as f64) / f64::from(b.sample_rate.max(1));
+    let duration_secs = primary_stems
+        .iter()
+        .map(|(_, b)| buf_duration_secs(b))
+        .chain(std::iter::once(buf_duration_secs(&mastered)))
+        .fold(0.0_f64, f64::max)
+        .max(buf_duration_secs(&full_mix));
+    let stem_duration = |path: Option<&PathBuf>| -> f64 {
+        path.and_then(|p| {
+            primary_stems
+                .iter()
+                .find(|(sp, _)| sp == p)
+                .map(|(_, b)| buf_duration_secs(b))
+        })
+        .unwrap_or(duration_secs)
+    };
 
     // 9. Build Complete REAPER 7.82 Multitrack .RPP Project (with <TEMPOENVEX> when unquantized & drifting)
     let mut rpp = ReaperProjectBuilder::new(
@@ -1439,7 +1469,7 @@ fn run_ingest_cli(args: IngestCliArgs) -> anyhow::Result<()> {
         ReaperTrackSpec::audio(
             "01 Lead Vocal (Dry De-Fizzed)",
             bundle.vocals.clone(),
-            duration_secs,
+            stem_duration(bundle.vocals.as_ref()),
             0.85,
             0x0155_88FF,
         )
@@ -1449,7 +1479,7 @@ fn run_ingest_cli(args: IngestCliArgs) -> anyhow::Result<()> {
     rpp.tracks.push(ReaperTrackSpec::audio(
         "02 Drums Stem",
         bundle.drums.clone(),
-        duration_secs,
+        stem_duration(bundle.drums.as_ref()),
         0.80,
         0x0144_CC44,
     ));
@@ -1457,7 +1487,7 @@ fn run_ingest_cli(args: IngestCliArgs) -> anyhow::Result<()> {
         ReaperTrackSpec::audio(
             "03 Bass Stem (Sidechain Unmasked + Mono Sub)",
             bundle.bass.clone(),
-            duration_secs,
+            stem_duration(bundle.bass.as_ref()),
             0.82,
             0x01FF_8844,
         )
@@ -1471,7 +1501,7 @@ fn run_ingest_cli(args: IngestCliArgs) -> anyhow::Result<()> {
         ReaperTrackSpec::audio(
             "04 Instruments Bus (Vocal Unmasked + De-Fizzed)",
             bundle.other.clone(),
-            duration_secs,
+            stem_duration(bundle.other.as_ref()),
             0.78,
             0x01CC_66FF,
         )
@@ -1502,20 +1532,20 @@ fn run_ingest_cli(args: IngestCliArgs) -> anyhow::Result<()> {
         0.88,
         0x01FF_6644,
     ));
-    if let Some(guitar) = bundle.guitar {
+    if let Some(ref guitar) = bundle.guitar {
         rpp.tracks.push(ReaperTrackSpec::audio(
             "08 Guitar Stem",
-            Some(guitar),
-            duration_secs,
+            Some(guitar.clone()),
+            stem_duration(Some(guitar)),
             0.78,
             0x0144_AAFF,
         ));
     }
-    if let Some(keys) = bundle.keys {
+    if let Some(ref keys) = bundle.keys {
         rpp.tracks.push(ReaperTrackSpec::audio(
             "09 Keys / Piano Stem",
-            Some(keys),
-            duration_secs,
+            Some(keys.clone()),
+            stem_duration(Some(keys)),
             0.78,
             0x01AA_FF44,
         ));

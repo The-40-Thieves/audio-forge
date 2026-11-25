@@ -1120,4 +1120,14 @@ mod tests {
         assert!(drifted_rpp.contains("PT 0.00000 118.5000 1 262148 0 0"));
         assert!(drifted_rpp.contains("PT 2.02500 122.7500 1 262148 0 0"));
     }
+
+    #[test]
+    fn jsfx_master_limiter_uses_4x_polyphase_true_peak_detector_and_lookahead() {
+        assert!(JSFX_MASTER_LIMITER.contains("init_tp_phase(tp_c1, 0.25)"));
+        assert!(JSFX_MASTER_LIMITER.contains("init_tp_phase(tp_c2, 0.50)"));
+        assert!(JSFX_MASTER_LIMITER.contains("init_tp_phase(tp_c3, 0.75)"));
+        assert!(JSFX_MASTER_LIMITER.contains("peak_buf["));
+        assert!(JSFX_MASTER_LIMITER.contains("loop(lookahead + 1,"));
+        assert!(JSFX_MASTER_LIMITER.contains("gain_env = min(gain_env, req_here);"));
+    }
 }
