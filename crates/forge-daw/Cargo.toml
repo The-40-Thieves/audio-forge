@@ -18,5 +18,8 @@ forge-dsp = { path = "../forge-dsp" }
 forge-engine = { path = "../forge-engine" }
 forge-worker = { path = "../forge-worker" }
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

@@ -88,6 +88,79 @@ mod tests {
     use std::f64::consts::PI;
 
     #[test]
+    fn packed_ms_fft_matches_independent_real_ffts() {
+        use rustfft::{FftPlanner, num_complex::Complex};
+
+        const N: usize = 2048;
+        const HALF: usize = N / 2;
+        let mut planner = FftPlanner::<f64>::new();
+        let fft = planner.plan_fft_forward(N);
+        let inv_n_sq = 1.0 / ((N * N) as f64);
+
+        let mut mid_buf = vec![Complex::new(0.0, 0.0); N];
+        let mut side_buf = vec![Complex::new(0.0, 0.0); N];
+        let mut packed_buf = vec![Complex::new(0.0, 0.0); N];
+
+        for i in 0..N {
+            let t = (i as f64) / 48_000.0;
+            let m = 0.12
+                + 0.4 * (2.0 * PI * 310.0 * t).sin()
+                + 0.15 * if i % 2 == 0 { 1.0 } else { -1.0 };
+            let s = -0.07
+                + 0.3 * (2.0 * PI * 4_200.0 * t).cos()
+                + 0.09 * if i % 2 == 0 { -1.0 } else { 1.0 };
+            mid_buf[i] = Complex::new(m, 0.0);
+            side_buf[i] = Complex::new(s, 0.0);
+            packed_buf[i] = Complex::new(m, s);
+        }
+
+        fft.process(&mut mid_buf);
+        fft.process(&mut side_buf);
+        fft.process(&mut packed_buf);
+
+        let mut unpacked_mid = vec![0.0_f64; HALF + 1];
+        let mut unpacked_side = vec![0.0_f64; HALF + 1];
+        loudness_limiter::unpack_packed_ms_power(
+            &packed_buf,
+            inv_n_sq,
+            &mut unpacked_mid,
+            &mut unpacked_side,
+        );
+
+        for b in 0..=HALF {
+            let ref_m = (mid_buf[b].re * mid_buf[b].re + mid_buf[b].im * mid_buf[b].im) * inv_n_sq;
+            let ref_s =
+                (side_buf[b].re * side_buf[b].re + side_buf[b].im * side_buf[b].im) * inv_n_sq;
+            assert!(
+                (unpacked_mid[b] - ref_m).abs() < 1e-12,
+                "mid bin {b} mismatch: unpacked={}, ref={ref_m}",
+                unpacked_mid[b]
+            );
+            assert!(
+                (unpacked_side[b] - ref_s).abs() < 1e-12,
+                "side bin {b} mismatch: unpacked={}, ref={ref_s}",
+                unpacked_side[b]
+            );
+        }
+    }
+
+    #[test]
+    fn transient_sharpness_covers_tail_at_44_1khz() {
+        let frames = 529_200;
+        let mut mono = vec![0.0_f64; frames];
+        for sample in &mut mono[(frames - 1_323)..(frames - 1_235)] {
+            *sample = 0.8;
+        }
+        let buf = forge_core::AudioBuffer::from_channels(vec![mono], 44_100).expect("valid buffer");
+        let report = audit_audio(&buf);
+        assert!(
+            report.transient_sharpness_db > 6.0,
+            "expected tail transient burst at 44.1 kHz to be detected, got {} dB",
+            report.transient_sharpness_db
+        );
+    }
+
+    #[test]
     fn test_bs1770_loudness_and_brickwall_true_peak_limiter() {
         let sr = 48_000_u32;
         let frames = (sr as usize) * 2; // 2 seconds

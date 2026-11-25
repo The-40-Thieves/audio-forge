@@ -207,31 +207,44 @@ const BEAT_BACKENDS: &[&str] = &[
 ];
 const EVAL_BACKENDS: &[&str] = &["auto", "audiobox", "singmos", "acoustic-proxy", "rust"];
 
-fn worker_tool(
-    meta: (&'static str, &str, &'static str, ToolKind),
-    output_dir_desc: Option<&str>,
-    backends: &[&str],
+struct WorkerToolSpec {
+    meta: (&'static str, &'static str, &'static str, ToolKind),
+    output_dir_desc: Option<&'static str>,
+    backends: &'static [&'static str],
     default_timeout_secs: i64,
     extra: Vec<(&'static str, Value)>,
     output_schema: Arc<JsonObject>,
-) -> Tool {
-    let (name, title, desc, kind) = meta;
+}
+
+fn worker_tool(spec: WorkerToolSpec) -> Tool {
+    let (name, title, desc, kind) = spec.meta;
     let mut props = vec![("input", prop_str(None, "Input audio file"))];
     let mut required = vec!["input"];
-    if let Some(dir_desc) = output_dir_desc {
+    if let Some(dir_desc) = spec.output_dir_desc {
         props.push(("output_dir", prop_str(None, dir_desc)));
         required.push("output_dir");
     }
-    props.push(("backend", prop_enum("string", backends, json!("auto"), "")));
-    props.extend(extra);
+    props.push((
+        "backend",
+        prop_enum("string", spec.backends, json!("auto"), ""),
+    ));
+    props.extend(spec.extra);
     props.push((
         "timeout_secs",
         prop_int(
-            Some(default_timeout_secs),
+            Some(spec.default_timeout_secs),
             "Worker timeout in seconds (1..=3600)",
         ),
     ));
-    mcp_tool(name, title, desc, kind, &props, &required, output_schema)
+    mcp_tool(
+        name,
+        title,
+        desc,
+        kind,
+        &props,
+        &required,
+        spec.output_schema,
+    )
 }
 
 pub(crate) fn delivery_target_names() -> Vec<&'static str> {
@@ -634,25 +647,25 @@ pub(crate) fn build_tools() -> Vec<Tool> {
                 ("report", "object"),
             ]),
         ),
-        worker_tool(
-            (
+        worker_tool(WorkerToolSpec {
+            meta: (
                 "forge_neural_denoise",
                 "Neural Denoise (DeepFilterNet3 / RoFormer)",
                 "Run neural audio denoising via DeepFilterNet3 or Mel-Band-RoFormer on the local Python GPU worker, confined to the MCP path sandbox.",
                 ToolKind::WriteExternal,
             ),
-            Some("Output directory for denoised audio"),
-            DENOISE_BACKENDS,
-            300,
-            vec![(
+            output_dir_desc: Some("Output directory for denoised audio"),
+            backends: DENOISE_BACKENDS,
+            default_timeout_secs: 300,
+            extra: vec![(
                 "attenuation_limit_db",
                 prop_num(
                     None,
                     "Optional attenuation limit in dB (0..=100, DeepFilterNet3)",
                 ),
             )],
-            out_backend_output(),
-        ),
+            output_schema: out_backend_output(),
+        }),
         mcp_tool(
             "forge_transcribe_midi",
             "Polyphonic Audio-to-MIDI Transcription",
@@ -754,17 +767,17 @@ pub(crate) fn build_tools() -> Vec<Tool> {
                 ("drum_hits_layered", "integer"),
             ]),
         ),
-        worker_tool(
-            (
+        worker_tool(WorkerToolSpec {
+            meta: (
                 "forge_neural_restore",
                 "Neural Bandwidth Restoration (Apollo / AudioSR)",
                 "Run neural bandwidth restoration and AI artifact cleanup (Apollo, FlowHigh, AudioSR, SonicMaster, or spectral exciter fallback) within the MCP path sandbox.",
                 ToolKind::WriteExternal,
             ),
-            Some("Output directory for restored audio"),
-            RESTORE_BACKENDS,
-            600,
-            vec![
+            output_dir_desc: Some("Output directory for restored audio"),
+            backends: RESTORE_BACKENDS,
+            default_timeout_secs: 600,
+            extra: vec![
                 (
                     "prompt",
                     prop_str(None, "Optional instruction prompt (used by SonicMaster)"),
@@ -774,19 +787,19 @@ pub(crate) fn build_tools() -> Vec<Tool> {
                     prop_num(None, "Processing chunk length in seconds (0.5..=120.0)"),
                 ),
             ],
-            out_backend_output(),
-        ),
-        worker_tool(
-            (
+            output_schema: out_backend_output(),
+        }),
+        worker_tool(WorkerToolSpec {
+            meta: (
                 "forge_vocal_rescue",
                 "Neural AI Vocal Rescue",
                 "Rescue robotic or phasey AI vocals (Resemble Enhance, Seed-VC zero-shot timbre, or RoFormer chain) within the MCP path sandbox.",
                 ToolKind::WriteExternal,
             ),
-            Some("Output directory for rescued vocal"),
-            RESCUE_BACKENDS,
-            600,
-            vec![
+            output_dir_desc: Some("Output directory for rescued vocal"),
+            backends: RESCUE_BACKENDS,
+            default_timeout_secs: 600,
+            extra: vec![
                 (
                     "reference_voice",
                     prop_str(
@@ -803,40 +816,40 @@ pub(crate) fn build_tools() -> Vec<Tool> {
                     prop_bool(true, "Run vocal aspiration suppression"),
                 ),
             ],
-            out_backend_output(),
-        ),
-        worker_tool(
-            (
+            output_schema: out_backend_output(),
+        }),
+        worker_tool(WorkerToolSpec {
+            meta: (
                 "forge_beat_track",
                 "Beat & Tempo Drift Tracker",
                 "Extract beats, downbeats, median BPM, and tempo-drift map (beat-this, librosa, energy, or pure-Rust onset DP) within the MCP path sandbox.",
                 ToolKind::ReadOpenWorld,
             ),
-            None,
-            BEAT_BACKENDS,
-            300,
-            vec![(
+            output_dir_desc: None,
+            backends: BEAT_BACKENDS,
+            default_timeout_secs: 300,
+            extra: vec![(
                 "hint_bpm",
                 prop_num(None, "Optional BPM hint (30.0..=300.0) for Rust fallback"),
             )],
-            out_fields(&[
+            output_schema: out_fields(&[
                 ("backend", "string"),
                 ("median_bpm", "number"),
                 ("max_bpm_drift", "number"),
                 ("beats_secs", "array"),
             ]),
-        ),
-        worker_tool(
-            (
+        }),
+        worker_tool(WorkerToolSpec {
+            meta: (
                 "forge_evaluate_quality",
                 "Perceptual Quality Assessment",
                 "Evaluate perceptual audio quality (Meta Audiobox Aesthetics PQ/PC/CE/CU, SingMOS, or acoustic proxy) within the MCP path sandbox.",
                 ToolKind::ReadOpenWorld,
             ),
-            None,
-            EVAL_BACKENDS,
-            300,
-            vec![
+            output_dir_desc: None,
+            backends: EVAL_BACKENDS,
+            default_timeout_secs: 300,
+            extra: vec![
                 (
                     "reference",
                     prop_str(
@@ -849,7 +862,7 @@ pub(crate) fn build_tools() -> Vec<Tool> {
                     prop_bool(false, "Prioritize vocal quality (SingMOS)"),
                 ),
             ],
-            out_fields(&[("backend", "string")]),
-        ),
+            output_schema: out_fields(&[("backend", "string")]),
+        }),
     ]
 }

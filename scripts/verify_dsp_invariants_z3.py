@@ -17,6 +17,11 @@ import sys
 import z3
 
 
+def _require(condition: bool, message: str = "Z3 invariant check failed") -> None:
+    if not condition:
+        raise AssertionError(message)
+
+
 def z3_clamp(val: z3.ArithRef, lo: z3.ArithRef, hi: z3.ArithRef) -> z3.ArithRef:
     return z3.If(val < lo, lo, z3.If(val > hi, hi, val))
 
@@ -57,7 +62,7 @@ def prove_clamp_hazards_and_fixes() -> dict[str, str]:
     # Negate invariant: can (b_2k_fixed + 1) > 1020 ever hold?
     s_fix.add(b_2k_fixed + 1 > 1020)
     chk = s_fix.check()
-    assert chk == z3.unsat, f"Expected UNSAT for fixed b_2k/b_6k clamp, got {chk}"
+    _require(chk == z3.unsat, f"Expected UNSAT for fixed b_2k/b_6k clamp, got {chk}")
     results["hardened_audit_b6k_clamp_proof"] = (
         "UNSAT (Mathematically Proven Panic-Free for all sr > 0)"
     )
@@ -76,7 +81,7 @@ def prove_clamp_hazards_and_fixes() -> dict[str, str]:
     # Can b_low_fixed + 1 > half_bins - 2 ever occur?
     s_unmask.add(b_low_fixed + 1 > half_bins - 2)
     chk_u = s_unmask.check()
-    assert chk_u == z3.unsat
+    _require(chk_u == z3.unsat, "Expected UNSAT for fixed unmask clamp")
     results["hardened_unmask_clamp_proof"] = (
         "UNSAT (Mathematically Proven Panic-Free for all frequencies & sample rates)"
     )
@@ -118,7 +123,7 @@ def prove_walsh_hadamard_8_orthogonality_and_involution() -> dict[str, str]:
     # Proof 1: Involution: unscaled H(H(v)) == 8 * v  <=>  (H/sqrt(8))(H/sqrt(8)) v == v
     s_inv = z3.Solver()
     s_inv.add(z3.Or(*[h2[i] != 8 * v[i] for i in range(8)]))
-    assert s_inv.check() == z3.unsat
+    _require(s_inv.check() == z3.unsat, "Hadamard involution failed")
 
     # Proof 2: Parseval Energy Conservation: sum_i (h1[i]^2) == 8 * sum_i (v[i]^2)
     # Therefore with scale factor 1/sqrt(8), sum_i ((h1[i]/sqrt(8))^2) == sum_i (v[i]^2) identically!
@@ -126,7 +131,7 @@ def prove_walsh_hadamard_8_orthogonality_and_involution() -> dict[str, str]:
     energy_in = sum(x * x for x in v)
     energy_out_unscaled = sum(y * y for y in h1)
     s_energy.add(energy_out_unscaled != 8 * energy_in)
-    assert s_energy.check() == z3.unsat
+    _require(s_energy.check() == z3.unsat, "Hadamard Parseval energy failed")
 
     return {
         "hadamard_8_involution_proof": "UNSAT (Proven H(H(v)) == v for all v in R^8)",
@@ -163,7 +168,7 @@ def prove_fdn_lyapunov_stability_and_index_bounds() -> dict[str, str]:
             raw_sum >= 2 * delay_len,
         )
     )
-    assert s_idx.check() == z3.unsat
+    _require(s_idx.check() == z3.unsat, "FDN circular index proof failed")
 
     # Prove one-pole damping convex combination stability: for d in [0.05, 0.90] and |x| <= M, |s_prev| <= M,
     # |(1 - d)*x + d*s_prev| * fb_gain <= 0.985 * M < M for all M > 0
@@ -184,7 +189,7 @@ def prove_fdn_lyapunov_stability_and_index_bounds() -> dict[str, str]:
     next_loop_val = damped * fb_gain
     # Can |next_loop_val| ever exceed 0.985 * bound_m?
     s_lyap.add(z3.Or(next_loop_val > 0.985 * bound_m, next_loop_val < -0.985 * bound_m))
-    assert s_lyap.check() == z3.unsat
+    _require(s_lyap.check() == z3.unsat, "FDN Lyapunov contraction proof failed")
 
     return {
         "fdn_circular_index_safety_proof": "UNSAT (Proven 0 <= read_idx < delay_len without underflow/out-of-bounds)",
@@ -221,7 +226,7 @@ def prove_repo_wide_vocal_theory_and_core_invariants() -> dict[str, str]:
     s_dither.add(
         z3.Or(q16 < -32768.0, q16 > 32767.0, q24 < -8388608.0, q24 > 8388607.0)
     )
-    assert s_dither.check() == z3.unsat
+    _require(s_dither.check() == z3.unsat, "TPDF dither bounds proof failed")
     results["forge_core_noise_shaped_tpdf_dither_bounds_proof"] = (
         "UNSAT (Proven 1st-order error-feedback noise-shaped 16-bit & 24-bit TPDF dither strictly stays within i16/i24 limits)"
     )
@@ -235,7 +240,7 @@ def prove_repo_wide_vocal_theory_and_core_invariants() -> dict[str, str]:
     denom = 1.0 + g * (g + k)
     a1 = 1.0 / denom
     s_svf.add(z3.Or(denom <= 1.0, a1 <= 0.0, a1 >= 1.0))
-    assert s_svf.check() == z3.unsat
+    _require(s_svf.check() == z3.unsat, "Cytomic TPT SVF stability proof failed")
     results["cytomic_tpt_svf_trapezoidal_stability_proof"] = (
         "UNSAT (Proven Cytomic TPT SVF denominator 1 + g*(g+k) > 1 and 0 < a1 < 1 for all g > 0, k > 0)"
     )
@@ -247,7 +252,7 @@ def prove_repo_wide_vocal_theory_and_core_invariants() -> dict[str, str]:
     s_ap.add(t > 0.0)
     a_coeff = (t - 1.0) / (t + 1.0)
     s_ap.add(z3.Or(a_coeff <= -1.0, a_coeff >= 1.0))
-    assert s_ap.check() == z3.unsat
+    _require(s_ap.check() == z3.unsat, "Allpass disperser pole proof failed")
     results["allpass_disperser_unit_circle_pole_proof"] = (
         "UNSAT (Proven 1st-order allpass pole/zero coefficient |(t-1)/(t+1)| < 1 for all t > 0)"
     )
@@ -276,7 +281,7 @@ def prove_repo_wide_vocal_theory_and_core_invariants() -> dict[str, str]:
             target_idx >= scale_len,
         )
     )
-    assert s_vocal.check() == z3.unsat
+    _require(s_vocal.check() == z3.unsat, "Diatonic shift bounds proof failed")
     results["forge_vocal_diatonic_shift_bounds_proof"] = (
         "UNSAT (Proven diatonic_shift_semitones is overflow-free and in-bounds for all i32 inputs)"
     )
@@ -306,7 +311,7 @@ def prove_repo_wide_vocal_theory_and_core_invariants() -> dict[str, str]:
             delta > u28_max,
         )
     )
-    assert s_midi.check() == z3.unsat
+    _require(s_midi.check() == z3.unsat, "SMF u28 tick bounds proof failed")
     results["forge_theory_smf_u28_tick_bounds_proof"] = (
         "UNSAT (Proven SMF MIDI start/end/delta ticks strictly satisfy 0 <= tick <= 0x0FFF_FFFF for all u32 inputs)"
     )
@@ -314,18 +319,9 @@ def prove_repo_wide_vocal_theory_and_core_invariants() -> dict[str, str]:
     return results
 
 
-def prove_milestone3_sinc_ulpf_tempo_and_ms_invariants() -> dict[str, str]:
-    """Proves Milestone-3 DSP & timeline invariants:
-    1. Normalized signed windowed-sinc weights (|sum(w)| > 1e-12) preserve exact DC unity and
-       satisfy the signed-weight BIBO bound |y| <= M * sum(|w|) / |sum(w)|, plus a SAT sharpness
-       witness showing negative lobes produce |y| > M.
-    2. Ultrasonic LPF cutoff clamping stays strictly in [1 kHz, 0.48 * sr] < Nyquist for sr >= 8 kHz.
-    3. Piecewise-constant tempo map beat<->seconds conversion is strictly monotonic and exact inverse.
-    4. High-mid 2-12 kHz M/S Cauchy-Schwarz correlation + convex EMA stays strictly in [-1.0, 1.0].
-    """
+def prove_sinc_resampler_dc_and_bound() -> dict[str, str]:
+    """Proves exact DC unity and |y| <= M * sum(|w|) / |sum(w)| for signed sinc weights."""
     results: dict[str, str] = {}
-
-    # 1A. Normalized signed windowed-sinc FIR weights: exact DC unity & signed-weight BIBO bound
     s_sinc = z3.Solver()
     w0, w1, w2, w3 = z3.Reals("w0 w1 w2 w3")
     x0, x1, x2, x3 = z3.Reals("x0 x1 x2 x3")
@@ -350,12 +346,16 @@ def prove_milestone3_sinc_ulpf_tempo_and_ms_invariants() -> dict[str, str]:
     s_sinc.add(
         z3.Or(dc_out != c_dc, y > signed_bound, y < -signed_bound, l1_gain < 1.0)
     )
-    assert s_sinc.check() == z3.unsat
+    _require(s_sinc.check() == z3.unsat, "Sinc resampler signed bound proof failed")
     results["sinc_resampler_dc_unity_and_signed_gain_bound_proof"] = (
         "UNSAT (Proven normalized signed sinc weights preserve exact DC unity and |y| <= M * sum(|w|) / |sum(w)| for all |sum(w)| > 1e-12)"
     )
+    return results
 
-    # 1B. Companion SAT witness: negative sinc lobes strictly attain |y| = M * sum(|w|)/|sum(w)| > M
+
+def prove_sinc_resampler_overshoot_witness() -> dict[str, str]:
+    """Proves negative sinc lobes attain overshoot witness for bounded inputs."""
+    results: dict[str, str] = {}
     s_sinc_overshoot = z3.Solver()
     ow0, ow1, ow2, ow3 = z3.Reals("ow0 ow1 ow2 ow3")
     ox0, ox1, ox2, ox3 = z3.Reals("ox0 ox1 ox2 ox3")
@@ -377,27 +377,33 @@ def prove_milestone3_sinc_ulpf_tempo_and_ms_invariants() -> dict[str, str]:
     o_l1_gain = (z3_abs(ow0) + z3_abs(ow1) + z3_abs(ow2) + z3_abs(ow3)) / z3_abs(ow_sum)
     o_signed_bound = om_bound * o_l1_gain
     s_sinc_overshoot.add(oy == o_signed_bound, oy > om_bound)
-    assert s_sinc_overshoot.check() == z3.sat
+    _require(s_sinc_overshoot.check() == z3.sat, "Sinc overshoot witness failed")
     results["sinc_resampler_negative_lobe_overshoot_witness"] = (
         "SAT (Proven negative sinc lobes strictly attain |y| = M * sum(|w|)/|sum(w)| > M for bounded inputs)"
     )
+    return results
 
-    # 2. Ultrasonic LPF Nyquist guard matching RealtimeOpenSoothe::set_ultrasonic_lpf_hz ([1 kHz, 0.48*sr] < 0.5*sr)
+
+def prove_ultrasonic_lpf_nyquist_guard() -> dict[str, str]:
+    """Proves active ultrasonic LPF cutoff stays in [1 kHz, 0.48 * sr] < Nyquist for sr >= 8 kHz."""
     s_ulpf = z3.Solver()
     sr_val = z3.Real("sr_val")
     req_hz = z3.Real("req_hz")
     s_ulpf.add(sr_val >= 8000.0, req_hz > 0.0)
     nyquist_guard = 0.48 * sr_val
     fc_safe = z3_clamp(req_hz, z3.RealVal(1000.0), nyquist_guard)
-    # Active path executes only when req_hz < nyquist_guard; clamped cutoff must sit in [1 kHz, 0.5*sr)
     s_ulpf.add(req_hz < nyquist_guard)
     s_ulpf.add(z3.Or(fc_safe < 1000.0, fc_safe >= 0.5 * sr_val, fc_safe <= 0.0))
-    assert s_ulpf.check() == z3.unsat
-    results["ultrasonic_lpf_cutoff_nyquist_guard_proof"] = (
-        "UNSAT (Proven active ultrasonic LPF fc stays in [1 kHz, 0.48*sr] < Nyquist for all sr >= 8 kHz)"
-    )
+    _require(s_ulpf.check() == z3.unsat, "Ultrasonic LPF Nyquist guard proof failed")
+    return {
+        "ultrasonic_lpf_cutoff_nyquist_guard_proof": (
+            "UNSAT (Proven active ultrasonic LPF fc stays in [1 kHz, 0.48*sr] < Nyquist for all sr >= 8 kHz)"
+        )
+    }
 
-    # 3. Piecewise-constant tempo map beat <-> seconds strict monotonicity and bijective inverse
+
+def prove_tempo_map_monotonic_inverse() -> dict[str, str]:
+    """Proves piecewise-constant tempo map beat<->seconds conversion is strictly monotonic and bijective."""
     s_tempo = z3.Solver()
     t1, bpm0, bpm1 = z3.Reals("t1 bpm0 bpm1")
     ta, tb = z3.Reals("ta tb")
@@ -421,12 +427,16 @@ def prove_milestone3_sinc_ulpf_tempo_and_ms_invariants() -> dict[str, str]:
     rt_a = beat_to_secs(ba)
     rt_b = beat_to_secs(bb)
     s_tempo.add(z3.Or(bb <= ba, rt_a != ta, rt_b != tb))
-    assert s_tempo.check() == z3.unsat
-    results["tempo_map_monotonic_beat_phase_roundtrip_proof"] = (
-        "UNSAT (Proven piecewise-linear tempo map secs<->beat is strictly increasing and exact bijective inverse)"
-    )
+    _require(s_tempo.check() == z3.unsat, "Tempo map bijective proof failed")
+    return {
+        "tempo_map_monotonic_beat_phase_roundtrip_proof": (
+            "UNSAT (Proven piecewise-linear tempo map secs<->beat is strictly increasing and exact bijective inverse)"
+        )
+    }
 
-    # 4. High-mid M/S Cauchy-Schwarz correlation bound & convex EMA invariant in [-1, 1]
+
+def prove_ms_high_mid_correlation_bounds() -> dict[str, str]:
+    """Proves Cauchy-Schwarz correlation bound and convex EMA stability in [-1.0, 1.0]."""
     s_corr = z3.Solver()
     l0, l1, r0_sig, r1_sig = z3.Reals("l0 l1 r0_sig r1_sig")
     raw_corr, prev_corr, alpha_ema = z3.Reals("raw_corr prev_corr alpha_ema")
@@ -437,14 +447,13 @@ def prove_milestone3_sinc_ulpf_tempo_and_ms_invariants() -> dict[str, str]:
     s_corr.add(prev_corr >= -1.0, prev_corr <= 1.0)
     s_corr.add(raw_corr >= -1.0, raw_corr <= 1.0)
     next_corr = alpha_ema * raw_corr + (1.0 - alpha_ema) * prev_corr
-    # Violate either Cauchy-Schwarz dot^2 <= ee_l * ee_r OR EMA output bounds [-1, 1]
     s_corr.add(z3.Or(dot_lr * dot_lr > ee_l * ee_r, next_corr < -1.0, next_corr > 1.0))
-    assert s_corr.check() == z3.unsat
-    results["ms_high_mid_correlation_bounded_and_ema_invariant_proof"] = (
-        "UNSAT (Proven Cauchy-Schwarz correlation dot^2 <= E_L*E_R and EMA state stays strictly in [-1.0, 1.0])"
-    )
-
-    return results
+    _require(s_corr.check() == z3.unsat, "M/S correlation bound proof failed")
+    return {
+        "ms_high_mid_correlation_bounded_and_ema_invariant_proof": (
+            "UNSAT (Proven Cauchy-Schwarz correlation dot^2 <= E_L*E_R and EMA state stays strictly in [-1.0, 1.0])"
+        )
+    }
 
 
 def main() -> int:
@@ -453,7 +462,11 @@ def main() -> int:
     report.update(prove_walsh_hadamard_8_orthogonality_and_involution())
     report.update(prove_fdn_lyapunov_stability_and_index_bounds())
     report.update(prove_repo_wide_vocal_theory_and_core_invariants())
-    report.update(prove_milestone3_sinc_ulpf_tempo_and_ms_invariants())
+    report.update(prove_sinc_resampler_dc_and_bound())
+    report.update(prove_sinc_resampler_overshoot_witness())
+    report.update(prove_ultrasonic_lpf_nyquist_guard())
+    report.update(prove_tempo_map_monotonic_inverse())
+    report.update(prove_ms_high_mid_correlation_bounds())
     print(json.dumps(report, indent=2))
     return 0
 

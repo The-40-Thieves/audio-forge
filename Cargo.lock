@@ -1690,6 +1690,7 @@ dependencies = [
  "forge-engine",
  "forge-worker",
  "rfd",
+ "tempfile",
 ]
 
 [[package]]
@@ -1749,6 +1750,7 @@ name = "forge-mcp"
 version = "0.1.0"
 dependencies = [
  "cap-std",
+ "clap",
  "forge-core",
  "forge-dsp",
  "forge-engine",

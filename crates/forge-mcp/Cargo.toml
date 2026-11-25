@@ -19,6 +19,7 @@ forge-reaper = { path = "../forge-reaper" }
 forge-worker = { path = "../forge-worker" }
 forge-engine = { path = "../forge-engine" }
 cap-std.workspace = true
+clap.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 rmcp.workspace = true

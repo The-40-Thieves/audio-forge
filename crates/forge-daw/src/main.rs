@@ -1994,10 +1994,8 @@ mod tests {
 
     #[test]
     fn stage_selected_object_wav_slices_split_bounds_without_leaking_prefix() {
-        let dir = std::env::temp_dir().join(format!("forge_daw_stage_test_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp test dir");
-        let src_path = dir.join("full.wav");
+        let dir = tempfile::tempdir().expect("create temp test dir");
+        let src_path = dir.path().join("full.wav");
         // Left half: silence (0.0); right half: 0.4 amplitude DC-ish pulse
         let mut ch = vec![0.0_f64; 4_800];
         ch.extend(std::iter::repeat_n(0.4_f64, 4_800));
@@ -2006,13 +2004,12 @@ mod tests {
             .save_wav(&src_path, 24)
             .expect("save");
 
-        let out_dir = dir.join("ai_obj");
+        let out_dir = dir.path().join("ai_obj");
         let staged = stage_selected_object_wav(&src_path, &out_dir, 48_000, 4_800, 2_400, 1.0)
             .expect("stage split");
         assert_ne!(staged, src_path);
         let loaded = AudioBuffer::load(&staged).expect("load staged");
         assert_eq!(loaded.num_frames(), 2_400);
         assert!((loaded.channels[0][0] - 0.4).abs() < 1e-4);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
