@@ -65,6 +65,18 @@ impl ParamSmoother {
             flush_denormal_f64(self.coeff * self.current + (1.0 - self.coeff) * self.target);
         self.current
     }
+
+    #[inline]
+    pub fn reset(&mut self, value: f64) {
+        let v = if value.is_finite() { value } else { 0.0 };
+        self.current = v;
+        self.target = v;
+    }
+
+    #[inline]
+    pub fn current(&self) -> f64 {
+        self.current
+    }
 }
 
 /// Pre-allocated zero-allocation Stereo Overlap-Add STFT engine shared by spectral processors.

@@ -252,7 +252,6 @@ fn decode_audio_task_reply(
     Ok((path, backend))
 }
 
-#[allow(dead_code)]
 pub(crate) fn denoise(
     base_url: &str,
     input_path: &Path,
@@ -276,7 +275,6 @@ pub(crate) fn denoise(
     })
 }
 
-#[allow(dead_code)]
 pub(crate) fn transcribe(
     base_url: &str,
     input_path: &Path,

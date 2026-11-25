@@ -431,6 +431,14 @@ impl LiveAudioEngine {
                 err_cb,
                 None,
             ),
+            cpal::SampleFormat::F64 => device.build_output_stream(
+                stream_config,
+                move |data: &mut [f64], _: &cpal::OutputCallbackInfo| {
+                    render_converted_output(data, channels, &mut f32_buf, &mut render_f32);
+                },
+                err_cb,
+                None,
+            ),
             other => {
                 return Err(ForgeError::AudioIo {
                     path: device_name,
@@ -738,6 +746,14 @@ impl LiveRecorder {
             cpal::SampleFormat::I32 => device.build_input_stream(
                 stream_config,
                 move |data: &[i32], _: &cpal::InputCallbackInfo| {
+                    capture_input_frames(data, channels, &ring_cb);
+                },
+                err_cb,
+                None,
+            ),
+            cpal::SampleFormat::F64 => device.build_input_stream(
+                stream_config,
+                move |data: &[f64], _: &cpal::InputCallbackInfo| {
                     capture_input_frames(data, channels, &ring_cb);
                 },
                 err_cb,

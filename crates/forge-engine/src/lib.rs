@@ -1022,4 +1022,168 @@ mod tests {
             "expected master OpenSpacer ducking after burst: post_muted={m_post_muted}, post_active={m_post_active}"
         );
     }
+
+    #[test]
+    fn drum_trigger_fx_reinforces_transients_above_threshold() {
+        let sr = 48_000_u32;
+        let frames = 4096_usize;
+        let mut cache = ClipCache::default();
+        let clip_path = PathBuf::from("mem://kick_transient.wav");
+        let mut sig = vec![0.0_f64; frames];
+        for (i, s) in sig.iter_mut().enumerate().take(600).skip(512) {
+            *s = 0.9 * (2.0 * PI * 75.0 * (i as f64) / f64::from(sr)).sin();
+        }
+        cache.insert_memory_clip(
+            clip_path.clone(),
+            AudioBuffer::from_channels(vec![sig.clone(), sig], sr).unwrap(),
+        );
+
+        let mut dry_proj = DawProject::new("DrumDry", sr, 120.0);
+        dry_proj.master_inserts.clear();
+        dry_proj.tracks[0]
+            .objects
+            .push(AudioObject::new(10, "Kick", clip_path, frames as u64));
+        let dry = ObjectOrientedEngine::bounce_offline(&dry_proj, &cache, frames).unwrap();
+
+        let mut wet_proj = dry_proj.clone();
+        wet_proj.tracks[0].inserts.push(FxSlotConfig::DrumTrigger {
+            bypass: false,
+            threshold_db: -18.0,
+            mix: 0.75,
+        });
+        let wet = ObjectOrientedEngine::bounce_offline(&wet_proj, &cache, frames).unwrap();
+
+        let diff_energy: f64 = wet.channels[0]
+            .iter()
+            .zip(&dry.channels[0])
+            .map(|(w, d)| (w - d).powi(2))
+            .sum();
+        assert!(
+            diff_energy > 0.5,
+            "DrumTrigger FX should synthesize percussive punch energy, got diff_energy={diff_energy}"
+        );
+    }
+
+    #[test]
+    fn open_spacer_track_insert_sidechain_pdc_aligned() {
+        let frames = 28_000_usize;
+        let mut cache = ClipCache::default();
+        let bed_path = PathBuf::from("mem://tr_sc_bed.wav");
+        let key_path = PathBuf::from("mem://tr_sc_key.wav");
+        cache.insert_memory_clip(bed_path.clone(), sine_clip(48_000, frames, 1_000.0, 0.5));
+        let mut key_ch = vec![0.0_f64; frames];
+        for (i, s) in key_ch.iter_mut().enumerate().skip(16_000) {
+            *s = 0.7 * (2.0 * PI * 1_000.0 * (i as f64) / 48_000.0).sin();
+        }
+        cache.insert_memory_clip(
+            key_path.clone(),
+            AudioBuffer::from_channels(vec![key_ch.clone(), key_ch], 48_000).unwrap(),
+        );
+
+        let zero_soothe = FxSlotConfig::OpenSoothe {
+            bypass: false,
+            sensitivity_db: 0.0,
+            max_depth_db: 0.0,
+            sharpness_bins: 10,
+            low_latency: false,
+            tilt_db_per_oct: 0.0,
+            ultrasonic_lpf_hz: 0.0,
+            mid_side_balance: 0.0,
+            stereo_link: 1.0,
+            hard_mode: false,
+        };
+        let mut proj = DawProject::new("TrackInsertScAlign", 48_000, 120.0);
+        proj.master_inserts.clear();
+        proj.aux_buses.clear();
+        let sc_id = proj.tracks[1].id;
+        proj.tracks[0]
+            .objects
+            .push(AudioObject::new(10, "Bed", bed_path, frames as u64));
+        proj.tracks[0].inserts.push(zero_soothe);
+        proj.tracks[0].inserts.push(FxSlotConfig::OpenSpacer {
+            bypass: false,
+            amount: 1.0,
+            max_cut_db: 18.0,
+            low_hz: 200.0,
+            high_hz: 8_000.0,
+            mid_side_balance: 0.0,
+            delta_listen: false,
+            sidechain_track_id: Some(sc_id),
+        });
+        proj.tracks[1]
+            .objects
+            .push(AudioObject::new(11, "Key", key_path, frames as u64));
+        proj.tracks[1].gain_db = -60.0;
+
+        proj.tracks[1].mute = true;
+        let muted = ObjectOrientedEngine::bounce_offline(&proj, &cache, frames).unwrap();
+        proj.tracks[1].mute = false;
+        let active = ObjectOrientedEngine::bounce_offline(&proj, &cache, frames).unwrap();
+
+        let rms = |buf: &AudioBuffer, a: usize, b: usize| -> f64 {
+            let sl = &buf.channels[0][a..b];
+            (sl.iter().map(|v| v * v).sum::<f64>() / (sl.len() as f64)).sqrt()
+        };
+        assert!(rms(&active, 13_000, 15_000) >= rms(&muted, 13_000, 15_000) * 0.98);
+        assert!(rms(&active, 20_000, 26_000) < rms(&muted, 20_000, 26_000) * 0.85);
+    }
+
+    #[test]
+    fn polysynth_adsr_and_musical_bpm_rescale() {
+        let sr = 48_000_u32;
+        let mut proj = DawProject::new("MusicalMidi", sr, 120.0);
+        let id = proj.alloc_id();
+        proj.tracks[0]
+            .midi_clips
+            .push(MidiClip::demo_am7_progression(id, sr, 120.0));
+        let len_120 = proj.tracks[0].midi_clips[0].length_samples;
+        assert_eq!(len_120, 384_000);
+        proj.bpm = 60.0;
+        proj.rescale_musical_midi_clips();
+        assert_eq!(proj.tracks[0].midi_clips[0].length_samples, 768_000);
+
+        let mut synth = PolySynth::new(f64::from(sr));
+        let clips = &proj.tracks[0].midi_clips;
+        let mut out = Vec::with_capacity(4096);
+        for s in 0..4096_u64 {
+            out.push(synth.render_sample(clips, SynthPreset::PluckLead, s).0);
+        }
+        assert!(out.iter().all(|v| v.is_finite()));
+        assert!(out.iter().any(|v| v.abs() > 0.01));
+    }
+
+    #[test]
+    fn object_and_aux_mute_smoothing_no_click() {
+        let sr = 48_000_u32;
+        let frames = 2048_usize;
+        let mut cache = ClipCache::default();
+        let clip_path = PathBuf::from("mem://dc_smooth.wav");
+        let dc = vec![0.5_f64; frames];
+        cache.insert_memory_clip(
+            clip_path.clone(),
+            AudioBuffer::from_channels(vec![dc.clone(), dc], sr).unwrap(),
+        );
+        let mut proj = DawProject::new("MuteSmooth", sr, 120.0);
+        proj.master_inserts.clear();
+        proj.tracks[0]
+            .objects
+            .push(AudioObject::new(10, "Tone", clip_path, frames as u64));
+        let mut engine = ObjectOrientedEngine::compile(&proj, &cache);
+
+        let mut l = vec![0.0_f32; 512];
+        let mut r = vec![0.0_f32; 512];
+        engine.render_block(&mut l, &mut r);
+        let last_unmuted = l[511];
+
+        proj.tracks[0].objects[0].mute = true;
+        assert!(engine.sync_mix_params(&proj));
+        engine.render_block(&mut l, &mut r);
+        // Smoothed mute must avoid an instant jump to 0 on sample 0 of the new block.
+        assert!(
+            (l[0] - last_unmuted).abs() < 0.05 && l[511].abs() < last_unmuted.abs() * 0.5,
+            "expected smooth mute ramp: last={last_unmuted}, first_after={}, tail={}",
+            l[0],
+            l[511]
+        );
+    }
 }

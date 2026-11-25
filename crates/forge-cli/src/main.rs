@@ -19,17 +19,18 @@ use forge_reaper::{
 };
 use forge_theory::{
     GrooveStyle, NoteEvent, VoicingStyle, export_abc_score, extract_drum_midi_triggers,
-    reharmonize_progression, solve_voice_leading, validate_bpm, write_midi_file,
+    parse_abc_score, reharmonize_progression, solve_voice_leading, validate_bpm, write_midi_file,
 };
 use forge_vocal::{
     VocalScale, generate_vocal_harmony_stack, shift_vocal_pitch_formant_preserved,
     track_vocal_pitch,
 };
 use forge_worker::{
-    DrumHit, SeparationConfig, evaluate_quality_hybrid, generate_music_lyria,
-    index_drum_sample_library, neural_restore_hybrid, parse_backend, parse_quality,
-    render_drum_sample_layer, resolve_default_local_worker, run_local_neural_denoise,
-    run_local_transcribe_midi, separate_stems, track_beats_hybrid, vocal_rescue_hybrid,
+    DrumHit, F0TrackFrame, F0TrackResult, SeparationConfig, denoise_hybrid,
+    evaluate_quality_hybrid, generate_music_lyria, index_drum_sample_library,
+    neural_restore_hybrid, parse_backend, parse_quality, render_drum_sample_layer,
+    resolve_default_local_worker, run_local_f0_track, separate_stems, track_beats_hybrid,
+    transcribe_midi_hybrid, vocal_rescue_hybrid,
 };
 
 #[derive(Parser)]
@@ -80,7 +81,7 @@ enum Commands {
         #[arg(long, allow_negative_numbers = true, value_parser = parse_mid_side)]
         mid_side: Option<f64>,
         /// Fundamental hum frequency (50 or 60 Hz; 0 to disable; default: 60 or auto with --ai-mode)
-        #[arg(long)]
+        #[arg(long, value_parser = parse_hum_hz)]
         hum_hz: Option<f64>,
         /// Airwindows Console8 / ChowTape analog warmth drive (0.0 to 1.0; default: auto with --ai-mode, else 0.15)
         #[arg(long, value_parser = parse_unit_interval)]
@@ -148,7 +149,7 @@ enum Commands {
         #[arg(long, default_value = "D minor")]
         scale: String,
         /// Retune strength (0.0 = natural, 1.0 = hard snap)
-        #[arg(long, default_value_t = 0.85)]
+        #[arg(long, default_value_t = 0.85, value_parser = parse_unit_interval)]
         retune: f64,
         /// Generate 3-part chord-aware vocal harmony stack (3rd up, 3rd down, formant double)
         #[arg(long)]
@@ -178,6 +179,9 @@ enum Commands {
         /// Optional output ABC notation score file (.abc)
         #[arg(long)]
         output_abc: Option<PathBuf>,
+        /// Optional input ABC notation score file (.abc) to compile alongside voiced chords
+        #[arg(long)]
+        abc_input: Option<PathBuf>,
     },
 
     /// Deliver a mix to a platform target: repair, de-fizz, master, then verify with pass/fail checks
@@ -191,10 +195,10 @@ enum Commands {
         #[arg(short, long, default_value = "spotify", conflicts_with = "lufs")]
         target: String,
         /// Custom integrated loudness in LUFS (requires --ceiling-dbtp)
-        #[arg(long, requires = "ceiling_dbtp", allow_negative_numbers = true)]
+        #[arg(long, requires = "ceiling_dbtp", allow_negative_numbers = true, value_parser = parse_target_lufs)]
         lufs: Option<f64>,
         /// Custom true-peak ceiling in dBTP (requires --lufs)
-        #[arg(long, requires = "lufs", allow_negative_numbers = true)]
+        #[arg(long, requires = "lufs", allow_negative_numbers = true, value_parser = parse_ceiling_dbtp)]
         ceiling_dbtp: Option<f64>,
         /// Skip DC removal, de-clip and hum notch
         #[arg(long)]
@@ -215,13 +219,13 @@ enum Commands {
         #[arg(long, default_value = "transparent")]
         limiter_style: String,
         /// Stereo channel link (0.0 = dual-mono, 1.0 = linked stereo)
-        #[arg(long, default_value_t = 1.0)]
+        #[arg(long, default_value_t = 1.0, value_parser = parse_unit_interval)]
         channel_link: f64,
         /// Mastering output dither (`none`, `tpdf`, `noise-shaped`); omit for default 24-bit WAV TPDF
         #[arg(long)]
         dither: Option<String>,
         /// Bit depth for dithering (8..=24, typically 16 or 24)
-        #[arg(long, default_value_t = 24)]
+        #[arg(long, default_value_t = 24, value_parser = parse_dither_bits)]
         dither_bits: u16,
         /// Treat input as AI-generated audio (telemetry-driven restoration/de-fizz, avoids artificial high widening)
         #[arg(long)]
@@ -239,10 +243,10 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
         /// Target Integrated LUFS (-14.0 for streaming, -9.0 for competitive club/pop)
-        #[arg(long, default_value_t = -14.0, allow_negative_numbers = true)]
+        #[arg(long, default_value_t = -14.0, allow_negative_numbers = true, value_parser = parse_target_lufs)]
         target_lufs: f64,
         /// True-Peak brickwall ceiling in dBTP, -24.0 to 0.0 (-1.0 recommended by DistroKid/Spotify)
-        #[arg(long, default_value_t = -1.0, allow_negative_numbers = true)]
+        #[arg(long, default_value_t = -1.0, allow_negative_numbers = true, value_parser = parse_ceiling_dbtp)]
         ceiling_dbtp: f64,
         /// Optional reference track WAV to match spectral balance against
         #[arg(long)]
@@ -497,6 +501,24 @@ enum Commands {
         #[arg(long, default_value_t = 300, value_parser = parse_timeout_secs)]
         timeout_secs: u64,
     },
+
+    /// Track fundamental frequency (`F0`) contour via `RMVPE` / `FCPE` / `autocorr` worker or pure-Rust YIN fallback
+    F0Track {
+        /// Input audio file
+        input: PathBuf,
+        /// Backend (`auto`, `rmvpe`, `fcpe`, `autocorr`, `rust`)
+        #[arg(long, default_value = "auto")]
+        backend: String,
+        /// Frame hop size in seconds (0.002..=0.25)
+        #[arg(long, default_value_t = 0.01, value_parser = parse_hop_secs)]
+        hop_secs: f64,
+        /// Worker timeout in seconds (1..=3600)
+        #[arg(long, default_value_t = 300, value_parser = parse_timeout_secs)]
+        timeout_secs: u64,
+        /// Emit raw JSON output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -534,59 +556,27 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_cli(cli: Cli) -> anyhow::Result<()> {
-    match cli.command {
-        Commands::Audit { input, json } => {
-            let buf = AudioBuffer::load(&input)?;
-            let report = audit_audio(&buf);
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                println!(
-                    "=== ForgeAudio Studio Telemetry Audit: {} ===",
-                    input.display()
-                );
-                println!(
-                    "Format        : {} Hz | {} ch | {:.2} s",
-                    report.sample_rate, report.channels, report.duration_secs
-                );
-                println!("Integrated    : {:.2} LUFS", report.integrated_lufs);
-                println!(
-                    "Short-Term Max: {:.2} LUFS | Momentary Max: {:.2} LUFS",
-                    report.short_term_max_lufs, report.momentary_max_lufs
-                );
-                println!(
-                    "Loudness Range: {:.2} LU   | Crest Factor : {:.2} dB",
-                    report.loudness_range_lu, report.crest_factor_db
-                );
-                println!(
-                    "True Peak     : {:.2} dBTP @ {:.2}s (Sample Peak: {:.2} dBFS)",
-                    report.true_peak_dbtp, report.true_peak_timestamp_secs, report.sample_peak_dbfs
-                );
-                println!(
-                    "Stereo Phase  : {:.2} (Sub-160Hz: {:.2} | 2-12kHz: {:.2})",
-                    report.stereo_correlation,
-                    report.sub_160hz_correlation,
-                    report.high_mid_stereo_correlation
-                );
-                println!(
-                    "AI Artifacts  : Fizz Index {:.1}/100 (Mid p95: {:.1} dB | Side p95: {:.1} dB)",
-                    report.ai_fizz_index, report.mid_fizz_p95_db, report.side_fizz_p95_db
-                );
-                println!(
-                    "Bandwidth/Snap: Effective BW {:.0} Hz | Transient Sharpness {:.1} dB | DistroKid Ready: {}",
-                    report.effective_bandwidth_hz,
-                    report.transient_sharpness_db,
-                    if report.distrokid_ready { "YES" } else { "NO" }
-                );
-                if !report.recommendations.is_empty() {
-                    println!("\nRecommendations:");
-                    for rec in &report.recommendations {
-                        println!("  • {rec}");
-                    }
-                }
-            }
-        }
+    let mut rem = Some(cli.command);
+    for stage in [
+        try_dispatch_restore,
+        dispatch_mix_cli,
+        dispatch_delivery_cli,
+        dispatch_studio_cli,
+        dispatch_worker_ai,
+    ] {
+        let Some(cmd) = rem else {
+            return Ok(());
+        };
+        rem = stage(cmd)?;
+    }
+    if let Some(cmd) = rem {
+        dispatch_worker_analysis(cmd)?;
+    }
+    Ok(())
+}
 
+fn try_dispatch_restore(command: Commands) -> anyhow::Result<Option<Commands>> {
+    match command {
         Commands::Restore {
             input,
             output,
@@ -603,61 +593,31 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             ultrasonic_lpf_hz,
             ai_mode,
         } => {
-            let buf = AudioBuffer::load(&input)?;
-            let pre_audit = audit_audio(&buf);
-            let mut rest_cfg = if ai_mode {
-                RestorationConfig::from_audit(&pre_audit, true)
-            } else {
-                RestorationConfig::default()
-            };
-            if let Some(hz) = hum_hz {
-                rest_cfg.hum_fundamental_hz = if hz > 0.0 { Some(hz) } else { None };
-            } else if !ai_mode {
-                rest_cfg.hum_fundamental_hz = Some(60.0);
-            }
-            if let Some(drive) = tape_drive {
-                rest_cfg.analog_tape_drive = drive;
-            } else if !ai_mode {
-                rest_cfg.analog_tape_drive = 0.15;
-            }
-            let stage1 = run_full_restoration_chain(&buf, &rest_cfg)?;
-            let mut defizz_cfg = if ai_mode {
-                DeFizzConfig::ai_mix_from_audit(&audit_audio(&stage1))
-            } else {
-                DeFizzConfig::default()
-            };
-            if let Some(sens) = defizz_sensitivity {
-                defizz_cfg.sensitivity_db = sens;
-            }
-            if let Some(depth) = defizz_depth {
-                defizz_cfg.max_depth_db = depth;
-            }
-            defizz_cfg.delta_listen = delta_listen;
-            defizz_cfg.tilt_db_per_oct = tilt;
-            defizz_cfg.stereo_link = stereo_link;
-            if let Some(ms) = mid_side {
-                defizz_cfg.mid_side_balance = ms;
-            } else if !ai_mode {
-                defizz_cfg.mid_side_balance = 0.0;
-            }
-            defizz_cfg.hard_mode |= hard_mode;
-            if hpss_shimmer > 0.0 {
-                defizz_cfg.hpss_shimmer_suppress = hpss_shimmer;
-            }
-            if let Some(lpf_hz) = ultrasonic_lpf_hz {
-                defizz_cfg.ultrasonic_lpf_hz = Some(lpf_hz);
-            }
-            let cleaned = apply_spectral_defizz(&stage1, &defizz_cfg)?;
-            cleaned.save_wav(&output, 24)?;
-            let post_audit = audit_audio(&cleaned);
-            println!(
-                "Restored audio saved to {} (Post AI Fizz Index: {:.1}/100, Sub-160Hz Correlation: {:.2})",
-                output.display(),
-                post_audit.ai_fizz_index,
-                post_audit.sub_160hz_correlation
-            );
+            run_restore_cli(RestoreCliArgs {
+                input,
+                output,
+                defizz_sensitivity,
+                defizz_depth,
+                delta_listen,
+                tilt,
+                stereo_link,
+                mid_side,
+                hum_hz,
+                tape_drive,
+                hard_mode,
+                hpss_shimmer,
+                ultrasonic_lpf_hz,
+                ai_mode,
+            })?;
+            Ok(None)
         }
+        other => Ok(Some(other)),
+    }
+}
 
+fn dispatch_mix_cli(command: Commands) -> anyhow::Result<Option<Commands>> {
+    match command {
+        Commands::Audit { input, json } => run_audit_cli(&input, json)?,
         Commands::Unmask {
             target,
             sidechain,
@@ -665,55 +625,14 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             mode,
             delta_listen,
             mid_side,
-        } => {
-            let t_buf = AudioBuffer::load(&target)?;
-            let sc_buf = AudioBuffer::load(&sidechain)?;
-            let mut cfg = if mode.eq_ignore_ascii_case("kick") {
-                UnmaskConfig::kick_over_bass()
-            } else {
-                UnmaskConfig::vocal_over_instruments()
-            };
-            cfg.delta_listen = delta_listen;
-            cfg.mid_side_balance = mid_side;
-            let unmasked = apply_spectral_unmask(&t_buf, &sc_buf, &cfg)?;
-            unmasked.save_wav(&output, 24)?;
-            println!("Sidechain-unmasked stem written to {}", output.display());
-        }
-
+        } => run_unmask_cli(&target, &sidechain, &output, &mode, delta_listen, mid_side)?,
         Commands::PhaseAlign {
             reference,
             target,
             output,
             vocal_dtw,
             elastic,
-        } => {
-            let ref_buf = AudioBuffer::load(&reference)?;
-            let tgt_buf = AudioBuffer::load(&target)?;
-            if vocal_dtw {
-                let (warped, markers) = if elastic {
-                    align_vocal_double_dtw_elastic(&ref_buf, &tgt_buf, 120.0)?
-                } else {
-                    align_vocal_double_dtw(&ref_buf, &tgt_buf, 120.0)?
-                };
-                warped.save_wav(&output, 24)?;
-                println!(
-                    "DTW-aligned track written to {} (elastic={elastic}, {} stretch markers)",
-                    output.display(),
-                    markers.len()
-                );
-            } else {
-                let (aligned, info) = align_phase_gcc_phat(&ref_buf, &tgt_buf, 35.0)?;
-                aligned.save_wav(&output, 24)?;
-                println!(
-                    "Phase-aligned track written to {} (Delay corrected: {} samples / {:.2} ms, Polarity inverted: {})",
-                    output.display(),
-                    info.delay_samples,
-                    info.delay_ms,
-                    info.invert_polarity
-                );
-            }
-        }
-
+        } => run_phase_align_cli(&reference, &target, &output, vocal_dtw, elastic)?,
         Commands::Vocal {
             input,
             output_dir,
@@ -721,54 +640,14 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             retune,
             harmonize,
             align_to,
-        } => {
-            std::fs::create_dir_all(&output_dir)?;
-            let raw = AudioBuffer::load(&input)?;
-            let surgically_clean = clean_vocal_surgical(&raw, true, true, -12.0)?;
-            let parsed_scale = VocalScale::parse(&scale)?;
-            let contour = track_vocal_pitch(&surgically_clean, &parsed_scale, retune);
-
-            let corr_curve: Vec<(f64, f64)> = contour
-                .iter()
-                .map(|f| (f.time_secs, f.correction_semitones))
-                .collect();
-            let mut tuned =
-                shift_vocal_pitch_formant_preserved(&surgically_clean, &corr_curve, 0.0)?;
-
-            if let Some(guide_path) = align_to {
-                let guide_buf = AudioBuffer::load(&guide_path)?;
-                let (warped, markers) = align_vocal_double_dtw(&guide_buf, &tuned, 120.0)?;
-                tuned = warped;
-                println!(
-                    "FastDTW aligned vocal to guide ({} REAPER stretch markers generated)",
-                    markers.len()
-                );
-            }
-
-            let lead_out = output_dir.join("Vocal_Lead_Tuned_Clean.wav");
-            tuned.save_wav(&lead_out, 24)?;
-            println!(
-                "Tuned & cleaned lead vocal written to {}",
-                lead_out.display()
-            );
-
-            if harmonize {
-                let (h_up, h_down, h_dbl) = generate_vocal_harmony_stack(&tuned, &parsed_scale)?;
-                let p_up = output_dir.join("Vocal_Harmony_3rd_Above.wav");
-                let p_down = output_dir.join("Vocal_Harmony_3rd_Below.wav");
-                let p_dbl = output_dir.join("Vocal_Formant_Double.wav");
-                h_up.save_wav(&p_up, 24)?;
-                h_down.save_wav(&p_down, 24)?;
-                h_dbl.save_wav(&p_dbl, 24)?;
-                println!(
-                    "3-part harmony stack written to:\n  • {}\n  • {}\n  • {}",
-                    p_up.display(),
-                    p_down.display(),
-                    p_dbl.display()
-                );
-            }
-        }
-
+        } => run_vocal_cli(
+            &input,
+            &output_dir,
+            &scale,
+            retune,
+            harmonize,
+            align_to.as_deref(),
+        )?,
         Commands::Theory {
             chords,
             style,
@@ -776,45 +655,334 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             bpm,
             output_midi,
             output_abc,
-        } => {
-            let v_style = match style.to_ascii_lowercase().as_str() {
-                "drop2" => VoicingStyle::Drop2,
-                "close" => VoicingStyle::Close,
-                "cinematic" => VoicingStyle::CinematicSpread,
-                _ => VoicingStyle::NeoSoulRootless,
-            };
-            let g_style = match groove.to_ascii_lowercase().as_str() {
-                "straight" => GrooveStyle::Straight,
-                "mpc58" => GrooveStyle::MpcSwing58,
-                "strum" => GrooveStyle::AcousticStrum,
-                _ => GrooveStyle::NeoSoulDilla,
-            };
+            abc_input,
+        } => run_theory_cli(TheoryCliArgs {
+            chords,
+            style,
+            groove,
+            bpm,
+            output_midi,
+            output_abc,
+            abc_input,
+        })?,
+        other => return Ok(Some(other)),
+    }
+    Ok(None)
+}
 
-            let raw_chords: Vec<String> =
-                chords.split_whitespace().map(ToString::to_string).collect();
-            let reharm = reharmonize_progression(&raw_chords, v_style);
-            let (chord_notes, bass_notes) = solve_voice_leading(&reharm, v_style, g_style, 480, 4)?;
+fn run_audit_cli(input: &std::path::Path, json: bool) -> anyhow::Result<()> {
+    let buf = AudioBuffer::load(input)?;
+    let report = audit_audio(&buf);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    println!(
+        "=== ForgeAudio Studio Telemetry Audit: {} ===",
+        input.display()
+    );
+    println!(
+        "Format        : {} Hz | {} ch | {:.2} s",
+        report.sample_rate, report.channels, report.duration_secs
+    );
+    println!("Integrated    : {:.2} LUFS", report.integrated_lufs);
+    println!(
+        "Short-Term Max: {:.2} LUFS | Momentary Max: {:.2} LUFS",
+        report.short_term_max_lufs, report.momentary_max_lufs
+    );
+    println!(
+        "Loudness Range: {:.2} LU   | Crest Factor : {:.2} dB",
+        report.loudness_range_lu, report.crest_factor_db
+    );
+    println!(
+        "True Peak     : {:.2} dBTP @ {:.2}s (Sample Peak: {:.2} dBFS)",
+        report.true_peak_dbtp, report.true_peak_timestamp_secs, report.sample_peak_dbfs
+    );
+    println!(
+        "Stereo Phase  : {:.2} (Sub-160Hz: {:.2} | 2-12kHz: {:.2})",
+        report.stereo_correlation, report.sub_160hz_correlation, report.high_mid_stereo_correlation
+    );
+    println!(
+        "AI Artifacts  : Fizz Index {:.1}/100 (Mid p95: {:.1} dB | Side p95: {:.1} dB)",
+        report.ai_fizz_index, report.mid_fizz_p95_db, report.side_fizz_p95_db
+    );
+    println!(
+        "Bandwidth/Snap: Effective BW {:.0} Hz | Transient Sharpness {:.1} dB | DistroKid Ready: {}",
+        report.effective_bandwidth_hz,
+        report.transient_sharpness_db,
+        if report.distrokid_ready { "YES" } else { "NO" }
+    );
+    for rec in &report.recommendations {
+        println!("  • {rec}");
+    }
+    Ok(())
+}
 
-            write_midi_file(
-                &output_midi,
-                bpm,
-                480,
-                &[("Voiced_Chords", &chord_notes), ("Sub_Bass", &bass_notes)],
-            )?;
-            println!(
-                "Voice-led MIDI written to {} (Progression: {})",
-                output_midi.display(),
-                reharm.join(" -> ")
-            );
+struct RestoreCliArgs {
+    input: PathBuf,
+    output: PathBuf,
+    defizz_sensitivity: Option<f64>,
+    defizz_depth: Option<f64>,
+    delta_listen: bool,
+    tilt: f64,
+    stereo_link: f64,
+    mid_side: Option<f64>,
+    hum_hz: Option<f64>,
+    tape_drive: Option<f64>,
+    hard_mode: bool,
+    hpss_shimmer: f64,
+    ultrasonic_lpf_hz: Option<f64>,
+    ai_mode: bool,
+}
 
-            if let Some(abc_path) = output_abc {
-                let abc_str =
-                    export_abc_score("ForgeAudio Progression", "C", bpm.round() as u32, &reharm);
-                std::fs::write(&abc_path, abc_str)?;
-                println!("ABC lead sheet written to {}", abc_path.display());
-            }
-        }
+fn build_restoration_cfg(
+    a: &RestoreCliArgs,
+    pre_audit: &forge_core::AuditReport,
+) -> RestorationConfig {
+    let mut cfg = if a.ai_mode {
+        RestorationConfig::from_audit(pre_audit, true)
+    } else {
+        RestorationConfig::default()
+    };
+    cfg.hum_fundamental_hz = match a.hum_hz {
+        Some(hz) if hz > 0.0 => Some(hz),
+        Some(_) => None,
+        None if !a.ai_mode => Some(60.0),
+        None => cfg.hum_fundamental_hz,
+    };
+    if let Some(drive) = a.tape_drive {
+        cfg.analog_tape_drive = drive;
+    } else if !a.ai_mode {
+        cfg.analog_tape_drive = 0.15;
+    }
+    cfg
+}
 
+fn build_defizz_cfg(a: &RestoreCliArgs, stage1: &AudioBuffer) -> DeFizzConfig {
+    let mut cfg = if a.ai_mode {
+        DeFizzConfig::ai_mix_from_audit(&audit_audio(stage1))
+    } else {
+        DeFizzConfig::default()
+    };
+    cfg.sensitivity_db = a.defizz_sensitivity.unwrap_or(cfg.sensitivity_db);
+    cfg.max_depth_db = a.defizz_depth.unwrap_or(cfg.max_depth_db);
+    cfg.delta_listen = a.delta_listen;
+    cfg.tilt_db_per_oct = a.tilt;
+    cfg.stereo_link = a.stereo_link;
+    cfg.mid_side_balance = a
+        .mid_side
+        .unwrap_or(if a.ai_mode { cfg.mid_side_balance } else { 0.0 });
+    cfg.hard_mode |= a.hard_mode;
+    if a.hpss_shimmer > 0.0 {
+        cfg.hpss_shimmer_suppress = a.hpss_shimmer;
+    }
+    if let Some(lpf_hz) = a.ultrasonic_lpf_hz {
+        cfg.ultrasonic_lpf_hz = Some(lpf_hz);
+    }
+    cfg
+}
+
+fn run_restore_cli(a: RestoreCliArgs) -> anyhow::Result<()> {
+    let buf = AudioBuffer::load(&a.input)?;
+    let rest_cfg = build_restoration_cfg(&a, &audit_audio(&buf));
+    let stage1 = run_full_restoration_chain(&buf, &rest_cfg)?;
+    let defizz_cfg = build_defizz_cfg(&a, &stage1);
+    let cleaned = apply_spectral_defizz(&stage1, &defizz_cfg)?;
+    cleaned.save_wav(&a.output, 24)?;
+    let post_audit = audit_audio(&cleaned);
+    println!(
+        "Restored audio saved to {} (Post AI Fizz Index: {:.1}/100, Sub-160Hz Correlation: {:.2})",
+        a.output.display(),
+        post_audit.ai_fizz_index,
+        post_audit.sub_160hz_correlation
+    );
+    Ok(())
+}
+
+fn run_unmask_cli(
+    target: &std::path::Path,
+    sidechain: &std::path::Path,
+    output: &std::path::Path,
+    mode: &str,
+    delta_listen: bool,
+    mid_side: f64,
+) -> anyhow::Result<()> {
+    let t_buf = AudioBuffer::load(target)?;
+    let sc_buf = AudioBuffer::load(sidechain)?;
+    let valid_mode = validate_choice(mode, "mode", &["vocal", "kick"])?;
+    let mut cfg = if valid_mode == "kick" {
+        UnmaskConfig::kick_over_bass()
+    } else {
+        UnmaskConfig::vocal_over_instruments()
+    };
+    cfg.delta_listen = delta_listen;
+    cfg.mid_side_balance = mid_side;
+    let unmasked = apply_spectral_unmask(&t_buf, &sc_buf, &cfg)?;
+    unmasked.save_wav(output, 24)?;
+    println!("Sidechain-unmasked stem written to {}", output.display());
+    Ok(())
+}
+
+fn run_phase_align_cli(
+    reference: &std::path::Path,
+    target: &std::path::Path,
+    output: &std::path::Path,
+    vocal_dtw: bool,
+    elastic: bool,
+) -> anyhow::Result<()> {
+    let ref_buf = AudioBuffer::load(reference)?;
+    let tgt_buf = AudioBuffer::load(target)?;
+    if vocal_dtw {
+        let (warped, markers) = if elastic {
+            align_vocal_double_dtw_elastic(&ref_buf, &tgt_buf, 120.0)?
+        } else {
+            align_vocal_double_dtw(&ref_buf, &tgt_buf, 120.0)?
+        };
+        warped.save_wav(output, 24)?;
+        println!(
+            "DTW-aligned track written to {} (elastic={elastic}, {} stretch markers)",
+            output.display(),
+            markers.len()
+        );
+    } else {
+        let (aligned, info) = align_phase_gcc_phat(&ref_buf, &tgt_buf, 35.0)?;
+        aligned.save_wav(output, 24)?;
+        println!(
+            "Phase-aligned track written to {} (Delay corrected: {} samples / {:.2} ms, Polarity inverted: {})",
+            output.display(),
+            info.delay_samples,
+            info.delay_ms,
+            info.invert_polarity
+        );
+    }
+    Ok(())
+}
+
+fn run_vocal_cli(
+    input: &std::path::Path,
+    output_dir: &std::path::Path,
+    scale: &str,
+    retune: f64,
+    harmonize: bool,
+    align_to: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(output_dir)?;
+    let raw = AudioBuffer::load(input)?;
+    let surgically_clean = clean_vocal_surgical(&raw, true, true, -12.0)?;
+    let parsed_scale = VocalScale::parse(scale)?;
+    let contour = track_vocal_pitch(&surgically_clean, &parsed_scale, retune);
+    let corr_curve: Vec<(f64, f64)> = contour
+        .iter()
+        .map(|f| (f.time_secs, f.correction_semitones))
+        .collect();
+    let mut tuned = shift_vocal_pitch_formant_preserved(&surgically_clean, &corr_curve, 0.0)?;
+    if let Some(guide_path) = align_to {
+        let guide_buf = AudioBuffer::load(guide_path)?;
+        let (warped, markers) = align_vocal_double_dtw(&guide_buf, &tuned, 120.0)?;
+        tuned = warped;
+        println!(
+            "FastDTW aligned vocal to guide ({} REAPER stretch markers generated)",
+            markers.len()
+        );
+    }
+    let lead_out = output_dir.join("Vocal_Lead_Tuned_Clean.wav");
+    tuned.save_wav(&lead_out, 24)?;
+    println!(
+        "Tuned & cleaned lead vocal written to {}",
+        lead_out.display()
+    );
+    if harmonize {
+        let (h_up, h_down, h_dbl) = generate_vocal_harmony_stack(&tuned, &parsed_scale)?;
+        h_up.save_wav(output_dir.join("Vocal_Harmony_3rd_Above.wav"), 24)?;
+        h_down.save_wav(output_dir.join("Vocal_Harmony_3rd_Below.wav"), 24)?;
+        h_dbl.save_wav(output_dir.join("Vocal_Formant_Double.wav"), 24)?;
+    }
+    Ok(())
+}
+
+struct TheoryCliArgs {
+    chords: String,
+    style: String,
+    groove: String,
+    bpm: f64,
+    output_midi: PathBuf,
+    output_abc: Option<PathBuf>,
+    abc_input: Option<PathBuf>,
+}
+
+fn write_theory_outputs(
+    a: &TheoryCliArgs,
+    reharm: &[String],
+    chord_notes: &[NoteEvent],
+    bass_notes: &[NoteEvent],
+) -> anyhow::Result<()> {
+    if let Some(abc_in_path) = &a.abc_input {
+        let raw_abc = std::fs::read_to_string(abc_in_path)?;
+        let (_abc_chords, melody_notes) = parse_abc_score(&raw_abc, 480)?;
+        write_midi_file(
+            &a.output_midi,
+            a.bpm,
+            480,
+            &[
+                ("ABC_Melody", &melody_notes),
+                ("Voiced_Chords", chord_notes),
+                ("Sub_Bass", bass_notes),
+            ],
+        )?;
+    } else {
+        write_midi_file(
+            &a.output_midi,
+            a.bpm,
+            480,
+            &[("Voiced_Chords", chord_notes), ("Sub_Bass", bass_notes)],
+        )?;
+    }
+    println!(
+        "Voice-led MIDI written to {} (Progression: {})",
+        a.output_midi.display(),
+        reharm.join(" -> ")
+    );
+    if let Some(abc_path) = &a.output_abc {
+        let abc_str = export_abc_score("ForgeAudio Progression", "C", a.bpm.round() as u32, reharm);
+        std::fs::write(abc_path, abc_str)?;
+        println!("ABC lead sheet written to {}", abc_path.display());
+    }
+    Ok(())
+}
+
+fn run_theory_cli(a: TheoryCliArgs) -> anyhow::Result<()> {
+    let v_style = match validate_choice(
+        &a.style,
+        "style",
+        &["neo-soul", "drop2", "close", "cinematic"],
+    )? {
+        "drop2" => VoicingStyle::Drop2,
+        "close" => VoicingStyle::Close,
+        "cinematic" => VoicingStyle::CinematicSpread,
+        _ => VoicingStyle::NeoSoulRootless,
+    };
+    let g_style = match validate_choice(
+        &a.groove,
+        "groove",
+        &["dilla", "mpc58", "strum", "straight"],
+    )? {
+        "straight" => GrooveStyle::Straight,
+        "mpc58" => GrooveStyle::MpcSwing58,
+        "strum" => GrooveStyle::AcousticStrum,
+        _ => GrooveStyle::NeoSoulDilla,
+    };
+    let raw_chords: Vec<String> = a
+        .chords
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect();
+    let reharm = reharmonize_progression(&raw_chords, v_style);
+    let (chord_notes, bass_notes) = solve_voice_leading(&reharm, v_style, g_style, 480, 4)?;
+    write_theory_outputs(&a, &reharm, &chord_notes, &bass_notes)
+}
+
+fn dispatch_delivery_cli(command: Commands) -> anyhow::Result<Option<Commands>> {
+    match command {
         Commands::Master {
             input,
             output,
@@ -825,51 +993,17 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             isrc,
             title,
             artist,
-        } => {
-            let mut buf = AudioBuffer::load(&input)?;
-            if let Some(ref_path) = reference {
-                let ref_buf = AudioBuffer::load(&ref_path)?;
-                let match_curve = compute_reference_match_eq(&buf, &ref_buf, 4.5);
-                apply_18_band_eq(&mut buf, &match_curve);
-            } else if let Some(ref g_str) = genre {
-                let target = GenreTonalTarget::parse(g_str);
-                let genre_curve = compute_genre_tonal_balance_eq(&buf, target, 3.5);
-                apply_18_band_eq(&mut buf, &genre_curve);
-            }
-
-            let mastered = normalize_and_limit(&buf, target_lufs, ceiling_dbtp)?;
-            if let Some(raw_isrc) = isrc {
-                let canonical = validate_isrc(&raw_isrc)?;
-                let tmp = TempFileGuard::new(output.with_extension("pre_tag.wav"));
-                mastered.save_wav(tmp.path(), 24)?;
-                let meta = ReleaseMetadata {
-                    title,
-                    artist,
-                    album: "Single".to_string(),
-                    isrc: canonical.clone(),
-                    bpm: None,
-                    key: None,
-                    year: Some(2026),
-                };
-                write_distrokid_metadata(tmp.path(), output.as_path(), &meta)?;
-                println!(
-                    "Mastered & tagged with ISRC {canonical} -> {}",
-                    output.display()
-                );
-            } else {
-                mastered.save_wav(&output, 24)?;
-            }
-
-            let audit = audit_audio(&mastered);
-            println!(
-                "Final Master: {:.2} LUFS | {:.2} dBTP True Peak | LRA {:.2} LU | DistroKid Ready: {}",
-                audit.integrated_lufs,
-                audit.true_peak_dbtp,
-                audit.loudness_range_lu,
-                audit.distrokid_ready
-            );
-        }
-
+        } => run_master_cli(MasterCliArgs {
+            input,
+            output,
+            target_lufs,
+            ceiling_dbtp,
+            reference,
+            genre,
+            isrc,
+            title,
+            artist,
+        })?,
         Commands::Deliver {
             input,
             output,
@@ -887,97 +1021,31 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             dither_bits,
             ai_track,
             hpss_shimmer,
-        } => {
-            let target = match (lufs, ceiling_dbtp) {
-                (Some(lufs), Some(ceiling)) => DeliveryTarget::custom(lufs, ceiling)?,
-                _ => DeliveryTarget::parse(&target)?,
-            };
-            let mut options = DeliveryOptions::for_target(target);
-            options.repair = !no_repair;
-            options.defizz = !no_defizz;
-            options.vocal = vocal;
-            options.ai_track_mode = ai_track;
-            options.limiter_style = match limiter_style.trim().to_ascii_lowercase().as_str() {
-                "transparent" => LimiterStyle::Transparent,
-                "punchy" => LimiterStyle::Punchy,
-                "dynamic" => LimiterStyle::Dynamic,
-                "aggressive" => LimiterStyle::Aggressive,
-                other => anyhow::bail!(
-                    "unknown --limiter-style '{other}' (expected transparent, punchy, dynamic, or aggressive)"
-                ),
-            };
-            if !channel_link.is_finite() || !(0.0..=1.0).contains(&channel_link) {
-                anyhow::bail!("--channel-link ({channel_link}) must be finite and in 0.0..=1.0");
-            }
-            options.channel_link = channel_link;
-            let explicit_dither = dither.is_some();
-            options.dither = match dither
-                .as_deref()
-                .unwrap_or("none")
-                .trim()
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "none" => DitherMode::None,
-                "tpdf" => DitherMode::Tpdf,
-                "noise-shaped" | "noise_shaped" | "shaped" => DitherMode::NoiseShapedHighPass,
-                other => anyhow::bail!(
-                    "unknown --dither '{other}' (expected none, tpdf, or noise-shaped)"
-                ),
-            };
-            if !(8..=24).contains(&dither_bits) {
-                anyhow::bail!("--dither-bits ({dither_bits}) must be in 8..=24");
-            }
-            options.dither_bits = dither_bits;
-            options.tone_match = match (reference, genre) {
-                (Some(path), _) => Some(ToneMatch::Reference(AudioBuffer::load(&path)?)),
-                (None, Some(g)) => Some(ToneMatch::Genre(GenreTonalTarget::parse(&g))),
-                (None, None) => None,
-            };
+        } => run_deliver_cli(DeliverCliArgs {
+            input,
+            output,
+            target,
+            lufs,
+            ceiling_dbtp,
+            no_repair,
+            no_defizz,
+            vocal,
+            reference,
+            genre,
+            limiter_style,
+            channel_link,
+            dither,
+            dither_bits,
+            ai_track,
+            hpss_shimmer,
+        })?,
+        other => return Ok(Some(other)),
+    }
+    Ok(None)
+}
 
-            let buf = AudioBuffer::load(&input)?;
-            if let Some(shimmer) = hpss_shimmer {
-                let mut cfg = DeFizzConfig::ai_mix_from_audit(&audit_audio(&buf));
-                cfg.hpss_shimmer_suppress = shimmer;
-                options.defizz_config = Some(cfg);
-            }
-            let (master, report) = deliver(&buf, &options)?;
-            if options.dither != DitherMode::None {
-                let pcm_bits = if options.dither_bits <= 16 { 16 } else { 24 };
-                master.save_wav_no_dither(&output, pcm_bits)?;
-            } else if explicit_dither {
-                master.save_wav_no_dither(&output, 24)?;
-            } else {
-                master.save_wav(&output, 24)?;
-            }
-            let report_path = output.with_extension("delivery.json");
-            std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
-
-            println!(
-                "{} ({:.1} LUFS, {:.1} dBTP): {:.2} -> {:.2} LUFS, {:.2} -> {:.2} dBTP",
-                report.target,
-                report.target_lufs,
-                report.ceiling_dbtp,
-                report.before.integrated_lufs,
-                report.after.integrated_lufs,
-                report.before.true_peak_dbtp,
-                report.after.true_peak_dbtp
-            );
-            for check in &report.checks {
-                let mark = if check.passed { "PASS" } else { "FAIL" };
-                println!("  [{mark}] {}: {}", check.name, check.detail);
-            }
-            println!(
-                "{} -> {} (report: {})",
-                if report.ready { "READY" } else { "NOT READY" },
-                output.display(),
-                report_path.display()
-            );
-            if !report.ready {
-                std::process::exit(2);
-            }
-        }
-
+fn dispatch_studio_cli(command: Commands) -> anyhow::Result<Option<Commands>> {
+    match command {
         Commands::Ingest {
             input,
             output_dir,
@@ -989,102 +1057,102 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             replace_drums,
             drum_replace_mix,
             quantize_grid,
-        } => {
-            run_ingest_cli(IngestCliArgs {
-                input,
-                output_dir,
-                bpm,
-                scale,
-                chords,
-                isrc,
-                require_neural,
-                replace_drums,
-                drum_replace_mix,
-                quantize_grid,
-            })?;
-        }
-
+        } => run_ingest_cli(IngestCliArgs {
+            input,
+            output_dir,
+            bpm,
+            scale,
+            chords,
+            isrc,
+            require_neural,
+            replace_drums,
+            drum_replace_mix,
+            quantize_grid,
+        })?,
         Commands::Reaper {
             install_jsfx,
             jsfx_dir,
             osc_addr,
             osc_host,
-        } => {
-            if install_jsfx {
-                let installed = install_jsfx_plugins(jsfx_dir.as_deref())?;
-                println!("Installed {} ForgeAudio JSFX plugins:", installed.len());
-                for p in installed {
-                    println!("  • {}", p.display());
-                }
-            }
-            if let Some(addr) = osc_addr {
-                send_reaper_osc(&osc_host, &addr, Some(1.0))?;
-                println!("Sent UDP OSC message '{addr}' to {osc_host}");
-            }
-        }
-
+        } => run_reaper_cli(
+            install_jsfx,
+            jsfx_dir.as_deref(),
+            osc_addr.as_deref(),
+            &osc_host,
+        )?,
         Commands::SampleIndex { folder } => {
             let indexed = index_drum_sample_library(&folder)?;
             println!("{}", serde_json::to_string_pretty(&indexed)?);
         }
-
         Commands::Lyria {
             prompt,
             output,
             model,
-        } => {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            let (saved, lyrics) = rt.block_on(generate_music_lyria(&prompt, &model, &output))?;
-            println!("Lyria audio saved to {}", saved.display());
-            if let Some(l) = lyrics {
-                println!("\nGenerated Structure / Lyrics:\n{l}");
-            }
-        }
+        } => run_lyria_cli(&prompt, &output, &model)?,
+        other => return Ok(Some(other)),
+    }
+    Ok(None)
+}
 
+fn run_reaper_cli(
+    install_jsfx: bool,
+    jsfx_dir: Option<&std::path::Path>,
+    osc_addr: Option<&str>,
+    osc_host: &str,
+) -> anyhow::Result<()> {
+    if install_jsfx {
+        let installed = install_jsfx_plugins(jsfx_dir)?;
+        println!("Installed {} ForgeAudio JSFX plugins:", installed.len());
+        for p in installed {
+            println!("  • {}", p.display());
+        }
+    }
+    if let Some(addr) = osc_addr {
+        send_reaper_osc(osc_host, addr, Some(1.0))?;
+        println!("Sent UDP OSC message '{addr}' to {osc_host}");
+    }
+    Ok(())
+}
+
+fn run_lyria_cli(prompt: &str, output: &std::path::Path, model: &str) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let (saved, lyrics) = rt.block_on(generate_music_lyria(prompt, model, output))?;
+    println!("Lyria audio saved to {}", saved.display());
+    if let Some(l) = lyrics {
+        println!("\nGenerated Structure / Lyrics:\n{l}");
+    }
+    Ok(())
+}
+
+fn dispatch_worker_ai(command: Commands) -> anyhow::Result<Option<Commands>> {
+    match command {
         Commands::Denoise {
             input,
             output_dir,
             backend,
             attenuation_limit_db,
             timeout_secs,
-        } => {
-            let worker_backend = match backend.trim().to_ascii_lowercase().as_str() {
-                "auto" => "auto",
-                "deepfilternet" | "deepfilternet3" => "deepfilternet",
-                "mel-band-roformer" | "roformer" => "mel-band-roformer",
-                other => anyhow::bail!(
-                    "unknown --backend '{other}' (expected auto, deepfilternet, or mel-band-roformer)"
-                ),
-            };
-            let worker = resolve_default_local_worker()?;
-            let res = run_local_neural_denoise(
-                &worker,
-                &input,
-                &output_dir,
-                worker_backend,
-                attenuation_limit_db,
-                std::time::Duration::from_secs(timeout_secs),
-            )?;
-            println!("{}", serde_json::to_string_pretty(&res)?);
-        }
-
+        } => run_denoise_cli(
+            &input,
+            &output_dir,
+            &backend,
+            attenuation_limit_db,
+            timeout_secs,
+        )?,
         Commands::Transcribe {
             input,
             output_dir,
             timeout_secs,
         } => {
-            let worker = resolve_default_local_worker()?;
-            let res = run_local_transcribe_midi(
-                &worker,
+            let res = transcribe_midi_hybrid(
                 &input,
                 &output_dir,
                 std::time::Duration::from_secs(timeout_secs),
             )?;
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
-
         Commands::Separate {
             input,
             output_dir,
@@ -1103,38 +1171,33 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             de_aspiration,
             dereverb_echo,
             backend,
-        } => {
-            if !matches!(stems, 2 | 4 | 6) {
-                anyhow::bail!("--stems must be 2, 4, or 6 (got {stems})");
-            }
-            let mut cfg = SeparationConfig::from_env();
-            cfg.stems = stems;
-            cfg.quality = parse_quality(&quality)?;
-            cfg.dereverb = !no_dereverb;
-            cfg.drum_sep = drum_sep;
-            cfg.split_lead_backing = split_lead_backing;
-            cfg.split_male_female = split_male_female;
-            cfg.split_guitar = split_guitar;
-            cfg.split_orchestral = split_orchestral;
-            cfg.split_crowd = split_crowd;
-            if all_stems {
-                cfg.enable_all_stems();
-                if no_dereverb {
-                    cfg.dereverb = false;
-                }
-            }
-            cfg.restore = restore;
-            cfg.debleed = debleed;
-            cfg.de_aspiration = de_aspiration;
-            cfg.dereverb_echo = dereverb_echo;
-            if let Some(b) = backend {
-                cfg.backend = parse_backend(&b, cfg.colab_url.as_deref())?;
-            }
-            run_separate_cli(&input, &output_dir, &cfg)?;
-        }
+        } => run_separate_cmd(SeparateCliArgs {
+            input,
+            output_dir,
+            stems,
+            quality,
+            no_dereverb,
+            drum_sep,
+            split_lead_backing,
+            split_male_female,
+            split_guitar,
+            split_orchestral,
+            split_crowd,
+            all_stems,
+            restore,
+            debleed,
+            de_aspiration,
+            dereverb_echo,
+            backend,
+        })?,
+        other => return Ok(Some(other)),
+    }
+    Ok(None)
+}
 
+fn dispatch_worker_analysis(command: Commands) -> anyhow::Result<()> {
+    match command {
         Commands::Daw { action } => run_daw_cli(action)?,
-
         Commands::NeuralRestore {
             input,
             output_dir,
@@ -1142,29 +1205,14 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             prompt,
             chunk_secs,
             timeout_secs,
-        } => {
-            let backend = validate_backend_choice(
-                &backend,
-                &[
-                    "auto",
-                    "apollo",
-                    "flowhigh",
-                    "audiosr",
-                    "sonicmaster",
-                    "exciter",
-                ],
-            )?;
-            let res = neural_restore_hybrid(
-                &input,
-                &output_dir,
-                backend,
-                prompt.as_deref(),
-                chunk_secs,
-                std::time::Duration::from_secs(timeout_secs),
-            )?;
-            println!("{}", serde_json::to_string_pretty(&res)?);
-        }
-
+        } => run_neural_restore_cli(
+            &input,
+            &output_dir,
+            &backend,
+            prompt.as_deref(),
+            chunk_secs,
+            timeout_secs,
+        )?,
         Commands::VocalRescue {
             input,
             output_dir,
@@ -1173,71 +1221,483 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             no_dereverb,
             no_de_aspiration,
             timeout_secs,
-        } => {
-            let backend = validate_backend_choice(
-                &backend,
-                &["auto", "resemble-enhance", "seed-vc", "roformer-clean"],
-            )?;
-            let res = vocal_rescue_hybrid(
-                &input,
-                &output_dir,
-                backend,
-                reference_voice.as_deref(),
-                !no_dereverb,
-                !no_de_aspiration,
-                std::time::Duration::from_secs(timeout_secs),
-            )?;
-            println!("{}", serde_json::to_string_pretty(&res)?);
-        }
-
+        } => run_vocal_rescue_cli(
+            &input,
+            &output_dir,
+            &backend,
+            reference_voice.as_deref(),
+            no_dereverb,
+            no_de_aspiration,
+            timeout_secs,
+        )?,
         Commands::BeatTrack {
             input,
             hint_bpm,
             backend,
             timeout_secs,
-        } => {
-            let backend = validate_backend_choice(
-                &backend,
-                &[
-                    "auto",
-                    "beat-this",
-                    "librosa",
-                    "energy",
-                    "rust",
-                    "pure_rust_onset",
-                ],
-            )?;
-            let res = track_beats_hybrid(
-                &input,
-                hint_bpm,
-                backend,
-                std::time::Duration::from_secs(timeout_secs),
-            )?;
-            println!("{}", serde_json::to_string_pretty(&res)?);
-        }
-
+        } => run_beat_track_cli(&input, hint_bpm, &backend, timeout_secs)?,
         Commands::Evaluate {
             input,
             reference,
             vocal,
             backend,
             timeout_secs,
-        } => {
-            let backend = validate_backend_choice(
-                &backend,
-                &["auto", "audiobox", "singmos", "acoustic-proxy", "rust"],
-            )?;
-            let res = evaluate_quality_hybrid(
-                &input,
-                reference.as_deref(),
-                vocal,
-                backend,
-                std::time::Duration::from_secs(timeout_secs),
-            )?;
-            println!("{}", serde_json::to_string_pretty(&res)?);
-        }
+        } => run_evaluate_cli(&input, reference.as_deref(), vocal, &backend, timeout_secs)?,
+        Commands::F0Track {
+            input,
+            backend,
+            hop_secs,
+            timeout_secs,
+            json,
+        } => run_f0_track_cli(&input, &backend, hop_secs, timeout_secs, json)?,
+        _ => unreachable!("all CLI commands handled across dispatch stages"),
+    }
+    Ok(())
+}
+
+fn run_denoise_cli(
+    input: &std::path::Path,
+    output_dir: &std::path::Path,
+    backend: &str,
+    attenuation_limit_db: Option<f64>,
+    timeout_secs: u64,
+) -> anyhow::Result<()> {
+    let worker_backend = match validate_choice(
+        backend,
+        "backend",
+        &[
+            "auto",
+            "deepfilternet",
+            "deepfilternet3",
+            "mel-band-roformer",
+            "roformer",
+        ],
+    )? {
+        "deepfilternet3" => "deepfilternet",
+        "roformer" => "mel-band-roformer",
+        other => other,
+    };
+    let res = denoise_hybrid(
+        input,
+        output_dir,
+        worker_backend,
+        attenuation_limit_db,
+        std::time::Duration::from_secs(timeout_secs),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&res)?);
+    Ok(())
+}
+
+struct SeparateCliArgs {
+    input: PathBuf,
+    output_dir: PathBuf,
+    stems: u8,
+    quality: String,
+    no_dereverb: bool,
+    drum_sep: bool,
+    split_lead_backing: bool,
+    split_male_female: bool,
+    split_guitar: bool,
+    split_orchestral: bool,
+    split_crowd: bool,
+    all_stems: bool,
+    restore: bool,
+    debleed: bool,
+    de_aspiration: bool,
+    dereverb_echo: bool,
+    backend: Option<String>,
+}
+
+fn run_separate_cmd(a: SeparateCliArgs) -> anyhow::Result<()> {
+    if !matches!(a.stems, 2 | 4 | 6) {
+        anyhow::bail!("--stems must be 2, 4, or 6 (got {})", a.stems);
+    }
+    let mut cfg = SeparationConfig::from_env();
+    cfg.stems = a.stems;
+    cfg.quality = parse_quality(&a.quality)?;
+    cfg.dereverb = !a.no_dereverb;
+    cfg.drum_sep = a.drum_sep;
+    cfg.split_lead_backing = a.split_lead_backing;
+    cfg.split_male_female = a.split_male_female;
+    cfg.split_guitar = a.split_guitar;
+    cfg.split_orchestral = a.split_orchestral;
+    cfg.split_crowd = a.split_crowd;
+    if a.all_stems {
+        cfg.enable_all_stems();
+        cfg.dereverb &= !a.no_dereverb;
+    }
+    cfg.restore = a.restore;
+    cfg.debleed = a.debleed;
+    cfg.de_aspiration = a.de_aspiration;
+    cfg.dereverb_echo = a.dereverb_echo;
+    if let Some(b) = &a.backend {
+        cfg.backend = parse_backend(b, cfg.colab_url.as_deref())?;
+    }
+    run_separate_cli(&a.input, &a.output_dir, &cfg)
+}
+
+fn run_neural_restore_cli(
+    input: &std::path::Path,
+    output_dir: &std::path::Path,
+    backend: &str,
+    prompt: Option<&str>,
+    chunk_secs: Option<f64>,
+    timeout_secs: u64,
+) -> anyhow::Result<()> {
+    let backend = validate_backend_choice(
+        backend,
+        &[
+            "auto",
+            "apollo",
+            "flowhigh",
+            "audiosr",
+            "sonicmaster",
+            "exciter",
+        ],
+    )?;
+    let res = neural_restore_hybrid(
+        input,
+        output_dir,
+        backend,
+        prompt,
+        chunk_secs,
+        std::time::Duration::from_secs(timeout_secs),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&res)?);
+    Ok(())
+}
+
+fn run_vocal_rescue_cli(
+    input: &std::path::Path,
+    output_dir: &std::path::Path,
+    backend: &str,
+    reference_voice: Option<&std::path::Path>,
+    no_dereverb: bool,
+    no_de_aspiration: bool,
+    timeout_secs: u64,
+) -> anyhow::Result<()> {
+    let backend = validate_backend_choice(
+        backend,
+        &["auto", "resemble-enhance", "seed-vc", "roformer-clean"],
+    )?;
+    let res = vocal_rescue_hybrid(
+        input,
+        output_dir,
+        backend,
+        reference_voice,
+        !no_dereverb,
+        !no_de_aspiration,
+        std::time::Duration::from_secs(timeout_secs),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&res)?);
+    Ok(())
+}
+
+fn run_beat_track_cli(
+    input: &std::path::Path,
+    hint_bpm: Option<f64>,
+    backend: &str,
+    timeout_secs: u64,
+) -> anyhow::Result<()> {
+    let backend = validate_backend_choice(
+        backend,
+        &[
+            "auto",
+            "beat-this",
+            "librosa",
+            "energy",
+            "rust",
+            "pure_rust_onset",
+        ],
+    )?;
+    let res = track_beats_hybrid(
+        input,
+        hint_bpm,
+        backend,
+        std::time::Duration::from_secs(timeout_secs),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&res)?);
+    Ok(())
+}
+
+fn run_evaluate_cli(
+    input: &std::path::Path,
+    reference: Option<&std::path::Path>,
+    vocal: bool,
+    backend: &str,
+    timeout_secs: u64,
+) -> anyhow::Result<()> {
+    let backend = validate_backend_choice(
+        backend,
+        &["auto", "audiobox", "singmos", "acoustic-proxy", "rust"],
+    )?;
+    let res = evaluate_quality_hybrid(
+        input,
+        reference,
+        vocal,
+        backend,
+        std::time::Duration::from_secs(timeout_secs),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&res)?);
+    Ok(())
+}
+
+struct MasterCliArgs {
+    input: PathBuf,
+    output: PathBuf,
+    target_lufs: f64,
+    ceiling_dbtp: f64,
+    reference: Option<PathBuf>,
+    genre: Option<String>,
+    isrc: Option<String>,
+    title: String,
+    artist: String,
+}
+
+fn run_master_cli(a: MasterCliArgs) -> anyhow::Result<()> {
+    let mut buf = AudioBuffer::load(&a.input)?;
+    if let Some(ref_path) = &a.reference {
+        let ref_buf = AudioBuffer::load(ref_path)?;
+        let match_curve = compute_reference_match_eq(&buf, &ref_buf, 4.5);
+        apply_18_band_eq(&mut buf, &match_curve);
+    } else if let Some(ref g_str) = a.genre {
+        let g = validate_choice(
+            g_str,
+            "genre",
+            &["pop", "hiphop", "neosoul", "edm", "rock", "jazz"],
+        )?;
+        let target = GenreTonalTarget::parse(g);
+        let genre_curve = compute_genre_tonal_balance_eq(&buf, target, 3.5);
+        apply_18_band_eq(&mut buf, &genre_curve);
     }
 
+    let mastered = normalize_and_limit(&buf, a.target_lufs, a.ceiling_dbtp)?;
+    if let Some(raw_isrc) = &a.isrc {
+        let canonical = validate_isrc(raw_isrc)?;
+        let tmp = TempFileGuard::new(a.output.with_extension("pre_tag.wav"));
+        mastered.save_wav(tmp.path(), 24)?;
+        let meta = ReleaseMetadata {
+            title: a.title,
+            artist: a.artist,
+            album: "Single".to_string(),
+            isrc: canonical.clone(),
+            bpm: None,
+            key: None,
+            year: Some(2026),
+        };
+        write_distrokid_metadata(tmp.path(), a.output.as_path(), &meta)?;
+        println!(
+            "Mastered & tagged with ISRC {canonical} -> {}",
+            a.output.display()
+        );
+    } else {
+        mastered.save_wav(&a.output, 24)?;
+    }
+
+    let audit = audit_audio(&mastered);
+    println!(
+        "Final Master: {:.2} LUFS | {:.2} dBTP True Peak | LRA {:.2} LU | DistroKid Ready: {}",
+        audit.integrated_lufs, audit.true_peak_dbtp, audit.loudness_range_lu, audit.distrokid_ready
+    );
+    Ok(())
+}
+
+struct DeliverCliArgs {
+    input: PathBuf,
+    output: PathBuf,
+    target: String,
+    lufs: Option<f64>,
+    ceiling_dbtp: Option<f64>,
+    no_repair: bool,
+    no_defizz: bool,
+    vocal: bool,
+    reference: Option<PathBuf>,
+    genre: Option<String>,
+    limiter_style: String,
+    channel_link: f64,
+    dither: Option<String>,
+    dither_bits: u16,
+    ai_track: bool,
+    hpss_shimmer: Option<f64>,
+}
+
+fn configure_deliver_options(a: &DeliverCliArgs) -> anyhow::Result<(DeliveryOptions, bool)> {
+    let target = match (a.lufs, a.ceiling_dbtp) {
+        (Some(lufs), Some(ceiling)) => DeliveryTarget::custom(lufs, ceiling)?,
+        _ => DeliveryTarget::parse(&a.target)?,
+    };
+    let mut options = DeliveryOptions::for_target(target);
+    options.repair = !a.no_repair;
+    options.defizz = !a.no_defizz;
+    options.vocal = a.vocal;
+    options.ai_track_mode = a.ai_track;
+    options.limiter_style = match validate_choice(
+        &a.limiter_style,
+        "limiter-style",
+        &["transparent", "punchy", "dynamic", "aggressive"],
+    )? {
+        "punchy" => LimiterStyle::Punchy,
+        "dynamic" => LimiterStyle::Dynamic,
+        "aggressive" => LimiterStyle::Aggressive,
+        _ => LimiterStyle::Transparent,
+    };
+    options.channel_link = a.channel_link;
+    let explicit_dither = a.dither.is_some();
+    options.dither = match a
+        .dither
+        .as_deref()
+        .unwrap_or("none")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "none" => DitherMode::None,
+        "tpdf" => DitherMode::Tpdf,
+        "noise-shaped" | "noise_shaped" | "shaped" => DitherMode::NoiseShapedHighPass,
+        other => anyhow::bail!("unknown --dither '{other}' (expected none, tpdf, or noise-shaped)"),
+    };
+    options.dither_bits = a.dither_bits;
+    options.tone_match = match (&a.reference, &a.genre) {
+        (Some(path), _) => Some(ToneMatch::Reference(AudioBuffer::load(path)?)),
+        (None, Some(g_str)) => {
+            let g = validate_choice(
+                g_str,
+                "genre",
+                &["pop", "hiphop", "neosoul", "edm", "rock", "jazz"],
+            )?;
+            Some(ToneMatch::Genre(GenreTonalTarget::parse(g)))
+        }
+        (None, None) => None,
+    };
+    Ok((options, explicit_dither))
+}
+
+fn print_delivery_summary(report: &forge_dsp::DeliveryReport) {
+    println!(
+        "{} ({:.1} LUFS, {:.1} dBTP): {:.2} -> {:.2} LUFS, {:.2} -> {:.2} dBTP",
+        report.target,
+        report.target_lufs,
+        report.ceiling_dbtp,
+        report.before.integrated_lufs,
+        report.after.integrated_lufs,
+        report.before.true_peak_dbtp,
+        report.after.true_peak_dbtp
+    );
+    for check in &report.checks {
+        let mark = if check.passed { "PASS" } else { "FAIL" };
+        println!("  [{mark}] {}: {}", check.name, check.detail);
+    }
+}
+
+fn run_deliver_cli(a: DeliverCliArgs) -> anyhow::Result<()> {
+    let (mut options, explicit_dither) = configure_deliver_options(&a)?;
+    let buf = AudioBuffer::load(&a.input)?;
+    if let Some(shimmer) = a.hpss_shimmer {
+        let mut cfg = DeFizzConfig::ai_mix_from_audit(&audit_audio(&buf));
+        cfg.hpss_shimmer_suppress = shimmer;
+        options.defizz_config = Some(cfg);
+    }
+    let (master, report) = deliver(&buf, &options)?;
+    if options.dither != DitherMode::None {
+        let pcm_bits = if options.dither_bits <= 16 { 16 } else { 24 };
+        master.save_wav_no_dither(&a.output, pcm_bits)?;
+    } else if explicit_dither {
+        master.save_wav_no_dither(&a.output, 24)?;
+    } else {
+        master.save_wav(&a.output, 24)?;
+    }
+    let report_path = a.output.with_extension("delivery.json");
+    std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
+    print_delivery_summary(&report);
+    if !report.ready {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+fn rust_f0_track_cli(
+    input: &std::path::Path,
+    hop_secs: f64,
+    warnings: Vec<String>,
+) -> anyhow::Result<F0TrackResult> {
+    let buf = AudioBuffer::load(input)?;
+    let scale = VocalScale::parse("C chromatic")?;
+    let raw_frames = track_vocal_pitch(&buf, &scale, 1.0);
+    let frames: Vec<F0TrackFrame> = raw_frames
+        .iter()
+        .map(|f| F0TrackFrame {
+            time_secs: f.time_secs,
+            f0_hz: f.f0_hz,
+            voiced: f.f0_hz > 0.0,
+            confidence: if f.f0_hz > 0.0 { 0.85 } else { 0.0 },
+        })
+        .collect();
+    let mut voiced_hz: Vec<f64> = frames
+        .iter()
+        .filter(|f| f.voiced && f.f0_hz.is_finite() && f.f0_hz > 0.0)
+        .map(|f| f.f0_hz)
+        .collect();
+    voiced_hz.sort_by(f64::total_cmp);
+    let median_f0_hz = voiced_hz.get(voiced_hz.len() / 2).copied();
+    let voiced_ratio = if frames.is_empty() {
+        0.0
+    } else {
+        (voiced_hz.len() as f64) / (frames.len() as f64)
+    };
+    Ok(F0TrackResult {
+        backend: "rust-yin".to_string(),
+        sample_rate: buf.sample_rate,
+        hop_secs,
+        voiced_ratio,
+        median_f0_hz,
+        frames,
+        warnings,
+    })
+}
+
+fn run_f0_track_cli(
+    input: &std::path::Path,
+    backend: &str,
+    hop_secs: f64,
+    timeout_secs: u64,
+    json: bool,
+) -> anyhow::Result<()> {
+    let backend = validate_choice(
+        backend,
+        "backend",
+        &["auto", "rmvpe", "fcpe", "autocorr", "rust"],
+    )?;
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+    let res = if backend == "rust" {
+        rust_f0_track_cli(input, hop_secs, Vec::new())?
+    } else {
+        match resolve_default_local_worker()
+            .and_then(|worker| run_local_f0_track(&worker, input, backend, hop_secs, timeout))
+        {
+            Ok(res) => res,
+            Err(err) if backend == "auto" => rust_f0_track_cli(
+                input,
+                hop_secs,
+                vec![format!(
+                    "worker skipped ({err}), used pure-Rust YIN fallback"
+                )],
+            )?,
+            Err(err) => return Err(err.into()),
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&res)?);
+    } else {
+        println!(
+            "F0 Track ({}, {} Hz, hop {:.3}s): voiced {:.1}%, median {:.2} Hz ({} frames)",
+            res.backend,
+            res.sample_rate,
+            res.hop_secs,
+            res.voiced_ratio * 100.0,
+            res.median_f0_hz.unwrap_or(0.0),
+            res.frames.len()
+        );
+    }
     Ok(())
 }
 
@@ -1586,7 +2046,7 @@ fn run_ingest_cli(args: IngestCliArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_backend_choice<'a>(raw: &str, allowed: &[&'a str]) -> anyhow::Result<&'a str> {
+fn validate_choice<'a>(raw: &str, flag: &str, allowed: &[&'a str]) -> anyhow::Result<&'a str> {
     let trimmed = raw.trim();
     allowed
         .iter()
@@ -1594,10 +2054,44 @@ fn validate_backend_choice<'a>(raw: &str, allowed: &[&'a str]) -> anyhow::Result
         .find(|c| c.eq_ignore_ascii_case(trimmed))
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "unsupported --backend '{trimmed}' (expected one of {})",
+                "unsupported --{flag} '{trimmed}' (expected one of {})",
                 allowed.join(", ")
             )
         })
+}
+
+fn validate_backend_choice<'a>(raw: &str, allowed: &[&'a str]) -> anyhow::Result<&'a str> {
+    validate_choice(raw, "backend", allowed)
+}
+
+fn parse_hum_hz(raw: &str) -> Result<f64, String> {
+    let v: f64 = raw.parse().map_err(|e| format!("{e}"))?;
+    if v.is_finite() && (v == 0.0 || (40.0..=70.0).contains(&v)) {
+        Ok(v)
+    } else {
+        Err(format!("hum-hz ({v}) must be 0 (off) or in 40..=70 Hz"))
+    }
+}
+
+fn parse_hop_secs(raw: &str) -> Result<f64, String> {
+    parse_bounded_f64(raw, "hop-secs", 0.002, 0.25)
+}
+
+fn parse_dither_bits(raw: &str) -> Result<u16, String> {
+    let v: u16 = raw.parse().map_err(|e| format!("{e}"))?;
+    if (8..=24).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("dither-bits ({v}) must be in 8..=24"))
+    }
+}
+
+fn parse_target_lufs(raw: &str) -> Result<f64, String> {
+    parse_bounded_f64(raw, "target-lufs", -40.0, -4.0)
+}
+
+fn parse_ceiling_dbtp(raw: &str) -> Result<f64, String> {
+    parse_bounded_f64(raw, "ceiling-dbtp", -24.0, 0.0)
 }
 
 fn parse_lpf_hz(raw: &str) -> Result<f64, String> {
@@ -1982,5 +2476,189 @@ mod tests {
                 panic!("unexpected command variant");
             }
         }
+    }
+
+    #[test]
+    fn wave4_cli_bounds_and_enum_choices_are_validated() {
+        for bad_cmd in [
+            vec![
+                "forge", "restore", "in.wav", "-o", "out.wav", "--hum-hz", "500",
+            ],
+            vec!["forge", "vocal", "in.wav", "-o", "out", "--retune", "1.5"],
+            vec![
+                "forge",
+                "deliver",
+                "in.wav",
+                "-o",
+                "out.wav",
+                "--dither-bits",
+                "32",
+            ],
+            vec![
+                "forge",
+                "deliver",
+                "in.wav",
+                "-o",
+                "out.wav",
+                "--channel-link",
+                "-0.2",
+            ],
+            vec![
+                "forge",
+                "master",
+                "in.wav",
+                "-o",
+                "out.wav",
+                "--target-lufs",
+                "2.0",
+            ],
+            vec![
+                "forge",
+                "master",
+                "in.wav",
+                "-o",
+                "out.wav",
+                "--ceiling-dbtp",
+                "1.0",
+            ],
+            vec!["forge", "f0-track", "in.wav", "--hop-secs", "0.0001"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&bad_cmd).is_err(),
+                "{bad_cmd:?} must be rejected by value_parser"
+            );
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wav = dir.path().join("tone.wav");
+        let sr = 48_000_u32;
+        let samples: Vec<f64> = (0..(sr / 2))
+            .map(|i| 0.3 * (2.0 * std::f64::consts::PI * 220.0 * (i as f64) / f64::from(sr)).sin())
+            .collect();
+        AudioBuffer::from_channels(vec![samples.clone(), samples], sr)
+            .expect("buf")
+            .save_wav(&wav, 24)
+            .expect("save");
+        let out_wav = dir.path().join("out.wav");
+
+        for bad_exec in [
+            vec![
+                "forge",
+                "unmask",
+                wav.to_str().unwrap(),
+                "-s",
+                wav.to_str().unwrap(),
+                "-o",
+                out_wav.to_str().unwrap(),
+                "--mode",
+                "guitar",
+            ],
+            vec![
+                "forge",
+                "theory",
+                "-o",
+                dir.path().join("bad.mid").to_str().unwrap(),
+                "--style",
+                "baroque",
+            ],
+            vec![
+                "forge",
+                "theory",
+                "-o",
+                dir.path().join("bad2.mid").to_str().unwrap(),
+                "--groove",
+                "waltz",
+            ],
+            vec![
+                "forge",
+                "master",
+                wav.to_str().unwrap(),
+                "-o",
+                out_wav.to_str().unwrap(),
+                "--genre",
+                "polka",
+            ],
+        ] {
+            let parsed = Cli::try_parse_from(&bad_exec).expect("clap parse");
+            assert!(
+                run_cli(parsed).is_err(),
+                "{bad_exec:?} must error cleanly on unknown enum choice"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_end_to_end_audit_theory_f0_daw_and_reaper_execute() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wav = dir.path().join("voc.wav");
+        let sr = 48_000_u32;
+        let samples: Vec<f64> = (0..sr)
+            .map(|i| 0.35 * (2.0 * std::f64::consts::PI * 220.0 * (i as f64) / f64::from(sr)).sin())
+            .collect();
+        AudioBuffer::from_channels(vec![samples.clone(), samples], sr)
+            .expect("buf")
+            .save_wav(&wav, 24)
+            .expect("save");
+
+        let audit_cli = Cli::try_parse_from(["forge", "audit", wav.to_str().unwrap(), "--json"])
+            .expect("audit parse");
+        run_cli(audit_cli).expect("audit e2e");
+
+        let abc_in = dir.path().join("sheet.abc");
+        std::fs::write(&abc_in, "X:1\nM:4/4\nL:1/4\nK:C\n\"C\"C E G c |\n").expect("abc");
+        let out_mid = dir.path().join("theory.mid");
+        let out_abc = dir.path().join("out.abc");
+        let theory_cli = Cli::try_parse_from([
+            "forge",
+            "theory",
+            "--chords",
+            "Dm7 G7 Cmaj7 A7",
+            "-o",
+            out_mid.to_str().unwrap(),
+            "--abc-input",
+            abc_in.to_str().unwrap(),
+            "--output-abc",
+            out_abc.to_str().unwrap(),
+        ])
+        .expect("theory parse");
+        run_cli(theory_cli).expect("theory e2e");
+        assert!(out_mid.exists());
+        assert!(out_abc.exists());
+
+        let f0_cli = Cli::try_parse_from([
+            "forge",
+            "f0-track",
+            wav.to_str().unwrap(),
+            "--backend",
+            "rust",
+            "--json",
+        ])
+        .expect("f0-track parse");
+        run_cli(f0_cli).expect("f0-track e2e");
+
+        let proj_path = dir.path().join("session.forgeproj");
+        let proj = DawProject::new("CliE2E", 48_000, 120.0);
+        proj.save_to_file(&proj_path).expect("save proj");
+        let daw_cli = Cli::try_parse_from([
+            "forge",
+            "daw",
+            "inspect",
+            proj_path.to_str().unwrap(),
+            "--json",
+        ])
+        .expect("daw inspect parse");
+        run_cli(daw_cli).expect("daw inspect e2e");
+
+        let jsfx_dir = dir.path().join("jsfx");
+        let reaper_cli = Cli::try_parse_from([
+            "forge",
+            "reaper",
+            "--install-jsfx",
+            "--jsfx-dir",
+            jsfx_dir.to_str().unwrap(),
+        ])
+        .expect("reaper parse");
+        run_cli(reaper_cli).expect("reaper install_jsfx e2e");
+        assert!(jsfx_dir.join("Forge_Master_Limiter.jsfx").exists());
     }
 }

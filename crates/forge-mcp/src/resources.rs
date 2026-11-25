@@ -29,6 +29,12 @@ pub(crate) fn list_resources() -> Vec<Resource> {
                 "Canonical filesystem root directories permitted for anchored MCP file I/O.",
             )
             .with_mime_type("application/json"),
+        Resource::new("forge://apps/audit-dashboard", "Audio Audit Dashboard App")
+            .with_title("ForgeAudio Telemetry & Loudness Dashboard")
+            .with_description(
+                "Interactive MCP Apps (ext-apps) HTML dashboard visualizing BS.1770 LUFS, dBTP, LRA, M/S fizz, and spectral bandwidth.",
+            )
+            .with_mime_type("text/html;profile=mcp-app"),
     ]
 }
 
@@ -83,10 +89,62 @@ fn roots_payload(sandbox: &PathSandbox) -> Value {
     json!({ "roots": roots })
 }
 
+fn audit_dashboard_html() -> &'static str {
+    r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>ForgeAudio Audit Dashboard</title>
+<style>
+  :root { color-scheme: dark; --bg:#0b1120; --card:#131c31; --fg:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --warn:#fbbf24; }
+  body { margin:0; padding:16px; font-family:ui-sans-serif,system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  h1 { margin:0 0 8px; font-size:16px; color:var(--accent); letter-spacing:.04em; text-transform:uppercase; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; margin-top:12px; }
+  .card { background:var(--card); border:1px solid #24324d; border-radius:8px; padding:10px 12px; }
+  .lbl { font-size:11px; color:var(--muted); text-transform:uppercase; }
+  .val { font-size:20px; font-weight:700; margin-top:4px; font-variant-numeric:tabular-nums; }
+  #status { font-size:12px; color:var(--muted); margin-top:10px; }
+</style>
+</head>
+<body>
+  <h1>ForgeAudio Studio Telemetry</h1>
+  <div class="grid">
+    <div class="card"><div class="lbl">Integrated LUFS</div><div class="val" id="lufs">--</div></div>
+    <div class="card"><div class="lbl">True Peak (dBTP)</div><div class="val" id="tp">--</div></div>
+    <div class="card"><div class="lbl">LRA (LU)</div><div class="val" id="lra">--</div></div>
+    <div class="card"><div class="lbl">AI Fizz Index</div><div class="val" id="fizz">--</div></div>
+    <div class="card"><div class="lbl">M/S Corr (2-12k)</div><div class="val" id="corr">--</div></div>
+    <div class="card"><div class="lbl">Bandwidth (Hz)</div><div class="val" id="bw">--</div></div>
+  </div>
+  <div id="status">Waiting for MCP tool telemetry payload via postMessage...</div>
+<script>
+window.addEventListener("message", (ev) => {
+  const d = (ev.data && (ev.data.structuredContent || ev.data.params || ev.data)) || {};
+  const fmt = (v, n=2) => (typeof v === "number" && isFinite(v)) ? v.toFixed(n) : "--";
+  document.getElementById("lufs").textContent = fmt(d.integrated_lufs, 2);
+  document.getElementById("tp").textContent = fmt(d.true_peak_dbtp, 2);
+  document.getElementById("lra").textContent = fmt(d.lra_lu ?? d.loudness_range_lu, 2);
+  document.getElementById("fizz").textContent = fmt(d.ai_fizz_index, 1);
+  document.getElementById("corr").textContent = fmt(d.stereo_correlation ?? d.high_mid_stereo_correlation, 2);
+  document.getElementById("bw").textContent = fmt(d.bandwidth_cutoff_hz ?? d.effective_bandwidth_hz, 0);
+  document.getElementById("status").textContent = "Updated live from ForgeAudio MCP telemetry.";
+});
+</script>
+</body>
+</html>"#
+}
+
 pub(crate) fn read_resource(
     uri: &str,
     sandbox: &PathSandbox,
 ) -> Result<ReadResourceResult, ErrorData> {
+    if uri == "forge://apps/audit-dashboard" {
+        return Ok(ReadResourceResult::new(vec![
+            ResourceContents::text(audit_dashboard_html(), uri)
+                .with_mime_type("text/html;profile=mcp-app"),
+        ]));
+    }
     let payload = match uri {
         "forge://targets" => targets_payload(),
         "forge://models" => models_payload(),

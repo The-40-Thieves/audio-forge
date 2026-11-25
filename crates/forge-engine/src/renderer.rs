@@ -128,8 +128,12 @@ struct ObjectRuntime {
     clip: Option<Arc<AudioBuffer>>,
     eq: ObjectEqRuntime,
     fx: Vec<FxProcessor>,
+    fx_audio_pdc: Vec<PdcDelayLine>,
+    fx_sc_pdc: Vec<PdcDelayLine>,
     pdc: PdcDelayLine,
     fx_latency: usize,
+    gain_l_smooth: ParamSmoother,
+    gain_r_smooth: ParamSmoother,
 }
 
 struct TrackRuntime {
@@ -138,6 +142,8 @@ struct TrackRuntime {
     synth: PolySynth,
     synth_pdc: PdcDelayLine,
     inserts: Vec<FxProcessor>,
+    insert_audio_pdc: Vec<PdcDelayLine>,
+    insert_sc_pdc: Vec<PdcDelayLine>,
     pdc: PdcDelayLine,
     total_latency: usize,
     peak_db: f32,
@@ -152,6 +158,8 @@ struct AuxBusRuntime {
     fx_latency: usize,
     acc_l: f32,
     acc_r: f32,
+    gain_l_smooth: ParamSmoother,
+    gain_r_smooth: ParamSmoother,
 }
 
 /// Live meter snapshot published from the audio engine to the DAW GUI.
@@ -257,6 +265,8 @@ impl ClipCache {
     }
 }
 
+const LOOP_FADE_SAMPLES: usize = 64;
+
 /// Samplitude-inspired **Object-Oriented Multitrack Audio Engine** with automatic PDC.
 ///
 /// Compiles a [`DawProject`] + [`ClipCache`] into a zero-allocation per-sample execution graph
@@ -267,6 +277,7 @@ pub struct ObjectOrientedEngine {
     loop_enabled: bool,
     loop_start: u64,
     loop_end: u64,
+    loop_fade_remaining: usize,
     master_gain_lin: f32,
     master_gain_smooth: ParamSmoother,
     master_insert_cfgs: Vec<crate::project::FxSlotConfig>,
@@ -289,14 +300,14 @@ pub struct ObjectOrientedEngine {
     track_master_sc_r: Vec<f32>,
 }
 
-fn resolve_sidechain_sample(
+#[inline]
+fn resolve_sidechain_idx(
     track_ids: &[u64],
     self_idx: Option<usize>,
-    buf_l: &[f32],
-    buf_r: &[f32],
     cfg: &crate::project::FxSlotConfig,
-) -> Option<(f32, f32)> {
+) -> Option<usize> {
     let crate::project::FxSlotConfig::OpenSpacer {
+        bypass: false,
         sidechain_track_id: Some(sc_id),
         ..
     } = cfg
@@ -307,7 +318,56 @@ fn resolve_sidechain_sample(
         .iter()
         .enumerate()
         .find(|&(idx, &id)| self_idx != Some(idx) && id == *sc_id)
-        .map(|(idx, _)| (buf_l[idx], buf_r[idx]))
+        .map(|(idx, _)| idx)
+}
+
+#[inline]
+fn resolve_sidechain_sample(
+    track_ids: &[u64],
+    self_idx: Option<usize>,
+    buf_l: &[f32],
+    buf_r: &[f32],
+    cfg: &crate::project::FxSlotConfig,
+) -> Option<(f32, f32)> {
+    resolve_sidechain_idx(track_ids, self_idx, cfg).map(|idx| (buf_l[idx], buf_r[idx]))
+}
+
+#[inline]
+fn db_to_lin_f32(db: f32, min_db: f32, max_db: f32) -> f32 {
+    let clean = if db.is_finite() { db } else { 0.0 };
+    10.0_f32.powf(clean.clamp(min_db, max_db) / 20.0)
+}
+
+#[inline]
+fn object_target_gains(obj: &AudioObject) -> (f64, f64) {
+    if obj.mute {
+        return (0.0, 0.0);
+    }
+    let g = db_to_lin_f32(obj.gain_db, -48.0, 24.0) * if obj.phase_invert { -1.0 } else { 1.0 };
+    let (pl, pr) = ObjectOrientedEngine::equal_power_pan(obj.pan);
+    (f64::from(g * pl), f64::from(g * pr))
+}
+
+#[inline]
+fn track_target_gains(track: &Track, pos: u64, audible: bool) -> (f64, f64) {
+    if !audible {
+        return (0.0, 0.0);
+    }
+    let gain_db = track.volume_auto.evaluate(pos, track.gain_db);
+    let pan = track.pan_auto.evaluate(pos, track.pan);
+    let tg = db_to_lin_f32(gain_db, -60.0, 12.0) * if track.phase_invert { -1.0 } else { 1.0 };
+    let (pl, pr) = ObjectOrientedEngine::equal_power_pan(pan);
+    (f64::from(tg * pl), f64::from(tg * pr))
+}
+
+#[inline]
+fn aux_target_gains(bus: &AuxBus) -> (f64, f64) {
+    if bus.mute {
+        return (0.0, 0.0);
+    }
+    let bg = db_to_lin_f32(bus.gain_db, -60.0, 12.0);
+    let (bpl, bpr) = ObjectOrientedEngine::equal_power_pan(bus.pan);
+    (f64::from(bg * bpl), f64::from(bg * bpr))
 }
 
 fn compile_fx_chain(
@@ -328,74 +388,135 @@ fn compile_fx_chain(
     (procs, latency)
 }
 
+fn align_object_sidechains(
+    tracks: &mut [TrackRuntime],
+    raw_obj_latencies: &[usize],
+    track_ids: &[u64],
+) {
+    for (tr_idx, tr) in tracks.iter_mut().enumerate() {
+        let mut max_obj_lat = 0_usize;
+        for obj_rt in &mut tr.objects {
+            let mut cur_lat = 0_usize;
+            for (k, (proc_fx, cfg)) in obj_rt.fx.iter().zip(&obj_rt.config.fx_chain).enumerate() {
+                if let Some(sc_idx) = resolve_sidechain_idx(track_ids, Some(tr_idx), cfg) {
+                    let sc_lat = raw_obj_latencies[sc_idx].saturating_add(1);
+                    let audio_pad = sc_lat.saturating_sub(cur_lat);
+                    let sc_pad = cur_lat.saturating_sub(sc_lat);
+                    obj_rt.fx_audio_pdc[k] = PdcDelayLine::new(audio_pad);
+                    obj_rt.fx_sc_pdc[k] = PdcDelayLine::new(sc_pad);
+                    cur_lat = cur_lat.saturating_add(audio_pad);
+                }
+                cur_lat = cur_lat.saturating_add(proc_fx.latency_samples_for(
+                    cfg,
+                    Some(tr_idx),
+                    track_ids,
+                ));
+            }
+            obj_rt.fx_latency = cur_lat;
+            max_obj_lat = max_obj_lat.max(cur_lat);
+        }
+        for obj_rt in &mut tr.objects {
+            obj_rt.pdc = PdcDelayLine::new(max_obj_lat.saturating_sub(obj_rt.fx_latency));
+        }
+        tr.synth_pdc = PdcDelayLine::new(max_obj_lat);
+        tr.total_latency = max_obj_lat;
+    }
+}
+
+fn align_track_insert_sidechains(tracks: &mut [TrackRuntime], track_ids: &[u64]) -> usize {
+    let base_obj_lats: Vec<usize> = tracks.iter().map(|t| t.total_latency).collect();
+    let mut max_track_latency = 0_usize;
+    for (tr_idx, tr) in tracks.iter_mut().enumerate() {
+        let mut cur_lat = base_obj_lats[tr_idx];
+        for (k, (proc_fx, cfg)) in tr.inserts.iter().zip(&tr.config.inserts).enumerate() {
+            if let Some(sc_idx) = resolve_sidechain_idx(track_ids, Some(tr_idx), cfg) {
+                let sc_lat = base_obj_lats[sc_idx];
+                let audio_pad = sc_lat.saturating_sub(cur_lat);
+                let sc_pad = cur_lat.saturating_sub(sc_lat);
+                tr.insert_audio_pdc[k] = PdcDelayLine::new(audio_pad);
+                tr.insert_sc_pdc[k] = PdcDelayLine::new(sc_pad);
+                cur_lat = cur_lat.saturating_add(audio_pad);
+            }
+            cur_lat =
+                cur_lat.saturating_add(proc_fx.latency_samples_for(cfg, Some(tr_idx), track_ids));
+        }
+        tr.total_latency = cur_lat;
+        max_track_latency = max_track_latency.max(cur_lat);
+    }
+    for tr in tracks {
+        tr.pdc = PdcDelayLine::new(max_track_latency.saturating_sub(tr.total_latency));
+    }
+    max_track_latency
+}
+
+fn compile_tracks(
+    project: &DawProject,
+    cache: &ClipCache,
+    sr: f64,
+    track_ids: &[u64],
+) -> (Vec<TrackRuntime>, usize) {
+    let mut tracks = Vec::with_capacity(project.tracks.len());
+    let mut raw_obj_latencies = Vec::with_capacity(project.tracks.len());
+    for (tr_idx, track) in project.tracks.iter().enumerate() {
+        let mut obj_runtimes = Vec::with_capacity(track.objects.len());
+        let mut max_obj_latency = 0_usize;
+        for obj in &track.objects {
+            let (fx, fx_latency) = compile_fx_chain(&obj.fx_chain, sr, Some(tr_idx), track_ids);
+            max_obj_latency = max_obj_latency.max(fx_latency);
+            let fx_len = fx.len();
+            let (ogl, ogr) = object_target_gains(obj);
+            obj_runtimes.push(ObjectRuntime {
+                config: obj.clone(),
+                clip: cache.get_clip(&obj.source_path),
+                eq: ObjectEqRuntime::new(sr, obj.eq),
+                fx,
+                fx_audio_pdc: (0..fx_len).map(|_| PdcDelayLine::new(0)).collect(),
+                fx_sc_pdc: (0..fx_len).map(|_| PdcDelayLine::new(0)).collect(),
+                pdc: PdcDelayLine::new(0),
+                fx_latency,
+                gain_l_smooth: ParamSmoother::new(ogl, sr, 5.0),
+                gain_r_smooth: ParamSmoother::new(ogr, sr, 5.0),
+            });
+        }
+        raw_obj_latencies.push(max_obj_latency);
+        let (inserts, _) = compile_fx_chain(&track.inserts, sr, Some(tr_idx), track_ids);
+        let ins_len = inserts.len();
+        let any_solo = project.tracks.iter().any(|t| t.solo);
+        let audible = if any_solo { track.solo } else { !track.mute };
+        let (tgl, tgr) = track_target_gains(track, 0, audible);
+        tracks.push(TrackRuntime {
+            config: track.clone(),
+            objects: obj_runtimes,
+            synth: PolySynth::new(sr),
+            synth_pdc: PdcDelayLine::new(max_obj_latency),
+            inserts,
+            insert_audio_pdc: (0..ins_len).map(|_| PdcDelayLine::new(0)).collect(),
+            insert_sc_pdc: (0..ins_len).map(|_| PdcDelayLine::new(0)).collect(),
+            pdc: PdcDelayLine::new(0),
+            total_latency: max_obj_latency,
+            peak_db: -90.0,
+            gain_l_smooth: ParamSmoother::new(tgl, sr, 5.0),
+            gain_r_smooth: ParamSmoother::new(tgr, sr, 5.0),
+        });
+    }
+    align_object_sidechains(&mut tracks, &raw_obj_latencies, track_ids);
+    let max_track_latency = align_track_insert_sidechains(&mut tracks, track_ids);
+    (tracks, max_track_latency)
+}
+
 impl ObjectOrientedEngine {
     /// Compiles `project` into an executable real-time audio graph (runs off-audio-thread).
     pub fn compile(project: &DawProject, cache: &ClipCache) -> Self {
         let sr = f64::from(project.sample_rate.max(8_000));
         let track_ids: Vec<u64> = project.tracks.iter().map(|t| t.id).collect();
-        let mut tracks = Vec::with_capacity(project.tracks.len());
-        let mut max_track_latency = 0_usize;
+        let (tracks, max_track_latency) = compile_tracks(project, cache, sr, &track_ids);
 
-        for (tr_idx, track) in project.tracks.iter().enumerate() {
-            let mut obj_runtimes = Vec::with_capacity(track.objects.len());
-            let mut max_obj_latency = 0_usize;
-
-            for obj in &track.objects {
-                let (fx, fx_latency) =
-                    compile_fx_chain(&obj.fx_chain, sr, Some(tr_idx), &track_ids);
-                max_obj_latency = max_obj_latency.max(fx_latency);
-                obj_runtimes.push(ObjectRuntime {
-                    config: obj.clone(),
-                    clip: cache.get_clip(&obj.source_path),
-                    eq: ObjectEqRuntime::new(sr, obj.eq),
-                    fx,
-                    pdc: PdcDelayLine::new(0),
-                    fx_latency,
-                });
-            }
-
-            // Align all objects within the same track to `max_obj_latency`
-            for obj_rt in &mut obj_runtimes {
-                let pad = max_obj_latency.saturating_sub(obj_rt.fx_latency);
-                obj_rt.pdc = PdcDelayLine::new(pad);
-            }
-
-            let (inserts, track_fx_lat) =
-                compile_fx_chain(&track.inserts, sr, Some(tr_idx), &track_ids);
-            let total_latency = max_obj_latency + track_fx_lat;
-            max_track_latency = max_track_latency.max(total_latency);
-
-            let init_gain_db = track.volume_auto.evaluate(0, track.gain_db);
-            let init_pan = track.pan_auto.evaluate(0, track.pan);
-            let init_tg = 10.0_f32.powf(init_gain_db.clamp(-60.0, 12.0) / 20.0)
-                * if track.phase_invert { -1.0 } else { 1.0 };
-            let (init_pl, init_pr) = Self::equal_power_pan(init_pan);
-            tracks.push(TrackRuntime {
-                config: track.clone(),
-                objects: obj_runtimes,
-                synth: PolySynth::new(sr),
-                synth_pdc: PdcDelayLine::new(max_obj_latency),
-                inserts,
-                pdc: PdcDelayLine::new(0),
-                total_latency,
-                peak_db: -90.0,
-                gain_l_smooth: ParamSmoother::new(f64::from(init_tg * init_pl), sr, 5.0),
-                gain_r_smooth: ParamSmoother::new(f64::from(init_tg * init_pr), sr, 5.0),
-            });
-        }
-
-        // Align all parallel tracks to `max_track_latency` for sample-accurate PDC
-        for tr in &mut tracks {
-            let pad = max_track_latency.saturating_sub(tr.total_latency);
-            tr.pdc = PdcDelayLine::new(pad);
-        }
-
-        // Compile Aux / FX Return Buses & align Main Mix vs Aux Bus PDC
         let mut aux_buses = Vec::with_capacity(project.aux_buses.len());
         let mut max_aux_latency = 0_usize;
         for bus in &project.aux_buses {
             let (inserts, fx_latency) = compile_fx_chain(&bus.inserts, sr, None, &track_ids);
             max_aux_latency = max_aux_latency.max(fx_latency);
+            let (bgl, bgr) = aux_target_gains(bus);
             aux_buses.push(AuxBusRuntime {
                 config: bus.clone(),
                 inserts,
@@ -403,11 +524,12 @@ impl ObjectOrientedEngine {
                 fx_latency,
                 acc_l: 0.0,
                 acc_r: 0.0,
+                gain_l_smooth: ParamSmoother::new(bgl, sr, 5.0),
+                gain_r_smooth: ParamSmoother::new(bgr, sr, 5.0),
             });
         }
         for bus in &mut aux_buses {
-            let pad = max_aux_latency.saturating_sub(bus.fx_latency);
-            bus.pdc = PdcDelayLine::new(pad);
+            bus.pdc = PdcDelayLine::new(max_aux_latency.saturating_sub(bus.fx_latency));
         }
         let main_bus_pdc = PdcDelayLine::new(max_aux_latency);
 
@@ -417,13 +539,14 @@ impl ObjectOrientedEngine {
 
         let num_tracks = tracks.len();
         let track_peaks_db = vec![-90.0; num_tracks];
-        let master_gain_lin = 10.0_f32.powf(project.master_gain_db.clamp(-48.0, 12.0) / 20.0);
+        let master_gain_lin = db_to_lin_f32(project.master_gain_db, -48.0, 12.0);
         Self {
             sample_rate: sr,
             playhead_samples: 0,
             loop_enabled: project.loop_enabled,
             loop_start: project.loop_start_samples,
             loop_end: project.loop_end_samples,
+            loop_fade_remaining: 0,
             master_gain_lin,
             master_gain_smooth: ParamSmoother::new(f64::from(master_gain_lin), sr, 5.0),
             master_insert_cfgs: project.master_inserts.clone(),
@@ -682,22 +805,53 @@ impl ObjectOrientedEngine {
 
     pub fn reset_dsp_state(&mut self) {
         let sr = self.sample_rate;
+        let pos = self.playhead_samples;
+        let any_solo = self.tracks.iter().any(|t| t.config.solo);
+        self.loop_fade_remaining = 0;
+        self.master_gain_smooth
+            .reset(f64::from(self.master_gain_lin));
         for tr in &mut self.tracks {
+            let audible = if any_solo {
+                tr.config.solo
+            } else {
+                !tr.config.mute
+            };
+            let (tgl, tgr) = track_target_gains(&tr.config, pos, audible);
+            tr.gain_l_smooth.reset(tgl);
+            tr.gain_r_smooth.reset(tgr);
             tr.pdc.reset();
             tr.synth.reset(sr);
             tr.synth_pdc.reset();
+            for p in &mut tr.insert_audio_pdc {
+                p.reset();
+            }
+            for p in &mut tr.insert_sc_pdc {
+                p.reset();
+            }
             for ins in &mut tr.inserts {
                 ins.reset(sr);
             }
             for obj in &mut tr.objects {
+                let (ogl, ogr) = object_target_gains(&obj.config);
+                obj.gain_l_smooth.reset(ogl);
+                obj.gain_r_smooth.reset(ogr);
                 obj.pdc.reset();
                 obj.eq.reset();
+                for p in &mut obj.fx_audio_pdc {
+                    p.reset();
+                }
+                for p in &mut obj.fx_sc_pdc {
+                    p.reset();
+                }
                 for fx in &mut obj.fx {
                     fx.reset(sr);
                 }
             }
         }
         for bus in &mut self.aux_buses {
+            let (bgl, bgr) = aux_target_gains(&bus.config);
+            bus.gain_l_smooth.reset(bgl);
+            bus.gain_r_smooth.reset(bgr);
             bus.pdc.reset();
             bus.acc_l = 0.0;
             bus.acc_r = 0.0;
@@ -724,22 +878,36 @@ impl ObjectOrientedEngine {
     }
 
     #[inline]
+    fn catmull_rom(p0: f64, p1: f64, p2: f64, p3: f64, t: f64) -> f32 {
+        let t2 = t * t;
+        let t3 = t2 * t;
+        let out = 0.5
+            * ((2.0 * p1)
+                + (-p0 + p2) * t
+                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);
+        out as f32
+    }
+
+    #[inline]
     fn sample_clip_interp(clip: &AudioBuffer, src_pos: f64) -> (f32, f32, bool) {
         let clip_frames = clip.num_frames();
         if clip_frames == 0 || src_pos < 0.0 || !src_pos.is_finite() {
             return (0.0, 0.0, false);
         }
-        let idx0 = src_pos.floor() as usize;
-        if idx0 >= clip_frames {
+        let i1 = src_pos.floor() as usize;
+        if i1 >= clip_frames {
             return (0.0, 0.0, false);
         }
-        let idx1 = (idx0 + 1).min(clip_frames - 1);
-        let frac = src_pos - (idx0 as f64);
-        let c0 = (clip.channels[0][idx0] + (clip.channels[0][idx1] - clip.channels[0][idx0]) * frac)
-            as f32;
+        let i0 = i1.saturating_sub(1);
+        let i2 = (i1 + 1).min(clip_frames - 1);
+        let i3 = (i1 + 2).min(clip_frames - 1);
+        let frac = src_pos - (i1 as f64);
+        let ch0 = &clip.channels[0];
+        let c0 = Self::catmull_rom(ch0[i0], ch0[i1], ch0[i2], ch0[i3], frac);
         let c1 = if clip.channels.len() > 1 {
-            (clip.channels[1][idx0] + (clip.channels[1][idx1] - clip.channels[1][idx0]) * frac)
-                as f32
+            let ch1 = &clip.channels[1];
+            Self::catmull_rom(ch1[i0], ch1[i1], ch1[i2], ch1[i3], frac)
         } else {
             c0
         };
@@ -822,6 +990,265 @@ impl ObjectOrientedEngine {
         )
     }
 
+    #[inline]
+    fn object_tail_pad(obj: &ObjectRuntime, sr: f64) -> u64 {
+        if obj.fx.is_empty() {
+            return (obj.pdc.delay_samples as u64).saturating_add(64);
+        }
+        let mut tail_secs = 4.0_f64;
+        for fx in &obj.config.fx_chain {
+            if !fx.is_bypassed()
+                && let crate::project::FxSlotConfig::SpaceVerb {
+                    decay_rt60_secs, ..
+                } = fx
+            {
+                tail_secs = tail_secs.max(f64::from(*decay_rt60_secs) * 1.5);
+            }
+        }
+        (tail_secs.clamp(4.0, 20.0) * sr).round() as u64
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn render_object_sample(
+        obj: &mut ObjectRuntime,
+        pos: u64,
+        sr: f64,
+        tr_idx: usize,
+        track_ids: &[u64],
+        track_prev_l: &[f32],
+        track_prev_r: &[f32],
+    ) -> (f32, f32) {
+        if obj.config.mute
+            && obj.gain_l_smooth.current().abs() < 1e-5
+            && obj.gain_r_smooth.current().abs() < 1e-5
+        {
+            return (0.0, 0.0);
+        }
+        let start = obj.config.timeline_start_samples;
+        let end = obj.config.timeline_end_samples();
+        let tail_pad = Self::object_tail_pad(obj, sr);
+        if pos < start || pos >= end.saturating_add(tail_pad) {
+            return (0.0, 0.0);
+        }
+        let (tgt_l, tgt_r) = object_target_gains(&obj.config);
+        obj.gain_l_smooth.set_target(tgt_l);
+        obj.gain_r_smooth.set_target(tgt_r);
+        let gl_sm = obj.gain_l_smooth.next_val() as f32;
+        let gr_sm = obj.gain_r_smooth.next_val() as f32;
+
+        let (mut ol, mut or_) = if pos >= start
+            && pos < end
+            && let Some(ref clip) = obj.clip
+        {
+            let local = pos - start;
+            let (s0, s1, in_bounds) =
+                Self::read_object_elastic_stereo(clip, &obj.config, local, sr);
+            if in_bounds {
+                let fade = obj.config.fade_gain_at(local) as f32;
+                (s0 * gl_sm * fade, s1 * gr_sm * fade)
+            } else {
+                (0.0, 0.0)
+            }
+        } else {
+            (0.0, 0.0)
+        };
+
+        (ol, or_) = obj.eq.process(ol, or_);
+        for (k, (proc_fx, cfg)) in obj.fx.iter_mut().zip(&obj.config.fx_chain).enumerate() {
+            (ol, or_) = obj.fx_audio_pdc[k].process(ol, or_);
+            let sc =
+                resolve_sidechain_sample(track_ids, Some(tr_idx), track_prev_l, track_prev_r, cfg)
+                    .map(|(sl, sr_)| obj.fx_sc_pdc[k].process(sl, sr_));
+            (ol, or_) = proc_fx.process_stereo_with_sidechain(cfg, ol, or_, sc);
+        }
+        obj.pdc.process(ol, or_)
+    }
+
+    #[inline]
+    fn render_track_pre_stage(&mut self, pos: u64, any_solo: bool) {
+        let sr = self.sample_rate;
+        for (tr_idx, tr) in self.tracks.iter_mut().enumerate() {
+            let audible = if any_solo {
+                tr.config.solo
+            } else {
+                !tr.config.mute
+            };
+            if !audible
+                && tr.gain_l_smooth.current().abs() < 1e-5
+                && tr.gain_r_smooth.current().abs() < 1e-5
+            {
+                self.track_pre_l[tr_idx] = 0.0;
+                self.track_pre_r[tr_idx] = 0.0;
+                continue;
+            }
+            let (mut tr_l, mut tr_r) = (0.0_f32, 0.0_f32);
+            for obj in &mut tr.objects {
+                let (ol, or_) = Self::render_object_sample(
+                    obj,
+                    pos,
+                    sr,
+                    tr_idx,
+                    &self.track_ids,
+                    &self.track_prev_l,
+                    &self.track_prev_r,
+                );
+                tr_l += ol;
+                tr_r += or_;
+            }
+            if !tr.config.midi_clips.is_empty() {
+                let (mut ml, mut mr) =
+                    tr.synth
+                        .render_sample(&tr.config.midi_clips, tr.config.synth_preset, pos);
+                (ml, mr) = tr.synth_pdc.process(ml, mr);
+                tr_l += ml;
+                tr_r += mr;
+            }
+            self.track_pre_l[tr_idx] = tr_l;
+            self.track_pre_r[tr_idx] = tr_r;
+        }
+    }
+
+    #[inline]
+    fn render_tracks_post_stage(&mut self, pos: u64, any_solo: bool) -> (f32, f32) {
+        let (mut mix_l, mut mix_r) = (0.0_f32, 0.0_f32);
+        for (tr_idx, tr) in self.tracks.iter_mut().enumerate() {
+            let audible = if any_solo {
+                tr.config.solo
+            } else {
+                !tr.config.mute
+            };
+            if !audible
+                && tr.gain_l_smooth.current().abs() < 1e-5
+                && tr.gain_r_smooth.current().abs() < 1e-5
+            {
+                self.track_post_pdc_l[tr_idx] = 0.0;
+                self.track_post_pdc_r[tr_idx] = 0.0;
+                continue;
+            }
+            let mut tr_l = self.track_pre_l[tr_idx];
+            let mut tr_r = self.track_pre_r[tr_idx];
+            for (k, (proc_fx, cfg)) in tr.inserts.iter_mut().zip(&tr.config.inserts).enumerate() {
+                (tr_l, tr_r) = tr.insert_audio_pdc[k].process(tr_l, tr_r);
+                let sc = resolve_sidechain_sample(
+                    &self.track_ids,
+                    Some(tr_idx),
+                    &self.track_pre_l,
+                    &self.track_pre_r,
+                    cfg,
+                )
+                .map(|(sl, sr_)| tr.insert_sc_pdc[k].process(sl, sr_));
+                (tr_l, tr_r) = proc_fx.process_stereo_with_sidechain(cfg, tr_l, tr_r, sc);
+            }
+            (tr_l, tr_r) = tr.pdc.process(tr_l, tr_r);
+            let (pre_l, pre_r) = (tr_l, tr_r);
+            self.track_post_pdc_l[tr_idx] = pre_l;
+            self.track_post_pdc_r[tr_idx] = pre_r;
+
+            let (tpl, tpr) = track_target_gains(&tr.config, pos, audible);
+            tr.gain_l_smooth.set_target(tpl);
+            tr.gain_r_smooth.set_target(tpr);
+            tr_l *= tr.gain_l_smooth.next_val() as f32;
+            tr_r *= tr.gain_r_smooth.next_val() as f32;
+
+            Self::accumulate_track_sends(
+                &tr.config.sends,
+                &mut self.aux_buses,
+                (pre_l, pre_r),
+                (tr_l, tr_r),
+            );
+            let pk_db = 20.0 * tr_l.abs().max(tr_r.abs()).max(1e-5).log10();
+            if pk_db > tr.peak_db {
+                tr.peak_db = pk_db;
+            }
+            mix_l += tr_l;
+            mix_r += tr_r;
+        }
+        (mix_l, mix_r)
+    }
+
+    #[inline]
+    fn accumulate_track_sends(
+        sends: &[crate::project::TrackSend],
+        aux_buses: &mut [AuxBusRuntime],
+        pre: (f32, f32),
+        post: (f32, f32),
+    ) {
+        for send in sends {
+            if send.mute || send.gain_db <= -59.5 {
+                continue;
+            }
+            let sg = db_to_lin_f32(send.gain_db, -60.0, 6.0);
+            let (sl, sr_) = if send.pre_fader {
+                (pre.0 * sg, pre.1 * sg)
+            } else {
+                (post.0 * sg, post.1 * sg)
+            };
+            for bus in aux_buses.iter_mut() {
+                if bus.config.id == send.bus_id && !bus.config.mute {
+                    bus.acc_l += sl;
+                    bus.acc_r += sr_;
+                    break;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn render_aux_and_master_sample(&mut self, mix_l: f32, mix_r: f32) -> (f32, f32) {
+        let (mut out_l, mut out_r) = self.main_bus_pdc.process(mix_l, mix_r);
+        for bus in &mut self.aux_buses {
+            if bus.config.mute
+                && bus.gain_l_smooth.current().abs() < 1e-5
+                && bus.gain_r_smooth.current().abs() < 1e-5
+            {
+                continue;
+            }
+            let (mut bl, mut br) = (bus.acc_l, bus.acc_r);
+            for (proc_fx, cfg) in bus.inserts.iter_mut().zip(&bus.config.inserts) {
+                let sc = resolve_sidechain_sample(
+                    &self.track_ids,
+                    None,
+                    &self.track_post_pdc_l,
+                    &self.track_post_pdc_r,
+                    cfg,
+                );
+                (bl, br) = proc_fx.process_stereo_with_sidechain(cfg, bl, br, sc);
+            }
+            (bl, br) = bus.pdc.process(bl, br);
+            let (bgl, bgr) = aux_target_gains(&bus.config);
+            bus.gain_l_smooth.set_target(bgl);
+            bus.gain_r_smooth.set_target(bgr);
+            out_l += bl * (bus.gain_l_smooth.next_val() as f32);
+            out_r += br * (bus.gain_r_smooth.next_val() as f32);
+        }
+
+        for (proc_fx, cfg) in self.master_inserts.iter_mut().zip(&self.master_insert_cfgs) {
+            let sc = resolve_sidechain_sample(
+                &self.track_ids,
+                None,
+                &self.track_master_sc_l,
+                &self.track_master_sc_r,
+                cfg,
+            );
+            (out_l, out_r) = proc_fx.process_stereo_with_sidechain(cfg, out_l, out_r, sc);
+        }
+        let mg = self.master_gain_smooth.next_val() as f32;
+        out_l *= mg;
+        out_r *= mg;
+        if self.loop_fade_remaining > 0 {
+            let ramp =
+                (LOOP_FADE_SAMPLES - self.loop_fade_remaining) as f32 / (LOOP_FADE_SAMPLES as f32);
+            out_l *= ramp;
+            out_r *= ramp;
+            self.loop_fade_remaining -= 1;
+        }
+        (
+            if out_l.is_finite() { out_l } else { 0.0 },
+            if out_r.is_finite() { out_r } else { 0.0 },
+        )
+    }
+
     /// Renders `out_l.len()` stereo samples starting at `self.playhead_samples` with zero
     /// heap allocations and advances `self.playhead_samples`.
     pub fn render_block(&mut self, out_l: &mut [f32], out_r: &mut [f32]) {
@@ -829,193 +1256,18 @@ impl ObjectOrientedEngine {
         let any_solo = self.tracks.iter().any(|t| t.config.solo);
         let mut master_pk_l = 1e-6_f32;
         let mut master_pk_r = 1e-6_f32;
-
         for tr in &mut self.tracks {
             tr.peak_db = -90.0;
         }
 
         for i in 0..frames {
             let pos = self.playhead_samples;
-            let mut mix_l = 0.0_f32;
-            let mut mix_r = 0.0_f32;
-
             for bus in &mut self.aux_buses {
                 bus.acc_l = 0.0;
                 bus.acc_r = 0.0;
             }
-
-            for (tr_idx, tr) in self.tracks.iter_mut().enumerate() {
-                let audible = if any_solo {
-                    tr.config.solo
-                } else {
-                    !tr.config.mute
-                };
-                if !audible {
-                    self.track_pre_l[tr_idx] = 0.0;
-                    self.track_pre_r[tr_idx] = 0.0;
-                    continue;
-                }
-
-                let mut tr_l = 0.0_f32;
-                let mut tr_r = 0.0_f32;
-
-                for obj in &mut tr.objects {
-                    if obj.config.mute {
-                        continue;
-                    }
-                    let start = obj.config.timeline_start_samples;
-                    let end = obj.config.timeline_end_samples();
-                    // Fast-skip idle objects far outside their clip + FX/PDC tail window
-                    let tail_pad = if obj.fx.is_empty() {
-                        (obj.pdc.delay_samples as u64).saturating_add(64)
-                    } else {
-                        let mut tail_secs = 4.0_f64;
-                        for fx in &obj.config.fx_chain {
-                            if !fx.is_bypassed()
-                                && let crate::project::FxSlotConfig::SpaceVerb {
-                                    decay_rt60_secs,
-                                    ..
-                                } = fx
-                            {
-                                tail_secs = tail_secs.max(f64::from(*decay_rt60_secs) * 1.5);
-                            }
-                        }
-                        (tail_secs.clamp(4.0, 20.0) * self.sample_rate).round() as u64
-                    };
-                    if pos < start || pos >= end.saturating_add(tail_pad) {
-                        continue;
-                    }
-                    let (mut ol, mut or_) = if pos >= start && pos < end {
-                        let local = pos - start;
-                        if let Some(ref clip) = obj.clip {
-                            let (s0, s1, in_bounds) = Self::read_object_elastic_stereo(
-                                clip,
-                                &obj.config,
-                                local,
-                                self.sample_rate,
-                            );
-                            if in_bounds {
-                                let fade = obj.config.fade_gain_at(local) as f32;
-                                let g = 10.0_f32.powf(obj.config.gain_db.clamp(-48.0, 24.0) / 20.0)
-                                    * fade
-                                    * if obj.config.phase_invert { -1.0 } else { 1.0 };
-                                let (pl, pr) = Self::equal_power_pan(obj.config.pan);
-                                (s0 * g * pl, s1 * g * pr)
-                            } else {
-                                (0.0, 0.0)
-                            }
-                        } else {
-                            (0.0, 0.0)
-                        }
-                    } else {
-                        (0.0, 0.0)
-                    };
-
-                    // Run per-object 3-band EQ & per-object FX chain + intra-track PDC
-                    (ol, or_) = obj.eq.process(ol, or_);
-                    for (proc_fx, cfg) in obj.fx.iter_mut().zip(&obj.config.fx_chain) {
-                        let sc = resolve_sidechain_sample(
-                            &self.track_ids,
-                            Some(tr_idx),
-                            &self.track_prev_l,
-                            &self.track_prev_r,
-                            cfg,
-                        );
-                        (ol, or_) = proc_fx.process_stereo_with_sidechain(cfg, ol, or_, sc);
-                    }
-                    (ol, or_) = obj.pdc.process(ol, or_);
-
-                    tr_l += ol;
-                    tr_r += or_;
-                }
-
-                // Render built-in zero-alloc 16-voice PolySynth for any MIDI clips on this track,
-                // PDC-aligned to match latency-compensated audio objects on the same track.
-                if !tr.config.midi_clips.is_empty() {
-                    let (mut ml, mut mr) =
-                        tr.synth
-                            .render_sample(&tr.config.midi_clips, tr.config.synth_preset, pos);
-                    (ml, mr) = tr.synth_pdc.process(ml, mr);
-                    tr_l += ml;
-                    tr_r += mr;
-                }
-
-                self.track_pre_l[tr_idx] = tr_l;
-                self.track_pre_r[tr_idx] = tr_r;
-            }
-
-            for (tr_idx, tr) in self.tracks.iter_mut().enumerate() {
-                let audible = if any_solo {
-                    tr.config.solo
-                } else {
-                    !tr.config.mute
-                };
-                if !audible {
-                    self.track_post_pdc_l[tr_idx] = 0.0;
-                    self.track_post_pdc_r[tr_idx] = 0.0;
-                    continue;
-                }
-
-                let mut tr_l = self.track_pre_l[tr_idx];
-                let mut tr_r = self.track_pre_r[tr_idx];
-
-                // Track-level FX inserts + track fader/pan/automation/polarity + inter-track PDC
-                for (proc_fx, cfg) in tr.inserts.iter_mut().zip(&tr.config.inserts) {
-                    let sc = resolve_sidechain_sample(
-                        &self.track_ids,
-                        Some(tr_idx),
-                        &self.track_pre_l,
-                        &self.track_pre_r,
-                        cfg,
-                    );
-                    (tr_l, tr_r) = proc_fx.process_stereo_with_sidechain(cfg, tr_l, tr_r, sc);
-                }
-                (tr_l, tr_r) = tr.pdc.process(tr_l, tr_r);
-
-                let pre_l = tr_l;
-                let pre_r = tr_r;
-                self.track_post_pdc_l[tr_idx] = pre_l;
-                self.track_post_pdc_r[tr_idx] = pre_r;
-
-                let gain_db = tr.config.volume_auto.evaluate(pos, tr.config.gain_db);
-                let pan = tr.config.pan_auto.evaluate(pos, tr.config.pan);
-                let tg = 10.0_f32.powf(gain_db.clamp(-60.0, 12.0) / 20.0)
-                    * if tr.config.phase_invert { -1.0 } else { 1.0 };
-                let (tpl, tpr) = Self::equal_power_pan(pan);
-                tr.gain_l_smooth.set_target(f64::from(tg * tpl));
-                tr.gain_r_smooth.set_target(f64::from(tg * tpr));
-                tr_l *= tr.gain_l_smooth.next_val() as f32;
-                tr_r *= tr.gain_r_smooth.next_val() as f32;
-
-                // Route pre-fader and post-fader track sends to Aux Buses (zero alloc)
-                for send in &tr.config.sends {
-                    if send.mute || send.gain_db <= -59.5 {
-                        continue;
-                    }
-                    let sg = 10.0_f32.powf(send.gain_db.clamp(-60.0, 6.0) / 20.0);
-                    let (sl, sr_) = if send.pre_fader {
-                        (pre_l * sg, pre_r * sg)
-                    } else {
-                        (tr_l * sg, tr_r * sg)
-                    };
-                    for bus in &mut self.aux_buses {
-                        if bus.config.id == send.bus_id && !bus.config.mute {
-                            bus.acc_l += sl;
-                            bus.acc_r += sr_;
-                            break;
-                        }
-                    }
-                }
-
-                let pk = tr_l.abs().max(tr_r.abs());
-                let pk_db = 20.0 * pk.max(1e-5).log10();
-                if pk_db > tr.peak_db {
-                    tr.peak_db = pk_db;
-                }
-
-                mix_l += tr_l;
-                mix_r += tr_r;
-            }
+            self.render_track_pre_stage(pos, any_solo);
+            let (raw_mix_l, raw_mix_r) = self.render_tracks_post_stage(pos, any_solo);
             self.track_prev_l.copy_from_slice(&self.track_pre_l);
             self.track_prev_r.copy_from_slice(&self.track_pre_r);
             for (tr_idx, pdc) in self.track_master_sc_pdc.iter_mut().enumerate() {
@@ -1024,64 +1276,17 @@ impl ObjectOrientedEngine {
                 self.track_master_sc_l[tr_idx] = ml;
                 self.track_master_sc_r[tr_idx] = mr;
             }
-
-            // Align Main Mix bus with parallel Aux bus PDC, then sum processed Aux returns
-            (mix_l, mix_r) = self.main_bus_pdc.process(mix_l, mix_r);
-            for bus in &mut self.aux_buses {
-                if bus.config.mute {
-                    continue;
-                }
-                let mut bl = bus.acc_l;
-                let mut br = bus.acc_r;
-                for (proc_fx, cfg) in bus.inserts.iter_mut().zip(&bus.config.inserts) {
-                    let sc = resolve_sidechain_sample(
-                        &self.track_ids,
-                        None,
-                        &self.track_post_pdc_l,
-                        &self.track_post_pdc_r,
-                        cfg,
-                    );
-                    (bl, br) = proc_fx.process_stereo_with_sidechain(cfg, bl, br, sc);
-                }
-                (bl, br) = bus.pdc.process(bl, br);
-                let bg = 10.0_f32.powf(bus.config.gain_db.clamp(-60.0, 12.0) / 20.0);
-                let (bpl, bpr) = Self::equal_power_pan(bus.config.pan);
-                mix_l += bl * bg * bpl;
-                mix_r += br * bg * bpr;
-            }
-
-            // Master bus inserts & smoothed gain
-            for (proc_fx, cfg) in self.master_inserts.iter_mut().zip(&self.master_insert_cfgs) {
-                let sc = resolve_sidechain_sample(
-                    &self.track_ids,
-                    None,
-                    &self.track_master_sc_l,
-                    &self.track_master_sc_r,
-                    cfg,
-                );
-                (mix_l, mix_r) = proc_fx.process_stereo_with_sidechain(cfg, mix_l, mix_r, sc);
-            }
-            let mg = self.master_gain_smooth.next_val() as f32;
-            mix_l *= mg;
-            mix_r *= mg;
-
-            if !mix_l.is_finite() {
-                mix_l = 0.0;
-            }
-            if !mix_r.is_finite() {
-                mix_r = 0.0;
-            }
-
+            let (mix_l, mix_r) = self.render_aux_and_master_sample(raw_mix_l, raw_mix_r);
             self.analyzer.push_stereo_sample(mix_l, mix_r);
             master_pk_l = master_pk_l.max(mix_l.abs());
             master_pk_r = master_pk_r.max(mix_r.abs());
-
             out_l[i] = mix_l;
             out_r[i] = mix_r;
 
             let next_pos = pos.saturating_add(1);
             if self.loop_enabled && self.loop_end > self.loop_start && next_pos >= self.loop_end {
                 self.playhead_samples = self.loop_start;
+                self.loop_fade_remaining = LOOP_FADE_SAMPLES;
             } else {
                 self.playhead_samples = next_pos;
             }

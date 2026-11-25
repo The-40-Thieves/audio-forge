@@ -2,10 +2,10 @@
 //! engines per-object, per-track, and on the master bus.
 
 use forge_dsp::{
-    AnalogHardwareModel, IspOversampling, RealtimeDensityAndClipper, RealtimeDrumTrigger,
-    RealtimeFdnReverb, RealtimeMasterLimiter, RealtimeMasteringEq18, RealtimeNeuralPreamp,
-    RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner, RealtimeSubAndTapeBus,
-    RealtimeTransientTonalSplit, RealtimeVocalSurgical,
+    AnalogHardwareModel, IspOversampling, ParamSmoother, RealtimeDensityAndClipper,
+    RealtimeDrumTrigger, RealtimeFdnReverb, RealtimeMasterLimiter, RealtimeMasteringEq18,
+    RealtimeNeuralPreamp, RealtimeOpenSoothe, RealtimeOpenSpacer, RealtimePhaseAligner,
+    RealtimeSubAndTapeBus, RealtimeTransientTonalSplit, RealtimeVocalSurgical,
 };
 use forge_vocal::{RealtimeVocalTune, VocalTuneScaleMode};
 
@@ -58,9 +58,99 @@ pub fn open_spacer_sidechain_active(
     )
 }
 
+/// Zero-allocation 3-voice percussive reinforcement synthesizer driven by [`RealtimeDrumTrigger`].
+pub struct DrumPunchSynth {
+    sample_rate: f64,
+    kick_env: f64,
+    kick_phase: f64,
+    snare_env: f64,
+    snare_phase: f64,
+    hat_env: f64,
+    rng_state: u32,
+}
+
+impl DrumPunchSynth {
+    pub fn new(sample_rate: f64) -> Self {
+        Self {
+            sample_rate: sample_rate.max(8_000.0),
+            kick_env: 0.0,
+            kick_phase: 0.0,
+            snare_env: 0.0,
+            snare_phase: 0.0,
+            hat_env: 0.0,
+            rng_state: 0x6D2B_79F5,
+        }
+    }
+
+    pub fn reset(&mut self, sample_rate: f64) {
+        self.sample_rate = sample_rate.max(8_000.0);
+        self.kick_env = 0.0;
+        self.kick_phase = 0.0;
+        self.snare_env = 0.0;
+        self.snare_phase = 0.0;
+        self.hat_env = 0.0;
+    }
+
+    #[inline]
+    fn trigger(&mut self, note: u8, velocity: f32) {
+        let v = f64::from(velocity.clamp(0.05, 1.0));
+        match note {
+            36 => {
+                self.kick_env = self.kick_env.max(v);
+                self.kick_phase = 0.0;
+            }
+            38 => {
+                self.snare_env = self.snare_env.max(v);
+                self.snare_phase = 0.0;
+            }
+            _ => {
+                self.hat_env = self.hat_env.max(v * 0.7);
+            }
+        }
+    }
+
+    #[inline]
+    fn next_noise(&mut self) -> f64 {
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rng_state = x;
+        ((x as f64) / f64::from(u32::MAX)) * 2.0 - 1.0
+    }
+
+    #[inline]
+    fn next_sample(&mut self) -> f32 {
+        if self.kick_env < 1e-4 && self.snare_env < 1e-4 && self.hat_env < 1e-4 {
+            return 0.0;
+        }
+        let sr = self.sample_rate;
+        let mut sum = 0.0_f64;
+        if self.kick_env >= 1e-4 {
+            let hz = 48.0 + 72.0 * self.kick_env;
+            self.kick_phase = (self.kick_phase + hz / sr).fract();
+            sum += (2.0 * std::f64::consts::PI * self.kick_phase).sin() * self.kick_env * 0.85;
+            self.kick_env *= 1.0 - (14.0 / sr).min(0.1);
+        }
+        if self.snare_env >= 1e-4 {
+            self.snare_phase = (self.snare_phase + 190.0 / sr).fract();
+            let noise = self.next_noise();
+            let tone = (2.0 * std::f64::consts::PI * self.snare_phase).sin();
+            sum += (0.45 * tone + 0.55 * noise) * self.snare_env * 0.65;
+            self.snare_env *= 1.0 - (24.0 / sr).min(0.15);
+        }
+        if self.hat_env >= 1e-4 {
+            let noise = self.next_noise();
+            sum += noise * self.hat_env * 0.4;
+            self.hat_env *= 1.0 - (60.0 / sr).min(0.25);
+        }
+        sum.clamp(-1.0, 1.0) as f32
+    }
+}
+
 /// Live zero-alloc DSP runtime corresponding to one [`FxSlotConfig`].
 pub enum FxProcessor {
-    GainTrim,
+    GainTrim(ParamSmoother),
     OpenSoothe(Box<RealtimeOpenSoothe>),
     VocalSurgical(Box<RealtimeVocalSurgical>),
     SubMonoTape(Box<RealtimeSubAndTapeBus>),
@@ -76,7 +166,10 @@ pub enum FxProcessor {
         cached_curve: [f32; 3],
     },
     NeuralPreamp(Box<RealtimeNeuralPreamp>),
-    DrumTrigger(Box<RealtimeDrumTrigger>),
+    DrumTrigger {
+        detector: Box<RealtimeDrumTrigger>,
+        punch: Box<DrumPunchSynth>,
+    },
 }
 
 impl FxProcessor {
@@ -84,7 +177,10 @@ impl FxProcessor {
     pub fn from_config(cfg: &FxSlotConfig, sample_rate: f64) -> Self {
         let sr = sample_rate.max(8_000.0);
         match cfg {
-            FxSlotConfig::GainTrim { .. } => Self::GainTrim,
+            FxSlotConfig::GainTrim { gain_db, .. } => {
+                let g = 10.0_f64.powf(f64::from(gain_db.clamp(-48.0, 24.0)) / 20.0);
+                Self::GainTrim(ParamSmoother::new(g, sr, 5.0))
+            }
             FxSlotConfig::OpenSoothe {
                 low_latency,
                 ultrasonic_lpf_hz,
@@ -157,9 +253,10 @@ impl FxProcessor {
                 d.set_sample_rate(sr);
                 Self::NeuralPreamp(Box::new(d))
             }
-            FxSlotConfig::DrumTrigger { .. } => {
-                Self::DrumTrigger(Box::new(RealtimeDrumTrigger::new(sr)))
-            }
+            FxSlotConfig::DrumTrigger { .. } => Self::DrumTrigger {
+                detector: Box::new(RealtimeDrumTrigger::new(sr)),
+                punch: Box::new(DrumPunchSynth::new(sr)),
+            },
         }
     }
 
@@ -211,7 +308,7 @@ impl FxProcessor {
     pub fn reset(&mut self, sample_rate: f64) {
         let sr = sample_rate.max(8_000.0);
         match self {
-            Self::GainTrim => {}
+            Self::GainTrim(s) => s.set_sample_rate(sr, 5.0),
             Self::OpenSoothe(d) => d.reset(sr),
             Self::VocalSurgical(d) => d.reset(sr),
             Self::SubMonoTape(d) => d.reset(sr),
@@ -229,7 +326,10 @@ impl FxProcessor {
                 d.set_sample_rate(sr);
                 d.reset();
             }
-            Self::DrumTrigger(d) => d.reset(sr),
+            Self::DrumTrigger { detector, punch } => {
+                detector.reset(sr);
+                punch.reset(sr);
+            }
         }
     }
 
@@ -253,8 +353,10 @@ impl FxProcessor {
             return (in_l, in_r);
         }
         match (self, cfg) {
-            (Self::GainTrim, FxSlotConfig::GainTrim { gain_db, .. }) => {
-                let g = 10.0_f32.powf(gain_db.clamp(-48.0, 24.0) / 20.0);
+            (Self::GainTrim(smoother), FxSlotConfig::GainTrim { gain_db, .. }) => {
+                let target = 10.0_f64.powf(f64::from(gain_db.clamp(-48.0, 24.0)) / 20.0);
+                smoother.set_target(target);
+                let g = smoother.next_val() as f32;
                 (in_l * g, in_r * g)
             }
             (
@@ -504,9 +606,24 @@ impl FxProcessor {
                     f64::from(*output_trim_db),
                 )
             }
-            (Self::DrumTrigger(d), FxSlotConfig::DrumTrigger { threshold_db, .. }) => {
-                let _ = d.process_stereo_sample(in_l, in_r, f64::from(*threshold_db));
-                (in_l, in_r)
+            (
+                Self::DrumTrigger { detector, punch },
+                FxSlotConfig::DrumTrigger {
+                    threshold_db, mix, ..
+                },
+            ) => {
+                for (note, vel) in detector
+                    .process_stereo_sample(in_l, in_r, f64::from(*threshold_db))
+                    .into_iter()
+                    .flatten()
+                {
+                    punch.trigger(note, vel);
+                }
+                let hit = punch.next_sample();
+                let wet = mix.clamp(0.0, 1.0);
+                let out_l = (in_l + hit * wet).clamp(-1.5, 1.5);
+                let out_r = (in_r + hit * wet).clamp(-1.5, 1.5);
+                (out_l, out_r)
             }
             _ => (in_l, in_r),
         }

@@ -14,11 +14,12 @@ use forge_core::{AudioBuffer, ForgeError, StemBundle};
 use forge_dsp::BeatGridReport;
 use forge_reaper::{ReleaseMetadata, write_distrokid_metadata};
 use forge_worker::{
-    DrumHit, MidiTranscribeResult, NeuralDenoiseResult, NeuralRestoreResult, QualityEvalResult,
-    SeparationConfig, SeparationReport, VocalRescueResult, evaluate_quality_hybrid,
-    index_drum_sample_library, neural_restore_hybrid, render_drum_sample_layer,
-    resolve_default_local_worker, run_local_neural_denoise, run_local_transcribe_midi,
-    separate_stems, track_beats_hybrid, vocal_rescue_hybrid,
+    DrumHit, F0TrackFrame, F0TrackResult, MidiTranscribeResult, NeuralDenoiseResult,
+    NeuralRestoreResult, QualityEvalResult, SeparationConfig, SeparationReport, VocalRescueResult,
+    evaluate_quality_hybrid, index_drum_sample_library, neural_restore_hybrid,
+    render_drum_sample_layer, resolve_default_local_worker, run_local_f0_track,
+    run_local_neural_denoise, run_local_transcribe_midi, separate_stems, track_beats_hybrid,
+    vocal_rescue_hybrid,
 };
 use std::fs::File;
 use std::io::{self, Write};
@@ -309,6 +310,79 @@ pub fn transcribe_midi_checked(
     let mut res = run_local_transcribe_midi(&worker, &io.staged_in, &io.staged_out, timeout)?;
     res.midi = commit_staged_named(sandbox, &io, &res.midi, "MIDI")?;
     Ok(res)
+}
+
+fn rust_f0_track_fallback(
+    staged_in: &Path,
+    hop_secs: f64,
+    warnings: Vec<String>,
+) -> Result<F0TrackResult, ForgeError> {
+    let buf = AudioBuffer::load(staged_in)?;
+    let scale = forge_vocal::VocalScale::parse("C chromatic")?;
+    let raw_frames = forge_vocal::track_vocal_pitch(&buf, &scale, 1.0);
+    let frames: Vec<F0TrackFrame> = raw_frames
+        .iter()
+        .map(|f| F0TrackFrame {
+            time_secs: f.time_secs,
+            f0_hz: f.f0_hz,
+            voiced: f.f0_hz > 0.0,
+            confidence: if f.f0_hz > 0.0 { 0.85 } else { 0.0 },
+        })
+        .collect();
+    let mut voiced_hz: Vec<f64> = frames
+        .iter()
+        .filter(|f| f.voiced && f.f0_hz.is_finite() && f.f0_hz > 0.0)
+        .map(|f| f.f0_hz)
+        .collect();
+    voiced_hz.sort_by(f64::total_cmp);
+    let median_f0_hz = if voiced_hz.is_empty() {
+        None
+    } else {
+        Some(voiced_hz[voiced_hz.len() / 2])
+    };
+    let voiced_ratio = if frames.is_empty() {
+        0.0
+    } else {
+        (voiced_hz.len() as f64) / (frames.len() as f64)
+    };
+    Ok(F0TrackResult {
+        backend: "rust-yin".to_string(),
+        sample_rate: buf.sample_rate,
+        hop_secs,
+        voiced_ratio,
+        median_f0_hz,
+        frames,
+        warnings,
+    })
+}
+
+/// Extracts frame-level F0 pitch contour (`rmvpe`/`fcpe`/`autocorr` worker, or `rust` YIN fallback)
+/// from a private staged copy of `input`.
+pub fn f0_track_checked(
+    sandbox: &PathSandbox,
+    input: &Path,
+    backend: &str,
+    hop_secs: f64,
+    timeout: Duration,
+) -> Result<F0TrackResult, ForgeError> {
+    let stage = tempfile::tempdir()?;
+    let staged_in = stage_in(sandbox, input, stage.path())?;
+    if backend.eq_ignore_ascii_case("rust") {
+        return rust_f0_track_fallback(&staged_in, hop_secs, Vec::new());
+    }
+    match resolve_default_local_worker()
+        .and_then(|worker| run_local_f0_track(&worker, &staged_in, backend, hop_secs, timeout))
+    {
+        Ok(res) => Ok(res),
+        Err(err) if backend.eq_ignore_ascii_case("auto") => rust_f0_track_fallback(
+            &staged_in,
+            hop_secs,
+            vec![format!(
+                "worker skipped ({err}), used pure-Rust YIN fallback"
+            )],
+        ),
+        Err(err) => Err(err),
+    }
 }
 
 /// Indexes `.wav` one-shots from a sandboxed `samples_dir` inside a private staging directory

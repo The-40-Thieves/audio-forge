@@ -806,3 +806,43 @@ mod tests {
         assert!(!alive(pid), "grandchild {pid} survived the timeout");
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    fn pid_alive(pid: &str) -> bool {
+        let needle = format!("\"{pid}\"");
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&needle))
+    }
+
+    #[test]
+    fn timeout_kills_windows_grandchild_process_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("grandchild.pid");
+        let mut cmd = Command::new("powershell");
+        cmd.env("FORGE_TEST_PID_FILE", &pid_file).args([
+            "-NoProfile",
+            "-Command",
+            "$p = Start-Process -FilePath 'ping.exe' -ArgumentList '-n','60','127.0.0.1' -NoNewWindow -PassThru; [IO.File]::WriteAllText($env:FORGE_TEST_PID_FILE, [string]$p.Id); Wait-Process -Id $p.Id",
+        ]);
+        let Err(err) = run_with_timeout(cmd, Duration::from_millis(3000)) else {
+            panic!("worker finished before the timeout");
+        };
+        assert!(err.to_string().contains("timed out"), "{err}");
+
+        let pid = std::fs::read_to_string(&pid_file).expect("pid file written by worker");
+        let pid = pid.trim();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pid_alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            !pid_alive(pid),
+            "Windows grandchild PID {pid} survived timeout kill_tree"
+        );
+    }
+}
