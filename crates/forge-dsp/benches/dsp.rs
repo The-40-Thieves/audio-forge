@@ -10,7 +10,8 @@ use forge_dsp::{
     RealtimeOpenSpacer, RealtimeSubAndTapeBus, RealtimeTransientTonalSplit, RealtimeVocalSurgical,
     RestorationConfig, UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw,
     apply_18_band_eq, apply_spectral_defizz, apply_spectral_unmask, audit_audio,
-    clean_vocal_surgical, compute_true_peak, normalize_and_limit, run_full_restoration_chain,
+    clean_vocal_surgical, compute_true_peak, normalize_and_limit, resample_buffer_sinc,
+    run_full_restoration_chain,
 };
 
 const SR: u32 = 48_000;
@@ -169,6 +170,13 @@ fn dtw_vocal_double_align(bencher: Bencher, frames: usize) {
     });
 }
 
+#[divan::bench(args = [22_050, 44_100])]
+fn sinc_resample_44k_to_48k(bencher: Bencher, frames: usize) {
+    let ch = test_signal(frames, 11);
+    let buf = AudioBuffer::from_channels(vec![ch.clone(), ch], 44_100).expect("valid buffer");
+    bencher.bench(|| resample_buffer_sinc(black_box(&buf), 48_000).expect("resampled"));
+}
+
 // ---------------------------------------------------------------------------
 // Real-time streaming processors (one block of BLOCK stereo samples)
 // ---------------------------------------------------------------------------
@@ -184,6 +192,26 @@ mod realtime {
             for &s in &input {
                 black_box(proc.process_stereo_sample(s, s, 3.5, 9.0, 8, false));
             }
+        });
+    }
+
+    #[divan::bench]
+    fn open_soothe_ulpf(bencher: Bencher) {
+        let input = block_f32(BLOCK);
+        let mut proc = RealtimeOpenSoothe::new(f64::from(SR));
+        proc.set_ultrasonic_lpf_hz(16_500.0);
+        proc.set_mid_side_balance(0.5);
+        proc.set_stereo_link(0.5);
+        bencher.bench_local(|| {
+            for (idx, &s) in input.iter().enumerate() {
+                let right = if idx % 3 == 0 { -s * 0.8 } else { s };
+                black_box(proc.process_stereo_sample(s, right, 3.5, 9.0, 8, false));
+            }
+            black_box((
+                proc.high_mid_correlation(),
+                proc.mid_fizz_db(),
+                proc.side_fizz_db(),
+            ));
         });
     }
 

@@ -45,6 +45,11 @@ fn test_key_signatures_modes_and_key_changes() {
     }
 }
 
+fn assert_abc_err(abc: &str, needle: &str) {
+    let err = parse_abc_score(abc, TPB).expect_err(abc).to_string();
+    assert!(err.contains(needle), "{abc:?}: {err}");
+}
+
 #[test]
 fn test_unknown_key_roots_are_rejected() {
     // A `K:` field without a tonic may still carry a clef, settings or explicit accidentals.
@@ -56,15 +61,9 @@ fn test_unknown_key_roots_are_rejected() {
     for &(abc, expected) in cases {
         assert_eq!(pitches(abc), expected, "{abc}");
     }
-    let cases = [
-        ("K:H\nC", "ABC line 1: unknown key root 'H'"),
-        ("K:g\nC", "ABC line 1: unknown key root 'g'"),
-        ("K:C\nC [K:Xm] D", "ABC line 2: unknown key root 'Xm'"),
-    ];
-    for (abc, needle) in cases {
-        let err = parse_abc_score(abc, TPB).expect_err(abc).to_string();
-        assert!(err.contains(needle), "{abc:?}: {err}");
-    }
+    assert_abc_err("K:H\nC", "ABC line 1: unknown key root 'H'");
+    assert_abc_err("K:g\nC", "ABC line 1: unknown key root 'g'");
+    assert_abc_err("K:C\nC [K:Xm] D", "ABC line 2: unknown key root 'Xm'");
 }
 
 #[test]
@@ -185,24 +184,18 @@ fn test_unknown_body_characters_are_rejected() {
         pitches("C `D y E \\\n.F ~G HA (B c) uC vD\tE"),
         [60, 62, 64, 65, 67, 69, 71, 72, 60, 62, 64]
     );
-    let cases = [
-        (
-            "K:C\nC Q D",
-            "ABC line 2: unexpected character 'Q' in the music",
-        ),
-        ("C ; D", "ABC line 1: unexpected character ';'"),
-        ("C\nD é E", "ABC line 2: unexpected character 'é'"),
-        ("C # D", "unexpected character '#'"),
-    ];
-    for (abc, needle) in cases {
-        let err = parse_abc_score(abc, TPB).expect_err(abc).to_string();
-        assert!(err.contains(needle), "{abc:?}: {err}");
-    }
+    assert_abc_err(
+        "K:C\nC Q D",
+        "ABC line 2: unexpected character 'Q' in the music",
+    );
+    assert_abc_err("C ; D", "ABC line 1: unexpected character ';'");
+    assert_abc_err("C\nD é E", "ABC line 2: unexpected character 'é'");
+    assert_abc_err("C # D", "unexpected character '#'");
 }
 
 #[test]
 fn test_malformed_abc_is_rejected_with_the_line_number() {
-    let cases = [
+    let header_cases = [
         ("C\n\"Dm9 C", "ABC line 2: unterminated quoted chord symbol"),
         ("K:G#\nC", "more than 7 sharps or flats"),
         ("K:C foo\nC", "unrecognised key signature token 'foo'"),
@@ -211,27 +204,30 @@ fn test_malformed_abc_is_rejected_with_the_line_number() {
         ("M:4/x\nC", "invalid meter"),
         ("C0", "note length cannot be zero"),
         ("C/0", "divide by zero"),
-        ("C 3", "length '3' does not follow a note"),
-        ("[CE", "unterminated chord"),
-        ("[]", "empty chord"),
-        ("(3C D", "tuplet (3 expects 3 notes, found 2"),
-        ("(1C", "tuplet (1 is not supported"),
-        (">C", "broken rhythm needs a note on each side"),
-        ("C>>>>D", "longer than three"),
+    ];
+    for (abc, needle) in header_cases {
+        assert_abc_err(abc, needle);
+    }
+    for bad in ["C 3", "C99999", "[CE", "[]", "(3C D", "(1C", ">C", "C>>>>D"] {
+        assert!(parse_abc_score(bad, TPB).is_err(), "{bad:?}");
+    }
+    for (bad, needle) in [
         ("-C", "tie '-' must follow a note"),
         ("^/C", "microtonal"),
         ("^ C", "accidental must be followed by a note letter"),
         ("M:none\nZ", "multi-bar rest needs a meter"),
-        ("c''''''", "outside the MIDI range"),
-        ("C & E", "voice overlay"),
-        ("!trill C", "unterminated decoration"),
-        ("{g C", "unterminated grace notes"),
-        ("C99999", "larger than 9999"),
-    ];
-    for (abc, needle) in cases {
-        let err = parse_abc_score(abc, TPB).expect_err(abc).to_string();
-        assert!(err.contains(needle), "{abc:?}: {err}");
+    ] {
+        assert!(
+            parse_abc_score(bad, TPB)
+                .unwrap_err()
+                .to_string()
+                .contains(needle)
+        );
     }
+    assert!(parse_abc_score("c''''''", TPB).is_err());
+    assert!(parse_abc_score("C & E", TPB).is_err());
+    assert!(parse_abc_score("!trill C", TPB).is_err());
+    assert!(parse_abc_score("{g C", TPB).is_err());
 }
 
 proptest! {

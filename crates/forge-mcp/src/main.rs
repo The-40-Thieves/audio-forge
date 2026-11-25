@@ -1,95 +1,389 @@
-//! # `forge-mcp` — Model Context Protocol (MCP) JSON-RPC 2.0 Server
+//! # `forge-mcp` — Model Context Protocol (MCP) Server
 //!
-//! Zero-overhead native Rust stdio MCP server exposing all ForgeAudio DSP,
-//! music theory, vocal surgery, GPU worker, and REAPER 7.82 session tools to
-//! AI agents (Antigravity, Claude Code, Cursor, REAPER AI scripts).
+//! Official `rmcp` 3.11 server (`2026-07-28` + backward-compatible `initialize`) exposing all
+//! ForgeAudio DSP, music theory, vocal surgery, GPU worker, and REAPER 7.82 session tools,
+//! resources, and prompts to AI agents (Antigravity, Claude Code, Cursor, REAPER AI scripts).
 //!
 //! File access is confined: every path argument must resolve inside the roots listed in
 //! `FORGE_MCP_ROOT` (default: the directory the server was launched from). See [`sandbox`].
-//! Files are then opened through handles anchored at those roots; see [`anchored`] and,
-//! for the FFmpeg and worker steps that still take path names, [`external`].
 
 mod anchored;
 mod external;
+mod handlers;
+mod resources;
 mod sandbox;
 #[cfg(all(test, unix))]
 mod toctou_tests;
+mod tools;
 
-use forge_core::{AudioBuffer, ForgeError, StemBundle};
-use forge_dsp::{
-    DeFizzConfig, DeliveryOptions, DeliveryTarget, DitherMode, GenreTonalTarget, LimiterStyle,
-    RestorationConfig, ToneMatch, UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw,
-    apply_18_band_eq, apply_spectral_defizz, apply_spectral_unmask, audit_audio,
-    clean_vocal_surgical, compute_reference_match_eq, deliver, normalize_and_limit,
-    run_full_restoration_chain,
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
+use hyper_util::service::TowerToHyperService;
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, GetPromptRequestParams, GetPromptResponse,
+    Implementation, ListPromptsResult, ListResourcesResult, ListToolsResult,
+    PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
+    ServerCapabilities, ServerConfig, Tool,
 };
-use forge_reaper::{
-    ReaperProjectBuilder, ReaperTrackSpec, ReleaseMetadata, install_jsfx_plugins, jsfx_install_dir,
-    reaper_resource_dir, validate_isrc,
+use rmcp::service::RequestContext;
+use rmcp::transport::io::stdio_pipes;
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
-use forge_theory::{
-    GrooveStyle, NoteEvent, VoicingStyle, export_abc_score, extract_drum_midi_triggers,
-    reharmonize_progression, solve_voice_leading, validate_bpm,
-};
-use forge_vocal::{
-    PitchFrame, VocalScale, generate_vocal_harmony_stack, shift_vocal_pitch_formant_preserved,
-    track_vocal_pitch,
-};
-use forge_worker::SeparationConfig;
+use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
 use sandbox::PathSandbox;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use std::any::Any;
-use std::io::{self, BufRead, Write};
-use std::panic::{self, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use serde_json::Value;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::net::TcpListener;
 
-#[derive(Debug, Deserialize)]
-struct JsonRpcRequest {
-    #[allow(dead_code)]
-    jsonrpc: String,
-    id: Option<Value>,
-    method: String,
-    #[serde(default)]
-    params: Value,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransportMode {
+    Stdio,
+    Http {
+        addr: SocketAddr,
+        allow_non_loopback: bool,
+    },
 }
 
-#[derive(Debug, Serialize)]
-struct JsonRpcResponse {
-    jsonrpc: &'static str,
-    id: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<JsonRpcError>,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcError {
-    code: i32,
-    message: String,
-}
-
-/// Result of a successful tool call. `success` is false when the tool ran but its outcome
-/// is a failure the caller must act on (e.g. a delivery that is not `ready`).
-struct ToolOutput {
-    value: Value,
-    success: bool,
-}
-
-impl From<Value> for ToolOutput {
-    fn from(value: Value) -> Self {
-        Self {
-            value,
-            success: true,
+fn parse_cli_args(args: &[String]) -> Result<TransportMode, String> {
+    let mut http_addr: Option<SocketAddr> = None;
+    let mut allow_non_loopback = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--http" => {
+                let raw = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--http requires a <host:port> socket address".to_string())?;
+                let parsed: SocketAddr = raw
+                    .parse()
+                    .map_err(|e| format!("Invalid --http address '{raw}': {e}"))?;
+                http_addr = Some(parsed);
+                i += 2;
+            }
+            "--allow-non-loopback" => {
+                allow_non_loopback = true;
+                i += 1;
+            }
+            other => {
+                return Err(format!(
+                    "Unknown argument '{other}'. Usage: forge-mcp [--http <ip:port> [--allow-non-loopback]]"
+                ));
+            }
+        }
+    }
+    match http_addr {
+        None => Ok(TransportMode::Stdio),
+        Some(addr) => {
+            if !addr.ip().is_loopback() && !allow_non_loopback {
+                return Err(format!(
+                    "Refusing non-loopback HTTP bind address '{addr}' without --allow-non-loopback"
+                ));
+            }
+            Ok(TransportMode::Http {
+                addr,
+                allow_non_loopback,
+            })
         }
     }
 }
 
-fn main() {
+#[derive(Clone)]
+struct ForgeMcpServer {
+    sandbox: Arc<PathSandbox>,
+    tools: Arc<Vec<Tool>>,
+}
+
+impl ForgeMcpServer {
+    fn new(sandbox: Arc<PathSandbox>) -> Self {
+        Self {
+            sandbox,
+            tools: Arc::new(tools::build_tools()),
+        }
+    }
+}
+
+impl ServerHandler for ForgeMcpServer {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_prompts()
+                .build(),
+        )
+        .with_protocol_version(ProtocolVersion::LATEST)
+        .with_server_info(
+            Implementation::new("forge-mcp", env!("CARGO_PKG_VERSION"))
+                .with_title("ForgeAudio Studio MCP Server"),
+        )
+        .with_instructions(
+            "Sandboxed ForgeAudio DSP, neural stem separation/restoration, music theory, and REAPER 7.82 session server. File paths must stay within FORGE_MCP_ROOT.",
+        )
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult::with_all_items((*self.tools).clone()))
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tools.iter().find(|t| t.name.as_ref() == name).cloned()
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let name = request.name.into_owned();
+        let args = Value::Object(request.arguments.unwrap_or_default());
+        let sandbox = Arc::clone(&self.sandbox);
+        tokio::task::spawn_blocking(move || handlers::call_tool_result(&name, &args, &sandbox))
+            .await
+            .map(CallToolResponse::from)
+            .map_err(|e| McpError::internal_error(format!("Tool worker task failed: {e}"), None))
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        Ok(ListResourcesResult::with_all_items(
+            resources::list_resources(),
+        ))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, McpError> {
+        resources::read_resource(&request.uri, &self.sandbox).map(ReadResourceResponse::from)
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        Ok(ListPromptsResult::with_all_items(resources::list_prompts()))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, McpError> {
+        resources::get_prompt(&request.name, request.arguments.as_ref())
+            .map(GetPromptResponse::from)
+    }
+}
+
+enum AuthBody<B> {
+    Upstream(B),
+    Unauthorized(&'static [u8]),
+}
+
+impl<B: hyper::body::Body + Unpin> hyper::body::Body for AuthBody<B>
+where
+    B::Data: From<&'static [u8]>,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        match &mut *self {
+            Self::Upstream(inner) => std::pin::Pin::new(inner).poll_frame(cx),
+            Self::Unauthorized(msg) => {
+                if msg.is_empty() {
+                    std::task::Poll::Ready(None)
+                } else {
+                    let slice = std::mem::take(msg);
+                    std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(slice.into()))))
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            Self::Upstream(inner) => inner.is_end_stream(),
+            Self::Unauthorized(msg) => msg.is_empty(),
+        }
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        match self {
+            Self::Upstream(inner) => inner.size_hint(),
+            Self::Unauthorized(msg) => hyper::body::SizeHint::with_exact(msg.len() as u64),
+        }
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= usize::from(x ^ y);
+    }
+    diff == 0
+}
+
+fn check_bearer_auth(headers: &hyper::HeaderMap, expected: &str) -> bool {
+    let Some(raw) = headers
+        .get(hyper::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let Some((scheme, token)) = raw.trim().split_once(' ') else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("bearer")
+        && constant_time_eq(token.trim().as_bytes(), expected.as_bytes())
+}
+
+fn resolve_http_policy(
+    addr: SocketAddr,
+    allow_non_loopback: bool,
+    raw_token: Option<&str>,
+) -> Result<(bool, Option<String>), String> {
+    let is_loopback = addr.ip().is_loopback();
+    if !is_loopback && !allow_non_loopback {
+        return Err(format!(
+            "Refusing non-loopback HTTP bind address '{addr}' without --allow-non-loopback"
+        ));
+    }
+    let token = raw_token
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    if !is_loopback && token.is_none() {
+        return Err(
+            "Refusing non-loopback HTTP bind without a non-empty FORGE_MCP_HTTP_TOKEN bearer secret"
+                .to_string(),
+        );
+    }
+    // Never disable Host-header checks on loopback addresses even if --allow-non-loopback is passed.
+    let disable_host_check = !is_loopback && allow_non_loopback;
+    Ok((disable_host_check, token))
+}
+
+async fn run_http_on_listener(
+    server: ForgeMcpServer,
+    listener: TcpListener,
+    mut config: StreamableHttpServerConfig,
+    bearer_token: Option<Arc<str>>,
+) {
+    let ct = config.cancellation_token.clone();
+    let mcp_svc = TowerToHyperService::new(StreamableHttpService::new(
+        move || Ok(server.clone()),
+        Arc::new(LocalSessionManager::default()),
+        std::mem::take(&mut config),
+    ));
+    loop {
+        tokio::select! {
+            _ = ct.cancelled() => break,
+            accepted = listener.accept() => {
+                let Ok((stream, _)) = accepted else {
+                    break;
+                };
+                let svc = mcp_svc.clone();
+                let token = bearer_token.clone();
+                let conn_ct = ct.child_token();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let hyper_svc = hyper::service::service_fn(
+                        move |req: hyper::Request<hyper::body::Incoming>| {
+                            let svc = svc.clone();
+                            let token = token.clone();
+                            async move {
+                                if let Some(ref expected) = token
+                                    && !check_bearer_auth(req.headers(), expected)
+                                {
+                                    let resp = hyper::Response::builder()
+                                        .status(hyper::StatusCode::UNAUTHORIZED)
+                                        .header(hyper::header::WWW_AUTHENTICATE, "Bearer")
+                                        .body(AuthBody::Unauthorized(b"Unauthorized\n"))
+                                        .expect("valid 401 response");
+                                    return Ok::<_, std::convert::Infallible>(resp);
+                                }
+                                let resp = hyper::service::Service::call(&svc, req)
+                                    .await
+                                    .expect("TowerToHyperService error is Infallible");
+                                Ok::<_, std::convert::Infallible>(resp.map(AuthBody::Upstream))
+                            }
+                        },
+                    );
+                    let builder = AutoServerBuilder::new(TokioExecutor::new());
+                    let conn = builder.serve_connection(io, hyper_svc);
+                    tokio::select! {
+                        res = conn => {
+                            if let Err(err) = res {
+                                eprintln!("forge-mcp: HTTP connection error: {err}");
+                            }
+                        }
+                        _ = conn_ct.cancelled() => {}
+                    }
+                });
+            }
+        }
+    }
+}
+
+async fn run_http(
+    server: ForgeMcpServer,
+    addr: SocketAddr,
+    allow_non_loopback: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let raw_token = std::env::var("FORGE_MCP_HTTP_TOKEN").ok();
+    let (disable_host_check, token) =
+        resolve_http_policy(addr, allow_non_loopback, raw_token.as_deref())
+            .map_err(std::io::Error::other)?;
+    let listener = TcpListener::bind(addr).await?;
+    let local_addr = listener.local_addr()?;
+    eprintln!("forge-mcp: Streamable HTTP listening on http://{local_addr}");
+    let mut config = StreamableHttpServerConfig::default();
+    if disable_host_check {
+        config = config.disable_allowed_hosts();
+    }
+    let shutdown_ct = config.cancellation_token.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        shutdown_ct.cancel();
+    });
+    run_http_on_listener(server, listener, config, token.map(Arc::<str>::from)).await;
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() {
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(env_filter)
+        .try_init();
+
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    let mode = match parse_cli_args(&cli_args) {
+        Ok(m) => m,
+        Err(msg) => {
+            eprintln!("forge-mcp: {msg}");
+            std::process::exit(2);
+        }
+    };
+
     let sandbox = match PathSandbox::from_env() {
-        Ok(sb) => sb,
+        Ok(sb) => Arc::new(sb),
         Err(e) => {
             eprintln!("forge-mcp: cannot set up the file sandbox: {e}");
             std::process::exit(1);
@@ -98,1520 +392,55 @@ fn main() {
     let roots: Vec<String> = sandbox.roots().map(|r| r.display().to_string()).collect();
     eprintln!("forge-mcp: file access confined to {}", roots.join(", "));
 
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    if let Err(e) = serve(stdin.lock(), &mut stdout, &sandbox) {
-        eprintln!("forge-mcp: stdio failure: {e}");
-        std::process::exit(1);
-    }
-}
-
-const MAX_JSONRPC_LINE_BYTES: u64 = 4 * 1024 * 1024;
-
-/// Reads newline-delimited JSON-RPC requests until EOF, answering each on `output`.
-/// A malformed line (bad JSON, invalid UTF-8, or >4 MiB) gets a -32700 reply; the loop keeps going.
-fn serve<R: BufRead, W: Write>(
-    mut input: R,
-    output: &mut W,
-    sandbox: &PathSandbox,
-) -> io::Result<()> {
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        let n =
-            io::Read::take(&mut input, MAX_JSONRPC_LINE_BYTES + 1).read_until(b'\n', &mut line)?;
-        if n == 0 {
-            return Ok(());
-        }
-        let response = if (n as u64) > MAX_JSONRPC_LINE_BYTES && !line.ends_with(b"\n") {
-            // Drain the remainder of the oversized line safely without buffering it in RAM
-            let mut discard = [0_u8; 4096];
-            loop {
-                let buf = input.fill_buf()?;
-                if buf.is_empty() {
-                    break;
+    let server = ForgeMcpServer::new(sandbox);
+    match mode {
+        TransportMode::Stdio => match server.serve(stdio_pipes()).await {
+            Ok(running) => {
+                if let Err(e) = running.waiting().await {
+                    eprintln!("forge-mcp: stdio server error: {e}");
+                    std::process::exit(1);
                 }
-                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                    input.consume(pos + 1);
-                    break;
-                }
-                let len = buf.len().min(discard.len());
-                discard[..len].copy_from_slice(&buf[..len]);
-                input.consume(len);
             }
-            Some(parse_error(format!(
-                "Parse error: request line exceeds {MAX_JSONRPC_LINE_BYTES} byte limit"
-            )))
-        } else {
-            match std::str::from_utf8(&line) {
-                Ok(text) => process_line(text, sandbox),
-                Err(e) => Some(parse_error(format!("Parse error: invalid UTF-8: {e}"))),
+            Err(e) => {
+                eprintln!("forge-mcp: stdio initialize/discover failure: {e}");
+                std::process::exit(1);
             }
-        };
-        if let Some(resp) = response {
-            let serialized = serde_json::to_string(&resp).map_err(io::Error::other)?;
-            writeln!(output, "{serialized}")?;
-            output.flush()?;
-        }
-    }
-}
-
-/// Handles one request line. Returns `None` for blank lines and notifications (no `id`).
-fn process_line(text: &str, sandbox: &PathSandbox) -> Option<JsonRpcResponse> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let req: JsonRpcRequest = match serde_json::from_str(trimmed) {
-        Ok(r) => r,
-        Err(e) => return Some(parse_error(format!("Parse error: {e}"))),
-    };
-    let id = req.id?;
-    Some(handle_request(id, &req.method, &req.params, sandbox))
-}
-
-fn parse_error(message: String) -> JsonRpcResponse {
-    JsonRpcResponse {
-        jsonrpc: "2.0",
-        id: Value::Null,
-        result: None,
-        error: Some(JsonRpcError {
-            code: -32700,
-            message,
-        }),
-    }
-}
-
-fn panic_message(payload: &(dyn Any + Send)) -> &str {
-    payload
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("unknown panic")
-}
-
-fn handle_request(
-    id: Value,
-    method: &str,
-    params: &Value,
-    sandbox: &PathSandbox,
-) -> JsonRpcResponse {
-    match method {
-        "initialize" => JsonRpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": {}
-                },
-                "serverInfo": {
-                    "name": "forge-mcp",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            })),
-            error: None,
         },
-        "tools/list" => JsonRpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(json!({
-                "tools": tool_definitions()
-            })),
-            error: None,
-        },
-        "tools/call" => JsonRpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: Some(call_tool_result(params, sandbox)),
-            error: None,
-        },
-        _ => JsonRpcResponse {
-            jsonrpc: "2.0",
-            id,
-            result: None,
-            error: Some(JsonRpcError {
-                code: -32601,
-                message: format!("Method not found: {method}"),
-            }),
-        },
-    }
-}
-
-/// Builds the MCP `tools/call` result: `{ content, isError }`.
-fn call_tool_result(params: &Value, sandbox: &PathSandbox) -> Value {
-    let tool_name = params
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let args = params
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let (text, is_error) = run_tool(tool_name, &args, sandbox);
-    json!({
-        "content": [{ "type": "text", "text": text }],
-        "isError": is_error
-    })
-}
-
-/// Runs a tool and renders its outcome as `(text, is_error)`. A panic in DSP code fails
-/// this call instead of taking down the server.
-fn run_tool(tool_name: &str, args: &Value, sandbox: &PathSandbox) -> (String, bool) {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| dispatch_tool(tool_name, args, sandbox)));
-    match outcome {
-        Ok(Ok(out)) => (
-            serde_json::to_string_pretty(&out.value).unwrap_or_default(),
-            !out.success,
-        ),
-        Ok(Err(err)) => (format!("ForgeAudio Error: {err}"), true),
-        Err(payload) => (
-            format!(
-                "ForgeAudio internal error: tool '{tool_name}' panicked: {}",
-                panic_message(payload.as_ref())
-            ),
-            true,
-        ),
-    }
-}
-
-fn schema_prop(ty: &str, default: Option<Value>, enum_vals: Option<Value>, desc: &str) -> Value {
-    let mut map = serde_json::Map::new();
-    map.insert("type".to_string(), json!(ty));
-    if let Some(vals) = enum_vals {
-        map.insert("enum".to_string(), vals);
-    }
-    if let Some(def) = default {
-        map.insert("default".to_string(), def);
-    }
-    if !desc.is_empty() {
-        map.insert("description".to_string(), json!(desc));
-    }
-    Value::Object(map)
-}
-
-fn prop_str(default: Option<&str>, desc: &str) -> Value {
-    schema_prop("string", default.map(|d| json!(d)), None, desc)
-}
-
-fn prop_bool(default: bool, desc: &str) -> Value {
-    schema_prop("boolean", Some(json!(default)), None, desc)
-}
-
-fn prop_num(default: Option<f64>, desc: &str) -> Value {
-    schema_prop("number", default.map(|d| json!(d)), None, desc)
-}
-
-fn prop_int(default: Option<i64>, desc: &str) -> Value {
-    schema_prop("integer", default.map(|d| json!(d)), None, desc)
-}
-
-fn prop_enum<T: Serialize>(ty: &str, values: &[T], default: Value, desc: &str) -> Value {
-    schema_prop(ty, Some(default), Some(json!(values)), desc)
-}
-
-fn mcp_tool(name: &str, description: &str, props: &[(&str, Value)], required: &[&str]) -> Value {
-    let mut properties = serde_json::Map::new();
-    for (k, v) in props {
-        properties.insert((*k).to_string(), v.clone());
-    }
-    json!({
-        "name": name,
-        "description": description,
-        "inputSchema": {
-            "type": "object",
-            "properties": Value::Object(properties),
-            "required": required
-        }
-    })
-}
-
-fn tool_definitions() -> Vec<Value> {
-    let targets = delivery_target_names();
-    let mid_side_prop = || {
-        prop_num(
-            Some(0.0),
-            "Mid/Side balance (-1.0=Mid only, 0.0=linked, +1.0=Side only)",
-        )
-    };
-    let mut separate_props = vec![
-        ("input", prop_str(None, "Input audio file")),
-        (
-            "output_dir",
-            prop_str(None, "Output directory for separated WAV stems"),
-        ),
-        (
-            "stems",
-            prop_enum(
-                "integer",
-                &[2, 4, 6],
-                json!(6),
-                "Primary stem count (2, 4, or 6)",
-            ),
-        ),
-        (
-            "quality",
-            prop_enum(
-                "string",
-                &["fast", "studio", "ultra"],
-                json!("studio"),
-                "Separation quality tier",
-            ),
-        ),
-    ];
-    for &(flag, default, desc) in &[
-        (
-            "dereverb",
-            true,
-            "Run BS-RoFormer de-reverb on isolated vocals",
-        ),
-        (
-            "drum_sep",
-            false,
-            "Also split isolated drums into Kick, Snare, Toms, Hi-Hat, and Cymbals",
-        ),
-        (
-            "split_lead_backing",
-            false,
-            "Also split isolated vocals into Lead Vocals and Backing Vocals / Harmonies (RoFormer Karaoke)",
-        ),
-        (
-            "split_male_female",
-            false,
-            "Also split isolated vocals into Male and Female vocal stems",
-        ),
-        (
-            "split_guitar",
-            false,
-            "Also split isolated guitar into Electric Guitar and Acoustic Guitar",
-        ),
-        (
-            "split_orchestral",
-            false,
-            "Also extract Strings, Brass, Woodwinds, and Synth from residual Other stem",
-        ),
-        (
-            "split_crowd",
-            false,
-            "Also extract live Crowd / Audience / Room Noise from residual Other stem",
-        ),
-        (
-            "all_stems",
-            false,
-            "Enable full 23-slot hierarchical pro studio cascade (all sub-splitters)",
-        ),
-        (
-            "restore",
-            false,
-            "Run optional Apollo / spectral bandwidth restoration post-pass on separated stems",
-        ),
-    ] {
-        separate_props.push((flag, prop_bool(default, desc)));
-    }
-
-    vec![
-        mcp_tool(
-            "forge_audit_audio",
-            "Run an ITU-R BS.1770-4 / EBU R128 loudness, 4x polyphase True Peak (dBTP), LRA, and AI Spectral Fizz Index (2.5-6.5 kHz) audit on an audio file.",
-            &[("path", prop_str(None, "Path to audio file"))],
-            &["path"],
-        ),
-        mcp_tool(
-            "forge_restore_and_defizz",
-            "Clean AI-generated or live audio: DC offset, cubic Hermite de-clip, 50/60Hz hum removal, vocal de-click/de-plosive/de-breath, and OpenSoothe dynamic spectral de-fizz.",
-            &[
-                ("input", prop_str(None, "")),
-                ("output", prop_str(None, "")),
-                ("vocal", prop_bool(false, "")),
-                ("defizz_depth_db", prop_num(Some(9.0), "")),
-                ("sensitivity_db", prop_num(Some(3.5), "")),
-                (
-                    "tilt",
-                    prop_num(Some(0.0), "Spectral tilt in dB/oct (-6.0..=6.0)"),
-                ),
-                (
-                    "stereo_link",
-                    prop_num(Some(1.0), "Stereo link ratio (0.0..=1.0)"),
-                ),
-                ("mid_side", mid_side_prop()),
-                (
-                    "delta",
-                    prop_bool(false, "Audition only the removed spectral resonance delta"),
-                ),
-            ],
-            &["input", "output"],
-        ),
-        mcp_tool(
-            "forge_spectral_unmask",
-            "Run OpenSpacer (Trackspacer equivalent) sidechain STFT dynamic frequency unmasking between a sidechain trigger (vocal or kick) and target bed (music or bass).",
-            &[
-                ("target", prop_str(None, "")),
-                ("sidechain", prop_str(None, "")),
-                ("output", prop_str(None, "")),
-                ("kick_bass_mode", prop_bool(false, "")),
-                ("mid_side", mid_side_prop()),
-                (
-                    "delta",
-                    prop_bool(false, "Audition only the carved sidechain delta"),
-                ),
-            ],
-            &["target", "sidechain", "output"],
-        ),
-        mcp_tool(
-            "forge_phase_align",
-            "Align multi-mic phase via GCC-PHAT (Auto-Align equivalent) or vocal doubles via FastDTW stretch markers (VocAlign equivalent).",
-            &[
-                ("reference", prop_str(None, "")),
-                ("target", prop_str(None, "")),
-                ("output", prop_str(None, "")),
-                ("vocal_dtw", prop_bool(false, "")),
-            ],
-            &["reference", "target", "output"],
-        ),
-        mcp_tool(
-            "forge_vocal_suite",
-            "Run YIN pitch tracking, formant-preserving pitch correction, 3-part chord-aware vocal harmony generation, and REAPER <PITCHENV compilation.",
-            &[
-                ("input", prop_str(None, "")),
-                ("output_dir", prop_str(None, "")),
-                ("scale", prop_str(Some("D minor"), "")),
-                ("retune_strength", prop_num(Some(0.85), "")),
-                ("generate_harmonies", prop_bool(true, "")),
-            ],
-            &["input", "output_dir"],
-        ),
-        mcp_tool(
-            "forge_music_theory_midi",
-            "Generate voice-led MIDI chords, Neo-Soul/Jazz reharmonizations, Dilla/MPC humanized grooves, and ABC notation.",
-            &[
-                ("chords", prop_str(None, "")),
-                ("output_midi", prop_str(None, "")),
-                ("bpm", prop_num(Some(92.0), "")),
-                ("style", prop_str(Some("neo-soul"), "")),
-            ],
-            &["chords", "output_midi"],
-        ),
-        mcp_tool(
-            "forge_master_distrokid",
-            "Master stereo audio to -14.0 LUFS / -1.0 dBTP with Reference Match EQ, 18-band Mastering EQ, and optional ISO 3901 ISRC tagging.",
-            &[
-                ("input", prop_str(None, "")),
-                ("output", prop_str(None, "")),
-                ("reference", prop_str(None, "")),
-                ("target_lufs", prop_num(Some(-14.0), "")),
-                ("ceiling_dbtp", prop_num(Some(-1.0), "")),
-                ("isrc", prop_str(None, "")),
-                ("title", prop_str(None, "")),
-                ("artist", prop_str(None, "")),
-            ],
-            &["input", "output"],
-        ),
-        mcp_tool(
-            "forge_deliver",
-            "Deliver a mix to a distribution target in one call: audit, repair (DC, clipping, hum), de-fizz, optional reference/genre tone match, loudness-normalize and true-peak limit, then re-audit. Returns before/after BS.1770-4 audits and explicit pass/fail checks (loudness within 1 LU, true peak under ceiling, no clipping, sample rate >= 44.1 kHz). Writes a 24-bit WAV and a .delivery.json report next to it.",
-            &[
-                ("input", prop_str(None, "Input mix or stem (WAV)")),
-                ("output", prop_str(None, "Output master WAV path")),
-                (
-                    "target",
-                    prop_enum("string", &targets, json!("spotify"), ""),
-                ),
-                (
-                    "target_lufs",
-                    prop_num(None, "Required when target is 'custom'"),
-                ),
-                (
-                    "ceiling_dbtp",
-                    prop_num(None, "Required when target is 'custom'"),
-                ),
-                ("repair", prop_bool(true, "")),
-                ("defizz", prop_bool(true, "")),
-                (
-                    "vocal",
-                    prop_bool(false, "Vocal clean-up; use on vocal stems only"),
-                ),
-                (
-                    "reference",
-                    prop_str(None, "Reference track WAV for 18-band tone match"),
-                ),
-                (
-                    "genre",
-                    prop_str(
-                        None,
-                        "Genre tonal-balance target (pop, hiphop, neosoul, edm, rock, jazz); ignored when reference is set",
-                    ),
-                ),
-                (
-                    "limiter_style",
-                    prop_enum(
-                        "string",
-                        &["transparent", "punchy", "dynamic", "aggressive"],
-                        json!("transparent"),
-                        "",
-                    ),
-                ),
-                (
-                    "channel_link",
-                    prop_num(Some(1.0), "Stereo limiter channel link ratio (0.0..=1.0)"),
-                ),
-                (
-                    "dither",
-                    prop_enum(
-                        "string",
-                        &["none", "tpdf", "noise-shaped"],
-                        json!("none"),
-                        "",
-                    ),
-                ),
-                (
-                    "dither_bits",
-                    prop_int(Some(24), "Target bit depth for dither (8..=24)"),
-                ),
-            ],
-            &["input", "output"],
-        ),
-        mcp_tool(
-            "forge_neural_denoise",
-            "Run neural audio denoising via DeepFilterNet3 or Mel-Band-RoFormer on the local Python GPU worker, confined to the MCP path sandbox.",
-            &[
-                ("input", prop_str(None, "Input audio file")),
-                (
-                    "output_dir",
-                    prop_str(None, "Output directory for denoised audio"),
-                ),
-                (
-                    "backend",
-                    prop_enum(
-                        "string",
-                        &[
-                            "auto",
-                            "deepfilternet",
-                            "deepfilternet3",
-                            "mel-band-roformer",
-                            "roformer",
-                        ],
-                        json!("auto"),
-                        "",
-                    ),
-                ),
-                (
-                    "attenuation_limit_db",
-                    prop_num(
-                        None,
-                        "Optional attenuation limit in dB (0..=100, DeepFilterNet3)",
-                    ),
-                ),
-                (
-                    "timeout_secs",
-                    prop_int(Some(300), "Worker timeout in seconds (1..=3600)"),
-                ),
-            ],
-            &["input", "output_dir"],
-        ),
-        mcp_tool(
-            "forge_transcribe_midi",
-            "Run polyphonic audio-to-MIDI transcription via basic-pitch on the local Python GPU worker, confined to the MCP path sandbox.",
-            &[
-                ("input", prop_str(None, "Input audio file")),
-                (
-                    "output_dir",
-                    prop_str(None, "Output directory for transcribed MIDI"),
-                ),
-                (
-                    "timeout_secs",
-                    prop_int(Some(300), "Worker timeout in seconds (1..=3600)"),
-                ),
-            ],
-            &["input", "output_dir"],
-        ),
-        mcp_tool(
-            "forge_separate_stems",
-            "Studio-grade neural stem separation (BS-RoFormer 1297 / SCNet XL / BS-RoFormer SW cascade, 2/4/6 stems + optional BS-RoFormer de-reverb, RoFormer Karaoke Lead/Backing split, 5-piece MDX23C DrumSep & Apollo spectral restoration) with pure-Rust DSP fallback, confined to the MCP path sandbox.",
-            &separate_props,
-            &["input", "output_dir"],
-        ),
-        mcp_tool(
-            "forge_daw_inspect",
-            "Validate and inspect a ForgeStudio DAW `.forgeproj` session (BPM, sample rate, tracks, audio objects, MIDI clips, aux buses, total PDC) within the MCP path sandbox.",
-            &[(
-                "project",
-                prop_str(None, "Path to `.forgeproj` session file"),
-            )],
-            &["project"],
-        ),
-        mcp_tool(
-            "forge_daw_bounce",
-            "Headless 24-bit WAV mastering bounce (with ITU-R BS.1770-4 audit) and optional batch stem export from a ForgeStudio DAW `.forgeproj` session within the MCP path sandbox.",
-            &[
-                (
-                    "project",
-                    prop_str(None, "Path to `.forgeproj` session file"),
-                ),
-                (
-                    "output",
-                    prop_str(None, "Output 24-bit WAV master bounce path"),
-                ),
-                (
-                    "stems_dir",
-                    prop_str(
-                        None,
-                        "Optional directory for batch per-track stem WAV export",
-                    ),
-                ),
-            ],
-            &["project", "output"],
-        ),
-        mcp_tool(
-            "forge_ingest_to_reaper",
-            "Full autonomous pipeline: separate stems, clean & de-fizz audio, extract drum MIDI, build voice-led chords, deliver a verified master for the chosen target, install JSFX plugins, and generate a REAPER 7.82 .RPP project.",
-            &[
-                ("input", prop_str(None, "")),
-                ("output_dir", prop_str(None, "")),
-                (
-                    "target",
-                    prop_enum("string", &targets, json!("spotify"), ""),
-                ),
-                (
-                    "target_lufs",
-                    prop_num(None, "Required when target is 'custom'"),
-                ),
-                (
-                    "ceiling_dbtp",
-                    prop_num(None, "Required when target is 'custom'"),
-                ),
-                ("bpm", prop_num(Some(120.0), "")),
-                ("scale", prop_str(Some("D minor"), "")),
-                ("chords", prop_str(Some("Dm9 Bbmaj7 Gm9 A7b13"), "")),
-                (
-                    "require_neural",
-                    prop_bool(
-                        false,
-                        "Fail instead of falling back to the DSP stem split when no GPU or Colab worker produces stems",
-                    ),
-                ),
-            ],
-            &["input", "output_dir"],
-        ),
-    ]
-}
-
-fn delivery_target_names() -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = DeliveryTarget::NAMED.iter().map(|t| t.name()).collect();
-    names.push("custom");
-    names
-}
-
-/// Reads `target` (default `spotify`), or `target_lufs` + `ceiling_dbtp` for `custom`.
-fn delivery_target_from_args(args: &Value) -> Result<DeliveryTarget, ForgeError> {
-    let raw = args
-        .get("target")
-        .and_then(Value::as_str)
-        .unwrap_or("spotify");
-    if !raw.eq_ignore_ascii_case("custom") {
-        return DeliveryTarget::parse(raw);
-    }
-    let lufs = args.get("target_lufs").and_then(Value::as_f64);
-    let ceiling = args.get("ceiling_dbtp").and_then(Value::as_f64);
-    match (lufs, ceiling) {
-        (Some(lufs), Some(ceiling)) => DeliveryTarget::custom(lufs, ceiling),
-        _ => Err(ForgeError::InvalidParameter(
-            "target 'custom' requires 'target_lufs' and 'ceiling_dbtp'".into(),
-        )),
-    }
-}
-
-/// Reads a required path argument and resolves it inside the sandbox.
-fn path_arg(args: &Value, key: &str, sandbox: &PathSandbox) -> Result<PathBuf, ForgeError> {
-    match args.get(key) {
-        None | Some(Value::Null) => Err(ForgeError::InvalidParameter(format!("Missing '{key}'"))),
-        Some(value) => resolve_path_value(key, value, sandbox),
-    }
-}
-
-/// Reads an optional path argument and resolves it inside the sandbox. Only an absent or
-/// `null` field means "not given"; any other non-string value is rejected.
-fn optional_path_arg(
-    args: &Value,
-    key: &str,
-    sandbox: &PathSandbox,
-) -> Result<Option<PathBuf>, ForgeError> {
-    match args.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => resolve_path_value(key, value, sandbox).map(Some),
-    }
-}
-
-fn resolve_path_value(
-    key: &str,
-    value: &Value,
-    sandbox: &PathSandbox,
-) -> Result<PathBuf, ForgeError> {
-    let raw = value
-        .as_str()
-        .ok_or_else(|| ForgeError::InvalidParameter(format!("'{key}' must be a string path")))?;
-    sandbox.resolve(raw)
-}
-
-fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, ForgeError> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| ForgeError::InvalidParameter(format!("Missing '{key}'")))
-}
-
-fn bool_arg(args: &Value, key: &str, default: bool) -> bool {
-    args.get(key).and_then(Value::as_bool).unwrap_or(default)
-}
-
-fn f64_arg(args: &Value, key: &str, default: f64) -> f64 {
-    args.get(key).and_then(Value::as_f64).unwrap_or(default)
-}
-
-fn str_arg_or<'a>(args: &'a Value, key: &str, default: &'a str) -> &'a str {
-    args.get(key).and_then(Value::as_str).unwrap_or(default)
-}
-
-fn bounded_f64_arg(
-    args: &Value,
-    key: &str,
-    default: f64,
-    min: f64,
-    max: f64,
-) -> Result<f64, ForgeError> {
-    let v = match args.get(key) {
-        None | Some(Value::Null) => default,
-        Some(raw) => raw
-            .as_f64()
-            .ok_or_else(|| ForgeError::InvalidParameter(format!("'{key}' must be a number")))?,
-    };
-    if !v.is_finite() || !(min..=max).contains(&v) {
-        return Err(ForgeError::InvalidParameter(format!(
-            "'{key}' ({v}) must be finite and in {min}..={max}"
-        )));
-    }
-    Ok(v)
-}
-
-fn timeout_secs_arg(args: &Value) -> Result<Duration, ForgeError> {
-    let secs = match args.get("timeout_secs") {
-        None | Some(Value::Null) => 300_u64,
-        Some(raw) => raw.as_u64().ok_or_else(|| {
-            ForgeError::InvalidParameter("'timeout_secs' must be a positive integer".into())
-        })?,
-    };
-    if !(1..=3600).contains(&secs) {
-        return Err(ForgeError::InvalidParameter(format!(
-            "'timeout_secs' ({secs}) must be in 1..=3600"
-        )));
-    }
-    Ok(Duration::from_secs(secs))
-}
-
-fn parse_limiter_style(raw: &str) -> Result<LimiterStyle, ForgeError> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "transparent" => Ok(LimiterStyle::Transparent),
-        "punchy" => Ok(LimiterStyle::Punchy),
-        "dynamic" => Ok(LimiterStyle::Dynamic),
-        "aggressive" => Ok(LimiterStyle::Aggressive),
-        other => Err(ForgeError::InvalidParameter(format!(
-            "unknown 'limiter_style' '{other}' (expected transparent, punchy, dynamic, or aggressive)"
-        ))),
-    }
-}
-
-fn parse_dither_mode(raw: &str) -> Result<DitherMode, ForgeError> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "none" => Ok(DitherMode::None),
-        "tpdf" => Ok(DitherMode::Tpdf),
-        "noise-shaped" | "noise_shaped" | "shaped" => Ok(DitherMode::NoiseShapedHighPass),
-        other => Err(ForgeError::InvalidParameter(format!(
-            "unknown 'dither' '{other}' (expected none, tpdf, or noise-shaped)"
-        ))),
-    }
-}
-
-type ToolHandler = fn(&Value, &PathSandbox) -> Result<ToolOutput, ForgeError>;
-
-/// Runs one tool. Every path argument, and every path derived from one, is resolved
-/// through `sandbox` before any file I/O.
-fn dispatch_tool(
-    name: &str,
-    args: &Value,
-    sandbox: &PathSandbox,
-) -> Result<ToolOutput, ForgeError> {
-    let handler: ToolHandler = match name {
-        "forge_deliver" => tool_deliver,
-        "forge_audit_audio" => tool_audit_audio,
-        "forge_restore_and_defizz" => tool_restore_and_defizz,
-        "forge_spectral_unmask" => tool_spectral_unmask,
-        "forge_phase_align" => tool_phase_align,
-        "forge_vocal_suite" => tool_vocal_suite,
-        "forge_music_theory_midi" => tool_music_theory_midi,
-        "forge_master_distrokid" => tool_master_distrokid,
-        "forge_ingest_to_reaper" => tool_ingest_to_reaper,
-        "forge_neural_denoise" => tool_neural_denoise,
-        "forge_transcribe_midi" => tool_transcribe_midi,
-        "forge_separate_stems" => tool_separate_stems,
-        "forge_daw_inspect" => tool_daw_inspect,
-        "forge_daw_bounce" => tool_daw_bounce,
-        _ => {
-            return Err(ForgeError::InvalidParameter(format!(
-                "Unknown tool: {name}"
-            )));
-        }
-    };
-    handler(args, sandbox)
-}
-
-fn tool_deliver(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
-    let input = path_arg(args, "input", sandbox)?;
-    let output = path_arg(args, "output", sandbox)?;
-    let report_path = sandbox.check(&output.with_extension("delivery.json"))?;
-    let reference = optional_path_arg(args, "reference", sandbox)?;
-    let mut options = DeliveryOptions::for_target(delivery_target_from_args(args)?);
-    options.repair = bool_arg(args, "repair", true);
-    options.defizz = bool_arg(args, "defizz", true);
-    options.vocal = bool_arg(args, "vocal", false);
-    match args.get("limiter_style") {
-        None | Some(Value::Null) => {}
-        Some(raw) => {
-            let style = raw.as_str().ok_or_else(|| {
-                ForgeError::InvalidParameter("'limiter_style' must be a string".into())
-            })?;
-            options.limiter_style = parse_limiter_style(style)?;
-        }
-    }
-    options.channel_link = bounded_f64_arg(args, "channel_link", 1.0, 0.0, 1.0)?;
-    let explicit_dither = match args.get("dither") {
-        None | Some(Value::Null) => false,
-        Some(raw) => {
-            let dither = raw
-                .as_str()
-                .ok_or_else(|| ForgeError::InvalidParameter("'dither' must be a string".into()))?;
-            options.dither = parse_dither_mode(dither)?;
-            true
-        }
-    };
-    let dither_bits = match args.get("dither_bits") {
-        None | Some(Value::Null) => 24_u16,
-        Some(raw) => {
-            let v = raw.as_u64().ok_or_else(|| {
-                ForgeError::InvalidParameter("'dither_bits' must be an integer in 8..=24".into())
-            })?;
-            if !(8..=24).contains(&v) {
-                return Err(ForgeError::InvalidParameter(format!(
-                    "'dither_bits' ({v}) must be in 8..=24"
-                )));
-            }
-            v as u16
-        }
-    };
-    options.dither_bits = dither_bits;
-    if let Some(reference) = reference {
-        options.tone_match = Some(ToneMatch::Reference(sandbox.load_audio(&reference)?));
-    } else if let Some(genre) = args.get("genre").and_then(Value::as_str) {
-        options.tone_match = Some(ToneMatch::Genre(GenreTonalTarget::parse(genre)));
-    }
-
-    let buf = sandbox.load_audio(&input)?;
-    let (master, report) = deliver(&buf, &options)?;
-    if options.dither != DitherMode::None {
-        let pcm_bits = if options.dither_bits <= 16 { 16 } else { 24 };
-        sandbox.save_wav_no_dither(&master, &output, pcm_bits)?;
-    } else if explicit_dither {
-        sandbox.save_wav_no_dither(&master, &output, 24)?;
-    } else {
-        sandbox.save_wav(&master, &output, 24)?;
-    }
-    sandbox.write_json(&report_path, &report)?;
-    Ok(ToolOutput {
-        success: report.ready,
-        value: json!({
-            "output": output,
-            "report_path": report_path,
-            "report": report
-        }),
-    })
-}
-
-fn tool_audit_audio(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
-    let path = path_arg(args, "path", sandbox)?;
-    let buf = sandbox.load_audio(&path)?;
-    Ok(serde_json::to_value(audit_audio(&buf))?.into())
-}
-
-fn tool_restore_and_defizz(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
-    let input = path_arg(args, "input", sandbox)?;
-    let output = path_arg(args, "output", sandbox)?;
-    let config = DeFizzConfig {
-        sensitivity_db: f64_arg(args, "sensitivity_db", 3.5),
-        max_depth_db: f64_arg(args, "defizz_depth_db", 9.0),
-        tilt_db_per_oct: bounded_f64_arg(args, "tilt", 0.0, -6.0, 6.0)?,
-        stereo_link: bounded_f64_arg(args, "stereo_link", 1.0, 0.0, 1.0)?,
-        mid_side_balance: bounded_f64_arg(args, "mid_side", 0.0, -1.0, 1.0)?,
-        delta_listen: bool_arg(args, "delta", false),
-        ..DeFizzConfig::default()
-    };
-
-    let raw = sandbox.load_audio(&input)?;
-    let before = audit_audio(&raw);
-    let mut stage1 = run_full_restoration_chain(&raw, &RestorationConfig::default())?;
-    if bool_arg(args, "vocal", false) {
-        stage1 = clean_vocal_surgical(&stage1, true, true, -12.0)?;
-    }
-    let cleaned = apply_spectral_defizz(&stage1, &config)?;
-    let after = audit_audio(&cleaned);
-    sandbox.save_wav(&cleaned, &output, 24)?;
-    Ok(json!({
-        "output": output,
-        "before_fizz_index": before.ai_fizz_index,
-        "after_fizz_index": after.ai_fizz_index,
-        "after_lufs": after.integrated_lufs
-    })
-    .into())
-}
-
-fn tool_spectral_unmask(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
-    let target = path_arg(args, "target", sandbox)?;
-    let sidechain = path_arg(args, "sidechain", sandbox)?;
-    let output = path_arg(args, "output", sandbox)?;
-    let kick_bass = bool_arg(args, "kick_bass_mode", false);
-    let mid_side = bounded_f64_arg(args, "mid_side", 0.0, -1.0, 1.0)?;
-    let delta = bool_arg(args, "delta", false);
-
-    let target_buf = sandbox.load_audio(&target)?;
-    let sc_buf = sandbox.load_audio(&sidechain)?;
-    let mut cfg = if kick_bass {
-        UnmaskConfig::kick_over_bass()
-    } else {
-        UnmaskConfig::vocal_over_instruments()
-    };
-    cfg.mid_side_balance = mid_side;
-    cfg.delta_listen = delta;
-    let unmasked = apply_spectral_unmask(&target_buf, &sc_buf, &cfg)?;
-    sandbox.save_wav(&unmasked, &output, 24)?;
-    Ok(json!({
-        "output": output,
-        "kick_bass_mode": kick_bass,
-        "mid_side": mid_side,
-        "delta": delta
-    })
-    .into())
-}
-
-fn tool_neural_denoise(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
-    let input = path_arg(args, "input", sandbox)?;
-    let output_dir = path_arg(args, "output_dir", sandbox)?;
-    let raw_backend = match args.get("backend") {
-        None | Some(Value::Null) => "auto",
-        Some(v) => v
-            .as_str()
-            .ok_or_else(|| ForgeError::InvalidParameter("'backend' must be a string".into()))?,
-    };
-    let backend = match raw_backend.trim().to_ascii_lowercase().as_str() {
-        "auto" => "auto",
-        "deepfilternet" | "deepfilternet3" => "deepfilternet",
-        "mel-band-roformer" | "roformer" => "mel-band-roformer",
-        other => {
-            return Err(ForgeError::InvalidParameter(format!(
-                "unknown 'backend' '{other}' (expected auto, deepfilternet, deepfilternet3, mel-band-roformer, or roformer)"
-            )));
-        }
-    };
-    let attenuation_limit_db = match args.get("attenuation_limit_db") {
-        None | Some(Value::Null) => None,
-        Some(_) => Some(bounded_f64_arg(
-            args,
-            "attenuation_limit_db",
-            0.0,
-            0.0,
-            100.0,
-        )?),
-    };
-    let timeout = timeout_secs_arg(args)?;
-    let res = external::neural_denoise_checked(
-        sandbox,
-        &input,
-        &output_dir,
-        backend,
-        attenuation_limit_db,
-        timeout,
-    )?;
-    Ok(serde_json::to_value(res)?.into())
-}
-
-fn tool_transcribe_midi(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
-    let input = path_arg(args, "input", sandbox)?;
-    let output_dir = path_arg(args, "output_dir", sandbox)?;
-    let timeout = timeout_secs_arg(args)?;
-    let res = external::transcribe_midi_checked(sandbox, &input, &output_dir, timeout)?;
-    Ok(serde_json::to_value(res)?.into())
-}
-
-fn tool_phase_align(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
-    let reference = path_arg(args, "reference", sandbox)?;
-    let target = path_arg(args, "target", sandbox)?;
-    let output = path_arg(args, "output", sandbox)?;
-
-    let ref_buf = sandbox.load_audio(&reference)?;
-    let tgt_buf = sandbox.load_audio(&target)?;
-    if bool_arg(args, "vocal_dtw", false) {
-        let (warped, markers) = align_vocal_double_dtw(&ref_buf, &tgt_buf, 120.0)?;
-        sandbox.save_wav(&warped, &output, 24)?;
-        Ok(json!({
-            "mode": "vocal_dtw",
-            "output": output,
-            "stretch_markers_count": markers.len()
-        })
-        .into())
-    } else {
-        let (aligned, info) = align_phase_gcc_phat(&ref_buf, &tgt_buf, 35.0)?;
-        sandbox.save_wav(&aligned, &output, 24)?;
-        Ok(serde_json::to_value(info)?.into())
-    }
-}
-
-fn tool_vocal_suite(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
-    let input = path_arg(args, "input", sandbox)?;
-    let output_dir = path_arg(args, "output_dir", sandbox)?;
-    let tuned_path = sandbox.check(&output_dir.join("Vocal_Lead_Tuned_Clean.wav"))?;
-    let harmony_paths = [
-        sandbox.check(&output_dir.join("Vocal_Harmony_3rd_Above.wav"))?,
-        sandbox.check(&output_dir.join("Vocal_Harmony_3rd_Below.wav"))?,
-        sandbox.check(&output_dir.join("Vocal_Formant_Double.wav"))?,
-    ];
-    let scale = VocalScale::parse(str_arg_or(args, "scale", "D minor"))?;
-    let retune = f64_arg(args, "retune_strength", 0.85).clamp(0.0, 1.0);
-    sandbox.create_dir_all(&output_dir)?;
-
-    let raw = sandbox.load_audio(&input)?;
-    let clean = clean_vocal_surgical(&raw, true, true, -12.0)?;
-    let contour = track_vocal_pitch(&clean, &scale, retune);
-    let pitch_env = forge_vocal::compile_reaper_take_pitch_envelope(&contour);
-    let corr_curve: Vec<(f64, f64)> = contour
-        .iter()
-        .map(|f| (f.time_secs, f.correction_semitones))
-        .collect();
-    let tuned = shift_vocal_pitch_formant_preserved(&clean, &corr_curve, 0.0)?;
-    sandbox.save_wav(&tuned, &tuned_path, 24)?;
-
-    let mut harmonies = Vec::new();
-    if bool_arg(args, "generate_harmonies", true) {
-        let (h_up, h_down, h_dbl) = generate_vocal_harmony_stack(&tuned, &scale)?;
-        for (buf, path) in [h_up, h_down, h_dbl].iter().zip(&harmony_paths) {
-            sandbox.save_wav(buf, path, 24)?;
-            harmonies.push(path.to_string_lossy().into_owned());
-        }
-    }
-    Ok(json!({
-        "tuned_vocal": tuned_path,
-        "harmonies": harmonies,
-        "frames_tracked": contour.len(),
-        "reaper_pitch_envelope": pitch_env
-    })
-    .into())
-}
-
-/// Reharmonized chord symbols, then the voiced chord notes and the bass line.
-type VoicedChords = (Vec<String>, Vec<NoteEvent>, Vec<NoteEvent>);
-
-fn parse_voicing_style(style: &str) -> VoicingStyle {
-    match style.trim().to_ascii_lowercase().as_str() {
-        "jazz" | "jazz-drop2" | "drop2" => VoicingStyle::Drop2,
-        "pop" | "triad" | "close" => VoicingStyle::Close,
-        "cinematic" => VoicingStyle::CinematicSpread,
-        _ => VoicingStyle::NeoSoulRootless,
-    }
-}
-
-/// Reharmonizes a whitespace-separated chord list and voices it with the selected style.
-fn voice_chords(chords: &str, style: VoicingStyle) -> Result<VoicedChords, ForgeError> {
-    let raw_chords: Vec<String> = chords.split_whitespace().map(ToString::to_string).collect();
-    let reharm = reharmonize_progression(&raw_chords, style);
-    let (chord_notes, bass_notes) =
-        solve_voice_leading(&reharm, style, GrooveStyle::NeoSoulDilla, 480, 4)?;
-    Ok((reharm, chord_notes, bass_notes))
-}
-
-fn tool_music_theory_midi(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
-    let chords = str_arg(args, "chords")?;
-    let output_midi = path_arg(args, "output_midi", sandbox)?;
-    let bpm = validate_bpm(f64_arg(args, "bpm", 92.0))?;
-    let style = parse_voicing_style(str_arg_or(args, "style", "neo-soul"));
-    let (reharm, chord_notes, bass_notes) = voice_chords(chords, style)?;
-    sandbox.write_midi(
-        &output_midi,
-        bpm,
-        480,
-        &[("Voiced_Chords", &chord_notes), ("Sub_Bass", &bass_notes)],
-    )?;
-    let abc = export_abc_score("ForgeAudio Progression", "C", bpm.round() as u32, &reharm);
-    Ok(json!({
-        "output_midi": output_midi,
-        "abc_notation": abc,
-        "reharmonized_chords": reharm
-    })
-    .into())
-}
-
-fn tool_master_distrokid(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
-    let input = path_arg(args, "input", sandbox)?;
-    // Absolute after resolution, so it can never be read by ffmpeg as an option.
-    let out_path = path_arg(args, "output", sandbox)?;
-    let tmp = sandbox.check(&out_path.with_extension("pre_tag.wav"))?;
-    let reference = optional_path_arg(args, "reference", sandbox)?;
-
-    let mut buf = sandbox.load_audio(&input)?;
-    if let Some(reference) = reference {
-        let ref_buf = sandbox.load_audio(&reference)?;
-        let curve = compute_reference_match_eq(&buf, &ref_buf, 4.5);
-        apply_18_band_eq(&mut buf, &curve);
-    }
-    let mastered = normalize_and_limit(
-        &buf,
-        f64_arg(args, "target_lufs", -14.0),
-        f64_arg(args, "ceiling_dbtp", -1.0),
-    )?;
-    if let Some(raw_isrc) = args.get("isrc").and_then(Value::as_str) {
-        let meta = ReleaseMetadata {
-            title: str_arg_or(args, "title", "Untitled").into(),
-            artist: str_arg_or(args, "artist", "ForgeAudio").into(),
-            album: "Single".into(),
-            isrc: validate_isrc(raw_isrc)?,
-            bpm: None,
-            key: None,
-            year: Some(2026),
-        };
-        sandbox.save_wav(&mastered, &tmp, 24)?;
-        external::tag_master(sandbox, &tmp, &out_path, &meta)?;
-    } else {
-        sandbox.save_wav(&mastered, &out_path, 24)?;
-    }
-    Ok(serde_json::to_value(audit_audio(&mastered))?.into())
-}
-
-/// Every destination `forge_ingest_to_reaper` writes, each checked against the sandbox
-/// before any work starts.
-struct IngestPaths {
-    output_dir: PathBuf,
-    stems_dir: PathBuf,
-    midi_dir: PathBuf,
-    drum_midi: PathBuf,
-    chords_midi: PathBuf,
-    master: PathBuf,
-    delivery: PathBuf,
-    rpp: PathBuf,
-}
-
-impl IngestPaths {
-    fn new(
-        output_dir: PathBuf,
-        target: DeliveryTarget,
-        sandbox: &PathSandbox,
-    ) -> Result<Self, ForgeError> {
-        let check = |rel: &str| sandbox.check(&output_dir.join(rel));
-        let master = check(&format!("Master_{}_24bit.wav", target.name()))?;
-        Ok(Self {
-            stems_dir: check("stems")?,
-            midi_dir: check("midi")?,
-            drum_midi: check("midi/01_Drum_Triggers.mid")?,
-            chords_midi: check("midi/02_Voiced_Chords.mid")?,
-            delivery: sandbox.check(&master.with_extension("delivery.json"))?,
-            master,
-            rpp: check("ForgeAudio_Session.rpp")?,
-            output_dir,
-        })
-    }
-}
-
-/// Installs the JSFX into `Effects/ForgeAudio` under REAPER's resource folder, the only
-/// place the session's `<JS "ForgeAudio/...">` references resolve. These are fixed files at
-/// a fixed location, not a client path, so they are not confined to the sandbox. A missing
-/// REAPER install is reported rather than failing the rest of the ingest.
-fn install_session_jsfx(resource_dir: Result<PathBuf, ForgeError>) -> Value {
-    let installed =
-        resource_dir.and_then(|dir| install_jsfx_plugins(Some(&jsfx_install_dir(&dir))));
-    match installed {
-        Ok(files) => json!({ "installed": true, "files": files }),
-        Err(e) => json!({ "installed": false, "error": e.to_string() }),
-    }
-}
-
-fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
-    let input = path_arg(args, "input", sandbox)?;
-    let target = delivery_target_from_args(args)?;
-    let paths = IngestPaths::new(path_arg(args, "output_dir", sandbox)?, target, sandbox)?;
-    let bpm = validate_bpm(f64_arg(args, "bpm", 120.0))?;
-    let scale = VocalScale::parse(str_arg_or(args, "scale", "D minor"))?;
-    let chords = str_arg_or(args, "chords", "Dm9 Bbmaj7 Gm9 A7b13");
-
-    sandbox.create_dir_all(&paths.output_dir)?;
-    sandbox.create_dir_all(&paths.midi_dir)?;
-
-    let require_neural = bool_arg(args, "require_neural", false);
-    let (bundle, stem_separation) =
-        separate_ingest_stems(sandbox, &input, &paths.stems_dir, require_neural)?;
-    let vocal_pitch_frames = ingest_vocal_frames(sandbox, bundle.vocals.as_deref(), &scale)?;
-
-    let drum_buf = sandbox.load_audio(&sandbox.check(bundle.drums.as_ref().unwrap_or(&input))?)?;
-    let duration_secs = drum_buf.duration_secs();
-    write_ingest_midi(sandbox, &paths, &drum_buf, bpm, chords)?;
-
-    let full_mix = sandbox.load_audio(&input)?;
-    let (mastered, delivery) = deliver(&full_mix, &DeliveryOptions::for_target(target))?;
-    sandbox.save_wav(&mastered, &paths.master, 24)?;
-    sandbox.write_json(&paths.delivery, &delivery)?;
-
-    let session = SessionSpec {
-        bpm,
-        sample_rate: full_mix.sample_rate,
-        duration_secs,
-        vocal: bundle.vocals,
-        drums: bundle.drums,
-        bass: bundle.bass,
-        other: bundle.other,
-        vocal_pitch_frames,
-        chords_midi: paths.chords_midi.clone(),
-        drum_midi: paths.drum_midi.clone(),
-    };
-    sandbox.save_rpp(&build_session(session), &paths.rpp)?;
-
-    Ok(ToolOutput {
-        success: delivery.ready,
-        value: json!({
-            "rpp_project": paths.rpp,
-            "master_wav": paths.master,
-            "midi_file": paths.chords_midi,
-            "delivery_report": paths.delivery,
-            "jsfx": install_session_jsfx(reaper_resource_dir()),
-            "target": delivery.target,
-            "ready": delivery.ready,
-            "checks": delivery.checks,
-            "master_lufs": delivery.after.integrated_lufs,
-            "master_true_peak_dbtp": delivery.after.true_peak_dbtp,
-            "ai_fizz_index": delivery.after.ai_fizz_index,
-            "stem_separation": stem_separation
-        }),
-    })
-}
-
-/// Separates stems on the backend the environment selects (`FORGE_WORKER_BACKEND`) and
-/// returns them with `{"backend", "fallbacks"}` so callers can see which backend ran. The
-/// worker is an external step, so [`external::separate_stems_checked`] re-checks its paths
-/// and verifies every stem through the root handle.
-fn separate_ingest_stems(
-    sandbox: &PathSandbox,
-    input: &Path,
-    stems_dir: &Path,
-    require_neural: bool,
-) -> Result<(StemBundle, Value), ForgeError> {
-    let mut config = SeparationConfig::from_env();
-    config.require_neural |= require_neural;
-    let report = external::separate_stems_checked(sandbox, input, stems_dir, &config)?;
-    let info = json!({ "backend": report.backend, "fallbacks": report.fallbacks });
-    Ok((report.bundle, info))
-}
-
-/// Writes the drum-trigger MIDI (from `drum_buf`) and the voice-led chord MIDI.
-fn write_ingest_midi(
-    sandbox: &PathSandbox,
-    paths: &IngestPaths,
-    drum_buf: &AudioBuffer,
-    bpm: f64,
-    chords: &str,
-) -> Result<(), ForgeError> {
-    let (kick_notes, snare_notes, hat_notes) = extract_drum_midi_triggers(drum_buf, bpm, 480);
-    sandbox.write_midi(
-        &paths.drum_midi,
-        bpm,
-        480,
-        &[
-            ("Kick_Trigger_C1", &kick_notes),
-            ("Snare_Trigger_D1", &snare_notes),
-            ("HiHat_Trigger_F#1", &hat_notes),
-        ],
-    )?;
-    let (_, chord_notes, bass_notes) = voice_chords(chords, VoicingStyle::NeoSoulRootless)?;
-    sandbox.write_midi(
-        &paths.chords_midi,
-        bpm,
-        480,
-        &[("Voiced_Chords", &chord_notes), ("Sub_Bass", &bass_notes)],
-    )
-}
-
-/// The pitch contour of the separated vocal (cleaned in place), or none without a vocal.
-fn ingest_vocal_frames(
-    sandbox: &PathSandbox,
-    vocal: Option<&std::path::Path>,
-    scale: &VocalScale,
-) -> Result<Vec<PitchFrame>, ForgeError> {
-    match vocal {
-        Some(voc_path) => clean_ingested_vocal(sandbox, &sandbox.check(voc_path)?, scale),
-        None => Ok(Vec::new()),
-    }
-}
-
-/// Cleans and de-fizzes the separated vocal in place; returns its pitch contour.
-fn clean_ingested_vocal(
-    sandbox: &PathSandbox,
-    voc_path: &std::path::Path,
-    scale: &VocalScale,
-) -> Result<Vec<PitchFrame>, ForgeError> {
-    let voc_buf = sandbox.load_audio(voc_path)?;
-    let voc_clean = clean_vocal_surgical(&voc_buf, true, true, -10.0)?;
-    let voc_defizz = apply_spectral_defizz(&voc_clean, &DeFizzConfig::default())?;
-    let frames = track_vocal_pitch(&voc_defizz, scale, 0.85);
-    sandbox.save_wav(&voc_defizz, voc_path, 24)?;
-    Ok(frames)
-}
-
-/// Inputs for the generated REAPER session.
-struct SessionSpec {
-    bpm: f64,
-    sample_rate: u32,
-    duration_secs: f64,
-    vocal: Option<PathBuf>,
-    drums: Option<PathBuf>,
-    bass: Option<PathBuf>,
-    other: Option<PathBuf>,
-    vocal_pitch_frames: Vec<PitchFrame>,
-    chords_midi: PathBuf,
-    drum_midi: PathBuf,
-}
-
-fn build_session(spec: SessionSpec) -> ReaperProjectBuilder {
-    let mut rpp =
-        ReaperProjectBuilder::new("ForgeAudio Studio Session", spec.bpm, spec.sample_rate);
-    rpp.add_default_song_structure_markers();
-    rpp.tracks.push(
-        ReaperTrackSpec::audio(
-            "01 Lead Vocal",
-            spec.vocal,
-            spec.duration_secs,
-            0.85,
-            0x0155_88FF,
-        )
-        .with_jsfx(["Forge_Vocal_Surgical.jsfx", "Forge_OpenSoothe_DeFizz.jsfx"])
-        .with_pitch_envelope(spec.vocal_pitch_frames),
-    );
-    let has_drums = spec.drums.is_some();
-    if let Some(drums) = spec.drums {
-        rpp.tracks.push(ReaperTrackSpec::audio(
-            "02 Drums",
-            Some(drums),
-            spec.duration_secs,
-            0.90,
-            0x01FF_5555,
-        ));
-    }
-    if let Some(bass) = spec.bass {
-        rpp.tracks.push(
-            ReaperTrackSpec::audio("03 Bass", Some(bass), spec.duration_secs, 0.88, 0x01AA_66FF)
-                .with_jsfx(["Forge_OpenSpacer_Unmask.jsfx"])
-                .with_sidechain(if has_drums { Some(1) } else { None }),
-        );
-    }
-    if let Some(other) = spec.other {
-        rpp.tracks.push(
-            ReaperTrackSpec::audio(
-                "04 Instruments / Other",
-                Some(other),
-                spec.duration_secs,
-                0.82,
-                0x0144_DD88,
-            )
-            .with_jsfx(["Forge_OpenSpacer_Unmask.jsfx"])
-            .with_sidechain(Some(0)),
-        );
-    }
-    rpp.tracks.push(ReaperTrackSpec::midi(
-        "05 MIDI Chords & Sub-Bass",
-        spec.chords_midi,
-        spec.duration_secs,
-        0.85,
-        0x01FF_CC44,
-    ));
-    rpp.tracks.push(ReaperTrackSpec::midi(
-        "06 Drum MIDI Triggers",
-        spec.drum_midi,
-        spec.duration_secs,
-        0.85,
-        0x01FF_8844,
-    ));
-    rpp
-}
-
-fn tool_separate_stems(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
-    let input = path_arg(args, "input", sandbox)?;
-    let output_dir = path_arg(args, "output_dir", sandbox)?;
-    let stems_raw = args.get("stems").and_then(Value::as_u64).unwrap_or(6);
-    let stems = match stems_raw {
-        2 | 4 | 6 => stems_raw as u8,
-        other => {
-            return Err(ForgeError::InvalidParameter(format!(
-                "stems must be 2, 4, or 6, got {other}"
-            )));
-        }
-    };
-    let quality_str = args
-        .get("quality")
-        .and_then(Value::as_str)
-        .unwrap_or("studio");
-    let quality = forge_worker::parse_quality(quality_str)?;
-    let dereverb = args
-        .get("dereverb")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let drum_sep = args
-        .get("drum_sep")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let split_lead_backing = bool_arg(args, "split_lead_backing", false);
-    let split_male_female = bool_arg(args, "split_male_female", false);
-    let split_guitar = bool_arg(args, "split_guitar", false);
-    let split_orchestral = bool_arg(args, "split_orchestral", false);
-    let split_crowd = bool_arg(args, "split_crowd", false);
-    let all_stems = bool_arg(args, "all_stems", false);
-    let restore = bool_arg(args, "restore", false);
-
-    let mut cfg = SeparationConfig::from_env();
-    cfg.stems = stems;
-    cfg.quality = quality;
-    cfg.dereverb = dereverb;
-    cfg.drum_sep = drum_sep;
-    cfg.split_lead_backing = split_lead_backing;
-    cfg.split_male_female = split_male_female;
-    cfg.split_guitar = split_guitar;
-    cfg.split_orchestral = split_orchestral;
-    cfg.split_crowd = split_crowd;
-    if all_stems {
-        cfg.enable_all_stems();
-        cfg.dereverb = dereverb;
-    }
-    cfg.restore = restore;
-
-    let report = external::separate_stems_checked(sandbox, &input, &output_dir, &cfg)?;
-    let payload = serde_json::to_value(&report)
-        .map_err(|e| ForgeError::InvalidParameter(format!("Failed to serialize report: {e}")))?;
-    Ok(payload.into())
-}
-
-fn load_sandboxed_daw_project(
-    project_path: &std::path::Path,
-    sandbox: &PathSandbox,
-    require_all_clips: bool,
-) -> Result<
-    (
-        forge_engine::DawProject,
-        forge_engine::ClipCache,
-        Vec<String>,
-    ),
-    ForgeError,
-> {
-    const MAX_PROJ_BYTES: u64 = 16 * 1024 * 1024;
-    let file = sandbox.open_read(project_path)?;
-    let mut raw = String::new();
-    std::io::Read::read_to_string(&mut std::io::Read::take(file, MAX_PROJ_BYTES + 1), &mut raw)
-        .map_err(ForgeError::Io)?;
-    if (raw.len() as u64) > MAX_PROJ_BYTES {
-        return Err(ForgeError::InvalidParameter(
-            "Project file exceeds 16 MiB maximum size".to_string(),
-        ));
-    }
-    let proj = forge_engine::DawProject::from_json(&raw)?;
-    let mut cache = forge_engine::ClipCache::default();
-    let mut missing_clips = Vec::new();
-    for tr in &proj.tracks {
-        for obj in &tr.objects {
-            let safe_clip = sandbox.check(&obj.source_path)?;
-            match sandbox.load_audio(&safe_clip) {
-                Ok(buf) => {
-                    cache.insert_memory_clip(obj.source_path.clone(), buf);
-                }
-                Err(e) if !require_all_clips => {
-                    missing_clips.push(format!("{}: {e}", safe_clip.display()));
-                }
-                Err(e) => return Err(e),
+        TransportMode::Http {
+            addr,
+            allow_non_loopback,
+        } => {
+            if let Err(e) = run_http(server, addr, allow_non_loopback).await {
+                eprintln!("forge-mcp: HTTP server failure: {e}");
+                std::process::exit(1);
             }
         }
     }
-    Ok((proj, cache, missing_clips))
-}
-
-fn tool_daw_inspect(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
-    let project_path = path_arg(args, "project", sandbox)?;
-    let (proj, cache, missing_clips) = load_sandboxed_daw_project(&project_path, sandbox, false)?;
-    let engine = forge_engine::ObjectOrientedEngine::compile(&proj, &cache);
-    let summary =
-        serde_json::to_value(proj.inspect_summary(engine.total_pdc_samples(), missing_clips))?;
-    Ok(summary.into())
-}
-
-fn tool_daw_bounce(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
-    let project_path = path_arg(args, "project", sandbox)?;
-    let output_path = path_arg(args, "output", sandbox)?;
-    let stems_dir = optional_path_arg(args, "stems_dir", sandbox)?;
-
-    let (proj, cache, _) = load_sandboxed_daw_project(&project_path, sandbox, true)?;
-    let base_frames = usize::try_from(proj.total_length_samples()).map_err(|_| {
-        ForgeError::InvalidParameter("Project duration overflows platform pointer width".into())
-    })?;
-    let tail_frames = forge_engine::ObjectOrientedEngine::compute_reverb_tail_frames(&proj);
-    let total = base_frames.saturating_add(tail_frames);
-    let master_buf = forge_engine::ObjectOrientedEngine::bounce_offline(&proj, &cache, total)?;
-    sandbox.save_wav(&master_buf, &output_path, 24)?;
-    let report = audit_audio(&master_buf);
-
-    let stems_exported = if let Some(dir) = stems_dir {
-        sandbox.create_dir_all(&dir)?;
-        forge_engine::ObjectOrientedEngine::bounce_stems_with(
-            &proj,
-            &cache,
-            |ti, safe_name, stem_buf| {
-                let stem_path =
-                    sandbox.check(&dir.join(format!("{:02}_{safe_name}.wav", ti + 1)))?;
-                sandbox.save_wav(stem_buf, &stem_path, 24)?;
-                Ok(())
-            },
-        )?
-    } else {
-        0
-    };
-    let payload = json!({
-        "output": output_path.display().to_string(),
-        "integrated_lufs": report.integrated_lufs,
-        "true_peak_dbtp": report.true_peak_dbtp,
-        "stems_exported": stems_exported,
-    });
-    Ok(payload.into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::{SessionSpec, build_session, install_session_jsfx, panic_message};
+    use forge_core::{AudioBuffer, ForgeError};
+    use serde_json::json;
+    use std::panic;
     use std::path::Path;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     fn sandbox_in(dir: &Path) -> PathSandbox {
         PathSandbox::new([dir.to_path_buf()]).expect("sandbox")
     }
 
-    /// 10 s stereo mix-like signal (two tones plus broadband hash), as in the delivery tests.
     fn write_test_mix(path: &Path, level: f64, sample_rate: u32) {
         forge_dsp::delivery::synthetic_delivery_fixture(level, sample_rate)
             .save_wav(path, 24)
             .expect("write fixture");
     }
 
-    /// Runs `tools/call` and returns the MCP result object.
     fn call_tool(sandbox: &PathSandbox, name: &str, arguments: Value) -> Value {
-        let resp = handle_request(
-            json!(1),
-            "tools/call",
-            &json!({ "name": name, "arguments": arguments }),
-            sandbox,
-        );
-        assert!(resp.error.is_none(), "unexpected JSON-RPC error");
-        resp.result.expect("tool result")
+        let res = handlers::call_tool_result(name, &arguments, sandbox);
+        serde_json::to_value(&res).expect("serialize CallToolResult")
     }
 
     fn is_error(result: &Value) -> bool {
@@ -1622,6 +451,18 @@ mod tests {
         result["content"][0]["text"].as_str().expect("text content")
     }
 
+    fn assert_tool_err_contains(sb: &PathSandbox, tool: &str, args: Value, needle: &str) {
+        let res = call_tool(sb, tool, args);
+        assert!(is_error(&res), "{tool} expected error: {}", text(&res));
+        if !needle.is_empty() {
+            assert!(
+                text(&res).contains(needle),
+                "{tool} expected '{needle}' in: {}",
+                text(&res)
+            );
+        }
+    }
+
     #[test]
     fn output_outside_root_is_rejected_before_any_write() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -1630,123 +471,125 @@ mod tests {
         write_test_mix(&root.path().join("mix.wav"), 0.05, 48_000);
 
         let victim = elsewhere.path().join("victim.wav");
-        let result = call_tool(
+        assert_tool_err_contains(
             &sb,
             "forge_deliver",
             json!({ "input": "mix.wav", "output": victim.to_string_lossy() }),
-        );
-        assert!(is_error(&result));
-        assert!(
-            text(&result).contains("outside the allowed roots"),
-            "{}",
-            text(&result)
+            "outside the allowed roots",
         );
         assert!(!victim.exists());
         assert!(!victim.with_extension("delivery.json").exists());
+    }
+
+    fn setup_mix_sandbox(level: f64, sr: u32) -> (tempfile::TempDir, PathSandbox) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sb = sandbox_in(root.path());
+        write_test_mix(&root.path().join("mix.wav"), level, sr);
+        (root, sb)
+    }
+
+    fn parse_kv_args(spec: &str) -> Value {
+        let mut map = serde_json::Map::new();
+        for pair in spec.split(';') {
+            if let Some((k, v)) = pair.split_once('=') {
+                map.insert(k.to_string(), json!(v));
+            }
+        }
+        Value::Object(map)
     }
 
     #[test]
     fn parent_dir_traversal_is_rejected_for_every_path_argument() {
         let root = tempfile::tempdir().expect("tempdir");
         let sb = sandbox_in(root.path());
-        let cases = [
-            ("forge_audit_audio", json!({ "path": "../secret.wav" })),
-            (
-                "forge_restore_and_defizz",
-                json!({ "input": "in.wav", "output": "../out.wav" }),
-            ),
+        for (tool, spec) in [
+            ("forge_audit_audio", "path=../secret.wav"),
+            ("forge_restore_and_defizz", "input=in.wav;output=../out.wav"),
             (
                 "forge_spectral_unmask",
-                json!({ "target": "t.wav", "sidechain": "../s.wav", "output": "o.wav" }),
+                "target=t.wav;sidechain=../s.wav;output=o.wav",
             ),
             (
                 "forge_phase_align",
-                json!({ "reference": "../r.wav", "target": "t.wav", "output": "o.wav" }),
+                "reference=../r.wav;target=t.wav;output=o.wav",
             ),
             (
                 "forge_vocal_suite",
-                json!({ "input": "v.wav", "output_dir": "stems/../../escape" }),
+                "input=v.wav;output_dir=stems/../../escape",
             ),
             (
                 "forge_music_theory_midi",
-                json!({ "chords": "Cmaj7", "output_midi": "../x.mid" }),
+                "chords=Cmaj7;output_midi=../x.mid",
             ),
             (
                 "forge_master_distrokid",
-                json!({ "input": "in.wav", "output": "o.wav", "reference": "../r.wav" }),
+                "input=in.wav;output=o.wav;reference=../r.wav",
             ),
             (
                 "forge_ingest_to_reaper",
-                json!({ "input": "in.wav", "output_dir": "../session" }),
+                "input=in.wav;output_dir=../session",
             ),
-            (
-                "forge_neural_denoise",
-                json!({ "input": "../in.wav", "output_dir": "out" }),
-            ),
+            ("forge_neural_denoise", "input=../in.wav;output_dir=out"),
             (
                 "forge_transcribe_midi",
-                json!({ "input": "in.wav", "output_dir": "../midi_out" }),
+                "input=in.wav;output_dir=../midi_out",
             ),
             (
                 "forge_separate_stems",
-                json!({ "input": "in.wav", "output_dir": "../stems_out" }),
+                "input=in.wav;output_dir=../stems_out",
             ),
-            (
-                "forge_daw_inspect",
-                json!({ "project": "../session.forgeproj" }),
-            ),
+            ("forge_daw_inspect", "project=../session.forgeproj"),
             (
                 "forge_daw_bounce",
-                json!({ "project": "session.forgeproj", "output": "../bounce.wav" }),
+                "project=session.forgeproj;output=../bounce.wav",
             ),
-        ];
-        for (tool, args) in cases {
-            let result = call_tool(&sb, tool, args);
-            assert!(is_error(&result), "{tool} accepted a '..' path");
-            assert!(text(&result).contains("'..'"), "{tool}: {}", text(&result));
+        ] {
+            assert_tool_err_contains(&sb, tool, parse_kv_args(spec), "'..'");
         }
         assert!(!root.path().join("..").join("session").exists());
     }
 
+    fn assert_mix_tool_error(tool: &str, args: Value, needle: &str, absent_rel: Option<&str>) {
+        let (root, sb) = setup_mix_sandbox(0.05, 48_000);
+        assert_tool_err_contains(&sb, tool, args, needle);
+        if let Some(rel) = absent_rel {
+            assert!(!root.path().join(rel).exists(), "{rel} should not exist");
+        }
+    }
+
     #[test]
     fn out_of_range_bpm_and_ceiling_are_tool_errors() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let sb = sandbox_in(root.path());
-        write_test_mix(&root.path().join("mix.wav"), 0.05, 48_000);
-
-        let theory = call_tool(
-            &sb,
+        assert_mix_tool_error(
             "forge_music_theory_midi",
             json!({ "chords": "Dm9 G13", "output_midi": "x.mid", "bpm": 0 }),
+            "bpm",
+            Some("x.mid"),
         );
-        assert!(is_error(&theory), "{}", text(&theory));
-        assert!(text(&theory).contains("bpm"), "{}", text(&theory));
-        assert!(!root.path().join("x.mid").exists());
-
-        let master = call_tool(
-            &sb,
+        assert_mix_tool_error(
             "forge_master_distrokid",
             json!({ "input": "mix.wav", "output": "master.wav", "ceiling_dbtp": 6.0 }),
+            "ceiling_dbtp",
+            Some("master.wav"),
         );
-        assert!(is_error(&master), "{}", text(&master));
-        assert!(text(&master).contains("ceiling_dbtp"), "{}", text(&master));
     }
 
     fn assert_delivery_ready(sample_rate: u32, output_rel: &str, expect_ready: bool) {
-        let root = tempfile::tempdir().expect("tempdir");
-        let sb = sandbox_in(root.path());
-        write_test_mix(&root.path().join("input.wav"), 0.05, sample_rate);
+        let (root, sb) = setup_mix_sandbox(0.05, sample_rate);
 
         let result = call_tool(
             &sb,
             "forge_deliver",
-            json!({ "input": "input.wav", "output": output_rel }),
+            json!({ "input": "mix.wav", "output": output_rel }),
         );
         assert_eq!(
             is_error(&result),
             !expect_ready,
             "ready={expect_ready}: {}",
             text(&result)
+        );
+        assert_eq!(
+            result["structuredContent"]["report"]["ready"],
+            json!(expect_ready)
         );
         let body: Value = serde_json::from_str(text(&result)).expect("JSON body");
         assert_eq!(body["report"]["ready"], json!(expect_ready));
@@ -1755,7 +598,6 @@ mod tests {
 
     #[test]
     fn not_ready_delivery_reports_is_error() {
-        // 22.05 kHz fails the sample-rate check, so the delivery cannot be `ready`.
         assert_delivery_ready(22_050, "out/master.wav", false);
     }
 
@@ -1765,75 +607,21 @@ mod tests {
     }
 
     #[test]
-    fn invalid_utf8_line_gets_parse_error_and_server_keeps_running() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let sb = sandbox_in(root.path());
-        let mut input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"\xff\xfe\"}\n".to_vec();
-        input.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\"}\n");
-
-        let mut output = Vec::new();
-        serve(input.as_slice(), &mut output, &sb).expect("serve");
-        let lines: Vec<Value> = String::from_utf8(output)
-            .expect("utf-8 output")
-            .lines()
-            .map(|l| serde_json::from_str(l).expect("JSON line"))
-            .collect();
-
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert_eq!(lines[0]["error"]["code"], json!(-32700));
-        assert!(
-            lines[0]["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("invalid UTF-8")
-        );
-        assert_eq!(lines[1]["id"], json!(2));
-        assert_eq!(lines[1]["result"]["serverInfo"]["name"], json!("forge-mcp"));
-    }
-
-    #[test]
-    fn malformed_json_and_notifications_do_not_stop_the_loop() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let sb = sandbox_in(root.path());
-        let input = b"not json\n\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/list\"}";
-
-        let mut output = Vec::new();
-        serve(input.as_slice(), &mut output, &sb).expect("serve");
-        let lines: Vec<Value> = String::from_utf8(output)
-            .unwrap()
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
-
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert_eq!(lines[0]["error"]["code"], json!(-32700));
-        assert_eq!(lines[1]["id"], json!(7));
-        assert!(lines[1]["result"]["tools"].as_array().unwrap().len() >= 9);
-    }
-
-    #[test]
     fn non_string_path_arguments_are_rejected() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let sb = sandbox_in(root.path());
-        write_test_mix(&root.path().join("mix.wav"), 0.05, 48_000);
-
-        let result = call_tool(
-            &sb,
+        assert_mix_tool_error(
             "forge_deliver",
             json!({ "input": "mix.wav", "output": "master.wav", "reference": 5 }),
+            "'reference' must be a string path",
+            Some("master.wav"),
         );
-        assert!(is_error(&result));
-        assert!(
-            text(&result).contains("'reference' must be a string path"),
-            "{}",
-            text(&result)
+        assert_mix_tool_error(
+            "forge_audit_audio",
+            json!({ "path": ["mix.wav"] }),
+            "'path' must be a string path",
+            None,
         );
-        assert!(!root.path().join("master.wav").exists());
 
-        let result = call_tool(&sb, "forge_audit_audio", json!({ "path": ["mix.wav"] }));
-        assert!(text(&result).contains("'path' must be a string path"));
-
-        // An explicit null optional is treated as absent.
+        let (_root, sb) = setup_mix_sandbox(0.05, 48_000);
         let result = call_tool(
             &sb,
             "forge_deliver",
@@ -1880,9 +668,9 @@ mod tests {
     }
 
     fn advertised_tool_names() -> Vec<String> {
-        tool_definitions()
-            .iter()
-            .map(|t| t["name"].as_str().expect("tool name").to_string())
+        tools::build_tools()
+            .into_iter()
+            .map(|t| t.name.into_owned())
             .collect()
     }
 
@@ -1905,7 +693,7 @@ mod tests {
         served.sort();
         assert_eq!(
             documented, served,
-            "README.md '### MCP tools' table is out of sync with tool_definitions()"
+            "README.md '### MCP tools' table is out of sync with build_tools()"
         );
     }
 
@@ -1916,7 +704,7 @@ mod tests {
         let count = format!("exposing {} structured tools", served.len());
         assert!(
             guide.contains(&count),
-            "architecture guide should say \"{count}\" to match tool_definitions()"
+            "architecture guide should say \"{count}\" to match build_tools()"
         );
         for name in &served {
             assert!(
@@ -1931,7 +719,6 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let sb = sandbox_in(root.path());
         write_test_mix(&root.path().join("mix.wav"), 0.05, 48_000);
-        // A directory at the output path makes ffmpeg fail (as does ffmpeg being absent).
         std::fs::create_dir(root.path().join("master.wav")).expect("mkdir");
 
         let result = call_tool(
@@ -1953,11 +740,20 @@ mod tests {
             bpm: 120.0,
             sample_rate: 48_000,
             duration_secs: 10.0,
+            vocal_duration_secs: 10.0,
+            drums_duration_secs: 10.0,
+            bass_duration_secs: 10.0,
+            other_duration_secs: 10.0,
+            guitar_duration_secs: 10.0,
+            keys_duration_secs: 10.0,
             vocal: Some(resource.path().join("vocals.wav")),
             drums: None,
             bass: None,
             other: None,
+            guitar: None,
+            keys: None,
             vocal_pitch_frames: Vec::new(),
+            tempo_map: Vec::new(),
             chords_midi: resource.path().join("chords.mid"),
             drum_midi: resource.path().join("drums.mid"),
         });
@@ -1993,7 +789,6 @@ mod tests {
         let sb = sandbox_in(root.path());
         write_test_mix(&root.path().join("mix.wav"), 0.08, 48_000);
 
-        // Valid Wave 1 params on forge_deliver
         let res = call_tool(
             &sb,
             "forge_deliver",
@@ -2010,32 +805,19 @@ mod tests {
         assert!(!is_error(&res), "{}", text(&res));
         assert!(root.path().join("out_punchy_16.wav").is_file());
 
-        // Invalid limiter_style rejected
-        let bad_style = call_tool(
+        assert_tool_err_contains(
             &sb,
             "forge_deliver",
-            json!({
-                "input": "mix.wav",
-                "output": "bad.wav",
-                "limiter_style": "hyper_extreme"
-            }),
+            json!({ "input": "mix.wav", "output": "bad.wav", "limiter_style": "hyper_extreme" }),
+            "limiter_style",
         );
-        assert!(is_error(&bad_style));
-        assert!(text(&bad_style).contains("limiter_style"));
-
-        // Invalid dither_bits rejected
-        let bad_bits = call_tool(
+        assert_tool_err_contains(
             &sb,
             "forge_deliver",
-            json!({
-                "input": "mix.wav",
-                "output": "bad.wav",
-                "dither_bits": 4
-            }),
+            json!({ "input": "mix.wav", "output": "bad.wav", "dither_bits": 4 }),
+            "dither_bits",
         );
-        assert!(is_error(&bad_bits));
 
-        // Valid Wave 1 params on forge_restore_and_defizz
         let restored = call_tool(
             &sb,
             "forge_restore_and_defizz",
@@ -2050,19 +832,13 @@ mod tests {
         );
         assert!(!is_error(&restored), "{}", text(&restored));
 
-        // Out-of-range tilt rejected
-        let bad_tilt = call_tool(
+        assert_tool_err_contains(
             &sb,
             "forge_restore_and_defizz",
-            json!({
-                "input": "mix.wav",
-                "output": "restored_bad.wav",
-                "tilt": 12.0
-            }),
+            json!({ "input": "mix.wav", "output": "restored_bad.wav", "tilt": 12.0 }),
+            "tilt",
         );
-        assert!(is_error(&bad_tilt));
 
-        // Valid Wave 1 params on forge_spectral_unmask
         let unmasked = call_tool(
             &sb,
             "forge_spectral_unmask",
@@ -2076,17 +852,586 @@ mod tests {
         );
         assert!(!is_error(&unmasked), "{}", text(&unmasked));
 
-        // Invalid neural denoise backend rejected
-        let bad_backend = call_tool(
+        assert_tool_err_contains(
             &sb,
             "forge_neural_denoise",
+            json!({ "input": "mix.wav", "output_dir": "denoised", "backend": "nonexistent" }),
+            "backend",
+        );
+    }
+
+    #[test]
+    fn ai_suite_tools_sandbox_enforcement_and_ingest_features() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sb = sandbox_in(root.path());
+
+        let sr = 48_000_u32;
+        let frames = (sr as usize) * 8;
+        let mut ch: Vec<f64> = (0..frames)
+            .map(|i| {
+                let ts = (i as f64) / f64::from(sr);
+                0.22 * (2.0 * std::f64::consts::PI * 220.0 * ts).sin()
+            })
+            .collect();
+        let mut t = 0.2_f64;
+        while t < 7.7 {
+            let start = (t * f64::from(sr)).round() as usize;
+            for k in 0..600 {
+                if start + k < frames {
+                    let env = (-(k as f64) / 100.0).exp();
+                    ch[start + k] += 0.35
+                        * env
+                        * (2.0 * std::f64::consts::PI * 105.0 * (k as f64) / f64::from(sr)).sin();
+                }
+            }
+            let bpm = if t < 4.0 { 100.0 } else { 132.0 };
+            t += 60.0 / bpm;
+        }
+        AudioBuffer::from_channels(vec![ch.clone(), ch], sr)
+            .unwrap()
+            .save_wav(root.path().join("ai_song.wav"), 24)
+            .unwrap();
+
+        let kit_dir = root.path().join("kit");
+        std::fs::create_dir_all(&kit_dir).unwrap();
+        let kick: Vec<f64> = (0..1800)
+            .map(|i| {
+                0.8 * (-(i as f64) / 250.0).exp()
+                    * (2.0 * std::f64::consts::PI * 65.0 * (i as f64) / f64::from(sr)).sin()
+            })
+            .collect();
+        AudioBuffer::from_channels(vec![kick.clone(), kick], sr)
+            .unwrap()
+            .save_wav(kit_dir.join("kick.wav"), 24)
+            .unwrap();
+
+        let beats = call_tool(
+            &sb,
+            "forge_beat_track",
+            json!({ "input": "ai_song.wav", "hint_bpm": 115.0, "backend": "rust" }),
+        );
+        assert!(!is_error(&beats), "{}", text(&beats));
+        let beats_json: Value = serde_json::from_str(text(&beats)).unwrap();
+        assert_eq!(beats_json["backend"], "pure_rust_onset");
+        assert!(!beats_json["beats_secs"].as_array().unwrap().is_empty());
+
+        let eval = call_tool(
+            &sb,
+            "forge_evaluate_quality",
+            json!({ "input": "ai_song.wav", "reference": "ai_song.wav", "vocal": true, "backend": "rust" }),
+        );
+        assert!(!is_error(&eval), "{}", text(&eval));
+        let eval_json: Value = serde_json::from_str(text(&eval)).unwrap();
+        assert_eq!(eval_json["backend"], "rust-acoustic-proxy");
+
+        for (tool, args) in [
+            (
+                "forge_neural_restore",
+                json!({ "input": "../escape.wav", "output_dir": "out" }),
+            ),
+            (
+                "forge_vocal_rescue",
+                json!({ "input": "ai_song.wav", "output_dir": "out", "reference_voice": "../escape.wav" }),
+            ),
+            (
+                "forge_evaluate_quality",
+                json!({ "input": "ai_song.wav", "reference": "../escape.wav" }),
+            ),
+            (
+                "forge_ingest_to_reaper",
+                json!({ "input": "ai_song.wav", "output_dir": "sess", "drum_samples_dir": "../escape_kit" }),
+            ),
+        ] {
+            assert_tool_err_contains(&sb, tool, args, "");
+        }
+
+        let delivered = call_tool(
+            &sb,
+            "forge_deliver",
             json!({
-                "input": "mix.wav",
-                "output_dir": "denoised",
-                "backend": "nonexistent"
+                "input": "ai_song.wav",
+                "output": "ai_master.wav",
+                "ai_track_mode": true,
+                "hpss_shimmer": 0.4
             }),
         );
-        assert!(is_error(&bad_backend));
-        assert!(text(&bad_backend).contains("backend"));
+        assert!(!is_error(&delivered), "{}", text(&delivered));
+
+        let ingested = call_tool(
+            &sb,
+            "forge_ingest_to_reaper",
+            json!({
+                "input": "ai_song.wav",
+                "output_dir": "reaper_sess",
+                "bpm": 115.0,
+                "backend": "rust",
+                "drum_samples_dir": "kit",
+                "drum_replace_mix": 0.5
+            }),
+        );
+        assert!(!is_error(&ingested), "{}", text(&ingested));
+        let ingest_json: Value = serde_json::from_str(text(&ingested)).unwrap();
+        assert!(ingest_json["beat_grid"]["beats_detected"].as_u64().unwrap() > 0);
+        assert!(
+            root.path()
+                .join("reaper_sess/ForgeAudio_Session.rpp")
+                .is_file()
+        );
+        let rpp_txt =
+            std::fs::read_to_string(root.path().join("reaper_sess/ForgeAudio_Session.rpp"))
+                .unwrap();
+        if ingest_json["beat_grid"]["max_bpm_drift"]
+            .as_f64()
+            .unwrap_or(0.0)
+            >= 1.5
+        {
+            assert!(
+                rpp_txt.contains("<TEMPOENVEX"),
+                "expected <TEMPOENVEX> in .rpp"
+            );
+        }
+    }
+
+    #[test]
+    fn http_cli_bind_enforces_loopback_policy() {
+        let to_vec = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_cli_args(&[]).unwrap(), TransportMode::Stdio);
+        assert!(matches!(
+            parse_cli_args(&to_vec(&["--http", "127.0.0.1:8787"])).unwrap(),
+            TransportMode::Http {
+                allow_non_loopback: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_cli_args(&to_vec(&["--http", "[::1]:8787"])).unwrap(),
+            TransportMode::Http {
+                allow_non_loopback: false,
+                ..
+            }
+        ));
+        let rejected = parse_cli_args(&to_vec(&["--http", "0.0.0.0:8787"])).unwrap_err();
+        assert!(rejected.contains("loopback"), "{rejected}");
+        assert!(matches!(
+            parse_cli_args(&to_vec(&["--http", "0.0.0.0:8787", "--allow-non-loopback"])).unwrap(),
+            TransportMode::Http {
+                allow_non_loopback: true,
+                ..
+            }
+        ));
+    }
+
+    async fn rpc_roundtrip(
+        writer: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        lines: &mut tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        msg: &Value,
+    ) -> Value {
+        let line = serde_json::to_string(msg).expect("serialize request");
+        writer.write_all(line.as_bytes()).await.expect("write line");
+        writer.write_all(b"\n").await.expect("write newline");
+        writer.flush().await.expect("flush");
+        let resp_line = lines.next_line().await.expect("read line").expect("eof");
+        serde_json::from_str(&resp_line).expect("parse response")
+    }
+
+    fn meta_2026_07_28() -> Value {
+        json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": { "name": "test-client", "version": "1.0.0" },
+            "io.modelcontextprotocol/clientCapabilities": {}
+        })
+    }
+
+    type DuplexSession = (
+        tempfile::TempDir,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        tokio::task::JoinHandle<()>,
+    );
+
+    fn spawn_duplex_session() -> DuplexSession {
+        let (root, sb) = setup_mix_sandbox(0.05, 48_000);
+        let server = ForgeMcpServer::new(Arc::new(sb));
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let lines = BufReader::new(client_read).lines();
+        let server_task = tokio::spawn(async move {
+            let running = server.serve(server_io).await.expect("serve");
+            running.waiting().await.expect("wait");
+        });
+        (root, client_write, lines, server_task)
+    }
+
+    #[tokio::test]
+    async fn rmcp_2026_07_28_discover_tools_resources_and_prompts() {
+        let (_root, mut client_write, mut lines, server_task) = spawn_duplex_session();
+
+        let disc = rpc_roundtrip(
+            &mut client_write,
+            &mut lines,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "server/discover",
+                "params": { "_meta": meta_2026_07_28() }
+            }),
+        )
+        .await;
+        let versions = disc["result"]["supportedVersions"].as_array().unwrap();
+        assert!(versions.iter().any(|v| v == "2026-07-28"), "{disc}");
+
+        let list = rpc_roundtrip(
+            &mut client_write,
+            &mut lines,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": { "_meta": meta_2026_07_28() }
+            }),
+        )
+        .await;
+        let listed_tools = list["result"]["tools"].as_array().unwrap();
+        assert_eq!(listed_tools.len(), 18);
+        assert!(listed_tools[0]["outputSchema"].is_object());
+        assert!(listed_tools[0]["annotations"].is_object());
+        assert!(list["result"]["ttlMs"].is_number());
+
+        let call = rpc_roundtrip(
+            &mut client_write,
+            &mut lines,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "_meta": meta_2026_07_28(),
+                    "name": "forge_audit_audio",
+                    "arguments": { "path": "mix.wav" }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(call["result"]["resultType"], "complete");
+        assert_eq!(call["result"]["isError"], false);
+        assert!(call["result"]["structuredContent"]["integrated_lufs"].is_number());
+
+        let res_list = rpc_roundtrip(
+            &mut client_write,
+            &mut lines,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "resources/list",
+                "params": { "_meta": meta_2026_07_28() }
+            }),
+        )
+        .await;
+        assert_eq!(res_list["result"]["resources"].as_array().unwrap().len(), 3);
+
+        for uri in ["forge://targets", "forge://models", "forge://roots"] {
+            let read = rpc_roundtrip(
+                &mut client_write,
+                &mut lines,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "resources/read",
+                    "params": { "_meta": meta_2026_07_28(), "uri": uri }
+                }),
+            )
+            .await;
+            assert!(
+                read["result"]["contents"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with('{'),
+                "{uri}: {read}"
+            );
+        }
+
+        let bad_res = rpc_roundtrip(
+            &mut client_write,
+            &mut lines,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "resources/read",
+                "params": { "_meta": meta_2026_07_28(), "uri": "forge://missing" }
+            }),
+        )
+        .await;
+        assert_eq!(bad_res["error"]["code"], json!(-32602));
+
+        let prompts = rpc_roundtrip(
+            &mut client_write,
+            &mut lines,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "prompts/list",
+                "params": { "_meta": meta_2026_07_28() }
+            }),
+        )
+        .await;
+        assert_eq!(prompts["result"]["prompts"].as_array().unwrap().len(), 3);
+
+        let prompt = rpc_roundtrip(
+            &mut client_write,
+            &mut lines,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "prompts/get",
+                "params": {
+                    "_meta": meta_2026_07_28(),
+                    "name": "master_ai_track",
+                    "arguments": { "input_wav": "mix.wav", "target": "spotify" }
+                }
+            }),
+        )
+        .await;
+        assert!(
+            prompt["result"]["messages"][0]["content"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("mix.wav")
+        );
+
+        drop(client_write);
+        drop(lines);
+        server_task.await.expect("server shutdown");
+    }
+
+    #[tokio::test]
+    async fn rmcp_legacy_initialize_versions_negotiate_cleanly() {
+        for version in ["2025-11-25", "2024-11-05"] {
+            let (_root, mut client_write, mut lines, server_task) = spawn_duplex_session();
+
+            let init = rpc_roundtrip(
+                &mut client_write,
+                &mut lines,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": version,
+                        "capabilities": {},
+                        "clientInfo": { "name": "legacy-test", "version": "0.1" }
+                    }
+                }),
+            )
+            .await;
+            assert_eq!(init["result"]["protocolVersion"], json!(version), "{init}");
+            assert_eq!(init["result"]["serverInfo"]["name"], json!("forge-mcp"));
+
+            let notif = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }))
+            .unwrap();
+            client_write.write_all(notif.as_bytes()).await.unwrap();
+            client_write.write_all(b"\n").await.unwrap();
+            client_write.flush().await.unwrap();
+
+            let list = rpc_roundtrip(
+                &mut client_write,
+                &mut lines,
+                &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+            )
+            .await;
+            assert!(list["result"].get("resultType").is_none(), "{list}");
+            assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 18);
+
+            let call = rpc_roundtrip(
+                &mut client_write,
+                &mut lines,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": { "name": "forge_audit_audio", "arguments": { "path": "mix.wav" } }
+                }),
+            )
+            .await;
+            assert!(call["result"].get("resultType").is_none(), "{call}");
+            assert_eq!(call["result"]["isError"], json!(false));
+
+            drop(client_write);
+            drop(lines);
+            server_task.await.expect("server shutdown");
+        }
+    }
+
+    #[test]
+    fn http_policy_enforces_token_on_non_loopback_and_keeps_loopback_host_check() {
+        let loop_addr: SocketAddr = "127.0.0.1:8787".parse().unwrap();
+        let any_addr: SocketAddr = "0.0.0.0:8787".parse().unwrap();
+
+        let (disable_host, tok) = resolve_http_policy(loop_addr, true, None).unwrap();
+        assert!(!disable_host, "loopback must keep Host-header validation");
+        assert!(tok.is_none());
+
+        assert!(resolve_http_policy(any_addr, false, Some("secret")).is_err());
+        assert!(resolve_http_policy(any_addr, true, None).is_err());
+        assert!(resolve_http_policy(any_addr, true, Some("   ")).is_err());
+
+        let (disable_host, tok) = resolve_http_policy(any_addr, true, Some("my-secret")).unwrap();
+        assert!(disable_host);
+        assert_eq!(tok.as_deref(), Some("my-secret"));
+    }
+
+    #[tokio::test]
+    async fn http_bearer_auth_and_loopback_host_check_enforce_access_control() {
+        use tokio::io::AsyncReadExt;
+        let (_root, sb) = setup_mix_sandbox(0.05, 48_000);
+        let server = ForgeMcpServer::new(Arc::new(sb));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let config = StreamableHttpServerConfig::default();
+        let ct = config.cancellation_token.clone();
+        let handle = tokio::spawn(async move {
+            run_http_on_listener(server, listener, config, Some(Arc::from("s3cr3t"))).await;
+        });
+
+        async fn send_http(addr: SocketAddr, req_head: &str) -> String {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream.write_all(req_head.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+
+        let no_auth = send_http(
+            local_addr,
+            &format!("POST / HTTP/1.1\r\nHost: {local_addr}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"),
+        )
+        .await;
+        assert!(no_auth.starts_with("HTTP/1.1 401 "), "{no_auth}");
+
+        let wrong_auth = send_http(
+            local_addr,
+            &format!(
+                "POST / HTTP/1.1\r\nHost: {local_addr}\r\nConnection: close\r\nAuthorization: Bearer wrong\r\nContent-Length: 0\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(wrong_auth.starts_with("HTTP/1.1 401 "), "{wrong_auth}");
+
+        let bad_host = send_http(
+            local_addr,
+            "POST / HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\nAuthorization: Bearer s3cr3t\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(
+            bad_host.starts_with("HTTP/1.1 403 ") || bad_host.starts_with("HTTP/1.1 421 "),
+            "expected Host rejection on loopback, got: {bad_host}"
+        );
+
+        let valid_auth = send_http(
+            local_addr,
+            &format!(
+                "POST / HTTP/1.1\r\nHost: {local_addr}\r\nConnection: close\r\nAuthorization: Bearer s3cr3t\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: 2\r\n\r\n{{}}"
+            ),
+        )
+        .await;
+        assert!(
+            !valid_auth.starts_with("HTTP/1.1 401 ") && !valid_auth.starts_with("HTTP/1.1 403 "),
+            "valid auth+host was unexpectedly rejected: {valid_auth}"
+        );
+
+        ct.cancel();
+        let _ = handle.await;
+    }
+
+    #[test]
+    fn quantize_stems_syncs_assets_and_session_uses_per_stem_sample_rate_duration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 44.1 kHz vocal & drum stems lasting exactly 2.0 seconds (88,200 frames)
+        let sr = 44_100_u32;
+        let frames = (sr as usize) * 2;
+        let mut voc = vec![0.0_f64; frames];
+        let mut drm = vec![0.0_f64; frames];
+        for (i, s) in voc.iter_mut().enumerate() {
+            let t = (i as f64) / f64::from(sr);
+            if (1.15..=1.65).contains(&t) {
+                *s = 0.45 * (2.0 * std::f64::consts::PI * 220.0 * t).sin();
+            }
+        }
+        // Place a clear drum hit at t = 1.25 s (delayed beat 2 before quantize onto 120 BPM)
+        let hit_smp = (1.25 * f64::from(sr)) as usize;
+        for k in 0..400 {
+            if hit_smp + k < frames {
+                drm[hit_smp + k] = 0.85 * (-(k as f64) / 80.0).exp();
+            }
+        }
+        let voc_buf = AudioBuffer::from_channels(vec![voc.clone(), voc], sr).expect("voc");
+        let drm_buf = AudioBuffer::from_channels(vec![drm.clone(), drm], sr).expect("drm");
+        assert!((handlers::buffer_duration_secs(&voc_buf) - 2.0).abs() < 1e-6);
+
+        let scale = forge_vocal::VocalScale::parse("C major").expect("scale");
+        let unquant_drum = forge_theory::extract_drum_midi_triggers(&drm_buf, 120.0, 480);
+        let beats = [0.0, 0.55, 1.25, 1.85];
+        let mut stems = vec![
+            (dir.path().join("voc.wav"), voc_buf),
+            (dir.path().join("drm.wav"), drm_buf),
+        ];
+        let (q_pitch, q_drums) = handlers::quantize_stems_and_sync_assets(
+            &mut stems,
+            Some(0),
+            Some(1),
+            &beats,
+            120.0,
+            &scale,
+        )
+        .expect("quantize");
+        assert!(!q_pitch.is_empty());
+        let (k_q, s_q, h_q) = q_drums.expect("drum midi present");
+        let orig_ticks: Vec<u32> = unquant_drum
+            .0
+            .iter()
+            .chain(&unquant_drum.1)
+            .chain(&unquant_drum.2)
+            .map(|n| n.start_tick)
+            .collect();
+        let quant_ticks: Vec<u32> = k_q
+            .iter()
+            .chain(&s_q)
+            .chain(&h_q)
+            .map(|n| n.start_tick)
+            .collect();
+        assert_ne!(
+            orig_ticks, quant_ticks,
+            "expected quantized MIDI ticks to shift"
+        );
+
+        let spec = SessionSpec {
+            bpm: 120.0,
+            sample_rate: 48_000,
+            duration_secs: 2.0,
+            vocal_duration_secs: 2.0,
+            drums_duration_secs: 2.0,
+            bass_duration_secs: 2.0,
+            other_duration_secs: 2.0,
+            guitar_duration_secs: 2.0,
+            keys_duration_secs: 2.0,
+            vocal: Some(dir.path().join("voc.wav")),
+            drums: None,
+            bass: None,
+            other: None,
+            guitar: None,
+            keys: None,
+            vocal_pitch_frames: q_pitch,
+            tempo_map: Vec::new(),
+            chords_midi: dir.path().join("chords.mid"),
+            drum_midi: dir.path().join("drums.mid"),
+        };
+        let rpp = build_session(spec).build_rpp_string();
+        assert!(
+            rpp.contains("LENGTH 2.0000"),
+            "expected 2.0 s LENGTH even at 48k session SR: {rpp}"
+        );
     }
 }

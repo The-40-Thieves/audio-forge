@@ -1,0 +1,79 @@
+desc:ForgeAudio - SplitEQ 3-Band Transient & Tonal Shaper
+//tags: equalizer transient tonal split
+//author: ForgeAudio (Apache-2.0)
+
+slider1:0.0<-12.0,12.0,0.1>Transient Low (<250 Hz, dB)
+slider2:0.0<-12.0,12.0,0.1>Transient Mid (0.25-3.2 kHz, dB)
+slider3:0.0<-12.0,12.0,0.1>Transient High (>3.2 kHz, dB)
+slider4:0.0<-12.0,12.0,0.1>Tonal Low (<250 Hz, dB)
+slider5:0.0<-12.0,12.0,0.1>Tonal Mid (0.25-3.2 kHz, dB)
+slider6:0.0<-12.0,12.0,0.1>Tonal High (>3.2 kHz, dB)
+
+@init
+srate_safe = max(srate, 44100);
+ic1_l0 = 0; ic2_l0 = 0; ic1_l1 = 0; ic2_l1 = 0;
+ic1_h0 = 0; ic2_h0 = 0; ic1_h1 = 0; ic2_h1 = 0;
+f_lo = 0; s_lo = 0;
+f_mid = 0; s_mid = 0;
+f_hi = 0; s_hi = 0;
+fast_a = exp(-1.0 / (srate_safe * 0.0015));
+slow_a = exp(-1.0 / (srate_safe * 0.045));
+
+@slider
+tr_lo_g = 10 ^ (slider1 / 20);
+tr_mid_g = 10 ^ (slider2 / 20);
+tr_hi_g = 10 ^ (slider3 / 20);
+tn_lo_g = 10 ^ (slider4 / 20);
+tn_mid_g = 10 ^ (slider5 / 20);
+tn_hi_g = 10 ^ (slider6 / 20);
+
+g_lo = tan($pi * min(250.0, srate_safe * 0.45) / srate_safe);
+k_svf = 1.41421356;
+a1_lo = 1.0 / (1.0 + g_lo * (g_lo + k_svf));
+a2_lo = g_lo * a1_lo;
+a3_lo = g_lo * a2_lo;
+
+g_hi = tan($pi * min(3200.0, srate_safe * 0.45) / srate_safe);
+a1_hi = 1.0 / (1.0 + g_hi * (g_hi + k_svf));
+a2_hi = g_hi * a1_hi;
+a3_hi = g_hi * a2_hi;
+
+@sample
+// 3-band Cytomic complementary split
+v3 = spl0 - ic2_l0; v1 = a1_lo * ic1_l0 + a2_lo * v3; v2 = ic2_l0 + a2_lo * ic1_l0 + a3_lo * v3;
+ic1_l0 = 2.0 * v1 - ic1_l0; ic2_l0 = 2.0 * v2 - ic2_l0;
+lo0 = v2; rem0 = spl0 - lo0;
+
+v3 = spl1 - ic2_l1; v1 = a1_lo * ic1_l1 + a2_lo * v3; v2 = ic2_l1 + a2_lo * ic1_l1 + a3_lo * v3;
+ic1_l1 = 2.0 * v1 - ic1_l1; ic2_l1 = 2.0 * v2 - ic2_l1;
+lo1 = v2; rem1 = spl1 - lo1;
+
+v3 = rem0 - ic2_h0; v1 = a1_hi * ic1_h0 + a2_hi * v3; v2 = ic2_h0 + a2_hi * ic1_h0 + a3_hi * v3;
+ic1_h0 = 2.0 * v1 - ic1_h0; ic2_h0 = 2.0 * v2 - ic2_h0;
+mid0 = v2; hi0 = rem0 - mid0;
+
+v3 = rem1 - ic2_h1; v1 = a1_hi * ic1_h1 + a2_hi * v3; v2 = ic2_h1 + a2_hi * ic1_h1 + a3_hi * v3;
+ic1_h1 = 2.0 * v1 - ic1_h1; ic2_h1 = 2.0 * v2 - ic2_h1;
+mid1 = v2; hi1 = rem1 - mid1;
+
+// Fast vs slow stereo envelope partition per band (strict partition of unity)
+abs_lo = max(abs(lo0), abs(lo1));
+f_lo = fast_a * f_lo + (1.0 - fast_a) * abs_lo;
+s_lo = slow_a * s_lo + (1.0 - slow_a) * abs_lo;
+tr_w_lo = f_lo > 1e-8 ? min(1.0, max(0.0, (f_lo - s_lo) / (f_lo + 1e-8) * 2.2)) : 0.0;
+g_lo_eff = tr_w_lo * tr_lo_g + (1.0 - tr_w_lo) * tn_lo_g;
+
+abs_mid = max(abs(mid0), abs(mid1));
+f_mid = fast_a * f_mid + (1.0 - fast_a) * abs_mid;
+s_mid = slow_a * s_mid + (1.0 - slow_a) * abs_mid;
+tr_w_mid = f_mid > 1e-8 ? min(1.0, max(0.0, (f_mid - s_mid) / (f_mid + 1e-8) * 2.2)) : 0.0;
+g_mid_eff = tr_w_mid * tr_mid_g + (1.0 - tr_w_mid) * tn_mid_g;
+
+abs_hi = max(abs(hi0), abs(hi1));
+f_hi = fast_a * f_hi + (1.0 - fast_a) * abs_hi;
+s_hi = slow_a * s_hi + (1.0 - slow_a) * abs_hi;
+tr_w_hi = f_hi > 1e-8 ? min(1.0, max(0.0, (f_hi - s_hi) / (f_hi + 1e-8) * 2.2)) : 0.0;
+g_hi_eff = tr_w_hi * tr_hi_g + (1.0 - tr_w_hi) * tn_hi_g;
+
+spl0 = lo0 * g_lo_eff + mid0 * g_mid_eff + hi0 * g_hi_eff;
+spl1 = lo1 * g_lo_eff + mid1 * g_mid_eff + hi1 * g_hi_eff;

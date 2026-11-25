@@ -6,7 +6,7 @@
 //! anchored I/O every case fails, which the tests assert.
 
 use crate::anchored::test_hook;
-use crate::handle_request;
+use crate::handlers::call_tool_result;
 use crate::sandbox::PathSandbox;
 use forge_core::AudioBuffer;
 use serde_json::{Value, json};
@@ -26,18 +26,14 @@ impl Drop for HookGuard {
 }
 
 fn call_tool(sandbox: &PathSandbox, name: &str, arguments: Value) -> (bool, String) {
-    let resp = handle_request(
-        json!(1),
-        "tools/call",
-        &json!({ "name": name, "arguments": arguments }),
-        sandbox,
-    );
-    let result = resp.result.expect("tool result");
-    let text = result["content"][0]["text"].as_str().unwrap_or_default();
-    (
-        result["isError"].as_bool().expect("isError"),
-        text.to_string(),
-    )
+    let result = call_tool_result(name, &arguments, sandbox);
+    let text = result
+        .content
+        .first()
+        .and_then(|block| block.as_text())
+        .map(|t| t.text.clone())
+        .unwrap_or_default();
+    (result.is_error.unwrap_or(false), text)
 }
 
 /// Two seconds of a stereo tone, enough for every analysis stage.

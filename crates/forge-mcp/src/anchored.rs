@@ -18,7 +18,7 @@ use forge_reaper::ReaperProjectBuilder;
 use forge_theory::{NoteEvent, write_midi_to_writer};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 impl PathSandbox {
     /// Runs `op` with the root handle containing `path` and the root-relative path.
@@ -81,6 +81,47 @@ impl PathSandbox {
             } else {
                 dir.open_dir(rel).map(drop)
             }
+        })
+    }
+
+    /// Lists regular files matching ASCII extension `ext` inside a sandboxed directory through the
+    /// `cap-std` root handle, bounding both inspected directory entries and returned paths.
+    pub fn list_files_with_ext(
+        &self,
+        path: &Path,
+        ext: &str,
+        max_entries: usize,
+    ) -> Result<Vec<PathBuf>, ForgeError> {
+        const MAX_SCAN: usize = 4096;
+        self.anchored(path, |root_dir, rel| {
+            let entries = if rel.as_os_str().is_empty() {
+                root_dir.entries()?
+            } else {
+                root_dir.open_dir(rel)?.entries()?
+            };
+            let mut out = Vec::new();
+            for (seen, entry) in entries.enumerate() {
+                if seen >= MAX_SCAN {
+                    break;
+                }
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let file_name = entry.file_name();
+                if Path::new(&file_name)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+                {
+                    out.push(path.join(file_name));
+                    if out.len() >= max_entries {
+                        break;
+                    }
+                }
+            }
+            out.sort();
+            Ok(out)
         })
     }
 

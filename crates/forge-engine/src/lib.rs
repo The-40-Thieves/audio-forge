@@ -17,12 +17,13 @@ pub mod project;
 pub mod renderer;
 
 pub use audio_io::{LiveAudioEngine, LiveRecorder};
+pub use forge_dsp::{BeatGridReport, TempoPoint, analyze_beat_grid, resample_buffer_sinc};
 pub use fx::FxProcessor;
 pub use midi::{MidiClip, MidiNote, PolySynth, SynthPreset};
 pub use project::{
     AudioObject, AutomationLane, AutomationPoint, AuxBus, DawProject, DawProjectSummary, FadeCurve,
-    FxSlotConfig, MAX_PROJECT_JSON_BYTES, MAX_UNDO_DEPTH, ObjectEq3, PROJECT_SCHEMA_VERSION,
-    TimelineMarker, Track, TrackSend, UndoStack, WaveformPeaks,
+    FxSlotConfig, MAX_PROJECT_JSON_BYTES, MAX_TEMPO_POINTS, MAX_UNDO_DEPTH, ObjectEq3,
+    PROJECT_SCHEMA_VERSION, TimelineMarker, Track, TrackSend, UndoStack, WaveformPeaks,
 };
 pub use renderer::{ClipCache, EngineMeters, ObjectOrientedEngine, resample_buffer_linear};
 
@@ -509,5 +510,505 @@ mod tests {
         // Oversized JSON payload (> 16 MiB) must fail fast before serde parsing.
         let oversized = format!(r#"{{"name":"{}"}}"#, "a".repeat(17 * 1024 * 1024));
         assert!(DawProject::from_json(&oversized).is_err());
+    }
+
+    #[test]
+    fn legacy_forgeproj_json_deserializes_with_defaults_and_tempo_map_roundtrips() {
+        let mut val = serde_json::to_value(DawProject::new("LegacyCompat", 48_000, 120.0)).unwrap();
+        let obj = val.as_object_mut().unwrap();
+        obj.remove("tempo_map");
+        val["tracks"][0]["inserts"] = serde_json::json!([{
+            "OpenSoothe": {
+                "bypass": false,
+                "sensitivity_db": 3.5,
+                "max_depth_db": 9.0,
+                "sharpness_bins": 10,
+                "low_latency": true,
+                "tilt_db_per_oct": 0.0
+            }
+        }]);
+        let mut loaded =
+            DawProject::from_json(&serde_json::to_string(&val).unwrap()).expect("legacy json");
+        assert!(loaded.tempo_map.is_empty());
+        assert!(matches!(
+            loaded.tracks[0].inserts[0],
+            FxSlotConfig::OpenSoothe {
+                stereo_link,
+                ultrasonic_lpf_hz,
+                hard_mode: false,
+                ..
+            } if (stereo_link - 1.0).abs() < 1e-6 && ultrasonic_lpf_hz == 0.0
+        ));
+
+        loaded.tempo_map = vec![
+            TempoPoint {
+                time_secs: 0.0,
+                bpm: 120.0,
+                time_sig_num: 4,
+                time_sig_den: 4,
+            },
+            TempoPoint {
+                time_secs: 2.0,
+                bpm: 150.0,
+                time_sig_num: 4,
+                time_sig_den: 4,
+            },
+        ];
+        // At 2.0 s @ 120 BPM => 4.0 beats; +1.2 s @ 150 BPM (+3.0 beats) => 7.0 beats at 3.2 s
+        assert!((loaded.secs_to_beat(3.2) - 7.0).abs() < 1e-9);
+        assert!((loaded.beat_to_secs(7.0) - 3.2).abs() < 1e-9);
+        assert!((loaded.bpm_at_secs(2.5) - 150.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bounce_offline_runs_all_expanded_fx_slots_cleanly() {
+        let mut proj = DawProject::new("ParityFx", 48_000, 120.0);
+        let mut cache = ClipCache::default();
+        let clip_path = PathBuf::from("mem://parity_tone.wav");
+        cache.insert_memory_clip(clip_path.clone(), sine_clip(48_000, 4_800, 220.0, 0.35));
+        let mut obj = AudioObject::new(1, "Tone", clip_path, 4_800);
+        obj.fx_chain = vec![
+            FxSlotConfig::OpenSoothe {
+                bypass: false,
+                sensitivity_db: 3.0,
+                max_depth_db: 9.0,
+                sharpness_bins: 10,
+                low_latency: true,
+                tilt_db_per_oct: -0.5,
+                ultrasonic_lpf_hz: 16_500.0,
+                mid_side_balance: 0.25,
+                stereo_link: 0.75,
+                hard_mode: true,
+            },
+            FxSlotConfig::default_open_spacer(),
+            FxSlotConfig::default_phase_match_eq(),
+            FxSlotConfig::default_neural_preamp(),
+            FxSlotConfig::default_drum_trigger(),
+        ];
+        proj.tracks[0].objects.push(obj);
+        let bounced = ObjectOrientedEngine::bounce_offline(&proj, &cache, 4_800).expect("bounce");
+        assert_eq!(bounced.num_frames(), 4_800);
+        assert!(bounced.channels.iter().flatten().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn open_spacer_bypasses_when_unconnected_and_ducks_from_sidechain_track() {
+        let frames = 16_000;
+        let mut cache = ClipCache::default();
+        let clip_target = PathBuf::from("mem://spacer_target.wav");
+        let clip_sc = PathBuf::from("mem://spacer_sc.wav");
+        cache.insert_memory_clip(clip_target.clone(), sine_clip(48_000, frames, 1_000.0, 0.5));
+        cache.insert_memory_clip(clip_sc.clone(), sine_clip(48_000, frames, 1_000.0, 0.6));
+
+        // 1. Isolated target with unconnected OpenSpacer (sidechain_track_id: None) -> full bypass
+        let mut isolated = DawProject::new("SpacerBypass", 48_000, 120.0);
+        isolated.tracks[0].objects.push(AudioObject::new(
+            10,
+            "Bed",
+            clip_target.clone(),
+            frames as u64,
+        ));
+        let dry = ObjectOrientedEngine::bounce_offline(&isolated, &cache, frames).expect("dry");
+        isolated.tracks[0]
+            .inserts
+            .push(FxSlotConfig::default_open_spacer());
+        let bypassed =
+            ObjectOrientedEngine::bounce_offline(&isolated, &cache, frames).expect("bypassed");
+        let max_diff = dry.channels[0]
+            .iter()
+            .zip(&bypassed.channels[0])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_diff < 1e-6,
+            "unconnected OpenSpacer attenuated isolated target: max_diff={max_diff}"
+        );
+
+        // 2. Routed sidechain track ducks target when unmuted and stays clean when sidechain muted
+        let mut routed = DawProject::new("SpacerRouted", 48_000, 120.0);
+        let sc_track_id = routed.tracks[1].id;
+        routed.tracks[0]
+            .objects
+            .push(AudioObject::new(11, "Bed", clip_target, frames as u64));
+        routed.tracks[0].inserts.push(FxSlotConfig::OpenSpacer {
+            bypass: false,
+            amount: 1.0,
+            max_cut_db: 18.0,
+            low_hz: 200.0,
+            high_hz: 8_000.0,
+            mid_side_balance: 0.0,
+            delta_listen: false,
+            sidechain_track_id: Some(sc_track_id),
+        });
+        routed.tracks[1]
+            .objects
+            .push(AudioObject::new(12, "Key", clip_sc, frames as u64));
+        routed.tracks[1].gain_db = -60.0; // silence key track's mix bleed while keeping pre-insert sidechain hot
+
+        routed.tracks[1].mute = true;
+        let sc_muted =
+            ObjectOrientedEngine::bounce_offline(&routed, &cache, frames).expect("sc muted");
+        routed.tracks[1].mute = false;
+        let sc_active =
+            ObjectOrientedEngine::bounce_offline(&routed, &cache, frames).expect("sc active");
+
+        let rms = |buf: &forge_core::AudioBuffer| -> f64 {
+            let tail = &buf.channels[0][frames / 2..];
+            (tail.iter().map(|s| s * s).sum::<f64>() / (tail.len() as f64)).sqrt()
+        };
+        let rms_muted = rms(&sc_muted);
+        let rms_active = rms(&sc_active);
+        assert!(
+            rms_active < rms_muted * 0.85,
+            "expected routed OpenSpacer sidechain to duck target: rms_muted={rms_muted}, rms_active={rms_active}"
+        );
+    }
+
+    #[test]
+    fn open_spacer_pdc_matches_missing_self_and_aux_master_sidechains() {
+        let frames = 16_000;
+        let mut cache = ClipCache::default();
+        let clip_target = PathBuf::from("mem://spacer_edge_target.wav");
+        let clip_sc = PathBuf::from("mem://spacer_edge_sc.wav");
+        cache.insert_memory_clip(clip_target.clone(), sine_clip(48_000, frames, 1_000.0, 0.5));
+        cache.insert_memory_clip(clip_sc.clone(), sine_clip(48_000, frames, 1_000.0, 0.6));
+
+        // 1. Missing or self sidechain ID reports 0 PDC and passes audio bit-identically
+        let mut base = DawProject::new("SpacerMissingSelf", 48_000, 120.0);
+        base.master_inserts.clear();
+        base.aux_buses.clear();
+        base.tracks[0].objects.push(AudioObject::new(
+            10,
+            "Bed",
+            clip_target.clone(),
+            frames as u64,
+        ));
+        let dry = ObjectOrientedEngine::bounce_offline(&base, &cache, frames).expect("dry");
+
+        let mut missing_proj = base.clone();
+        missing_proj.tracks[0]
+            .inserts
+            .push(FxSlotConfig::OpenSpacer {
+                bypass: false,
+                amount: 1.0,
+                max_cut_db: 18.0,
+                low_hz: 200.0,
+                high_hz: 8_000.0,
+                mid_side_balance: 0.0,
+                delta_listen: false,
+                sidechain_track_id: Some(999_999),
+            });
+        let mut engine = ObjectOrientedEngine::compile(&missing_proj, &cache);
+        assert_eq!(engine.total_pdc_samples(), 0);
+        let missing_buf =
+            ObjectOrientedEngine::bounce_offline(&missing_proj, &cache, frames).expect("missing");
+        let max_diff_missing = dry.channels[0]
+            .iter()
+            .zip(&missing_buf.channels[0])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(max_diff_missing < 1e-6);
+
+        let mut self_proj = missing_proj.clone();
+        self_proj.tracks[0].inserts[0] = FxSlotConfig::OpenSpacer {
+            bypass: false,
+            amount: 1.0,
+            max_cut_db: 18.0,
+            low_hz: 200.0,
+            high_hz: 8_000.0,
+            mid_side_balance: 0.0,
+            delta_listen: false,
+            sidechain_track_id: Some(self_proj.tracks[0].id),
+        };
+        assert_eq!(
+            ObjectOrientedEngine::compile(&self_proj, &cache).total_pdc_samples(),
+            0
+        );
+        let self_buf =
+            ObjectOrientedEngine::bounce_offline(&self_proj, &cache, frames).expect("self");
+        let max_diff_self = dry.channels[0]
+            .iter()
+            .zip(&self_buf.channels[0])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(max_diff_self < 1e-6);
+
+        // Switching missing sidechain ID -> valid non-self track ID invalidates topology
+        let mut valid_proj = missing_proj.clone();
+        let sc_track_id = valid_proj.tracks[1].id;
+        valid_proj.tracks[0].inserts[0] = FxSlotConfig::OpenSpacer {
+            bypass: false,
+            amount: 1.0,
+            max_cut_db: 18.0,
+            low_hz: 200.0,
+            high_hz: 8_000.0,
+            mid_side_balance: 0.0,
+            delta_listen: false,
+            sidechain_track_id: Some(sc_track_id),
+        };
+        assert!(!ObjectOrientedEngine::topology_compatible(
+            &missing_proj,
+            &valid_proj
+        ));
+        assert!(!engine.sync_mix_params(&valid_proj));
+        assert_eq!(
+            ObjectOrientedEngine::compile(&valid_proj, &cache).total_pdc_samples(),
+            2048
+        );
+
+        let rms = |buf: &forge_core::AudioBuffer| -> f64 {
+            let tail = &buf.channels[0][frames / 2..];
+            (tail.iter().map(|s| s * s).sum::<f64>() / (tail.len() as f64)).sqrt()
+        };
+
+        // 2. Aux-bus OpenSpacer resolves external track sidechain and aligns PDC
+        let mut aux_proj = DawProject::new("AuxSpacer", 48_000, 120.0);
+        aux_proj.master_inserts.clear();
+        aux_proj.aux_buses.clear();
+        let aux_sc_id = aux_proj.tracks[1].id;
+        let bus_id = aux_proj.add_aux_bus("SpacerReturn");
+        aux_proj.tracks[0].objects.push(AudioObject::new(
+            11,
+            "Bed",
+            clip_target.clone(),
+            frames as u64,
+        ));
+        aux_proj.tracks[0].gain_db = -60.0;
+        aux_proj.tracks[0].sends.push(TrackSend {
+            bus_id,
+            gain_db: 0.0,
+            pre_fader: true,
+            mute: false,
+        });
+        aux_proj.aux_buses[0]
+            .inserts
+            .push(FxSlotConfig::OpenSpacer {
+                bypass: false,
+                amount: 1.0,
+                max_cut_db: 18.0,
+                low_hz: 200.0,
+                high_hz: 8_000.0,
+                mid_side_balance: 0.0,
+                delta_listen: false,
+                sidechain_track_id: Some(aux_sc_id),
+            });
+        aux_proj.tracks[1].objects.push(AudioObject::new(
+            12,
+            "Key",
+            clip_sc.clone(),
+            frames as u64,
+        ));
+        aux_proj.tracks[1].gain_db = -60.0;
+        assert_eq!(
+            ObjectOrientedEngine::compile(&aux_proj, &cache).total_pdc_samples(),
+            2048
+        );
+        aux_proj.tracks[1].mute = true;
+        let aux_muted =
+            ObjectOrientedEngine::bounce_offline(&aux_proj, &cache, frames).expect("aux muted");
+        aux_proj.tracks[1].mute = false;
+        let aux_active =
+            ObjectOrientedEngine::bounce_offline(&aux_proj, &cache, frames).expect("aux active");
+        assert!(
+            rms(&aux_active) < rms(&aux_muted) * 0.85,
+            "expected aux OpenSpacer sidechain ducking: muted={}, active={}",
+            rms(&aux_muted),
+            rms(&aux_active)
+        );
+
+        // 3. Master-bus OpenSpacer resolves external track sidechain and aligns PDC
+        let mut master_proj = DawProject::new("MasterSpacer", 48_000, 120.0);
+        master_proj.master_inserts.clear();
+        master_proj.aux_buses.clear();
+        let master_sc_id = master_proj.tracks[1].id;
+        master_proj.tracks[0]
+            .objects
+            .push(AudioObject::new(13, "Bed", clip_target, frames as u64));
+        master_proj.master_inserts.push(FxSlotConfig::OpenSpacer {
+            bypass: false,
+            amount: 1.0,
+            max_cut_db: 18.0,
+            low_hz: 200.0,
+            high_hz: 8_000.0,
+            mid_side_balance: 0.0,
+            delta_listen: false,
+            sidechain_track_id: Some(master_sc_id),
+        });
+        master_proj.tracks[1]
+            .objects
+            .push(AudioObject::new(14, "Key", clip_sc, frames as u64));
+        master_proj.tracks[1].gain_db = -60.0;
+        assert_eq!(
+            ObjectOrientedEngine::compile(&master_proj, &cache).total_pdc_samples(),
+            2048
+        );
+        master_proj.tracks[1].mute = true;
+        let m_muted =
+            ObjectOrientedEngine::bounce_offline(&master_proj, &cache, frames).expect("m muted");
+        master_proj.tracks[1].mute = false;
+        let m_active =
+            ObjectOrientedEngine::bounce_offline(&master_proj, &cache, frames).expect("m active");
+        assert!(
+            rms(&m_active) < rms(&m_muted) * 0.85,
+            "expected master OpenSpacer sidechain ducking: muted={}, active={}",
+            rms(&m_muted),
+            rms(&m_active)
+        );
+    }
+
+    #[test]
+    fn open_spacer_aux_and_master_sidechain_keys_align_with_track_and_aux_pdc() {
+        let frames = 30_000_usize;
+        let mut cache = ClipCache::default();
+        let bed_path = PathBuf::from("mem://sc_pdc_bed.wav");
+        let key_path = PathBuf::from("mem://sc_pdc_key.wav");
+
+        cache.insert_memory_clip(bed_path.clone(), sine_clip(48_000, frames, 1_000.0, 0.5));
+
+        let mut key_ch = vec![0.0_f64; frames];
+        for (i, sample) in key_ch.iter_mut().enumerate().skip(16_000) {
+            *sample = 0.7 * (2.0 * PI * 1_000.0 * (i as f64) / 48_000.0).sin();
+        }
+        cache.insert_memory_clip(
+            key_path.clone(),
+            AudioBuffer::from_channels(vec![key_ch.clone(), key_ch], 48_000).expect("key clip"),
+        );
+
+        let zero_depth_soothe = FxSlotConfig::OpenSoothe {
+            bypass: false,
+            sensitivity_db: 0.0,
+            max_depth_db: 0.0,
+            sharpness_bins: 10,
+            low_latency: false,
+            tilt_db_per_oct: 0.0,
+            ultrasonic_lpf_hz: 0.0,
+            mid_side_balance: 0.0,
+            stereo_link: 1.0,
+            hard_mode: false,
+        };
+
+        let window_rms = |buf: &forge_core::AudioBuffer, start: usize, end: usize| -> f64 {
+            let slice = &buf.channels[0][start..end];
+            (slice.iter().map(|s| s * s).sum::<f64>() / (slice.len() as f64)).sqrt()
+        };
+
+        // 1. Aux-bus OpenSpacer aligns with 4096-sample track PDC (two OpenSoothe inserts on Bed)
+        let mut aux_proj = DawProject::new("AuxScPdcAlign", 48_000, 120.0);
+        aux_proj.master_inserts.clear();
+        aux_proj.aux_buses.clear();
+        let sc_track_id = aux_proj.tracks[1].id;
+        let bus_id = aux_proj.add_aux_bus("SpacerReturn");
+        aux_proj.tracks[0].objects.push(AudioObject::new(
+            20,
+            "Bed",
+            bed_path.clone(),
+            frames as u64,
+        ));
+        aux_proj.tracks[0].inserts.push(zero_depth_soothe.clone());
+        aux_proj.tracks[0].inserts.push(zero_depth_soothe.clone());
+        aux_proj.tracks[0].gain_db = -60.0;
+        aux_proj.tracks[0].sends.push(TrackSend {
+            bus_id,
+            gain_db: 0.0,
+            pre_fader: true,
+            mute: false,
+        });
+        aux_proj.aux_buses[0]
+            .inserts
+            .push(FxSlotConfig::OpenSpacer {
+                bypass: false,
+                amount: 1.0,
+                max_cut_db: 18.0,
+                low_hz: 200.0,
+                high_hz: 8_000.0,
+                mid_side_balance: 0.0,
+                delta_listen: false,
+                sidechain_track_id: Some(sc_track_id),
+            });
+        aux_proj.tracks[1].objects.push(AudioObject::new(
+            21,
+            "Key",
+            key_path.clone(),
+            frames as u64,
+        ));
+        aux_proj.tracks[1].gain_db = -60.0;
+
+        aux_proj.tracks[1].mute = true;
+        let aux_muted =
+            ObjectOrientedEngine::bounce_offline(&aux_proj, &cache, frames).expect("aux muted");
+        aux_proj.tracks[1].mute = false;
+        let aux_active =
+            ObjectOrientedEngine::bounce_offline(&aux_proj, &cache, frames).expect("aux active");
+
+        let aux_pre_muted = window_rms(&aux_muted, 12_500, 13_800);
+        let aux_pre_active = window_rms(&aux_active, 12_500, 13_800);
+        assert!(
+            aux_pre_active >= aux_pre_muted * 0.98,
+            "aux OpenSpacer ducked prematurely before burst: pre_muted={aux_pre_muted}, pre_active={aux_pre_active}"
+        );
+        let aux_post_muted = window_rms(&aux_muted, 20_000, 26_000);
+        let aux_post_active = window_rms(&aux_active, 20_000, 26_000);
+        assert!(
+            aux_post_active < aux_post_muted * 0.85,
+            "expected aux OpenSpacer ducking after burst: post_muted={aux_post_muted}, post_active={aux_post_active}"
+        );
+
+        // 2. Master-bus OpenSpacer aligns with max_track_latency (2048) + max_aux_latency (2048)
+        let mut master_proj = DawProject::new("MasterScPdcAlign", 48_000, 120.0);
+        master_proj.master_inserts.clear();
+        master_proj.aux_buses.clear();
+        let master_sc_id = master_proj.tracks[1].id;
+        let master_bus_id = master_proj.add_aux_bus("AuxPdc");
+        master_proj.aux_buses[0]
+            .inserts
+            .push(zero_depth_soothe.clone());
+        master_proj.tracks[0]
+            .objects
+            .push(AudioObject::new(22, "Bed", bed_path, frames as u64));
+        master_proj.tracks[0].inserts.push(zero_depth_soothe);
+        master_proj.tracks[0].sends.push(TrackSend {
+            bus_id: master_bus_id,
+            gain_db: -60.0,
+            pre_fader: false,
+            mute: false,
+        });
+        master_proj.master_inserts.push(FxSlotConfig::OpenSpacer {
+            bypass: false,
+            amount: 1.0,
+            max_cut_db: 18.0,
+            low_hz: 200.0,
+            high_hz: 8_000.0,
+            mid_side_balance: 0.0,
+            delta_listen: false,
+            sidechain_track_id: Some(master_sc_id),
+        });
+        master_proj.tracks[1]
+            .objects
+            .push(AudioObject::new(23, "Key", key_path, frames as u64));
+        master_proj.tracks[1].gain_db = -60.0;
+        assert_eq!(
+            ObjectOrientedEngine::compile(&master_proj, &cache).total_pdc_samples(),
+            6_144
+        );
+
+        master_proj.tracks[1].mute = true;
+        let m_muted =
+            ObjectOrientedEngine::bounce_offline(&master_proj, &cache, frames).expect("m muted");
+        master_proj.tracks[1].mute = false;
+        let m_active =
+            ObjectOrientedEngine::bounce_offline(&master_proj, &cache, frames).expect("m active");
+
+        let m_pre_muted = window_rms(&m_muted, 12_500, 13_800);
+        let m_pre_active = window_rms(&m_active, 12_500, 13_800);
+        assert!(
+            m_pre_active >= m_pre_muted * 0.98,
+            "master OpenSpacer ducked prematurely before burst: pre_muted={m_pre_muted}, pre_active={m_pre_active}"
+        );
+        let m_post_muted = window_rms(&m_muted, 20_000, 26_000);
+        let m_post_active = window_rms(&m_active, 20_000, 26_000);
+        assert!(
+            m_post_active < m_post_muted * 0.85,
+            "expected master OpenSpacer ducking after burst: post_muted={m_post_muted}, post_active={m_post_active}"
+        );
     }
 }

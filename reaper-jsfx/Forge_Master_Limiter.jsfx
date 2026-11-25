@@ -1,0 +1,124 @@
+desc:ForgeAudio - Lookahead Brickwall Master Limiter (True-Peak Safe)
+//tags: dynamics limiter mastering brickwall
+//author: ForgeAudio (Apache-2.0)
+
+options:gmem=ForgeAudioStudio
+
+slider1:0.0<-6.0,18.0,0.1>Input Drive (dB)
+slider2:-1.0<-6.0,-0.1,0.1>Output Ceiling (dBTP)
+slider3:85.0<10.0,400.0,5.0>Release Time (ms)
+slider4:0<0,1,1{Off,On}>Unity Gain Audition
+
+@init
+srate_safe = max(srate, 44100);
+lookahead = min(512, max(16, floor(srate_safe * 0.003)));
+buf_size = 1024;
+buf_l = 0;
+buf_r = 1024;
+peak_buf = 2048;
+hist_l = 3072;
+hist_r = 3088;
+tp_c1 = 3104;
+tp_c2 = 3120;
+tp_c3 = 3136;
+tp_taps = 12;
+h_pos = 0;
+w_pos = 0;
+gain_env = 1.0;
+rel_env = 1.0;
+att_a = exp(-1.0 / (srate_safe * 0.0005));
+pdc_delay = lookahead;
+
+// Precompute DC-normalized 12-tap 4x polyphase Hann-windowed sinc FIR coefficients
+function init_tp_phase(dst, frac) local(k, d, u, win, s, w, sum_w) (
+  sum_w = 0.0;
+  k = 0;
+  loop(tp_taps,
+    d = (k - 5) - frac;
+    u = d / 6.0;
+    win = 0.5 * (1.0 + cos($pi * u));
+    s = abs(d) < 1e-9 ? 1.0 : (sin($pi * d) / ($pi * d));
+    w = s * win;
+    dst[k] = w;
+    sum_w += w;
+    k += 1;
+  );
+  sum_w = max(1e-12, sum_w);
+  k = 0;
+  loop(tp_taps,
+    dst[k] /= sum_w;
+    k += 1;
+  );
+);
+init_tp_phase(tp_c1, 0.25);
+init_tp_phase(tp_c2, 0.50);
+init_tp_phase(tp_c3, 0.75);
+
+@slider
+drive_lin = 10 ^ (slider1 / 20);
+ceil_lin = 10 ^ (min(-0.1, slider2) / 20);
+rel_a = exp(-1.0 / (srate_safe * (max(10.0, slider3) * 0.001)));
+rel_slow_a = exp(-1.0 / (srate_safe * (max(30.0, slider3 * 3.0) * 0.001)));
+unity_mode = slider4 > 0.5;
+comp_lin = unity_mode ? min(1.0, 1.0 / max(0.01, drive_lin)) : 1.0;
+pdc_delay = lookahead;
+
+@sample
+in_l = spl0 * drive_lin;
+in_r = spl1 * drive_lin;
+buf_l[w_pos] = in_l;
+buf_r[w_pos] = in_r;
+
+hist_l[h_pos] = in_l;
+hist_r[h_pos] = in_r;
+
+// 4x oversampled 12-tap polyphase FIR inter-sample true-peak evaluation
+center_idx = (h_pos - 6 + 16) % 16;
+tp_max = max(abs(hist_l[center_idx]), abs(hist_r[center_idx]));
+p1_l = 0; p1_r = 0;
+p2_l = 0; p2_r = 0;
+p3_l = 0; p3_r = 0;
+k = 0;
+loop(tp_taps,
+  t_idx = (h_pos - (tp_taps - 1) + k + 16) % 16;
+  xl = hist_l[t_idx];
+  xr = hist_r[t_idx];
+  p1_l += tp_c1[k] * xl; p1_r += tp_c1[k] * xr;
+  p2_l += tp_c2[k] * xl; p2_r += tp_c2[k] * xr;
+  p3_l += tp_c3[k] * xl; p3_r += tp_c3[k] * xr;
+  k += 1;
+);
+tp_max = max(tp_max, max(abs(p1_l), abs(p1_r)));
+tp_max = max(tp_max, max(abs(p2_l), abs(p2_r)));
+tp_max = max(tp_max, max(abs(p3_l), abs(p3_r)));
+
+// Align centered true-peak measurement into the lookahead peak ring
+tp_pos = (w_pos - 6 + buf_size) % buf_size;
+peak_buf[w_pos] = max(abs(in_l), abs(in_r));
+peak_buf[tp_pos] = max(peak_buf[tp_pos], tp_max);
+
+// Scan lookahead window so gain reduction leads peaks and enforces ceiling without flat-top clipping
+win_peak = 0.0;
+j = 0;
+loop(lookahead + 1,
+  p_idx = (w_pos - j + buf_size) % buf_size;
+  win_peak = max(win_peak, peak_buf[p_idx]);
+  j += 1;
+);
+
+req_win = win_peak > ceil_lin ? (ceil_lin / max(1e-9, win_peak)) : 1.0;
+r_pos = (w_pos - lookahead + buf_size) % buf_size;
+req_here = peak_buf[r_pos] > ceil_lin ? (ceil_lin / max(1e-9, peak_buf[r_pos])) : 1.0;
+rel_env = req_win < rel_env ? req_win : (rel_slow_a * rel_env + (1.0 - rel_slow_a) * req_win);
+eff_req = min(req_win, rel_env);
+gain_env = eff_req < gain_env ? (att_a * gain_env + (1.0 - att_a) * eff_req) : (rel_a * gain_env + (1.0 - rel_a) * eff_req);
+gain_env = min(gain_env, req_here);
+
+h_pos = (h_pos + 1) % 16;
+w_pos = (w_pos + 1) % buf_size;
+
+out_l = min(ceil_lin, max(-ceil_lin, buf_l[r_pos] * gain_env)) * comp_lin;
+out_r = min(ceil_lin, max(-ceil_lin, buf_r[r_pos] * gain_env)) * comp_lin;
+gmem[2] = 20.0 * log10(max(0.001, gain_env));
+spl0 = out_l;
+spl1 = out_r;

@@ -3,6 +3,7 @@
 //! The worker runs with a wall-clock timeout. On timeout the whole process tree is killed and
 //! the pipes are abandoned, so a hung model download or CUDA stall cannot block the caller.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -11,6 +12,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use forge_core::{ForgeError, Result, StemBundle};
+use forge_dsp::BeatGridReport;
 use serde::{Deserialize, Serialize};
 
 /// Location of the worker script inside the repository.
@@ -82,14 +84,22 @@ fn worker_io_cmd(
     cmd
 }
 
-/// Runs `separate` on the local worker and parses the `StemBundle` it prints.
+#[derive(Debug, Deserialize)]
+struct SeparateWorkerResponse {
+    #[serde(flatten)]
+    bundle: StemBundle,
+    #[serde(default)]
+    warnings: Vec<String>,
+}
+
+/// Runs `separate` on the local worker and parses the `StemBundle` + warnings it prints.
 pub(crate) fn separate(
     worker: &LocalWorkerCommand,
     input_path: &Path,
     output_dir: &Path,
     stems: u8,
     config: &crate::routing::SeparationConfig,
-) -> Result<StemBundle> {
+) -> Result<(StemBundle, Vec<String>)> {
     let mut cmd = worker_io_cmd(worker, "separate", input_path, output_dir);
     cmd.arg("--stems")
         .arg(stems.to_string())
@@ -98,28 +108,25 @@ pub(crate) fn separate(
     if !config.dereverb {
         cmd.arg("--no-dereverb");
     }
-    if config.drum_sep {
-        cmd.arg("--drum-sep");
+    for &(enabled, flag) in &[
+        (config.drum_sep, "--drum-sep"),
+        (config.split_lead_backing, "--split-lead-backing"),
+        (config.split_male_female, "--split-male-female"),
+        (config.split_guitar, "--split-guitar"),
+        (config.split_orchestral, "--split-orchestral"),
+        (config.split_crowd, "--split-crowd"),
+        (config.restore, "--restore"),
+        (config.debleed, "--debleed"),
+        (config.de_aspiration, "--de-aspiration"),
+        (config.dereverb_echo, "--dereverb-echo"),
+    ] {
+        if enabled {
+            cmd.arg(flag);
+        }
     }
-    if config.split_lead_backing {
-        cmd.arg("--split-lead-backing");
-    }
-    if config.split_male_female {
-        cmd.arg("--split-male-female");
-    }
-    if config.split_guitar {
-        cmd.arg("--split-guitar");
-    }
-    if config.split_orchestral {
-        cmd.arg("--split-orchestral");
-    }
-    if config.split_crowd {
-        cmd.arg("--split-crowd");
-    }
-    if config.restore {
-        cmd.arg("--restore");
-    }
-    run_worker_json(cmd, config.local_timeout, "GPU worker", "stem")
+    let parsed: SeparateWorkerResponse =
+        run_worker_json(cmd, config.local_timeout, "GPU worker", "stem")?;
+    Ok((parsed.bundle, parsed.warnings))
 }
 
 fn run_worker_json<T: serde::de::DeserializeOwned>(
@@ -162,6 +169,77 @@ pub struct MidiTranscribeResult {
     pub midi: PathBuf,
 }
 
+/// Output of `forge_gpu_worker.py restore` / Colab `restore`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NeuralRestoreResult {
+    pub restored: PathBuf,
+    pub backend: String,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// Output of `forge_gpu_worker.py vocal-rescue` / Colab `vocal_rescue`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VocalRescueResult {
+    pub rescued: PathBuf,
+    pub backend: String,
+    #[serde(default)]
+    pub stages: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// Perceptual & acoustic quality scores produced by `forge_gpu_worker.py evaluate` or acoustic fallback.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QualityEvalMetrics {
+    pub production_quality: Option<f64>,
+    pub production_complexity: Option<f64>,
+    pub content_enjoyment: Option<f64>,
+    pub content_usefulness: Option<f64>,
+    pub singmos: Option<f64>,
+    pub crest_factor_db: f64,
+    pub hf_ratio_db: f64,
+    pub clipping_ratio: f64,
+    pub composite_score: f64,
+}
+
+/// Before/after perceptual quality evaluation report (`Audiobox Aesthetics`, `SingMOS`, or acoustic proxy).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QualityEvalResult {
+    pub backend: String,
+    pub metrics: QualityEvalMetrics,
+    #[serde(default)]
+    pub reference_metrics: Option<QualityEvalMetrics>,
+    #[serde(default)]
+    pub delta: Option<BTreeMap<String, f64>>,
+    #[serde(default)]
+    pub improved: Option<bool>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// Single frame emitted by `forge_gpu_worker.py f0-track`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct F0TrackFrame {
+    pub time_secs: f64,
+    pub f0_hz: f64,
+    pub voiced: bool,
+    pub confidence: f64,
+}
+
+/// Neural/autocorrelation fundamental-frequency (`f0-track`) report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct F0TrackResult {
+    pub backend: String,
+    pub sample_rate: u32,
+    pub hop_secs: f64,
+    pub voiced_ratio: f64,
+    pub median_f0_hz: Option<f64>,
+    pub frames: Vec<F0TrackFrame>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
 /// Resolves the default local GPU worker command from `FORGE_GPU_WORKER_SCRIPT` or
 /// `BUILD_SOURCE_ROOT`.
 pub fn resolve_default_local_worker() -> Result<LocalWorkerCommand> {
@@ -174,6 +252,15 @@ pub fn resolve_default_local_worker() -> Result<LocalWorkerCommand> {
             )
         })?;
     Ok(LocalWorkerCommand::uv(&script))
+}
+
+fn worker_in_only_cmd(worker: &LocalWorkerCommand, subcmd: &str, input_path: &Path) -> Command {
+    let mut cmd = Command::new(&worker.program);
+    cmd.args(&worker.args)
+        .arg(subcmd)
+        .arg("--input")
+        .arg(input_path);
+    cmd
 }
 
 /// Runs neural denoising (`DeepFilterNet3` / `Mel-Band-RoFormer`) via the local Python GPU worker.
@@ -196,6 +283,111 @@ pub fn run_local_neural_denoise(
         cmd.arg("--attenuation-limit-db").arg(format!("{lim}"));
     }
     run_worker_json(cmd, timeout, "GPU worker denoise", "denoise")
+}
+
+/// Runs neural bandwidth/codec restoration (`Apollo` / `FlowHigh` / `AudioSR` / `SonicMaster` / `exciter`).
+pub fn run_local_neural_restore(
+    worker: &LocalWorkerCommand,
+    input_path: &Path,
+    output_dir: &Path,
+    backend: &str,
+    prompt: Option<&str>,
+    chunk_secs: Option<f64>,
+    timeout: Duration,
+) -> Result<NeuralRestoreResult> {
+    let mut cmd = worker_io_cmd(worker, "restore", input_path, output_dir);
+    cmd.arg("--backend").arg(backend);
+    if let Some(p) = prompt.map(str::trim).filter(|s| !s.is_empty()) {
+        cmd.arg("--prompt").arg(p);
+    }
+    if let Some(cs) = chunk_secs {
+        if !cs.is_finite() || !(0.5..=120.0).contains(&cs) {
+            return Err(ForgeError::InvalidParameter(format!(
+                "chunk_secs ({cs}) must be finite and in 0.5..=120.0"
+            )));
+        }
+        cmd.arg("--chunk-secs").arg(format!("{cs}"));
+    }
+    run_worker_json(cmd, timeout, "GPU worker restore", "restore")
+}
+
+/// Runs neural/autocorrelation fundamental-frequency (`F0`) tracking via the local GPU worker.
+pub fn run_local_f0_track(
+    worker: &LocalWorkerCommand,
+    input_path: &Path,
+    backend: &str,
+    hop_secs: f64,
+    timeout: Duration,
+) -> Result<F0TrackResult> {
+    if !hop_secs.is_finite() || !(0.002..=0.25).contains(&hop_secs) {
+        return Err(ForgeError::InvalidParameter(format!(
+            "hop_secs ({hop_secs}) must be finite and in 0.002..=0.25"
+        )));
+    }
+    let mut cmd = worker_in_only_cmd(worker, "f0-track", input_path);
+    cmd.arg("--backend")
+        .arg(backend)
+        .arg("--hop-secs")
+        .arg(format!("{hop_secs}"));
+    run_worker_json(cmd, timeout, "GPU worker f0-track", "f0-track")
+}
+
+/// Runs neural vocal rescue / timbre resynthesis (`Seed-VC` / `Resemble Enhance` / `RoFormer`).
+#[allow(clippy::too_many_arguments)]
+pub fn run_local_vocal_rescue(
+    worker: &LocalWorkerCommand,
+    input_path: &Path,
+    output_dir: &Path,
+    backend: &str,
+    reference_voice: Option<&Path>,
+    dereverb: bool,
+    de_aspiration: bool,
+    timeout: Duration,
+) -> Result<VocalRescueResult> {
+    let mut cmd = worker_io_cmd(worker, "vocal-rescue", input_path, output_dir);
+    cmd.arg("--backend").arg(backend);
+    if let Some(ref_path) = reference_voice {
+        cmd.arg("--reference-voice").arg(ref_path);
+    }
+    if !dereverb {
+        cmd.arg("--no-dereverb");
+    }
+    if !de_aspiration {
+        cmd.arg("--no-de-aspiration");
+    }
+    run_worker_json(cmd, timeout, "GPU worker vocal-rescue", "vocal-rescue")
+}
+
+/// Runs neural beat & downbeat tracking (`beat_this` / `librosa` / `energy`) via local Python worker.
+pub fn run_local_beat_track(
+    worker: &LocalWorkerCommand,
+    input_path: &Path,
+    backend: &str,
+    timeout: Duration,
+) -> Result<BeatGridReport> {
+    let mut cmd = worker_in_only_cmd(worker, "beat-track", input_path);
+    cmd.arg("--backend").arg(backend);
+    run_worker_json(cmd, timeout, "GPU worker beat-track", "beat-track")
+}
+
+/// Runs perceptual audio quality scoring (`Audiobox Aesthetics` / `SingMOS` / `acoustic-proxy`).
+pub fn run_local_evaluate_quality(
+    worker: &LocalWorkerCommand,
+    input_path: &Path,
+    reference_path: Option<&Path>,
+    vocal: bool,
+    backend: &str,
+    timeout: Duration,
+) -> Result<QualityEvalResult> {
+    let mut cmd = worker_in_only_cmd(worker, "evaluate", input_path);
+    cmd.arg("--backend").arg(backend);
+    if let Some(ref_path) = reference_path {
+        cmd.arg("--reference").arg(ref_path);
+    }
+    if vocal {
+        cmd.arg("--vocal");
+    }
+    run_worker_json(cmd, timeout, "GPU worker evaluate", "evaluate")
 }
 
 /// Runs polyphonic audio-to-MIDI transcription (`basic-pitch`) via the local Python GPU worker.
@@ -389,6 +581,39 @@ mod client_tests {
             }
         };
         (dir, cmd)
+    }
+
+    #[test]
+    fn f0_track_client_parses_json_and_validates_hop() {
+        let (_dir, worker) = mock_worker_echo(
+            &[
+                "Tracking F0 with autocorr fallback...",
+                r#"{"backend":"autocorr","sample_rate":48000,"hop_secs":0.02,"voiced_ratio":1.0,"median_f0_hz":220.0,"frames":[{"time_secs":0.02,"f0_hz":220.0,"voiced":true,"confidence":0.95}],"warnings":[]}"#,
+            ],
+            0,
+        );
+        let err = run_local_f0_track(
+            &worker,
+            Path::new("vocal.wav"),
+            "auto",
+            0.0,
+            Duration::from_secs(10),
+        )
+        .expect_err("zero hop must be rejected");
+        assert!(err.to_string().contains("hop_secs"), "{err}");
+
+        let res = run_local_f0_track(
+            &worker,
+            Path::new("vocal.wav"),
+            "autocorr",
+            0.02,
+            Duration::from_secs(10),
+        )
+        .expect("f0-track json");
+        assert_eq!(res.backend, "autocorr");
+        assert_eq!(res.sample_rate, 48_000);
+        assert_eq!(res.frames.len(), 1);
+        assert!((res.frames[0].f0_hz - 220.0).abs() < 1e-6);
     }
 
     #[test]

@@ -10,12 +10,15 @@
 //!    `sandbox.create_file` handles, refusing any swapped symlink at write time.
 
 use crate::sandbox::PathSandbox;
-use forge_core::{ForgeError, StemBundle};
+use forge_core::{AudioBuffer, ForgeError, StemBundle};
+use forge_dsp::BeatGridReport;
 use forge_reaper::{ReleaseMetadata, write_distrokid_metadata};
 use forge_worker::{
-    MidiTranscribeResult, NeuralDenoiseResult, SeparationConfig, SeparationReport,
+    DrumHit, MidiTranscribeResult, NeuralDenoiseResult, NeuralRestoreResult, QualityEvalResult,
+    SeparationConfig, SeparationReport, VocalRescueResult, evaluate_quality_hybrid,
+    index_drum_sample_library, neural_restore_hybrid, render_drum_sample_layer,
     resolve_default_local_worker, run_local_neural_denoise, run_local_transcribe_midi,
-    separate_stems,
+    separate_stems, track_beats_hybrid, vocal_rescue_hybrid,
 };
 use std::fs::File;
 use std::io::{self, Write};
@@ -112,6 +115,7 @@ fn tag_into(
 struct StagedWorkerIo {
     _stage: tempfile::TempDir,
     output_dir: PathBuf,
+    stage_ref_dir: PathBuf,
     staged_in: PathBuf,
     staged_out: PathBuf,
 }
@@ -127,16 +131,27 @@ fn prepare_staged_io(
 
     let stage = tempfile::tempdir()?;
     let stage_in_dir = stage.path().join("in");
+    let stage_ref_dir = stage.path().join("ref");
     let staged_out = stage.path().join("out");
     std::fs::create_dir_all(&stage_in_dir)?;
+    std::fs::create_dir_all(&stage_ref_dir)?;
     std::fs::create_dir_all(&staged_out)?;
     let staged_in = stage_in(sandbox, input, &stage_in_dir)?;
     Ok(StagedWorkerIo {
         _stage: stage,
         output_dir,
+        stage_ref_dir,
         staged_in,
         staged_out,
     })
+}
+
+fn stage_optional_ref(
+    sandbox: &PathSandbox,
+    ref_dir: &Path,
+    reference: Option<&Path>,
+) -> Result<Option<PathBuf>, ForgeError> {
+    reference.map(|p| stage_in(sandbox, p, ref_dir)).transpose()
 }
 
 fn commit_staged_named(
@@ -195,6 +210,92 @@ pub fn neural_denoise_checked(
     Ok(res)
 }
 
+/// Runs neural bandwidth restoration (`Apollo` / `FlowHigh` / `AudioSR` / `SonicMaster` / `exciter`)
+/// inside a private staging directory and commits the restored file into `output_dir`.
+pub fn neural_restore_checked(
+    sandbox: &PathSandbox,
+    input: &Path,
+    output_dir: &Path,
+    backend: &str,
+    prompt: Option<&str>,
+    chunk_secs: Option<f64>,
+    timeout: Duration,
+) -> Result<NeuralRestoreResult, ForgeError> {
+    let io = prepare_staged_io(sandbox, input, output_dir)?;
+    let mut res = neural_restore_hybrid(
+        &io.staged_in,
+        &io.staged_out,
+        backend,
+        prompt,
+        chunk_secs,
+        timeout,
+    )?;
+    res.restored = commit_staged_named(sandbox, &io, &res.restored, "restored")?;
+    Ok(res)
+}
+
+/// Runs neural vocal rescue (`Seed-VC` / `Resemble Enhance` / `RoFormer`) inside a private
+/// staging directory, also staging optional `reference_voice`.
+#[allow(clippy::too_many_arguments)]
+pub fn vocal_rescue_checked(
+    sandbox: &PathSandbox,
+    input: &Path,
+    output_dir: &Path,
+    backend: &str,
+    reference_voice: Option<&Path>,
+    dereverb: bool,
+    de_aspiration: bool,
+    timeout: Duration,
+) -> Result<VocalRescueResult, ForgeError> {
+    let io = prepare_staged_io(sandbox, input, output_dir)?;
+    let staged_ref = stage_optional_ref(sandbox, &io.stage_ref_dir, reference_voice)?;
+    let mut res = vocal_rescue_hybrid(
+        &io.staged_in,
+        &io.staged_out,
+        backend,
+        staged_ref.as_deref(),
+        dereverb,
+        de_aspiration,
+        timeout,
+    )?;
+    res.rescued = commit_staged_named(sandbox, &io, &res.rescued, "vocal_rescued")?;
+    Ok(res)
+}
+
+/// Tracks beats, downbeats, and tempo drift (`beat_this` / `librosa` / Rust onset) from a private
+/// staged copy of `input`.
+pub fn beat_track_checked(
+    sandbox: &PathSandbox,
+    input: &Path,
+    hint_bpm: Option<f64>,
+    backend: &str,
+    timeout: Duration,
+) -> Result<BeatGridReport, ForgeError> {
+    let stage = tempfile::tempdir()?;
+    let staged_in = stage_in(sandbox, input, stage.path())?;
+    track_beats_hybrid(&staged_in, hint_bpm, backend, timeout)
+}
+
+/// Evaluates perceptual audio quality (`Audiobox Aesthetics` / `SingMOS` / proxy) from private
+/// staged copies of `input` and optional `reference`.
+pub fn evaluate_quality_checked(
+    sandbox: &PathSandbox,
+    input: &Path,
+    reference: Option<&Path>,
+    vocal: bool,
+    backend: &str,
+    timeout: Duration,
+) -> Result<QualityEvalResult, ForgeError> {
+    let stage = tempfile::tempdir()?;
+    let in_dir = stage.path().join("in");
+    let ref_dir = stage.path().join("ref");
+    std::fs::create_dir_all(&in_dir)?;
+    std::fs::create_dir_all(&ref_dir)?;
+    let staged_in = stage_in(sandbox, input, &in_dir)?;
+    let staged_ref = stage_optional_ref(sandbox, &ref_dir, reference)?;
+    evaluate_quality_hybrid(&staged_in, staged_ref.as_deref(), vocal, backend, timeout)
+}
+
 /// Runs polyphonic audio-to-MIDI transcription (`basic-pitch`) inside a private staging
 /// directory, then commits the produced MIDI file into `output_dir` through `cap-std` handles.
 pub fn transcribe_midi_checked(
@@ -208,6 +309,26 @@ pub fn transcribe_midi_checked(
     let mut res = run_local_transcribe_midi(&worker, &io.staged_in, &io.staged_out, timeout)?;
     res.midi = commit_staged_named(sandbox, &io, &res.midi, "MIDI")?;
     Ok(res)
+}
+
+/// Indexes `.wav` one-shots from a sandboxed `samples_dir` inside a private staging directory
+/// and renders a sample-layered drum track without unanchored directory reads in `FORGE_MCP_ROOT`.
+pub fn render_drum_layer_checked(
+    sandbox: &PathSandbox,
+    samples_dir: &Path,
+    frames: usize,
+    sample_rate: u32,
+    hits: &[DrumHit],
+    wet_mix: f64,
+    dry_drums: &AudioBuffer,
+) -> Result<(AudioBuffer, usize), ForgeError> {
+    let wav_paths = sandbox.list_files_with_ext(samples_dir, "wav", 256)?;
+    let stage = tempfile::tempdir()?;
+    for wav in wav_paths {
+        let _ = stage_in(sandbox, &wav, stage.path())?;
+    }
+    let lib = index_drum_sample_library(stage.path())?;
+    render_drum_sample_layer(frames, sample_rate, hits, &lib, wet_mix, Some(dry_drums))
 }
 
 fn commit_bundle(

@@ -197,34 +197,9 @@ impl EngineMeters {
     }
 }
 
-/// Resamples `buf` to `target_sr` using linear interpolation (used when importing clips whose
-/// sample rate differs from the project rate).
+/// Resamples `buf` to `target_sr` using normalized Kaiser-windowed sinc interpolation.
 pub fn resample_buffer_linear(buf: &AudioBuffer, target_sr: u32) -> Result<AudioBuffer> {
-    if buf.sample_rate == 0 || target_sr == 0 {
-        return Err(ForgeError::InvalidParameter(
-            "Sample rate must be greater than 0 Hz".to_string(),
-        ));
-    }
-    if buf.sample_rate == target_sr || buf.num_frames() == 0 {
-        return Ok(buf.clone());
-    }
-    let src_len = buf.num_frames();
-    let ratio = f64::from(buf.sample_rate) / f64::from(target_sr);
-    let dst_len = ((src_len as f64) / ratio).round().max(1.0) as usize;
-    let mut channels = Vec::with_capacity(buf.channels.len());
-    for ch in &buf.channels {
-        let mut out = Vec::with_capacity(dst_len);
-        for i in 0..dst_len {
-            let src_pos = (i as f64) * ratio;
-            let idx0 = (src_pos.floor() as usize).min(src_len - 1);
-            let idx1 = (idx0 + 1).min(src_len - 1);
-            let frac = src_pos - (idx0 as f64);
-            let s = ch[idx0] + (ch[idx1] - ch[idx0]) * frac;
-            out.push(s);
-        }
-        channels.push(out);
-    }
-    AudioBuffer::from_channels(channels, target_sr)
+    forge_dsp::resample_buffer_sinc(buf, target_sr)
 }
 
 /// Pre-loaded audio clip cache shared between the UI (for waveform peaks) and the audio engine.
@@ -256,7 +231,7 @@ impl ClipCache {
             }
         }
         let raw = AudioBuffer::load(path)?;
-        let converted = resample_buffer_linear(&raw, target_sr)?;
+        let converted = forge_dsp::resample_buffer_sinc(&raw, target_sr)?;
         let buf = Arc::new(converted);
         let peaks = Arc::new(WaveformPeaks::from_buffer(&buf, 256));
         self.clips.insert(path.to_path_buf(), Arc::clone(&buf));
@@ -302,9 +277,45 @@ pub struct ObjectOrientedEngine {
     analyzer: RealtimeSpectrumAnalyzer32,
     total_pdc_samples: usize,
     meters: EngineMeters,
+    track_ids: Vec<u64>,
+    track_pre_l: Vec<f32>,
+    track_pre_r: Vec<f32>,
+    track_prev_l: Vec<f32>,
+    track_prev_r: Vec<f32>,
+    track_post_pdc_l: Vec<f32>,
+    track_post_pdc_r: Vec<f32>,
+    track_master_sc_pdc: Vec<PdcDelayLine>,
+    track_master_sc_l: Vec<f32>,
+    track_master_sc_r: Vec<f32>,
 }
 
-fn compile_fx_chain(slots: &[crate::project::FxSlotConfig], sr: f64) -> (Vec<FxProcessor>, usize) {
+fn resolve_sidechain_sample(
+    track_ids: &[u64],
+    self_idx: Option<usize>,
+    buf_l: &[f32],
+    buf_r: &[f32],
+    cfg: &crate::project::FxSlotConfig,
+) -> Option<(f32, f32)> {
+    let crate::project::FxSlotConfig::OpenSpacer {
+        sidechain_track_id: Some(sc_id),
+        ..
+    } = cfg
+    else {
+        return None;
+    };
+    track_ids
+        .iter()
+        .enumerate()
+        .find(|&(idx, &id)| self_idx != Some(idx) && id == *sc_id)
+        .map(|(idx, _)| (buf_l[idx], buf_r[idx]))
+}
+
+fn compile_fx_chain(
+    slots: &[crate::project::FxSlotConfig],
+    sr: f64,
+    self_track_idx: Option<usize>,
+    track_ids: &[u64],
+) -> (Vec<FxProcessor>, usize) {
     let procs: Vec<FxProcessor> = slots
         .iter()
         .map(|c| FxProcessor::from_config(c, sr))
@@ -312,7 +323,7 @@ fn compile_fx_chain(slots: &[crate::project::FxSlotConfig], sr: f64) -> (Vec<FxP
     let latency: usize = procs
         .iter()
         .zip(slots)
-        .map(|(p, c)| p.latency_samples(c))
+        .map(|(p, c)| p.latency_samples_for(c, self_track_idx, track_ids))
         .sum();
     (procs, latency)
 }
@@ -321,15 +332,17 @@ impl ObjectOrientedEngine {
     /// Compiles `project` into an executable real-time audio graph (runs off-audio-thread).
     pub fn compile(project: &DawProject, cache: &ClipCache) -> Self {
         let sr = f64::from(project.sample_rate.max(8_000));
+        let track_ids: Vec<u64> = project.tracks.iter().map(|t| t.id).collect();
         let mut tracks = Vec::with_capacity(project.tracks.len());
         let mut max_track_latency = 0_usize;
 
-        for track in &project.tracks {
+        for (tr_idx, track) in project.tracks.iter().enumerate() {
             let mut obj_runtimes = Vec::with_capacity(track.objects.len());
             let mut max_obj_latency = 0_usize;
 
             for obj in &track.objects {
-                let (fx, fx_latency) = compile_fx_chain(&obj.fx_chain, sr);
+                let (fx, fx_latency) =
+                    compile_fx_chain(&obj.fx_chain, sr, Some(tr_idx), &track_ids);
                 max_obj_latency = max_obj_latency.max(fx_latency);
                 obj_runtimes.push(ObjectRuntime {
                     config: obj.clone(),
@@ -347,7 +360,8 @@ impl ObjectOrientedEngine {
                 obj_rt.pdc = PdcDelayLine::new(pad);
             }
 
-            let (inserts, track_fx_lat) = compile_fx_chain(&track.inserts, sr);
+            let (inserts, track_fx_lat) =
+                compile_fx_chain(&track.inserts, sr, Some(tr_idx), &track_ids);
             let total_latency = max_obj_latency + track_fx_lat;
             max_track_latency = max_track_latency.max(total_latency);
 
@@ -380,7 +394,7 @@ impl ObjectOrientedEngine {
         let mut aux_buses = Vec::with_capacity(project.aux_buses.len());
         let mut max_aux_latency = 0_usize;
         for bus in &project.aux_buses {
-            let (inserts, fx_latency) = compile_fx_chain(&bus.inserts, sr);
+            let (inserts, fx_latency) = compile_fx_chain(&bus.inserts, sr, None, &track_ids);
             max_aux_latency = max_aux_latency.max(fx_latency);
             aux_buses.push(AuxBusRuntime {
                 config: bus.clone(),
@@ -397,10 +411,12 @@ impl ObjectOrientedEngine {
         }
         let main_bus_pdc = PdcDelayLine::new(max_aux_latency);
 
-        let (master_inserts, master_lat) = compile_fx_chain(&project.master_inserts, sr);
+        let (master_inserts, master_lat) =
+            compile_fx_chain(&project.master_inserts, sr, None, &track_ids);
         let total_pdc_samples = max_track_latency + max_aux_latency + master_lat;
 
-        let track_peaks_db = vec![-90.0; tracks.len()];
+        let num_tracks = tracks.len();
+        let track_peaks_db = vec![-90.0; num_tracks];
         let master_gain_lin = 10.0_f32.powf(project.master_gain_db.clamp(-48.0, 12.0) / 20.0);
         Self {
             sample_rate: sr,
@@ -422,6 +438,18 @@ impl ObjectOrientedEngine {
                 total_pdc_samples,
                 ..EngineMeters::default()
             },
+            track_ids,
+            track_pre_l: vec![0.0_f32; num_tracks],
+            track_pre_r: vec![0.0_f32; num_tracks],
+            track_prev_l: vec![0.0_f32; num_tracks],
+            track_prev_r: vec![0.0_f32; num_tracks],
+            track_post_pdc_l: vec![0.0_f32; num_tracks],
+            track_post_pdc_r: vec![0.0_f32; num_tracks],
+            track_master_sc_pdc: (0..num_tracks)
+                .map(|_| PdcDelayLine::new(max_aux_latency))
+                .collect(),
+            track_master_sc_l: vec![0.0_f32; num_tracks],
+            track_master_sc_r: vec![0.0_f32; num_tracks],
         }
     }
 
@@ -449,6 +477,8 @@ impl ObjectOrientedEngine {
     fn fx_latency_changed(
         a: &crate::project::FxSlotConfig,
         b: &crate::project::FxSlotConfig,
+        self_track_idx: Option<usize>,
+        track_ids: &[u64],
     ) -> bool {
         if std::mem::discriminant(a) != std::mem::discriminant(b)
             || a.is_bypassed() != b.is_bypassed()
@@ -473,18 +503,22 @@ impl ObjectOrientedEngine {
                 crate::project::FxSlotConfig::MasterLimiter { isp_8x: ia, .. },
                 crate::project::FxSlotConfig::MasterLimiter { isp_8x: ib, .. },
             ) if ia != ib
-        )
+        ) || (matches!(a, crate::project::FxSlotConfig::OpenSpacer { .. })
+            && crate::fx::open_spacer_sidechain_active(a, self_track_idx, track_ids)
+                != crate::fx::open_spacer_sidechain_active(b, self_track_idx, track_ids))
     }
 
     fn fx_chain_latency_changed(
         prev: &[crate::project::FxSlotConfig],
         next: &[crate::project::FxSlotConfig],
+        self_track_idx: Option<usize>,
+        track_ids: &[u64],
     ) -> bool {
         prev.len() != next.len()
             || prev
                 .iter()
                 .zip(next.iter())
-                .any(|(a, b)| Self::fx_latency_changed(a, b))
+                .any(|(a, b)| Self::fx_latency_changed(a, b, self_track_idx, track_ids))
     }
 
     /// Checks off-audio-thread whether `next` has the exact same track, object, aux, and FX-latency
@@ -493,31 +527,49 @@ impl ObjectOrientedEngine {
         if prev.sample_rate != next.sample_rate
             || prev.tracks.len() != next.tracks.len()
             || prev.aux_buses.len() != next.aux_buses.len()
+            || prev
+                .tracks
+                .iter()
+                .zip(next.tracks.iter())
+                .any(|(a, b)| a.id != b.id)
         {
             return false;
         }
+        let track_ids: Vec<u64> = prev.tracks.iter().map(|t| t.id).collect();
         if prev
             .aux_buses
             .iter()
             .zip(next.aux_buses.iter())
-            .any(|(a, b)| a.id != b.id || Self::fx_chain_latency_changed(&a.inserts, &b.inserts))
+            .any(|(a, b)| {
+                a.id != b.id
+                    || Self::fx_chain_latency_changed(&a.inserts, &b.inserts, None, &track_ids)
+            })
         {
             return false;
         }
-        if Self::fx_chain_latency_changed(&prev.master_inserts, &next.master_inserts) {
+        if Self::fx_chain_latency_changed(
+            &prev.master_inserts,
+            &next.master_inserts,
+            None,
+            &track_ids,
+        ) {
             return false;
         }
-        for (a, b) in prev.tracks.iter().zip(next.tracks.iter()) {
-            if a.id != b.id
-                || a.objects.len() != b.objects.len()
-                || Self::fx_chain_latency_changed(&a.inserts, &b.inserts)
+        for (tr_idx, (a, b)) in prev.tracks.iter().zip(next.tracks.iter()).enumerate() {
+            if a.objects.len() != b.objects.len()
+                || Self::fx_chain_latency_changed(&a.inserts, &b.inserts, Some(tr_idx), &track_ids)
             {
                 return false;
             }
             if a.objects.iter().zip(b.objects.iter()).any(|(oa, ob)| {
                 oa.id != ob.id
                     || oa.source_path != ob.source_path
-                    || Self::fx_chain_latency_changed(&oa.fx_chain, &ob.fx_chain)
+                    || Self::fx_chain_latency_changed(
+                        &oa.fx_chain,
+                        &ob.fx_chain,
+                        Some(tr_idx),
+                        &track_ids,
+                    )
             }) {
                 return false;
             }
@@ -536,25 +588,44 @@ impl ObjectOrientedEngine {
         if self.tracks.len() != project.tracks.len()
             || self.aux_buses.len() != project.aux_buses.len()
             || self.master_insert_cfgs.len() != project.master_inserts.len()
+            || self
+                .tracks
+                .iter()
+                .zip(project.tracks.iter())
+                .any(|(tr_rt, tr_cfg)| tr_rt.config.id != tr_cfg.id)
         {
             return false;
         }
         for (bus_rt, bus_cfg) in self.aux_buses.iter().zip(project.aux_buses.iter()) {
             if bus_rt.config.id != bus_cfg.id
                 || bus_rt.inserts.len() != bus_cfg.inserts.len()
-                || Self::fx_chain_latency_changed(&bus_rt.config.inserts, &bus_cfg.inserts)
+                || Self::fx_chain_latency_changed(
+                    &bus_rt.config.inserts,
+                    &bus_cfg.inserts,
+                    None,
+                    &self.track_ids,
+                )
             {
                 return false;
             }
         }
-        if Self::fx_chain_latency_changed(&self.master_insert_cfgs, &project.master_inserts) {
+        if Self::fx_chain_latency_changed(
+            &self.master_insert_cfgs,
+            &project.master_inserts,
+            None,
+            &self.track_ids,
+        ) {
             return false;
         }
-        for (tr_rt, tr_cfg) in self.tracks.iter().zip(project.tracks.iter()) {
-            if tr_rt.config.id != tr_cfg.id
-                || tr_rt.objects.len() != tr_cfg.objects.len()
+        for (tr_idx, (tr_rt, tr_cfg)) in self.tracks.iter().zip(project.tracks.iter()).enumerate() {
+            if tr_rt.objects.len() != tr_cfg.objects.len()
                 || tr_rt.inserts.len() != tr_cfg.inserts.len()
-                || Self::fx_chain_latency_changed(&tr_rt.config.inserts, &tr_cfg.inserts)
+                || Self::fx_chain_latency_changed(
+                    &tr_rt.config.inserts,
+                    &tr_cfg.inserts,
+                    Some(tr_idx),
+                    &self.track_ids,
+                )
             {
                 return false;
             }
@@ -562,7 +633,12 @@ impl ObjectOrientedEngine {
                 if obj_rt.config.id != obj_cfg.id
                     || obj_rt.config.source_path != obj_cfg.source_path
                     || obj_rt.fx.len() != obj_cfg.fx_chain.len()
-                    || Self::fx_chain_latency_changed(&obj_rt.config.fx_chain, &obj_cfg.fx_chain)
+                    || Self::fx_chain_latency_changed(
+                        &obj_rt.config.fx_chain,
+                        &obj_cfg.fx_chain,
+                        Some(tr_idx),
+                        &self.track_ids,
+                    )
                 {
                     return false;
                 }
@@ -634,6 +710,17 @@ impl ObjectOrientedEngine {
             ins.reset(sr);
         }
         self.analyzer.reset(sr);
+        self.track_pre_l.fill(0.0);
+        self.track_pre_r.fill(0.0);
+        self.track_prev_l.fill(0.0);
+        self.track_prev_r.fill(0.0);
+        self.track_post_pdc_l.fill(0.0);
+        self.track_post_pdc_r.fill(0.0);
+        self.track_master_sc_l.fill(0.0);
+        self.track_master_sc_r.fill(0.0);
+        for pdc in &mut self.track_master_sc_pdc {
+            pdc.reset();
+        }
     }
 
     #[inline]
@@ -757,13 +844,15 @@ impl ObjectOrientedEngine {
                 bus.acc_r = 0.0;
             }
 
-            for tr in &mut self.tracks {
+            for (tr_idx, tr) in self.tracks.iter_mut().enumerate() {
                 let audible = if any_solo {
                     tr.config.solo
                 } else {
                     !tr.config.mute
                 };
                 if !audible {
+                    self.track_pre_l[tr_idx] = 0.0;
+                    self.track_pre_r[tr_idx] = 0.0;
                     continue;
                 }
 
@@ -825,7 +914,14 @@ impl ObjectOrientedEngine {
                     // Run per-object 3-band EQ & per-object FX chain + intra-track PDC
                     (ol, or_) = obj.eq.process(ol, or_);
                     for (proc_fx, cfg) in obj.fx.iter_mut().zip(&obj.config.fx_chain) {
-                        (ol, or_) = proc_fx.process_stereo(cfg, ol, or_);
+                        let sc = resolve_sidechain_sample(
+                            &self.track_ids,
+                            Some(tr_idx),
+                            &self.track_prev_l,
+                            &self.track_prev_r,
+                            cfg,
+                        );
+                        (ol, or_) = proc_fx.process_stereo_with_sidechain(cfg, ol, or_, sc);
                     }
                     (ol, or_) = obj.pdc.process(ol, or_);
 
@@ -844,14 +940,42 @@ impl ObjectOrientedEngine {
                     tr_r += mr;
                 }
 
+                self.track_pre_l[tr_idx] = tr_l;
+                self.track_pre_r[tr_idx] = tr_r;
+            }
+
+            for (tr_idx, tr) in self.tracks.iter_mut().enumerate() {
+                let audible = if any_solo {
+                    tr.config.solo
+                } else {
+                    !tr.config.mute
+                };
+                if !audible {
+                    self.track_post_pdc_l[tr_idx] = 0.0;
+                    self.track_post_pdc_r[tr_idx] = 0.0;
+                    continue;
+                }
+
+                let mut tr_l = self.track_pre_l[tr_idx];
+                let mut tr_r = self.track_pre_r[tr_idx];
+
                 // Track-level FX inserts + track fader/pan/automation/polarity + inter-track PDC
                 for (proc_fx, cfg) in tr.inserts.iter_mut().zip(&tr.config.inserts) {
-                    (tr_l, tr_r) = proc_fx.process_stereo(cfg, tr_l, tr_r);
+                    let sc = resolve_sidechain_sample(
+                        &self.track_ids,
+                        Some(tr_idx),
+                        &self.track_pre_l,
+                        &self.track_pre_r,
+                        cfg,
+                    );
+                    (tr_l, tr_r) = proc_fx.process_stereo_with_sidechain(cfg, tr_l, tr_r, sc);
                 }
                 (tr_l, tr_r) = tr.pdc.process(tr_l, tr_r);
 
                 let pre_l = tr_l;
                 let pre_r = tr_r;
+                self.track_post_pdc_l[tr_idx] = pre_l;
+                self.track_post_pdc_r[tr_idx] = pre_r;
 
                 let gain_db = tr.config.volume_auto.evaluate(pos, tr.config.gain_db);
                 let pan = tr.config.pan_auto.evaluate(pos, tr.config.pan);
@@ -892,6 +1016,14 @@ impl ObjectOrientedEngine {
                 mix_l += tr_l;
                 mix_r += tr_r;
             }
+            self.track_prev_l.copy_from_slice(&self.track_pre_l);
+            self.track_prev_r.copy_from_slice(&self.track_pre_r);
+            for (tr_idx, pdc) in self.track_master_sc_pdc.iter_mut().enumerate() {
+                let (ml, mr) =
+                    pdc.process(self.track_post_pdc_l[tr_idx], self.track_post_pdc_r[tr_idx]);
+                self.track_master_sc_l[tr_idx] = ml;
+                self.track_master_sc_r[tr_idx] = mr;
+            }
 
             // Align Main Mix bus with parallel Aux bus PDC, then sum processed Aux returns
             (mix_l, mix_r) = self.main_bus_pdc.process(mix_l, mix_r);
@@ -902,7 +1034,14 @@ impl ObjectOrientedEngine {
                 let mut bl = bus.acc_l;
                 let mut br = bus.acc_r;
                 for (proc_fx, cfg) in bus.inserts.iter_mut().zip(&bus.config.inserts) {
-                    (bl, br) = proc_fx.process_stereo(cfg, bl, br);
+                    let sc = resolve_sidechain_sample(
+                        &self.track_ids,
+                        None,
+                        &self.track_post_pdc_l,
+                        &self.track_post_pdc_r,
+                        cfg,
+                    );
+                    (bl, br) = proc_fx.process_stereo_with_sidechain(cfg, bl, br, sc);
                 }
                 (bl, br) = bus.pdc.process(bl, br);
                 let bg = 10.0_f32.powf(bus.config.gain_db.clamp(-60.0, 12.0) / 20.0);
@@ -913,7 +1052,14 @@ impl ObjectOrientedEngine {
 
             // Master bus inserts & smoothed gain
             for (proc_fx, cfg) in self.master_inserts.iter_mut().zip(&self.master_insert_cfgs) {
-                (mix_l, mix_r) = proc_fx.process_stereo(cfg, mix_l, mix_r);
+                let sc = resolve_sidechain_sample(
+                    &self.track_ids,
+                    None,
+                    &self.track_master_sc_l,
+                    &self.track_master_sc_r,
+                    cfg,
+                );
+                (mix_l, mix_r) = proc_fx.process_stereo_with_sidechain(cfg, mix_l, mix_r, sc);
             }
             let mg = self.master_gain_smooth.next_val() as f32;
             mix_l *= mg;

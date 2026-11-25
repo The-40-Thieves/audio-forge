@@ -1,19 +1,21 @@
 //! Remote Google Colab A100/L4 worker client (`notebooks/ForgeAudio_Colab_A100_Worker.ipynb`).
 //!
-//! Protocol: `POST {base_url}/api/v1/execute` with
-//! `{"task": "separate_stems", "payload": {"filename": ..., "audio_b64": ...}}`. The worker
-//! answers `{"ok": true, "data": {"stems": {"vocals": "<base64 wav>", "other": ...}}}`.
-//! The audio travels in the request because the Colab machine cannot read local paths.
+//! Protocol: `POST {base_url}/api/v1/execute` with `{"task": ..., "payload": {...}}`.
+//! Audio inputs are base64-encoded so the Colab GPU runtime needs no access to local paths.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::Engine as _;
 use forge_core::{ForgeError, Result, StemBundle};
-use serde_json::{Value, json};
+use forge_dsp::BeatGridReport;
+use serde_json::{Map, Value, json};
 
-/// Stem keys the worker may return, in `StemBundle` field order.
-const STEM_KEYS: [&str; 6] = ["vocals", "drums", "bass", "guitar", "keys", "other"];
+use crate::local_gpu::{
+    MidiTranscribeResult, NeuralDenoiseResult, NeuralRestoreResult, QualityEvalResult,
+    VocalRescueResult,
+};
+use crate::routing::SeparationConfig;
 
 const MAX_COLAB_UPLOAD_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_COLAB_RESPONSE_BYTES: u64 = 512 * 1024 * 1024;
@@ -47,36 +49,311 @@ fn validate_colab_url(base_url: &str) -> Result<reqwest::Url> {
     )))
 }
 
-/// Uploads `input_path` to the Colab worker and writes the returned stems into `output_dir`.
-pub(crate) fn separate(
-    base_url: &str,
-    input_path: &Path,
-    output_dir: &Path,
-    timeout: Duration,
-) -> Result<StemBundle> {
-    validate_colab_url(base_url)?;
-    let meta = std::fs::metadata(input_path)?;
+fn encode_audio_file(path: &Path) -> Result<(String, String)> {
+    let meta = std::fs::metadata(path)?;
     if meta.len() > MAX_COLAB_UPLOAD_BYTES {
         return Err(ForgeError::WorkerError(format!(
             "Input audio ({} bytes) exceeds Colab upload cap ({MAX_COLAB_UPLOAD_BYTES} bytes)",
             meta.len()
         )));
     }
-    let audio = std::fs::read(input_path)?;
-    let filename = input_path
+    let bytes = std::fs::read(path)?;
+    let filename = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "input.wav".to_string());
+    Ok((
+        filename,
+        base64::engine::general_purpose::STANDARD.encode(bytes),
+    ))
+}
+
+fn execute_task_with_audio(
+    base_url: &str,
+    task: &str,
+    input_path: &Path,
+    mut payload: Map<String, Value>,
+    timeout: Duration,
+) -> Result<Value> {
+    validate_colab_url(base_url)?;
+    let (filename, audio_b64) = encode_audio_file(input_path)?;
+    payload.insert("filename".to_string(), json!(filename));
+    payload.insert("audio_b64".to_string(), json!(audio_b64));
     let body = json!({
-        "task": "separate_stems",
-        "payload": {
-            "filename": filename,
-            "audio_b64": base64::engine::general_purpose::STANDARD.encode(audio),
-        }
+        "task": task,
+        "payload": Value::Object(payload),
     });
     let url = format!("{}/api/v1/execute", base_url.trim_end_matches('/'));
     let reply = post_json_blocking(&url, &body, timeout)?;
-    write_stems(&reply, output_dir)
+    if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+        let detail = reply.get("error").or_else(|| reply.get("detail"));
+        return Err(ForgeError::WorkerError(format!(
+            "Colab worker reported failure: {}",
+            detail.map_or_else(|| reply.to_string(), Value::to_string)
+        )));
+    }
+    Ok(reply)
+}
+
+fn decode_b64_to_path(b64: &str, out_path: &Path, label: &str) -> Result<PathBuf> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| ForgeError::WorkerError(format!("Colab {label} is not base64: {e}")))?;
+    if let Some(parent) = out_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(out_path, bytes)?;
+    Ok(out_path.to_path_buf())
+}
+
+fn extract_warnings(reply: &Value) -> Vec<String> {
+    reply
+        .pointer("/data/warnings")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn file_stem_safe(path: &Path) -> String {
+    let cleaned: String = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "audio".to_string())
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches(['.', '_']);
+    if trimmed.is_empty() {
+        "audio".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Uploads `input_path` to the Colab worker with full `SeparationConfig` flags and writes returned stems.
+pub(crate) fn separate(
+    base_url: &str,
+    input_path: &Path,
+    output_dir: &Path,
+    config: &SeparationConfig,
+) -> Result<(StemBundle, Vec<String>)> {
+    let mut payload = Map::new();
+    for (k, v) in [
+        ("stems", json!(config.stems)),
+        ("quality", json!(config.quality.as_str())),
+        ("dereverb", json!(config.dereverb)),
+        ("dereverb_echo", json!(config.dereverb_echo)),
+        ("debleed", json!(config.debleed)),
+        ("de_aspiration", json!(config.de_aspiration)),
+        ("drum_sep", json!(config.drum_sep)),
+        ("split_lead_backing", json!(config.split_lead_backing)),
+        ("split_male_female", json!(config.split_male_female)),
+        ("split_guitar", json!(config.split_guitar)),
+        ("split_orchestral", json!(config.split_orchestral)),
+        ("split_crowd", json!(config.split_crowd)),
+        ("restore", json!(config.restore)),
+    ] {
+        payload.insert(k.to_string(), v);
+    }
+    let reply = execute_task_with_audio(
+        base_url,
+        "separate_stems",
+        input_path,
+        payload,
+        config.http_timeout,
+    )?;
+    let warnings = extract_warnings(&reply);
+    let bundle = write_stems(&reply, output_dir)?;
+    Ok((bundle, warnings))
+}
+
+fn decode_audio_task_reply(
+    reply: &Value,
+    default_backend: &str,
+    out_path: PathBuf,
+    label: &str,
+    task_name: &str,
+) -> Result<(PathBuf, String)> {
+    let b64 = reply
+        .pointer("/data/audio_b64")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ForgeError::WorkerError(format!("Colab {task_name} reply missing data.audio_b64"))
+        })?;
+    let path = decode_b64_to_path(b64, &out_path, label)?;
+    let backend = reply
+        .pointer("/data/backend")
+        .and_then(Value::as_str)
+        .unwrap_or(default_backend)
+        .to_string();
+    Ok((path, backend))
+}
+
+#[allow(dead_code)]
+pub(crate) fn denoise(
+    base_url: &str,
+    input_path: &Path,
+    output_dir: &Path,
+    backend: &str,
+    attenuation_limit_db: Option<f64>,
+    timeout: Duration,
+) -> Result<NeuralDenoiseResult> {
+    let mut payload = Map::new();
+    payload.insert("backend".to_string(), json!(backend));
+    if let Some(lim) = attenuation_limit_db {
+        payload.insert("attenuation_limit_db".to_string(), json!(lim));
+    }
+    let reply = execute_task_with_audio(base_url, "denoise", input_path, payload, timeout)?;
+    let out_path = output_dir.join(format!("{}_denoised.wav", file_stem_safe(input_path)));
+    let (denoised, used_backend) =
+        decode_audio_task_reply(&reply, backend, out_path, "denoised audio", "denoise")?;
+    Ok(NeuralDenoiseResult {
+        denoised,
+        backend: used_backend,
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn transcribe(
+    base_url: &str,
+    input_path: &Path,
+    output_dir: &Path,
+    timeout: Duration,
+) -> Result<MidiTranscribeResult> {
+    let reply = execute_task_with_audio(base_url, "transcribe", input_path, Map::new(), timeout)?;
+    let b64 = reply
+        .pointer("/data/midi_b64")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ForgeError::WorkerError("Colab transcribe reply missing data.midi_b64".into())
+        })?;
+    let out_path = output_dir.join(format!("{}_basic_pitch.mid", file_stem_safe(input_path)));
+    Ok(MidiTranscribeResult {
+        midi: decode_b64_to_path(b64, &out_path, "MIDI")?,
+    })
+}
+
+pub(crate) fn restore(
+    base_url: &str,
+    input_path: &Path,
+    output_dir: &Path,
+    backend: &str,
+    prompt: Option<&str>,
+    chunk_secs: Option<f64>,
+    timeout: Duration,
+) -> Result<NeuralRestoreResult> {
+    let mut payload = Map::new();
+    payload.insert("backend".to_string(), json!(backend));
+    if let Some(p) = prompt {
+        payload.insert("prompt".to_string(), json!(p));
+    }
+    if let Some(cs) = chunk_secs {
+        payload.insert("chunk_secs".to_string(), json!(cs));
+    }
+    let reply = execute_task_with_audio(base_url, "restore", input_path, payload, timeout)?;
+    let out_path = output_dir.join(format!("{}_restored.wav", file_stem_safe(input_path)));
+    let (restored, used_backend) =
+        decode_audio_task_reply(&reply, backend, out_path, "restored audio", "restore")?;
+    Ok(NeuralRestoreResult {
+        restored,
+        backend: used_backend,
+        warnings: extract_warnings(&reply),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn vocal_rescue(
+    base_url: &str,
+    input_path: &Path,
+    output_dir: &Path,
+    backend: &str,
+    reference_voice: Option<&Path>,
+    dereverb: bool,
+    de_aspiration: bool,
+    timeout: Duration,
+) -> Result<VocalRescueResult> {
+    let mut payload = Map::new();
+    payload.insert("backend".to_string(), json!(backend));
+    payload.insert("dereverb".to_string(), json!(dereverb));
+    payload.insert("de_aspiration".to_string(), json!(de_aspiration));
+    if let Some(ref_path) = reference_voice {
+        let (ref_name, ref_b64) = encode_audio_file(ref_path)?;
+        payload.insert("reference_filename".to_string(), json!(ref_name));
+        payload.insert("reference_voice_b64".to_string(), json!(ref_b64));
+    }
+    let reply = execute_task_with_audio(base_url, "vocal_rescue", input_path, payload, timeout)?;
+    let out_path = output_dir.join(format!("{}_vocal_rescued.wav", file_stem_safe(input_path)));
+    let (rescued, used_backend) =
+        decode_audio_task_reply(&reply, backend, out_path, "rescued vocal", "vocal_rescue")?;
+    let stages = reply
+        .pointer("/data/stages")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(VocalRescueResult {
+        rescued,
+        backend: used_backend,
+        stages,
+        warnings: extract_warnings(&reply),
+    })
+}
+
+pub(crate) fn beat_track(
+    base_url: &str,
+    input_path: &Path,
+    backend: &str,
+    timeout: Duration,
+) -> Result<BeatGridReport> {
+    let mut payload = Map::new();
+    payload.insert("backend".to_string(), json!(backend));
+    let reply = execute_task_with_audio(base_url, "beat_track", input_path, payload, timeout)?;
+    let data = reply
+        .get("data")
+        .cloned()
+        .ok_or_else(|| ForgeError::WorkerError("Colab beat_track reply missing data".into()))?;
+    serde_json::from_value(data)
+        .map_err(|e| ForgeError::WorkerError(format!("Invalid Colab beat_track data: {e}")))
+}
+
+pub(crate) fn evaluate_quality(
+    base_url: &str,
+    input_path: &Path,
+    reference_path: Option<&Path>,
+    vocal: bool,
+    backend: &str,
+    timeout: Duration,
+) -> Result<QualityEvalResult> {
+    let mut payload = Map::new();
+    payload.insert("backend".to_string(), json!(backend));
+    payload.insert("vocal".to_string(), json!(vocal));
+    if let Some(ref_path) = reference_path {
+        let (ref_name, ref_b64) = encode_audio_file(ref_path)?;
+        payload.insert("reference_filename".to_string(), json!(ref_name));
+        payload.insert("reference_b64".to_string(), json!(ref_b64));
+    }
+    let reply =
+        execute_task_with_audio(base_url, "evaluate_quality", input_path, payload, timeout)?;
+    let data = reply.get("data").cloned().ok_or_else(|| {
+        ForgeError::WorkerError("Colab evaluate_quality reply missing data".into())
+    })?;
+    serde_json::from_value(data)
+        .map_err(|e| ForgeError::WorkerError(format!("Invalid Colab evaluate_quality data: {e}")))
 }
 
 /// Sends the request on a private current-thread runtime in its own thread, so this works
@@ -148,40 +425,43 @@ async fn post_json(url: &str, body: &Value, timeout: Duration) -> Result<Value> 
         .map_err(|e| ForgeError::WorkerError(format!("Colab worker sent invalid JSON: {e}")))
 }
 
-/// Decodes `data.stems` from a worker reply into `output_dir/colab_<stem>.wav` files.
+/// Decodes up to 23 `data.stems` entries from a worker reply into `output_dir/colab_<stem>.wav`.
 fn write_stems(reply: &Value, output_dir: &Path) -> Result<StemBundle> {
-    if reply.get("ok").and_then(Value::as_bool) != Some(true) {
-        let detail = reply.get("error").or_else(|| reply.get("detail"));
-        return Err(ForgeError::WorkerError(format!(
-            "Colab worker reported failure: {}",
-            detail.map_or_else(|| reply.to_string(), Value::to_string)
-        )));
-    }
     let stems = reply.pointer("/data/stems").and_then(Value::as_object);
-    let mut paths: [Option<std::path::PathBuf>; 6] = Default::default();
-    for (slot, key) in paths.iter_mut().zip(STEM_KEYS) {
+    let mut bundle = StemBundle::default();
+    let slots: [(&str, &mut Option<PathBuf>); 23] = [
+        ("vocals", &mut bundle.vocals),
+        ("lead_vocals", &mut bundle.lead_vocals),
+        ("backing_vocals", &mut bundle.backing_vocals),
+        ("male_vocals", &mut bundle.male_vocals),
+        ("female_vocals", &mut bundle.female_vocals),
+        ("vocal_reverb", &mut bundle.vocal_reverb),
+        ("drums", &mut bundle.drums),
+        ("bass", &mut bundle.bass),
+        ("guitar", &mut bundle.guitar),
+        ("electric_guitar", &mut bundle.electric_guitar),
+        ("acoustic_guitar", &mut bundle.acoustic_guitar),
+        ("keys", &mut bundle.keys),
+        ("strings", &mut bundle.strings),
+        ("brass", &mut bundle.brass),
+        ("wind", &mut bundle.wind),
+        ("synth", &mut bundle.synth),
+        ("crowd", &mut bundle.crowd),
+        ("other", &mut bundle.other),
+        ("kick", &mut bundle.kick),
+        ("snare", &mut bundle.snare),
+        ("toms", &mut bundle.toms),
+        ("hihat", &mut bundle.hihat),
+        ("cymbals", &mut bundle.cymbals),
+    ];
+    for (key, slot) in slots {
         let Some(b64) = stems.and_then(|s| s.get(key)).and_then(Value::as_str) else {
             continue;
         };
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .map_err(|e| {
-                ForgeError::WorkerError(format!("Colab stem '{key}' is not base64: {e}"))
-            })?;
         let path = output_dir.join(format!("colab_{key}.wav"));
-        std::fs::write(&path, bytes)?;
-        *slot = Some(path);
+        *slot = Some(decode_b64_to_path(b64, &path, &format!("stem '{key}'"))?);
     }
-    let [vocals, drums, bass, guitar, keys, other] = paths;
-    Ok(StemBundle {
-        vocals,
-        drums,
-        bass,
-        guitar,
-        keys,
-        other,
-        ..StemBundle::default()
-    })
+    Ok(bundle)
 }
 
 #[cfg(test)]
@@ -214,5 +494,98 @@ mod tests {
                 "must allow valid URL '{good}'"
             );
         }
+    }
+
+    #[test]
+    fn separate_forwards_flags_and_decodes_23_stem_slots() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let inp = dir.path().join("song.wav");
+        let out_dir = dir.path().join("stems");
+        std::fs::write(&inp, b"RIFFdemo").unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_srv = std::sync::Arc::clone(&captured);
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                let txt = String::from_utf8_lossy(&buf);
+                if let Some(hdr_end) = txt.find("\r\n\r\n") {
+                    let body_start = hdr_end + 4;
+                    let content_len = txt[..hdr_end]
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= body_start + content_len {
+                        *captured_srv.lock().unwrap() =
+                            String::from_utf8_lossy(&buf[body_start..body_start + content_len])
+                                .into_owned();
+                        break;
+                    }
+                }
+            }
+            let stem_b64 = base64::engine::general_purpose::STANDARD.encode(b"RIFFstem");
+            let resp_body = json!({
+                "ok": true,
+                "data": {
+                    "warnings": ["sub-split notice"],
+                    "stems": {
+                        "vocals": stem_b64,
+                        "lead_vocals": stem_b64,
+                        "strings": stem_b64,
+                        "cymbals": stem_b64,
+                        "other": stem_b64
+                    }
+                }
+            })
+            .to_string();
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            stream.write_all(reply.as_bytes()).unwrap();
+        });
+
+        let cfg = SeparationConfig {
+            debleed: true,
+            de_aspiration: true,
+            dereverb_echo: true,
+            http_timeout: Duration::from_secs(5),
+            ..SeparationConfig::default()
+        };
+        let url = format!("http://127.0.0.1:{}", addr.port());
+        let (bundle, warnings) = separate(&url, &inp, &out_dir, &cfg).expect("colab separate");
+        handle.join().unwrap();
+
+        let sent: Value = serde_json::from_str(&captured.lock().unwrap()).unwrap();
+        assert_eq!(sent["task"], "separate_stems");
+        assert_eq!(sent["payload"]["debleed"], true);
+        assert_eq!(sent["payload"]["de_aspiration"], true);
+        assert_eq!(sent["payload"]["dereverb_echo"], true);
+        assert_eq!(warnings, vec!["sub-split notice".to_string()]);
+        assert!(bundle.vocals.as_ref().unwrap().is_file());
+        assert!(bundle.lead_vocals.as_ref().unwrap().is_file());
+        assert!(bundle.strings.as_ref().unwrap().is_file());
+        assert!(bundle.cymbals.as_ref().unwrap().is_file());
+        assert!(bundle.other.as_ref().unwrap().is_file());
     }
 }

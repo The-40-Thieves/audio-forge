@@ -10,14 +10,21 @@ slider3:1.25<0.0,2.0,0.05>2.0-6.5 kHz AI Fizz / Metallic Weight
 slider4:1.00<0.0,2.0,0.05>5.5-14.0 kHz Sibilance Spray Weight
 slider5:160<20,300,1>Side-Channel Mono Cutoff (Hz)
 slider6:0<0,1,1{Normal (Suppressed Output),Delta Listen (Solo Removed Fizz)}>Monitor Mode
+slider7:0<0,22000,100>Ultrasonic LPF Cutoff (Hz, 0=Off)
+slider8:0.0<-1.0,1.0,0.05>Mid/Side Focus (-1=Mid .. +1=Side)
+slider9:0<0,1,1{Soft (Musical),Hard (Surgical AI)}>Suppression Curve
 
 @init
 srate_safe = max(srate, 44100);
 env_fizz = 0.0;
 env_sib = 0.0;
+env_fizz_s = 0.0;
+env_sib_s = 0.0;
 env_ref = 0.0001;
 gain_fizz = 1.0;
 gain_sib = 1.0;
+gain_fizz_s = 1.0;
+gain_sib_s = 1.0;
 
 // Sample-rate-independent envelope & attack/release coefficients (using actual positive srate)
 sr_env = max(srate, 1);
@@ -28,10 +35,14 @@ rel_f_a = exp(-1.0 / (sr_env * 0.0052));
 att_s_a = exp(-1.0 / (sr_env * 0.000095));
 rel_s_a = exp(-1.0 / (sr_env * 0.0042));
 
-// State variables for 2-pole SVF bandpass detectors
+// State variables for 2-pole SVF bandpass detectors + Side detectors + Ultrasonic LPF
 ic1_f = 0; ic2_f = 0;
 ic1_s = 0; ic2_s = 0;
+ic1_fs = 0; ic2_fs = 0;
+ic1_ss = 0; ic2_ss = 0;
 ic1_side = 0; ic2_side = 0;
+ic1_ul = 0; ic2_ul = 0;
+ic1_ur = 0; ic2_ur = 0;
 
 @slider
 thresh_lin = 10 ^ (slider1 / 20);
@@ -39,6 +50,11 @@ min_gain = 10 ^ (-slider2 / 20);
 w_fizz = slider3;
 w_sib = slider4;
 delta_mode = slider6;
+ulpf_on = slider7 >= 1000;
+ms_bal = min(1.0, max(-1.0, slider8));
+mid_focus = min(1.5, max(0.0, 1.0 - ms_bal * 0.5));
+side_focus = min(1.5, max(0.0, 1.0 + ms_bal * 0.5));
+curve_exp = slider9 > 0.5 ? 1.45 : 1.0;
 
 // SVF coefficients for 3800 Hz (2-6.5 kHz fizz zone) and 8500 Hz (sibilance zone)
 g_f = tan($pi * min(3800, srate_safe * 0.45) / srate_safe);
@@ -60,6 +76,14 @@ a1_side = 1.0 / (1.0 + g_side * (g_side + k_side));
 a2_side = g_side * a1_side;
 a3_side = g_side * a2_side;
 
+// Optional Ultrasonic Butterworth LPF (slider7 Hz)
+ul_fc = min(max(1000, slider7), srate_safe * 0.45);
+g_ul = tan($pi * ul_fc / srate_safe);
+k_ul = 1.41421356;
+a1_ul = 1.0 / (1.0 + g_ul * (g_ul + k_ul));
+a2_ul = g_ul * a1_ul;
+a3_ul = g_ul * a2_ul;
+
 @sample
 mid = 0.5 * (spl0 + spl1);
 side = 0.5 * (spl0 - spl1);
@@ -72,7 +96,7 @@ ic1_side = 2.0 * v1_side - ic1_side;
 ic2_side = 2.0 * v2_side - ic2_side;
 side_clean = side - k_side * v1_side - v2_side;
 
-// Extract 2-6.5 kHz Fizz Band
+// Extract Mid 2-6.5 kHz Fizz Band & 5.5-14 kHz Sibilance Band
 v3_f = mid - ic2_f;
 v1_f = a1_f * ic1_f + a2_f * v3_f;
 v2_f = ic2_f + a2_f * ic1_f + a3_f * v3_f;
@@ -80,7 +104,6 @@ ic1_f = 2.0 * v1_f - ic1_f;
 ic2_f = 2.0 * v2_f - ic2_f;
 bp_fizz = k_f * v1_f;
 
-// Extract 5.5-14 kHz Sibilance Band
 v3_s = mid - ic2_s;
 v1_s = a1_s * ic1_s + a2_s * v3_s;
 v2_s = ic2_s + a2_s * ic1_s + a3_s * v3_s;
@@ -88,26 +111,70 @@ ic1_s = 2.0 * v1_s - ic1_s;
 ic2_s = 2.0 * v2_s - ic2_s;
 bp_sib = k_s * v1_s;
 
-env_ref = ref_a * env_ref + (1.0 - ref_a) * abs(mid) + 0.000001;
+// Extract Side 2-6.5 kHz Fizz Band & 5.5-14 kHz Sibilance Band
+v3_fs = side_clean - ic2_fs;
+v1_fs = a1_f * ic1_fs + a2_f * v3_fs;
+v2_fs = ic2_fs + a2_f * ic1_fs + a3_f * v3_fs;
+ic1_fs = 2.0 * v1_fs - ic1_fs;
+ic2_fs = 2.0 * v2_fs - ic2_fs;
+bp_fizz_s = k_f * v1_fs;
+
+v3_ss = side_clean - ic2_ss;
+v1_ss = a1_s * ic1_ss + a2_s * v3_ss;
+v2_ss = ic2_ss + a2_s * ic1_ss + a3_s * v3_ss;
+ic1_ss = 2.0 * v1_ss - ic1_ss;
+ic2_ss = 2.0 * v2_ss - ic2_ss;
+bp_sib_s = k_s * v1_ss;
+
+env_ref = ref_a * env_ref + (1.0 - ref_a) * max(abs(mid), abs(side_clean)) + 0.000001;
 env_fizz = band_a * env_fizz + (1.0 - band_a) * abs(bp_fizz);
 env_sib = band_a * env_sib + (1.0 - band_a) * abs(bp_sib);
+env_fizz_s = band_a * env_fizz_s + (1.0 - band_a) * abs(bp_fizz_s);
+env_sib_s = band_a * env_sib_s + (1.0 - band_a) * abs(bp_sib_s);
 
-ratio_f = (env_fizz * w_fizz) / (env_ref * thresh_lin * 0.45);
-target_gf = ratio_f > 1.0 ? max(min_gain, 1.0 / ratio_f) : 1.0;
+ratio_f = (env_fizz * w_fizz * mid_focus) / (env_ref * thresh_lin * 0.45);
+target_gf = ratio_f > 1.0 ? max(min_gain, (1.0 / ratio_f) ^ curve_exp) : 1.0;
 gain_fizz = target_gf < gain_fizz ? (att_f_a * gain_fizz + (1.0 - att_f_a) * target_gf) : (rel_f_a * gain_fizz + (1.0 - rel_f_a) * target_gf);
 
-ratio_s = (env_sib * w_sib) / (env_ref * thresh_lin * 0.35);
-target_gs = ratio_s > 1.0 ? max(min_gain, 1.0 / ratio_s) : 1.0;
+ratio_s = (env_sib * w_sib * mid_focus) / (env_ref * thresh_lin * 0.35);
+target_gs = ratio_s > 1.0 ? max(min_gain, (1.0 / ratio_s) ^ curve_exp) : 1.0;
 gain_sib = target_gs < gain_sib ? (att_s_a * gain_sib + (1.0 - att_s_a) * target_gs) : (rel_s_a * gain_sib + (1.0 - rel_s_a) * target_gs);
 
-removed_fizz = bp_fizz * (1.0 - gain_fizz) + bp_sib * (1.0 - gain_sib);
-gmem[0] = 20.0 * log10(max(0.001, min(gain_fizz, gain_sib)));
+ratio_fs = (env_fizz_s * w_fizz * side_focus) / (env_ref * thresh_lin * 0.45);
+target_gfs = ratio_fs > 1.0 ? max(min_gain, (1.0 / ratio_fs) ^ curve_exp) : 1.0;
+gain_fizz_s = target_gfs < gain_fizz_s ? (att_f_a * gain_fizz_s + (1.0 - att_f_a) * target_gfs) : (rel_f_a * gain_fizz_s + (1.0 - rel_f_a) * target_gfs);
+
+ratio_ss = (env_sib_s * w_sib * side_focus) / (env_ref * thresh_lin * 0.35);
+target_gss = ratio_ss > 1.0 ? max(min_gain, (1.0 / ratio_ss) ^ curve_exp) : 1.0;
+gain_sib_s = target_gss < gain_sib_s ? (att_s_a * gain_sib_s + (1.0 - att_s_a) * target_gss) : (rel_s_a * gain_sib_s + (1.0 - rel_s_a) * target_gss);
+
+removed_mid = bp_fizz * (1.0 - gain_fizz) + bp_sib * (1.0 - gain_sib);
+removed_side = bp_fizz_s * (1.0 - gain_fizz_s) + bp_sib_s * (1.0 - gain_sib_s);
+gmem[0] = 20.0 * log10(max(0.001, min(min(gain_fizz, gain_sib), min(gain_fizz_s, gain_sib_s))));
 
 delta_mode > 0.5 ? (
-  spl0 = removed_fizz;
-  spl1 = removed_fizz;
+  spl0 = removed_mid + removed_side;
+  spl1 = removed_mid - removed_side;
 ) : (
-  mid_clean = mid - removed_fizz;
-  spl0 = mid_clean + side_clean;
-  spl1 = mid_clean - side_clean;
+  mid_out = mid - removed_mid;
+  side_out = side_clean - removed_side;
+  out_l = mid_out + side_out;
+  out_r = mid_out - side_out;
+  ulpf_on ? (
+    v3_ul = out_l - ic2_ul;
+    v1_ul = a1_ul * ic1_ul + a2_ul * v3_ul;
+    v2_ul = ic2_ul + a2_ul * ic1_ul + a3_ul * v3_ul;
+    ic1_ul = 2.0 * v1_ul - ic1_ul;
+    ic2_ul = 2.0 * v2_ul - ic2_ul;
+    out_l = v2_ul;
+
+    v3_ur = out_r - ic2_ur;
+    v1_ur = a1_ul * ic1_ur + a2_ul * v3_ur;
+    v2_ur = ic2_ur + a2_ul * ic1_ur + a3_ul * v3_ur;
+    ic1_ur = 2.0 * v1_ur - ic1_ur;
+    ic2_ur = 2.0 * v2_ur - ic2_ur;
+    out_r = v2_ur;
+  );
+  spl0 = out_l;
+  spl1 = out_r;
 );

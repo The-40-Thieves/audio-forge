@@ -11,6 +11,14 @@ use std::path::Path;
 use std::process::Command;
 
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
+use symphonia::core::audio::GenericAudioBufferRef;
+use symphonia::core::codecs::CodecParameters;
+use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, TrackType};
+use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
+use symphonia::core::meta::MetadataOptions;
 
 use crate::{AudioBuffer, ForgeError, Result};
 
@@ -74,18 +82,32 @@ impl AudioBuffer {
     /// Decodes audio from an open source. `name` gives the format hint (its extension) and
     /// the name used in errors; it is never opened.
     ///
-    /// WAV is decoded natively. Other formats, and WAV files hound rejects, are copied from
-    /// `reader` into a private temporary file that FFmpeg decodes, so FFmpeg reads the bytes
-    /// of the already-open source rather than re-opening `name`.
+    /// WAV is decoded natively with `hound`, then non-WAV (and fallback WAV) streams are decoded
+    /// in pure Rust via `symphonia` (FLAC, MP3, AAC, M4A, Ogg/Vorbis, AIFF, PCM). Exotic formats
+    /// rejected by Symphonia fall back to FFmpeg with explicit non-playlist demuxing.
     pub fn load_from_reader<R: Read + Seek>(mut reader: R, name: &Path) -> Result<Self> {
         let origin = name.display().to_string();
+        let _ = ffmpeg_demuxer_for_extension(name).ok_or_else(|| {
+            audio_io(
+                &origin,
+                "Unsupported audio format extension (playlist and unknown containers are rejected)",
+            )
+        })?;
         if has_wav_extension(name) {
             if let Ok(buf) = Self::load_wav_from_reader(BufReader::new(&mut reader), &origin) {
                 return Ok(buf);
             }
             reader.seek(SeekFrom::Start(0))?;
         }
-        decode_with_ffmpeg(&mut reader, name)
+        let bytes = read_bounded_bytes(&mut reader, &origin)?;
+        match decode_with_symphonia(bytes, name) {
+            SymphoniaDecodeOutcome::Ok(buf) => Ok(buf),
+            SymphoniaDecodeOutcome::FatalSafety(err) => Err(err),
+            SymphoniaDecodeOutcome::Fallback => {
+                reader.seek(SeekFrom::Start(0))?;
+                decode_with_ffmpeg(&mut reader, name)
+            }
+        }
     }
 
     /// Native WAV decoder (8/16/24/32-bit PCM and 32-bit IEEE float) over any reader.
@@ -202,6 +224,139 @@ fn has_wav_extension(name: &Path) -> bool {
 
 const MAX_FFMPEG_INPUT_BYTES: u64 = 512 * 1024 * 1024;
 const FFMPEG_DECODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+enum SymphoniaDecodeOutcome {
+    Ok(AudioBuffer),
+    FatalSafety(ForgeError),
+    Fallback,
+}
+
+fn read_bounded_bytes<R: Read + Seek>(reader: &mut R, origin: &str) -> Result<Vec<u8>> {
+    let end = reader
+        .seek(SeekFrom::End(0))
+        .map_err(|e| audio_io(origin, e))?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| audio_io(origin, e))?;
+    if end > MAX_FFMPEG_INPUT_BYTES {
+        return Err(audio_io(
+            origin,
+            format!("Input audio exceeds {MAX_FFMPEG_INPUT_BYTES} byte safety limit"),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(end as usize);
+    reader
+        .take(MAX_FFMPEG_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| audio_io(origin, e))?;
+    if (bytes.len() as u64) > MAX_FFMPEG_INPUT_BYTES {
+        return Err(audio_io(
+            origin,
+            format!("Input audio exceeds {MAX_FFMPEG_INPUT_BYTES} byte safety limit"),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn decode_with_symphonia(bytes: Vec<u8>, name: &Path) -> SymphoniaDecodeOutcome {
+    let origin = name.display().to_string();
+    let mut hint = Hint::new();
+    if let Some(ext) = name.extension().and_then(|e| e.to_str())
+        && !ext.is_empty()
+    {
+        hint.with_extension(ext);
+    }
+    let mss = MediaSourceStream::new(
+        Box::new(io::Cursor::new(bytes)),
+        MediaSourceStreamOptions::default(),
+    );
+    let Ok(mut format) = symphonia::default::get_probe().probe(
+        &hint,
+        mss,
+        FormatOptions::default(),
+        MetadataOptions::default(),
+    ) else {
+        return SymphoniaDecodeOutcome::Fallback;
+    };
+
+    let Some(track) = format.default_track(TrackType::Audio) else {
+        return SymphoniaDecodeOutcome::Fallback;
+    };
+    let track_id = track.id;
+    let Some(CodecParameters::Audio(audio_params)) = track.codec_params.clone() else {
+        return SymphoniaDecodeOutcome::Fallback;
+    };
+    let Some(sample_rate) = audio_params.sample_rate.filter(|&sr| sr > 0) else {
+        return SymphoniaDecodeOutcome::Fallback;
+    };
+    let Ok(mut decoder) = symphonia::default::get_codecs()
+        .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
+    else {
+        return SymphoniaDecodeOutcome::Fallback;
+    };
+
+    let mut channels: Vec<Vec<f64>> = Vec::new();
+    let mut packet_planes: Vec<Vec<f64>> = Vec::new();
+    let mut total_samples: usize = 0;
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(Some(packet)) => packet,
+            Ok(None) => break,
+            Err(SymphoniaError::IoError(err)) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                break;
+            }
+            Err(_) => return SymphoniaDecodeOutcome::Fallback,
+        };
+        if packet.track_id != track_id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(buf) => buf,
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(_) => return SymphoniaDecodeOutcome::Fallback,
+        };
+        if decoded.is_empty() {
+            continue;
+        }
+        packet_planes.clear();
+        GenericAudioBufferRef::copy_to_vecs_planar(&decoded, &mut packet_planes);
+        let ch_count = packet_planes.len();
+        if ch_count == 0 || ch_count > crate::MAX_WAV_CHANNELS {
+            return SymphoniaDecodeOutcome::FatalSafety(audio_io(
+                &origin,
+                format!("Unsupported audio channel count: {ch_count}"),
+            ));
+        }
+        if channels.is_empty() {
+            channels.resize_with(ch_count, Vec::new);
+        } else if channels.len() != ch_count {
+            return SymphoniaDecodeOutcome::Fallback;
+        }
+        let packet_samples: usize = packet_planes.iter().map(Vec::len).sum();
+        if total_samples.saturating_add(packet_samples) > crate::MAX_AUDIO_SAMPLES {
+            return SymphoniaDecodeOutcome::FatalSafety(audio_io(
+                &origin,
+                format!(
+                    "Audio exceeds maximum decoded sample limit ({} samples)",
+                    crate::MAX_AUDIO_SAMPLES
+                ),
+            ));
+        }
+        total_samples += packet_samples;
+        for (dst, src) in channels.iter_mut().zip(&packet_planes) {
+            dst.extend(src.iter().map(|&s| if s.is_finite() { s } else { 0.0 }));
+        }
+    }
+
+    if channels.is_empty() || channels[0].is_empty() {
+        return SymphoniaDecodeOutcome::Fallback;
+    }
+    match AudioBuffer::from_channels(channels, sample_rate) {
+        Ok(buf) => SymphoniaDecodeOutcome::Ok(buf),
+        Err(err) => SymphoniaDecodeOutcome::FatalSafety(err),
+    }
+}
 
 /// Maps a filename extension to a strict non-playlist FFmpeg demuxer name so
 /// auto-probing cannot treat disguised `#EXTM3U` playlists as `hls`/`concat` inputs.
@@ -511,5 +666,34 @@ mod tests {
                 .contains("Unsupported audio format extension"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn symphonia_decodes_pcm_and_float_wav_pure_rust() {
+        let buf = fixture();
+        for bits in [16_u16, 32] {
+            let mut bytes = Cursor::new(Vec::new());
+            buf.save_wav_to_writer(&mut bytes, bits, "symphonia_test")
+                .expect("encode wav");
+            let SymphoniaDecodeOutcome::Ok(decoded) =
+                decode_with_symphonia(bytes.into_inner(), Path::new("track.wav"))
+            else {
+                panic!("expected symphonia to decode {bits}-bit wav cleanly");
+            };
+            assert_eq!(decoded.sample_rate, 48_000);
+            assert_eq!(decoded.num_channels(), 2);
+            assert_eq!(decoded.num_frames(), 480);
+            let max_err = buf.channels[0]
+                .iter()
+                .zip(&decoded.channels[0])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f64::max);
+            assert!(max_err < 1e-3, "{bits}-bit symphonia error {max_err}");
+        }
+
+        assert!(matches!(
+            decode_with_symphonia(b"not valid audio".to_vec(), Path::new("bad.flac")),
+            SymphoniaDecodeOutcome::Fallback
+        ));
     }
 }

@@ -17,7 +17,7 @@ use crate::loudness_limiter::{
 };
 use crate::restoration::{
     RestorationConfig, apply_18_band_eq, clean_vocal_surgical, compute_reference_match_eq,
-    run_full_restoration_chain,
+    run_full_restoration_chain, sum_audio_buffers,
 };
 use crate::spectral_defizz::{DeFizzConfig, apply_spectral_defizz};
 
@@ -174,8 +174,14 @@ pub struct DeliveryOptions {
     pub channel_link: f64,
     /// Optional mastering dither / psychoacoustic noise shaping.
     pub dither: DitherMode,
-    /// Target integer bit depth when dithering (`8..=24`, typically `16` or `24`).
+    /// Mastering dither bit depth when dithering (`8..=24`, typically `16` or `24`).
     pub dither_bits: u16,
+    /// Treat input as AI-generated audio (avoids artificial high-band widening, enables HPSS shimmer).
+    pub ai_track_mode: bool,
+    /// Optional explicit OpenSoothe config; when `None`, derived from input telemetry/mode.
+    pub defizz_config: Option<DeFizzConfig>,
+    /// Optional explicit restoration config; when `None`, derived from input [`AuditReport`].
+    pub restoration_config: Option<RestorationConfig>,
 }
 
 impl DeliveryOptions {
@@ -191,6 +197,9 @@ impl DeliveryOptions {
             channel_link: 1.0,
             dither: DitherMode::None,
             dither_bits: 24,
+            ai_track_mode: false,
+            defizz_config: None,
+            restoration_config: None,
         }
     }
 }
@@ -229,15 +238,38 @@ pub fn deliver(
     let mut work = input.clone();
 
     if options.repair {
-        work = run_full_restoration_chain(&work, &RestorationConfig::default())?;
-        stages.push("repair: DC removal, de-clip, hum notch".to_string());
+        let rest_cfg = options
+            .restoration_config
+            .clone()
+            .unwrap_or_else(|| RestorationConfig::from_audit(&before, options.ai_track_mode));
+        let mut repair_notes = vec!["DC removal"];
+        if rest_cfg.declip {
+            repair_notes.push("de-clip");
+        }
+        if rest_cfg.hum_fundamental_hz.is_some() {
+            repair_notes.push("hum notch");
+        }
+        if rest_cfg.mono_below_hz.is_some() {
+            repair_notes.push("sub mono");
+        }
+        work = run_full_restoration_chain(&work, &rest_cfg)?;
+        stages.push(format!("repair: {}", repair_notes.join(", ")));
     }
     if options.vocal {
         work = clean_vocal_surgical(&work, true, true, -12.0)?;
         stages.push("vocal: de-click, de-plosive, breath gate".to_string());
     }
     if options.defizz {
-        work = apply_spectral_defizz(&work, &DeFizzConfig::default())?;
+        let defizz_cfg = options.defizz_config.unwrap_or_else(|| {
+            if options.ai_track_mode {
+                DeFizzConfig::ai_mix_from_audit(&before)
+            } else if options.vocal {
+                DeFizzConfig::ai_vocal()
+            } else {
+                DeFizzConfig::default()
+            }
+        });
+        work = apply_spectral_defizz(&work, &defizz_cfg)?;
         stages.push("defizz: dynamic spectral resonance suppression".to_string());
     }
     match &options.tone_match {
@@ -301,6 +333,42 @@ pub fn deliver(
         ready,
     };
     Ok((mastered, report))
+}
+
+/// Resamples `buf` to `target_sr` using windowed-sinc resampling when sample rates differ.
+fn match_stem_sample_rate(buf: &AudioBuffer, target_sr: u32) -> Result<AudioBuffer> {
+    if buf.sample_rate == target_sr || buf.num_frames() == 0 {
+        return Ok(buf.clone());
+    }
+    crate::resample::resample_buffer_sinc(buf, target_sr)
+}
+
+/// Sums active primary cleaned stems (or uses `fallback` if none) and runs telemetry-driven
+/// AI-track delivery mastering toward `target`, aligning any mismatched stem sample rates first.
+pub fn resum_and_deliver_ai_stems(
+    stems: &[&AudioBuffer],
+    fallback: &AudioBuffer,
+    target: DeliveryTarget,
+) -> Result<(AudioBuffer, DeliveryReport)> {
+    let mix = if stems.is_empty() {
+        fallback.clone()
+    } else {
+        let target_sr = fallback.sample_rate.max(1);
+        let mut aligned: Vec<AudioBuffer> = Vec::with_capacity(stems.len());
+        for s in stems {
+            aligned.push(match_stem_sample_rate(s, target_sr)?);
+        }
+        let target_frames = aligned
+            .iter()
+            .map(AudioBuffer::num_frames)
+            .max()
+            .unwrap_or_else(|| fallback.num_frames());
+        let aligned_refs: Vec<&AudioBuffer> = aligned.iter().collect();
+        sum_audio_buffers(&aligned_refs, target_frames, target_sr)?
+    };
+    let mut opts = DeliveryOptions::for_target(target);
+    opts.ai_track_mode = true;
+    deliver(&mix, &opts)
 }
 
 /// Checks an audit against a target's objective delivery requirements.

@@ -13,26 +13,19 @@ pub struct StretchMarker {
     pub source_pos_secs: f64,
 }
 
-/// Time-aligns a vocal double/harmony (`dub`) to a lead vocal (`guide`) using banded Dynamic Time Warping
-/// (Synchro Arts VocAlign equivalent) and emits native REAPER `SM` stretch markers.
-///
-/// DTW memory is linear in the input length: only the warp band of each row is stored. Output
-/// past the end of the dub is silent.
-pub fn align_vocal_double_dtw(
-    guide: &AudioBuffer,
-    dub: &AudioBuffer,
-    max_warp_ms: f64,
-) -> Result<(AudioBuffer, Vec<StretchMarker>)> {
-    align_vocal_double_dtw_traced(guide, dub, max_warp_ms).map(|(buf, markers, _)| (buf, markers))
+struct DtwAlignmentPlan {
+    step_map: Vec<f64>,
+    markers: Vec<StretchMarker>,
+    hop: usize,
+    cells: usize,
 }
 
-/// [`align_vocal_double_dtw`], also returning how many DTW cells it allocated (`0` when the
-/// input is too short to align). Tests use the count to check the memory bound.
-pub(crate) fn align_vocal_double_dtw_traced(
+/// Computes smoothed DTW step contour, decimated stretch markers, hop size, and cell count.
+fn compute_dtw_alignment(
     guide: &AudioBuffer,
     dub: &AudioBuffer,
     max_warp_ms: f64,
-) -> Result<(AudioBuffer, Vec<StretchMarker>, usize)> {
+) -> Result<Option<DtwAlignmentPlan>> {
     if guide.sample_rate != dub.sample_rate {
         return Err(ForgeError::InvalidParameter(
             "Guide and dub vocals must share the same sample rate".to_string(),
@@ -46,7 +39,7 @@ pub(crate) fn align_vocal_double_dtw_traced(
     let hop = ((sr * 0.010).round() as usize).max(64);
     let num_steps = frames / hop;
     if frames < 1024 || num_steps < 4 {
-        return Ok((dub.clone(), Vec::new(), 0));
+        return Ok(None);
     }
     let g_feats = dtw_features(&g_mono, hop, num_steps);
     let d_feats = dtw_features(&d_mono, hop, num_steps);
@@ -58,19 +51,68 @@ pub(crate) fn align_vocal_double_dtw_traced(
     dtw.fill(&g_feats, &d_feats);
     let raw_step_map = dtw.step_map();
     let step_map = smooth_step_map(&raw_step_map);
-
     let markers = stretch_markers(&step_map, hop, sr);
+    Ok(Some(DtwAlignmentPlan {
+        step_map,
+        markers,
+        hop,
+        cells: dtw.allocated_cells(),
+    }))
+}
+
+/// Time-aligns a vocal double/harmony (`dub`) to a lead vocal (`guide`) using banded Dynamic Time Warping
+/// (Synchro Arts VocAlign equivalent) and emits native REAPER `SM` stretch markers.
+///
+/// DTW memory is linear in the input length: only the warp band of each row is stored. Output
+/// past the end of the dub is silent.
+pub fn align_vocal_double_dtw(
+    guide: &AudioBuffer,
+    dub: &AudioBuffer,
+    max_warp_ms: f64,
+) -> Result<(AudioBuffer, Vec<StretchMarker>)> {
+    align_vocal_double_dtw_traced(guide, dub, max_warp_ms).map(|(buf, markers, _)| (buf, markers))
+}
+
+/// Time-aligns `dub` to `guide` via banded DTW + pitch-preserving stereo-locked WSOLA rendering
+/// so vocal doubles stay formantically faithful even on wider stretches.
+pub fn align_vocal_double_dtw_elastic(
+    guide: &AudioBuffer,
+    dub: &AudioBuffer,
+    max_warp_ms: f64,
+) -> Result<(AudioBuffer, Vec<StretchMarker>)> {
+    let Some(plan) = compute_dtw_alignment(guide, dub, max_warp_ms)? else {
+        return Ok((dub.clone(), Vec::new()));
+    };
+    let out_frames = guide.num_frames();
+    let warped = crate::beat_grid::warp_buffer_wsola(
+        dub,
+        |f| warped_source_pos(f, &plan.step_map, plan.hop),
+        out_frames,
+    );
+    Ok((warped, plan.markers))
+}
+
+/// [`align_vocal_double_dtw`], also returning how many DTW cells it allocated (`0` when the
+/// input is too short to align). Tests use the count to check the memory bound.
+pub(crate) fn align_vocal_double_dtw_traced(
+    guide: &AudioBuffer,
+    dub: &AudioBuffer,
+    max_warp_ms: f64,
+) -> Result<(AudioBuffer, Vec<StretchMarker>, usize)> {
+    let Some(plan) = compute_dtw_alignment(guide, dub, max_warp_ms)? else {
+        return Ok((dub.clone(), Vec::new(), 0));
+    };
     let out_frames = guide.num_frames();
     let channels = dub
         .channels
         .iter()
-        .map(|ch| warp_channel(ch, &step_map, hop, out_frames))
+        .map(|ch| warp_channel(ch, &plan.step_map, plan.hop, out_frames))
         .collect();
     let warped = AudioBuffer {
         channels,
         sample_rate: dub.sample_rate,
     };
-    Ok((warped, markers, dtw.allocated_cells()))
+    Ok((warped, plan.markers, plan.cells))
 }
 
 /// Per-hop `(log energy dB, zero-crossing rate × 40)` features for the first `num_steps` hops.

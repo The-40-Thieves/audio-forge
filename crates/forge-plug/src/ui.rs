@@ -17,6 +17,8 @@ pub const MAX_PRESET_JSON_BYTES: usize = 64 * 1024;
 /// Sentinel stored in `GuiTelemetry::lufs_momentary` / `true_peak_dbtp` when a plugin does not
 /// publish K-weighted loudness telemetry.
 pub const UNSET_LOUDNESS_DB: f32 = -120.0;
+/// Sentinel stored in `GuiTelemetry::high_mid_corr` when a plugin does not publish AI telemetry.
+pub const UNSET_AI_CORR: f32 = -2.0;
 
 /// Safe, zero-`unsafe` handle to any `nih_plug` parameter for A/B state recall and factory presets.
 #[derive(Clone, Copy)]
@@ -470,6 +472,9 @@ pub struct GuiTelemetry {
     pub lufs_momentary: AtomicU32,
     pub lufs_short_term: AtomicU32,
     pub true_peak_dbtp: AtomicU32,
+    pub high_mid_corr: AtomicU32,
+    pub mid_fizz_db: AtomicU32,
+    pub side_fizz_db: AtomicU32,
     pub ab_slot: AtomicU32,
     pub spectrum_frozen: AtomicBool,
 }
@@ -490,6 +495,9 @@ impl Default for GuiTelemetry {
             lufs_momentary: AtomicU32::new(UNSET_LOUDNESS_DB.to_bits()),
             lufs_short_term: AtomicU32::new(UNSET_LOUDNESS_DB.to_bits()),
             true_peak_dbtp: AtomicU32::new(UNSET_LOUDNESS_DB.to_bits()),
+            high_mid_corr: AtomicU32::new(UNSET_AI_CORR.to_bits()),
+            mid_fizz_db: AtomicU32::new(UNSET_LOUDNESS_DB.to_bits()),
+            side_fizz_db: AtomicU32::new(UNSET_LOUDNESS_DB.to_bits()),
             ab_slot: AtomicU32::new(0),
             spectrum_frozen: AtomicBool::new(false),
         }
@@ -814,6 +822,32 @@ impl GuiTelemetry {
             self.band_gr_db[i].store(g.to_bits(), Ordering::Relaxed);
         }
     }
+
+    /// Publishes 2–12 kHz stereo correlation (`-1..=1`) and Mid/Side fizz levels (`dB`) lock-free.
+    #[inline]
+    pub fn update_ai_telemetry(&self, corr: f32, mid_db: f32, side_db: f32) {
+        let clean_corr = if corr.is_finite() {
+            corr.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        let clean_mid = if mid_db.is_finite() {
+            mid_db.clamp(-90.0, 12.0)
+        } else {
+            -90.0
+        };
+        let clean_side = if side_db.is_finite() {
+            side_db.clamp(-90.0, 12.0)
+        } else {
+            -90.0
+        };
+        self.high_mid_corr
+            .store(clean_corr.to_bits(), Ordering::Relaxed);
+        self.mid_fizz_db
+            .store(clean_mid.to_bits(), Ordering::Relaxed);
+        self.side_fizz_db
+            .store(clean_side.to_bits(), Ordering::Relaxed);
+    }
 }
 
 /// Maps a dBFS level (`-60..=0`) to a color-coded studio meter fill color.
@@ -982,6 +1016,29 @@ pub(crate) fn draw_forge_studio_header_and_spectrum_interactive(
                     .monospace()
                     .small()
                     .color(egui::Color32::from_rgb(192, 132, 252)),
+                );
+            }
+
+            let ai_corr = f32::from_bits(telemetry.high_mid_corr.load(Ordering::Relaxed));
+            let mid_fz = f32::from_bits(telemetry.mid_fizz_db.load(Ordering::Relaxed));
+            let side_fz = f32::from_bits(telemetry.side_fizz_db.load(Ordering::Relaxed));
+            if ai_corr.is_finite() && ai_corr >= -1.01 {
+                let corr_color = if ai_corr < 0.25 {
+                    egui::Color32::from_rgb(251, 146, 60)
+                } else {
+                    egui::Color32::from_rgb(56, 189, 248)
+                };
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "CORR {:+4.2} | FIZZ M {:+4.0} / S {:+4.0} dB",
+                        ai_corr.clamp(-1.0, 1.0),
+                        mid_fz.clamp(-90.0, 12.0),
+                        side_fz.clamp(-90.0, 12.0),
+                    ))
+                    .monospace()
+                    .small()
+                    .color(corr_color),
                 );
             }
         });

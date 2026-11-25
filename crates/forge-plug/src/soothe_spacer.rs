@@ -79,6 +79,8 @@ pub struct OpenSootheParams {
     pub focus_mid_db: FloatParam,
     #[id = "foc_hi"]
     pub focus_high_db: FloatParam,
+    #[id = "ulpf"]
+    pub ultrasonic_lpf_hz: FloatParam,
 }
 
 impl Default for OpenSootheParams {
@@ -221,6 +223,34 @@ impl Default for OpenSootheParams {
             )
             .with_value_to_string(formatters::v2s_f32_rounded(1))
             .with_unit(" dB"),
+            ultrasonic_lpf_hz: FloatParam::new(
+                "Ultrasonic LPF",
+                0.0,
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 22_000.0,
+                },
+            )
+            .with_value_to_string(Arc::new(|v| {
+                if v < 1_000.0 {
+                    String::from("Off")
+                } else {
+                    format!("{v:.0} Hz")
+                }
+            }))
+            .with_string_to_value(Arc::new(|s| {
+                let t = s.trim();
+                if t.eq_ignore_ascii_case("off") {
+                    return Some(0.0);
+                }
+                t.trim_end_matches("Hz")
+                    .trim_end_matches("hz")
+                    .trim()
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|v| v.is_finite())
+                    .map(|v| v.clamp(0.0, 22_000.0))
+            })),
         }
     }
 }
@@ -342,6 +372,7 @@ impl Plugin for ForgeOpenSoothePlug {
             ("foc_lo", Float, focus_low_db, "Focus Low (<400 Hz)"),
             ("foc_mid", Float, focus_mid_db, "Focus Mid (0.4-4 kHz)"),
             ("foc_hi", Float, focus_high_db, "Focus High (>4 kHz)"),
+            ("ulpf", Float, ultrasonic_lpf_hz, "Ultrasonic LPF (0=Off)"),
         ]
     );
 
@@ -404,6 +435,8 @@ impl Plugin for ForgeOpenSoothePlug {
             f64::from(self.params.focus_mid_db.value()),
             f64::from(self.params.focus_high_db.value()),
         );
+        self.dsp
+            .set_ultrasonic_lpf_hz(f64::from(self.params.ultrasonic_lpf_hz.value()));
 
         for mut channel_samples in buffer.iter_samples() {
             let sens = f64::from(self.params.sensitivity_db.smoothed.next());
@@ -439,6 +472,11 @@ impl Plugin for ForgeOpenSoothePlug {
         let bands = self.dsp.last_spectrum_32_db();
         let gr_curve = self.dsp.last_band_gr_32_db();
         self.telemetry.update_spectrum_and_gr(&bands, &gr_curve);
+        self.telemetry.update_ai_telemetry(
+            self.dsp.high_mid_correlation() as f32,
+            self.dsp.mid_fizz_db() as f32,
+            self.dsp.side_fizz_db() as f32,
+        );
         self.publish_to_bus(bus_slot, &bands);
 
         ProcessStatus::Normal

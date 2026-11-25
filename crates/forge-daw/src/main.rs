@@ -19,8 +19,8 @@ mod mixer;
 use eframe::egui;
 use forge_core::AudioBuffer;
 use forge_engine::{
-    AudioObject, ClipCache, DawProject, LiveAudioEngine, LiveRecorder, MidiClip,
-    ObjectOrientedEngine, TimelineMarker, UndoStack,
+    AudioObject, BeatGridReport, ClipCache, DawProject, FxSlotConfig, LiveAudioEngine,
+    LiveRecorder, MidiClip, ObjectOrientedEngine, TimelineMarker, UndoStack,
 };
 use gpu::{build_native_options, configure_studio_theme, detect_gpu_label};
 
@@ -72,6 +72,7 @@ impl SnapGrid {
         }
     }
 
+    #[cfg(test)]
     fn snap_samples(self, raw_samples: u64, sample_rate: u32, bpm: f64, time_sig_num: u8) -> u64 {
         let beats_per_step = match self {
             Self::Off => return raw_samples,
@@ -83,6 +84,21 @@ impl SnapGrid {
         let step_secs = (60.0 / bpm.max(20.0)) * beats_per_step;
         let step_smp = (step_secs * f64::from(sample_rate.max(8_000))).max(1.0);
         (((raw_samples as f64) / step_smp).round() * step_smp).max(0.0) as u64
+    }
+
+    fn snap_samples_for_project(self, raw_samples: u64, project: &DawProject) -> u64 {
+        let step_beats = match self {
+            Self::Off => return raw_samples,
+            Self::Bar => f64::from(project.time_sig_num.max(1)),
+            Self::Quarter => 1.0,
+            Self::Eighth => 0.5,
+            Self::Sixteenth => 0.25,
+        };
+        let sr = f64::from(project.sample_rate.max(8_000));
+        let raw_secs = (raw_samples as f64) / sr;
+        let raw_beat = project.secs_to_beat(raw_secs);
+        let snapped_beat = (raw_beat / step_beats).round().max(0.0) * step_beats;
+        (project.beat_to_secs(snapped_beat) * sr).round().max(0.0) as u64
     }
 }
 
@@ -98,6 +114,61 @@ enum InspectorTab {
     Object,
     PianoRoll,
     TrackBusFx,
+    AiStudio,
+}
+
+pub(crate) enum AiJobOutcome {
+    Summary(String),
+    TempoMap(BeatGridReport),
+    ProducedStem {
+        track_title: String,
+        obj_name: String,
+        path: PathBuf,
+        start_samples: u64,
+        length_samples: u64,
+        time_stretch: f32,
+        pitch_semitones: f32,
+        summary: String,
+    },
+}
+
+pub(crate) fn stage_selected_object_wav(
+    src_path: &std::path::Path,
+    out_dir: &std::path::Path,
+    project_sr: u32,
+    source_offset_samples: u64,
+    length_samples: u64,
+    time_stretch: f32,
+) -> Result<PathBuf, String> {
+    let raw = AudioBuffer::load(src_path).map_err(|e| format!("Failed to read audio: {e}"))?;
+    let full_frames = raw.num_frames();
+    let sr_ratio = f64::from(raw.sample_rate.max(1)) / f64::from(project_sr.max(8_000));
+    let stretch = f64::from(time_stretch.clamp(0.5, 2.0));
+    let start_src = ((source_offset_samples as f64) * sr_ratio).round().max(0.0) as usize;
+    let needed_src = ((length_samples.max(1) as f64) * stretch * sr_ratio)
+        .round()
+        .max(1.0) as usize;
+    if source_offset_samples == 0 && needed_src >= full_frames {
+        return Ok(src_path.to_path_buf());
+    }
+    let clamped_start = start_src.min(full_frames);
+    let end_src = clamped_start.saturating_add(needed_src).min(full_frames);
+    if end_src <= clamped_start {
+        return Err("Selected audio object slice has zero source frames".to_string());
+    }
+    let sliced_ch: Vec<Vec<f64>> = raw
+        .channels
+        .iter()
+        .map(|ch| ch[clamped_start..end_src].to_vec())
+        .collect();
+    let sliced = AudioBuffer::from_channels(sliced_ch, raw.sample_rate)
+        .map_err(|e| format!("Failed to slice audio object: {e}"))?;
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("Failed to create AI dir: {e}"))?;
+    let staged_path = out_dir.join("staged_selection.wav");
+    sliced
+        .save_wav(&staged_path, 24)
+        .map_err(|e| format!("Failed to save staged slice: {e}"))?;
+    Ok(staged_path)
 }
 
 struct ForgeDawApp {
@@ -129,6 +200,9 @@ struct ForgeDawApp {
     piano_roll_bar: u64,
     stem_split_rx:
         Option<std::sync::mpsc::Receiver<Result<(u64, forge_worker::SeparationReport), String>>>,
+    ai_job_rx: Option<std::sync::mpsc::Receiver<Result<AiJobOutcome, String>>>,
+    ai_job_label: String,
+    ai_audit_summary: String,
 }
 
 impl ForgeDawApp {
@@ -188,6 +262,9 @@ impl ForgeDawApp {
             piano_roll_base_octave: 3,
             piano_roll_bar: 0,
             stem_split_rx: None,
+            ai_job_rx: None,
+            ai_job_label: String::new(),
+            ai_audit_summary: String::new(),
         }
     }
 
@@ -486,6 +563,200 @@ impl ForgeDawApp {
         }
     }
 
+    pub(crate) fn start_ai_studio_job<F>(&mut self, job_label: &str, work: F)
+    where
+        F: FnOnce(PathBuf, PathBuf, u64, f64) -> Result<AiJobOutcome, String> + Send + 'static,
+    {
+        if self.ai_job_rx.is_some() {
+            return;
+        }
+        let Some(obj_id) = self.selected_object_id else {
+            self.status_line = "Select an audio object before running AI Track Studio".to_string();
+            return;
+        };
+        let Some(found) = self
+            .project
+            .tracks
+            .iter()
+            .flat_map(|t| t.objects.iter())
+            .find(|o| o.id == obj_id)
+            .map(|o| {
+                (
+                    o.source_path.clone(),
+                    o.timeline_start_samples,
+                    o.source_offset_samples,
+                    o.length_samples,
+                    o.time_stretch,
+                    o.pitch_semitones,
+                )
+            })
+        else {
+            return;
+        };
+        let (src_path, start_smp, src_offset, obj_len, time_stretch, pitch_st) = found;
+        let out_dir = self.project_media_dir().join(format!("ai_studio_{obj_id}"));
+        let bpm_hint = self.project.bpm;
+        let proj_sr = self.project.sample_rate;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ai_job_rx = Some(rx);
+        self.ai_job_label = job_label.to_string();
+        self.status_line = format!("Running AI Studio: {job_label}...");
+        std::thread::spawn(move || {
+            let outcome = stage_selected_object_wav(
+                &src_path,
+                &out_dir,
+                proj_sr,
+                src_offset,
+                obj_len,
+                time_stretch,
+            )
+            .and_then(|staged| work(staged, out_dir, start_smp, bpm_hint))
+            .map(|mut res| {
+                if let AiJobOutcome::ProducedStem {
+                    length_samples,
+                    time_stretch: ts,
+                    pitch_semitones: ps,
+                    ..
+                } = &mut res
+                {
+                    *length_samples = obj_len;
+                    *ts = time_stretch;
+                    *ps = pitch_st;
+                }
+                res
+            });
+            let _ = tx.send(outcome);
+        });
+    }
+
+    pub(crate) fn apply_ai_defizz_preset(&mut self) {
+        let Some(obj_id) = self.selected_object_id else {
+            self.status_line = "Select an audio object to apply AI De-Fizz".to_string();
+            return;
+        };
+        let prev = self.project.clone();
+        let defizz = FxSlotConfig::OpenSoothe {
+            bypass: false,
+            sensitivity_db: 2.5,
+            max_depth_db: 12.0,
+            sharpness_bins: 12,
+            low_latency: true,
+            tilt_db_per_oct: -0.5,
+            ultrasonic_lpf_hz: 16_500.0,
+            mid_side_balance: 0.25,
+            stereo_link: 0.75,
+            hard_mode: true,
+        };
+        if let Some(obj) = self.project.object_mut(obj_id) {
+            if let Some(slot) = obj
+                .fx_chain
+                .iter_mut()
+                .find(|fx| matches!(fx, FxSlotConfig::OpenSoothe { .. }))
+            {
+                *slot = defizz;
+            } else {
+                obj.fx_chain.push(defizz);
+            }
+        }
+        if !self
+            .project
+            .master_inserts
+            .iter()
+            .any(|fx| matches!(fx, FxSlotConfig::MasterLimiter { .. }))
+        {
+            self.project
+                .master_inserts
+                .push(FxSlotConfig::default_master_limiter());
+        }
+        self.commit_project_change(prev);
+        self.ai_audit_summary =
+            "Applied AI De-Fizz (2.5 dB sens, 12 dB depth, 16.5 kHz ULPF, Hard Mode) + Master Limiter"
+                .to_string();
+        self.status_line = "Applied AI De-Fizz preset to selected object".to_string();
+    }
+
+    fn poll_ai_job_result(&mut self) {
+        let Some(ref rx) = self.ai_job_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(outcome)) => {
+                self.ai_job_rx = None;
+                self.ai_job_label.clear();
+                match outcome {
+                    AiJobOutcome::Summary(msg) => {
+                        self.ai_audit_summary = msg.clone();
+                        self.status_line = msg;
+                    }
+                    AiJobOutcome::TempoMap(rep) => {
+                        let prev = self.project.clone();
+                        self.project.bpm = rep.median_bpm.clamp(30.0, 300.0);
+                        self.project.tempo_map = rep.tempo_map.clone();
+                        let nodes = self.project.tempo_map.len();
+                        let summary = format!(
+                            "Tempo map ({}): {:.2} BPM, drift {:.2} BPM, {} nodes",
+                            rep.backend, rep.median_bpm, rep.max_bpm_drift, nodes
+                        );
+                        self.commit_project_change(prev);
+                        self.ai_audit_summary = summary.clone();
+                        self.status_line = summary;
+                    }
+                    AiJobOutcome::ProducedStem {
+                        track_title,
+                        obj_name,
+                        path,
+                        start_samples,
+                        length_samples,
+                        time_stretch,
+                        pitch_semitones,
+                        summary,
+                    } => {
+                        let target_sr = self.project.sample_rate;
+                        match self.cache.load_clip_for_rate(&path, target_sr) {
+                            Ok(buf) => {
+                                let prev = self.project.clone();
+                                let tr_idx = self.project.tracks.len();
+                                self.project.add_track(track_title);
+                                let id = self.project.alloc_id();
+                                let eff_stretch = f64::from(time_stretch.clamp(0.5, 2.0));
+                                let max_timeline =
+                                    ((buf.num_frames() as f64) / eff_stretch).round().max(1.0)
+                                        as u64;
+                                let bounded_len = length_samples.max(1).min(max_timeline);
+                                let mut obj = AudioObject::new(id, obj_name, path, bounded_len);
+                                obj.timeline_start_samples = start_samples;
+                                obj.source_offset_samples = 0;
+                                obj.time_stretch = time_stretch;
+                                obj.pitch_semitones = pitch_semitones;
+                                self.project.tracks[tr_idx].objects.push(obj);
+                                self.selected_track_idx = tr_idx;
+                                self.selected_object_id = Some(id);
+                                self.commit_project_change(prev);
+                                self.ai_audit_summary = summary.clone();
+                                self.status_line = summary;
+                            }
+                            Err(err) => {
+                                self.status_line = format!("Failed to import AI result: {err}");
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Err(err)) => {
+                self.ai_job_rx = None;
+                self.ai_job_label.clear();
+                self.status_line = format!("AI Studio job failed: {err}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.ai_job_rx = None;
+                self.ai_job_label.clear();
+                self.status_line =
+                    "AI Studio background thread terminated unexpectedly".to_string();
+            }
+        }
+    }
+
     fn split_selected_at_playhead(&mut self) {
         let Some(sel_id) = self.selected_object_id else {
             return;
@@ -722,7 +993,7 @@ impl ForgeDawApp {
                 let secs = (pos as f64) / f64::from(self.project.sample_rate.max(1));
                 let mins = (secs / 60.0).floor() as u64;
                 let rem_secs = secs - (mins as f64) * 60.0;
-                let beats = secs * (self.project.bpm / 60.0);
+                let beats = self.project.secs_to_beat(secs);
                 let bar = (beats / f64::from(self.project.time_sig_num)).floor() as u64 + 1;
                 let beat = (beats % f64::from(self.project.time_sig_num)).floor() as u64 + 1;
                 ui.label(
@@ -943,6 +1214,49 @@ impl ForgeDawApp {
                             egui::FontId::monospace(10.0),
                             egui::Color32::from_rgb(165, 175, 195),
                         );
+                    }
+                }
+
+                if !self.project.tempo_map.is_empty() {
+                    let vis_end_s = f64::from(self.scroll_secs)
+                        + f64::from(ruler_rect.width() / self.pixels_per_sec)
+                        + 2.0;
+                    let b_start = self
+                        .project
+                        .secs_to_beat(f64::from(self.scroll_secs.max(0.0)))
+                        .floor() as u64;
+                    let b_end = (self.project.secs_to_beat(vis_end_s).ceil() as u64)
+                        .min(b_start.saturating_add(512));
+                    let bar_len = u64::from(self.project.time_sig_num.max(1));
+                    for b in b_start..=b_end {
+                        if !b.is_multiple_of(bar_len) {
+                            continue;
+                        }
+                        let bx = ruler_rect.left()
+                            + (self.project.beat_to_secs(b as f64) as f32 - self.scroll_secs)
+                                * self.pixels_per_sec;
+                        if bx >= ruler_rect.left() && bx <= ruler_rect.right() {
+                            rp.line_segment(
+                                [
+                                    egui::pos2(bx, ruler_rect.center().y),
+                                    egui::pos2(bx, ruler_rect.bottom()),
+                                ],
+                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(250, 204, 21)),
+                            );
+                        }
+                    }
+                    for tp in self.project.tempo_map.iter().take(64) {
+                        let tx = ruler_rect.left()
+                            + (tp.time_secs as f32 - self.scroll_secs) * self.pixels_per_sec;
+                        if tx >= ruler_rect.left() && tx <= ruler_rect.right() {
+                            rp.text(
+                                egui::pos2(tx + 2.0, ruler_rect.top() + 2.0),
+                                egui::Align2::LEFT_TOP,
+                                format!("{:.0}", tp.bpm),
+                                egui::FontId::monospace(8.5),
+                                egui::Color32::from_rgb(250, 204, 21),
+                            );
+                        }
                     }
                 }
 
@@ -1258,23 +1572,25 @@ impl ForgeDawApp {
                                 if dx.abs() > 0.1 || matches!(drag_mode, DragMode::Move) {
                                     let delta_smp =
                                         (f64::from(dx / self.pixels_per_sec) * sr).round() as i64;
+                                    let move_snapped = if matches!(drag_mode, DragMode::Move) {
+                                        let cum_smp = (f64::from(cum_dx / self.pixels_per_sec) * sr)
+                                            .round()
+                                            as i64;
+                                        let raw = (self.drag_anchor_samples as i64 + cum_smp).max(0)
+                                            as u64;
+                                        Some(
+                                            self.snap_grid
+                                                .snap_samples_for_project(raw, &self.project),
+                                        )
+                                    } else {
+                                        None
+                                    };
                                     let obj = &mut self.project.tracks[ti].objects[oi];
                                     match drag_mode {
                                         DragMode::Move => {
-                                            let cum_smp = (f64::from(cum_dx / self.pixels_per_sec)
-                                                * sr)
-                                                .round()
-                                                as i64;
-                                            let raw = (self.drag_anchor_samples as i64 + cum_smp)
-                                                .max(0)
-                                                as u64;
-                                            let snapped = self.snap_grid.snap_samples(
-                                                raw,
-                                                self.project.sample_rate,
-                                                self.project.bpm,
-                                                self.project.time_sig_num,
-                                            );
-                                            if snapped != obj.timeline_start_samples {
+                                            if let Some(snapped) = move_snapped
+                                                && snapped != obj.timeline_start_samples
+                                            {
                                                 obj.timeline_start_samples = snapped;
                                                 changed = true;
                                             }
@@ -1446,12 +1762,9 @@ impl ForgeDawApp {
                                 let secs = ((pt.x - lane_rect.left()) / self.pixels_per_sec)
                                     + self.scroll_secs;
                                 let raw_smp = (f64::from(secs.max(0.0)) * sr).round() as u64;
-                                let smp = self.snap_grid.snap_samples(
-                                    raw_smp,
-                                    self.project.sample_rate,
-                                    self.project.bpm,
-                                    self.project.time_sig_num,
-                                );
+                                let smp = self
+                                    .snap_grid
+                                    .snap_samples_for_project(raw_smp, &self.project);
                                 let db = y_to_db(pt.y);
                                 self.project.tracks[ti].volume_auto.enabled = true;
                                 self.project.tracks[ti].volume_auto.upsert_point(smp, db);
@@ -1515,6 +1828,7 @@ impl ForgeDawApp {
 impl eframe::App for ForgeDawApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_stem_split_result();
+        self.poll_ai_job_result();
         self.pointer_down = ui.input(|i| i.pointer.primary_down());
         // Drag-and-drop audio file import directly onto the DAW window
         let dropped: Vec<PathBuf> = ui.input(|i| {
@@ -1581,7 +1895,7 @@ impl eframe::App for ForgeDawApp {
 
         if self.audio.as_ref().is_some_and(LiveAudioEngine::is_playing) || self.recorder.is_some() {
             ui.request_repaint();
-        } else if self.stem_split_rx.is_some() {
+        } else if self.stem_split_rx.is_some() || self.ai_job_rx.is_some() {
             ui.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
@@ -1654,5 +1968,51 @@ mod tests {
             .expect("should have 1 undo snapshot");
         assert!((restored.master_gain_db - initial_gain).abs() < 1e-6);
         assert!(app.undo.undo(restored).is_none());
+    }
+
+    #[test]
+    fn variable_tempo_map_snap_quantizes_across_bpm_changes() {
+        let mut proj = DawProject::new("TempoSnap", 48_000, 120.0);
+        proj.tempo_map = vec![
+            forge_engine::TempoPoint {
+                time_secs: 0.0,
+                bpm: 120.0,
+                time_sig_num: 4,
+                time_sig_den: 4,
+            },
+            forge_engine::TempoPoint {
+                time_secs: 2.0,
+                bpm: 60.0,
+                time_sig_num: 4,
+                time_sig_den: 4,
+            },
+        ];
+        // At 2.0s (4 beats @ 120 BPM) + 1.0s @ 60 BPM = beat 5 at 3.0s (144,000 samples).
+        let snapped = SnapGrid::Quarter.snap_samples_for_project(146_000, &proj);
+        assert_eq!(snapped, 144_000);
+    }
+
+    #[test]
+    fn stage_selected_object_wav_slices_split_bounds_without_leaking_prefix() {
+        let dir = std::env::temp_dir().join(format!("forge_daw_stage_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp test dir");
+        let src_path = dir.join("full.wav");
+        // Left half: silence (0.0); right half: 0.4 amplitude DC-ish pulse
+        let mut ch = vec![0.0_f64; 4_800];
+        ch.extend(std::iter::repeat_n(0.4_f64, 4_800));
+        AudioBuffer::from_channels(vec![ch.clone(), ch], 48_000)
+            .expect("buf")
+            .save_wav(&src_path, 24)
+            .expect("save");
+
+        let out_dir = dir.join("ai_obj");
+        let staged = stage_selected_object_wav(&src_path, &out_dir, 48_000, 4_800, 2_400, 1.0)
+            .expect("stage split");
+        assert_ne!(staged, src_path);
+        let loaded = AudioBuffer::load(&staged).expect("load staged");
+        assert_eq!(loaded.num_frames(), 2_400);
+        assert!((loaded.channels[0][0] - 0.4).abs() < 1e-4);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -2,7 +2,7 @@
 
 **Repository:** [`https://github.com/The-40-Thieves/audio-forge`](https://github.com/The-40-Thieves/audio-forge)  
 **License:** Apache-2.0  
-**Language & Stack:** Rust 2024 Edition (9 Workspace Crates) + `nih-plug` / `nih_plug_egui` (10 VST3 & CLAP Plugins) + REAPER 7.82 EEL2 `JSFX` & `.RPP` Engine + Hybrid GPU Sidecar (`uv` + PyTorch / Google Colab A100 / Google Lyria 3.5)
+**Language & Stack:** Rust 2024 Edition (Workspace Crates) + `nih-plug` / `nih_plug_egui` (11 VST3 & CLAP Plugins) + 9 REAPER 7.82 EEL2 `JSFX` Effects & `.RPP` Engine + Hybrid GPU Sidecar (`uv` + `pytorch-cu130` / Google Colab A100 / Google Lyria 3.5)
 
 ---
 
@@ -16,8 +16,8 @@
    - [2.4 `forge-theory` — Minimal-Motion Voice Leading, Neo-Soul Reharmonizer, Dilla Groove & MIDI/ABC](#24-forge-theory--minimal-motion-voice-leading-neo-soul-reharmonizer-dilla-groove--midiabc)
    - [2.5 `forge-reaper` — REAPER 7.82 `.RPP` AST Compiler, EEL2 JSFX Installer, OSC & ISO 3901 ISRC](#25-forge-reaper--reaper-782-rpp-ast-compiler-eel2-jsfx-installer-osc--iso-3901-isrc)
    - [2.6 `forge-worker` — Hybrid AI Model Dispatcher (Local RTX GPU + Colab A100 + Lyria 3.5)](#26-forge-worker--hybrid-ai-model-dispatcher-local-rtx-gpu--colab-a100--lyria-35)
-   - [2.7 `forge-plug` — 10 Native Cross-DAW VST3 & CLAP Real-Time Plugins (`nih-plug` + `egui`)](#27-forge-plug--10-native-cross-daw-vst3--clap-real-time-plugins-nih-plug--egui)
-   - [2.8 `forge-cli` & `forge-mcp` — Unified CLI Binary & JSON-RPC 2.0 MCP Agent Server](#28-forge-cli--forge-mcp--unified-cli-binary--json-rpc-20-mcp-agent-server)
+   - [2.7 `forge-plug` — 11 Native Cross-DAW VST3 & CLAP Real-Time Plugins (`nih-plug` + `egui`)](#27-forge-plug--11-native-cross-daw-vst3--clap-real-time-plugins-nih-plug--egui)
+   - [2.8 `forge-cli` & `forge-mcp` — Unified CLI Binary & `rmcp 3.11` MCP Agent Server](#28-forge-cli--forge-mcp--unified-cli-binary--rmcp-311-mcp-agent-server)
    - [2.9 `xtask` — Multi-Plugin VST3 & CLAP Bundle Packager](#29-xtask--multi-plugin-vst3--clap-bundle-packager)
 3. [Deep-Dive DSP Algorithms & Mathematical Foundations](#3-deep-dive-dsp-algorithms--mathematical-foundations)
 4. [REAPER 7.82 Native Integration (`JSFX`, `<PITCHENV`, Stretch Markers & Sidechain Routing)](#4-reaper-782-native-integration-jsfx-pitchenv-stretch-markers--sidechain-routing)
@@ -30,39 +30,43 @@
 ForgeAudio (`audio-forge`) is architected with strict domain separation so the **core DSP and music theory algorithms** run in pure, deterministic, memory-safe Rust, and can be consumed simultaneously by:
 1. **Cross-DAW Real-Time VST3 & CLAP Plugins (`forge-plug`)** with **zero audio-thread heap allocations** (`assert_process_allocs`) and a 60 FPS OpenGL GUI (`nih_plug_egui`).
 2. **Command-Line Studio Pipelines (`forge-cli`)** with `<5 ms` startup time.
-3. **Autonomous AI Coding & Studio Agents (`forge-mcp`)** via JSON-RPC 2.0 over `stdio`.
-4. **REAPER 7.82 Native Sessions (`forge-reaper` + `reaper-jsfx/`)** via compiled `.RPP` state chunks, EEL2 `JSFX` scripts, and UDP Open Sound Control (`OSC`).
+3. **Autonomous AI Coding & Studio Agents (`forge-mcp`)** via the official `rmcp 3.11.0` SDK over `stdio` or loopback-guarded `--http` Streamable HTTP.
+4. **REAPER 7.82 Native Sessions (`forge-reaper` + `reaper-jsfx/`)** via compiled `.RPP` state chunks, 9 EEL2 `JSFX` scripts, and UDP Open Sound Control (`OSC`).
 
 ```mermaid
 flowchart TD
     subgraph Interfaces["Presentation & Host Interfaces"]
+        DAW["forge-daw (wgpu DAW + AI Studio)"]
         CLI["forge-cli (CLI Binary)"]
-        MCP["forge-mcp (JSON-RPC 2.0 MCP Server)"]
-        PLUG["forge-plug (10 VST3 & CLAP Plugins + 60 FPS egui GUI)"]
-        JSFX["reaper-jsfx/ (4 Native REAPER EEL2 JSFX Plugins)"]
+        MCP["forge-mcp (rmcp 3.11 MCP Server)"]
+        PLUG["forge-plug (11 VST3 & CLAP Plugins + egui GUI)"]
+        JSFX["reaper-jsfx/ (9 Native REAPER EEL2 JSFX Plugins)"]
     end
 
     subgraph Domain["Core Pure-Rust Studio Domain Crates"]
-        DSP["forge-dsp (Offline + Real-Time Zero-Alloc DSP & Elite Kernels)"]
-        VOCAL["forge-vocal (YIN F0, Sibilant-Aware PSOLA, LPC Formants)"]
+        ENGINE["forge-engine (Multitrack Renderer, PDC, Tempo Map)"]
+        DSP["forge-dsp (Offline/RT Zero-Alloc DSP & Sinc Resampler)"]
+        VOCAL["forge-vocal (YIN & External F0, PSOLA, LPC Formants)"]
         THEORY["forge-theory (Voice-Leading, Neo-Soul, Dilla Groove, Drum-to-MIDI)"]
         REAPER["forge-reaper (.RPP Compiler, <PITCHENV, SM, OSC, ISRC)"]
-        WORKER["forge-worker (Hybrid GPU Router, Lyria 3.5, XO Drum Indexer)"]
+        WORKER["forge-worker (Hybrid GPU Router, f0-track, Lyria 3.5)"]
     end
 
     subgraph Foundation["Foundational Contracts & I/O"]
-        CORE["forge-core (64-bit Planar AudioBuffer, WAV/FFmpeg I/O, TPDF Dither)"]
+        CORE["forge-core (64-bit Planar AudioBuffer, Symphonia 0.6.1 / FFmpeg I/O, TPDF Dither)"]
     end
 
     subgraph External["External Hardware & Cloud Accelerators"]
-        UV["python-worker/ (Mel-Band-RoFormer, BS-RoFormer de-reverb)"]
+        UV["python-worker/ (pytorch-cu130, RoFormer, f0-track, warm-cache)"]
         COLAB["notebooks/ (Google Colab A100 Worker)"]
         LYRIA["Google DeepMind Lyria 3.5 API"]
     end
 
-    CLI --> DSP & VOCAL & THEORY & REAPER & WORKER
-    MCP --> DSP & VOCAL & THEORY & REAPER & WORKER
-    PLUG --> DSP
+    DAW --> ENGINE & WORKER & DSP
+    ENGINE --> DSP & VOCAL & CORE
+    CLI --> DSP & VOCAL & THEORY & REAPER & WORKER & ENGINE
+    MCP --> DSP & VOCAL & THEORY & REAPER & WORKER & ENGINE
+    PLUG --> DSP & VOCAL
     DSP --> CORE
     VOCAL --> CORE & DSP & THEORY
     THEORY --> CORE
@@ -80,7 +84,7 @@ flowchart TD
 - **Key Types & Functions:**
   - `ForgeError` & `Result<T>`: Structured `thiserror` domain error hierarchy (`AudioIo`, `InvalidParameter`, `TheoryError`, `ReaperError`, `WorkerError`, `IsrcError`).
   - `AudioBuffer`: 64-bit double-precision planar audio representation (`channels: Vec<Vec<f64>>`, `sample_rate: u32`). Using planar `f64` vectors avoids interleaved channel stride overhead and provides $>300\text{ dB}$ of internal dynamic range during cascaded IIR filtering.
-  - `AudioBuffer::load` & `AudioBuffer::load_wav`: Reads `8/16/24/32-bit PCM` and `32-bit IEEE float` WAV files natively via `hound`, and automatically falls back to `ffmpeg -c:a pcm_f32le` for `FLAC`, `MP3`, `OGG`, `M4A`, and `AIFF`. A WAV whose sample data does not end on a whole frame is rejected with `ForgeError::AudioIo`, so every loaded channel has the same length.
+  - `AudioBuffer::load` & `AudioBuffer::load_wav`: Reads `8/16/24/32-bit PCM` and `32-bit IEEE float` WAV files natively via `hound`, decodes `FLAC`, `MP3`, `AAC`, `ALAC`, `MP4/M4A`, `OGG/Vorbis`, `MKV`, and `AIFF` in pure Rust via `symphonia 0.6.1` (`opt-simd`, enforcing channel & sample safety bounds as fatal), and falls back to `ffmpeg -c:a pcm_f32le` only when Symphonia declines to decode a container. A WAV whose sample data does not end on a whole frame is rejected with `ForgeError::AudioIo`, so every loaded channel has the same length.
   - `AudioBuffer::save_wav`: Exports `16-bit PCM`, `24-bit PCM` (DistroKid/Apple Digital Masters standard), or `32-bit float` WAV. Integer exports apply **Triangular Probability Density Function (TPDF) dithering** (`next_uniform() + next_uniform()`) generated by a deterministic 64-bit `xorshift*` PRNG (`0x9E37_79B9_7F4A_7C15`) to eliminate quantization distortion in reverb tails and fade-outs.
   - `AuditReport`: Serializable studio telemetry struct capturing Integrated/Short-Term/Momentary LUFS, Loudness Range (`LRA`), 4x True Peak (`dBTP`), DC offset, stereo & `<160 Hz` correlation, `50/60 Hz` hum, `2.5–6.5 kHz` harshness, and the composite `0..100` **AI Fizz Index**.
 
@@ -124,6 +128,12 @@ flowchart TD
      - `SHARED_SPECTRUM_SLOTS`, `publish_shared_spectrum`, `read_shared_spectrum`, `clear_shared_spectrum`: 8-slot lock-free `AtomicU32` cross-instance IPC bus (`FabFilter Pro-Q 4` / `Neutron 5` wireless instance communication). A per-slot sequence counter makes every read one whole frame; publishing never waits and skips a frame if another instance is mid-publish on the same slot. Unpublished and cleared slots read as silence (`-90 dB`). The plugin's bus-slot parameter is `0 = Off`, `1-8 = Slot A-H` (its text also parses back from `Off`, `Slot A`, a bare letter or the plain number, case-insensitively).
      - Slot ownership: each instance holds a `SpectrumBusOwner` (a unique id from a global `AtomicU64` counter). A successful publish records its owner in the slot under the seqlock, so the last writer owns the slot. `clear_shared_spectrum(owner, slot)` empties the slot only if `owner` is still its owner, checked again under the seqlock; it retries a bounded number of times while another writer holds the slot. An instance clears its slot when it moves to another one or is removed, so when two instances share a slot, the one that leaves never silences the other. When the owner itself leaves, the slot reads as silence until the other instance's next publish. All of it is lock-free, allocation-free and `unsafe`-free.
 
+  9. **`beat_grid.rs` & `resample.rs` — Onset/DP Beat Tracking, WSOLA Time-Warping & Kaiser-Sinc / Polyphase Resampling:**
+      - Computes a 10 ms sub+broadband onset-flux envelope and Ellis-style DP beat/downbeat trajectory to measure `median_bpm`, `max_bpm_drift`, and per-bar `TempoPoint` nodes (`tempo_map`).
+      - Provides zero-pitch-shift stereo-locked WSOLA time-warping for `quantize_to_constant_bpm` and `align_vocal_double_dtw_elastic`, plus `sum_audio_buffers` (`restoration.rs`) and AI-telemetry-driven `DeFizzConfig::{ai_mix_from_audit, ai_vocal}` / `RestorationConfig::from_audit`.
+      - `resample.rs` implements DC-normalized Kaiser-windowed sinc offline resampling (`resample_buffer_sinc`) and zero-allocation 512-phase 32-tap polyphase streaming resampling (`RealtimeSincResampler`), while `RealtimeOpenSoothe` adds `set_ultrasonic_lpf_hz` and live 2–12 kHz stereo correlation & Mid/Side fizz telemetry.
+      - All core safety bounds (clamp panics, Hadamard orthogonality, FDN Lyapunov contraction, Cytomic SVF stability, sinc DC unity & signed-weight L1 gain bound (+ negative-lobe overshoot witness), ultrasonic LPF Nyquist guard, tempo-map bijective roundtrips, and M/S Cauchy-Schwarz correlation bounds) are verified across 17 Z3 SMT checks (`scripts/verify_dsp_invariants_z3.py`).
+
 ---
 
 ### 2.3 `forge-vocal` — YIN F0 Pitch Tracker, Sibilant Bypass & Levinson-Durbin LPC Formant Shifter
@@ -136,6 +146,7 @@ flowchart TD
   - `shift_vocal_pitch_formant_preserved`: Combines **Melodyne 5-style Sibilant Separation** (keeping unvoiced consonants `100%` dry and unshifted so they never sound lispy) with dual-grain Hanning crossfade PSOLA pitch shifting on voiced vowels and LPC F1 (`650 Hz`) / F2 (`2150 Hz`) formant envelope restoration.
   - `generate_vocal_harmony_stack`: Generates a 3-part humanized diatonic vocal harmony stack (3rd Above, 3rd/4th Below, and Formant-Lowered Octave Double) with decorrelated `4.8–5.6 Hz` vibrato LFOs.
   - `compile_reaper_take_pitch_envelope`: Serializes the `PitchFrame` contour into a native REAPER `<PITCHENV` chunk so every pitch node can be visually inspected and dragged inside REAPER.
+  - `pitch_frames_from_external_f0`: Converts external `(time_secs, f0_hz)` contours (`f0-track` `RMVPE` / `FCPE` / autocorrelation) into scale-snapped `PitchFrame` trajectories with octave-glitch suppression.
 
 ---
 
@@ -154,13 +165,13 @@ flowchart TD
 ### 2.5 `forge-reaper` — REAPER 7.82 `.RPP` AST Compiler, EEL2 JSFX Installer, OSC & ISO 3901 ISRC
 - **File:** `crates/forge-reaper/src/lib.rs` & `reaper-jsfx/*.jsfx`
 - **Key Components:**
-  - `install_jsfx_plugins`: Embeds all 4 EEL2 `JSFX` plugins at compile time via `include_str!` and installs them into `Effects/ForgeAudio` under REAPER's resource folder (`%APPDATA%\REAPER` on Windows, `~/Library/Application Support/REAPER` on macOS, `$XDG_CONFIG_HOME/REAPER` or `~/.config/REAPER` on Linux), where the session's `<JS "ForgeAudio/...">` references resolve. It returns an error when that folder cannot be found, instead of writing somewhere REAPER never looks. `forge_ingest_to_reaper` installs there too and reports the outcome in its `jsfx` result field.
+  - `install_jsfx_plugins`: Embeds all 9 EEL2 `JSFX` plugins at compile time via `include_str!` and installs them into `Effects/ForgeAudio` under REAPER's resource folder (`%APPDATA%\REAPER` on Windows, `~/Library/Application Support/REAPER` on macOS, `$XDG_CONFIG_HOME/REAPER` or `~/.config/REAPER` on Linux), where the session's `<JS "ForgeAudio/...">` references resolve. It returns an error when that folder cannot be found, instead of writing somewhere REAPER never looks. `forge_ingest_to_reaper` installs there too and reports the outcome in its `jsfx` result field.
   - `ReaperProjectBuilder`: Generates complete REAPER 7.82 `.RPP` project files containing:
     - Song structure timeline markers (`[Intro]`, `[Verse 1]`, `[Chorus]`, etc.)
     - Master bus `<MASTERFXLIST>` with `Forge_OpenSoothe_DeFizz.jsfx`
     - 4-channel tracks (`NCHAN 4`) with automatic sidechain routing (`AUXRECV <src_track> ... 1024` routing source channels `1/2` into destination sidechain channels `3/4`)
     - Non-destructive `élastique 3.3.3 Pro` pitch-preserving playback (`PLAYRATE 1.0 1 0.0 229376`)
-    - Embedded `SM` Stretch Markers and `<PITCHENV` Take Pitch Envelopes
+    - Embedded `SM` Stretch Markers, `<PITCHENV` Take Pitch Envelopes, and `<TEMPOENVEX` variable beat-grid tempo maps (`tempo_map: Vec<TempoPoint>`)
     - `<RENDER_METADATA>` chunks with `ISRC` and `ID3:TSRC`
     - Absolute `FILE` media paths (REAPER resolves relative paths against the `.rpp` folder), quoted with whichever of `"`, `'` or a backtick the string does not contain, as REAPER does; `save_rpp` rejects paths it cannot represent (line breaks, NULs, all three quote characters, non-UTF-8)
   - `send_reaper_osc`: Sends live UDP Open Sound Control (`OSC`) packets (`rosc`) to `127.0.0.1:9000` for real-time transport, fader, and action triggering. It rejects addresses that are not OSC patterns (must start with `/`) and hosts that do not resolve, and sends from the unspecified address for a non-loopback host. UDP has no acknowledgement, so success means the packet was sent.
@@ -169,26 +180,27 @@ flowchart TD
 ---
 
 ### 2.6 `forge-worker` — Hybrid AI Model Dispatcher (Local RTX GPU + Colab A100 + Lyria 3.5)
-- **Files:** `crates/forge-worker/src/lib.rs`, `python-worker/forge_gpu_worker.py`, `notebooks/ForgeAudio_Colab_A100_Worker.ipynb`
+- **Files:** `crates/forge-worker/src/lib.rs`, `crates/forge-worker/src/{routing.rs, local_gpu.rs, colab.rs}`, `python-worker/forge_gpu_worker.py`, `notebooks/ForgeAudio_Colab_A100_Worker.ipynb`
 - **Key Components:**
   - `separate_stems`: Supports 4 backends (`WorkerBackend::Auto`, `LocalGpu`, `RemoteColab`, `PureRustDsp`). `forge-mcp` and `forge-cli` build a `SeparationConfig::from_env()`:
     - `FORGE_WORKER_BACKEND` picks the backend: `auto` (default), `local_gpu`, `colab` or `dsp`.
     - `Auto` tries the local GPU worker, then the Colab worker when `FORGE_COLAB_WORKER_URL` is set, then the Rust DSP splitter. `LocalGpu` and `RemoteColab` fall back to the Rust DSP splitter if they fail.
-    - Every skipped or failed backend is logged to stderr with its reason. The returned `SeparationReport` names the backend that ran (`local_gpu`, `remote_colab` or `pure_rust_dsp`) and lists the fallback reasons; `forge_ingest_to_reaper` returns both as `stem_separation`.
+    - Every skipped or failed backend is logged to stderr with its reason. The returned `SeparationReport` names the backend that ran (`local_gpu`, `remote_colab` or `pure_rust_dsp`), fallback reasons, and non-fatal `warnings`; `forge_ingest_to_reaper` returns them as `stem_separation`.
     - To fail instead of falling back to the Rust DSP splitter, set `FORGE_WORKER_REQUIRE_NEURAL=1`, pass `forge ingest --require-neural`, or pass `require_neural: true` to `forge_ingest_to_reaper`. The error lists why each neural backend failed or was skipped. `forge ingest` also prints the backend that ran and every fallback reason.
-    - The local worker is an ephemeral `uv run --no-sync --project python-worker python-worker/forge_gpu_worker.py separate` subprocess running **`Mel-Band-RoFormer` (Kim Vocal)** + **`BS-RoFormer` De-Reverb**, writing two stems (`vocals` and the instrumental `other`) to disk and exiting immediately so **0 MB of VRAM** remains occupied while mixing in REAPER. The script comes from `FORGE_GPU_WORKER_SCRIPT` or, failing that, from the source tree the binary was built from; neither the working directory nor the executable's location is searched. Installed binaries outside the source tree need `FORGE_GPU_WORKER_SCRIPT`. A run that exceeds `FORGE_GPU_WORKER_TIMEOUT_SECS` (default 900) has its process tree killed and is reported as a timeout.
-    - The Colab worker receives the input as base64 in `POST /api/v1/execute` (`task: separate_stems`) and returns base64 WAV stems (`vocals` and `other` only), which are written to `colab_<stem>.wav`. Requests are limited by `FORGE_COLAB_TIMEOUT_SECS` (default 900).
+    - The local worker is an ephemeral `uv run --no-sync --project python-worker python-worker/forge_gpu_worker.py separate` subprocess running verified `audio-separator` checkpoints (`vocals_mel_band_roformer.ckpt`, `model_bs_roformer_ep_317_sdr_12.9755.ckpt`, `BS-Roformer-SW.ckpt` primary with `htdemucs_ft.yaml`/`htdemucs_6s.yaml` fallback, `deverb_bs_roformer_8_384dim_10depth.ckpt`, `dereverb-echo_mel_band_roformer_sdr_13.4843_v2.ckpt`, `mel_band_roformer_bleed_suppressor_v1.ckpt`, `aspiration_mel_band_roformer_sdr_18.9845.ckpt`, `MDX23C-DrumSep-aufr33-jarredou.ckpt`, and `bs_roformer_vocals_revive_v3e_unwa.ckpt`), writing separated stems to disk and exiting immediately so **0 MB of VRAM** remains occupied while mixing in REAPER.
+    - Hybrid AI restoration & telemetry dispatchers: `neural_restore_hybrid` (Apollo / FlowHigh / AudioSR / SonicMaster / spectral exciter), `vocal_rescue_hybrid` (Resemble Enhance / Seed-VC / RoFormer chain), `track_beats_hybrid` (`beat-this` / `librosa` / pure-Rust `analyze_beat_grid` fallback), `run_local_f0_track` (`f0-track` `RMVPE`/`FCPE`/autocorrelation), `list-models` & `warm-cache` SHA-256 checkpoint pre-warming, and `evaluate_quality_hybrid` (Audiobox Aesthetics / SingMOS / acoustic proxy fallback).
+    - The Colab worker receives the input as base64 in `POST /api/v1/execute` (`separate_stems`, `restore`, `vocal_rescue`, `beat_track`, `evaluate_quality`) and returns base64 WAV stems (up to 23 slots via `StemBundle`) or JSON telemetry. Requests are limited by `FORGE_COLAB_TIMEOUT_SECS` (default 900).
     - The Python worker picks each stem by the `_(<Stem>)_` tag that `audio-separator` writes, so the input file name cannot change which file is returned as the vocal.
-    - When `PureRustDsp` (or fallback) runs, executes a `<80 ms`, 0-VRAM Mid/Side + 4th-order Linkwitz-Riley + transient-mask 4-stem separator (`Vocals`, `Drums`, `Bass`, `Other`).
+    - When `PureRustDsp` (or fallback) runs, executes a `<80 ms`, 0-VRAM Mid/Side + 4th-order Linkwitz-Riley + transient-mask 4-stem separator (`Vocals`, `Drums`, `Bass`, `Other`), while `forge_dsp` provides `DeFizzConfig::{ai_mix_from_audit, ai_vocal}` (with HPSS shimmer suppression & `hard_mode`), `RestorationConfig::from_audit`, `sum_audio_buffers`, `beat_grid::{analyze_beat_grid, warp_buffer_wsola, quantize_to_constant_bpm}`, and `align_vocal_double_dtw_elastic`.
   - `generate_music_lyria`: Native async Rust client calling Google DeepMind's `Lyria 3.5` (`lyria-3.5`) or `Lyria 3 Clip` via `https://generativelanguage.googleapis.com/v1beta/interactions` using `GEMINI_API_KEY`.
-  - `index_drum_sample_library`: Scans local `.wav` drum sample folders and classifies every one-shot (`Kick`, `Snare`, `HiHat`) by `<120 Hz` sub-energy ratio, zero-crossing spectral centroid, and crest factor (`XLN Audio XO` / `Algonaut Atlas` equivalent).
+  - `index_drum_sample_library`, `DrumHit::from_ticks`, & `render_drum_sample_layer`: Scans local `.wav` drum sample folders, classifies one-shots (`Kick`, `Snare`, `HiHat`) by `<120 Hz` sub-energy ratio, spectral centroid, and crest factor, and renders phase-locked replacement layers.
 
 ---
 
-### 2.7 `forge-plug` — 10 Native Cross-DAW VST3 & CLAP Real-Time Plugins (`nih-plug` + `egui`)
+### 2.7 `forge-plug` — 11 Native Cross-DAW VST3 & CLAP Real-Time Plugins (`nih-plug` + `egui`)
 - **File:** `crates/forge-plug/src/lib.rs`
-- **Architecture:** Built on `nih-plug` (`rev de421011`) and `nih_plug_egui` (`egui 0.31.1` + `egui_glow` + `baseview`). Exports **all 10 plugins** from a single compiled dynamic library into both `forge-plug.vst3` and `forge-plug.clap`:
-  1. **`ForgeOpenSoothePlug`** (`Forge OpenSoothe De-Fizz`) — 2048-pt OLA STFT Dynamic Spectral Resonance & AI Fizz Suppressor (`2048`-sample STFT delay plus the limiter lookahead reported to the host for PDC, `egui` 60 FPS spectrum GUI, 8-slot Shared Spectrum Bus).
+- **Architecture:** Built on `nih-plug` (`rev de421011`) and `nih_plug_egui` (`egui 0.31.1` + `egui_glow` + `baseview`). Exports **all 11 plugins** from a single compiled dynamic library into both `forge-plug.vst3` and `forge-plug.clap`:
+  1. **`ForgeOpenSoothePlug`** (`Forge OpenSoothe De-Fizz`) — 2048-pt OLA STFT Dynamic Spectral Resonance & AI Fizz Suppressor (`2048`-sample STFT delay plus the limiter lookahead reported to the host for PDC, ultrasonic LPF `#[id = "ulpf"]`, `egui` 60 FPS spectrum GUI with live 2–12 kHz correlation & M/S fizz readout, 8-slot Shared Spectrum Bus).
   2. **`ForgeOpenSpacerPlug`** (`Forge OpenSpacer Unmask`) — 4-Channel Sidechain Spectral Unmasker (`aux_input_ports: &[new_nonzero_u32(2)]`).
   3. **`ForgeVocalSurgicalPlug`** (`Forge Vocal Surgical Strip`): Zero-Latency Mouth De-Click, `<115 Hz` Plosive Duck, Split-Band De-Esser & Breath Gate. All four controls ramp linearly over `20 ms` through `nih-plug` smoothers read every sample, so automation never steps.
   4. **`ForgeSubAndTapePlug`** (`Forge SubMono & Console Tape`) — Linkwitz-Riley `<160 Hz` Sub Mono-Maker, Harmonic Bass Reinforcer & Console8/ChowTape Saturation.
@@ -198,12 +210,13 @@ flowchart TD
   8. **`ForgeSplitEqPlug`** (`Forge SplitEQ Transient & Tonal`) — 3-Band Structural Transient Attack vs. Tonal Sustain Equalizer & Shaper with 60 FPS `egui` GUI.
   9. **`ForgeDensityClipperPlug`** (`Forge Density & 3-Band ADAA Clipper`) — Upward Low-Level Density Compressor + 3-Band 2x-Oversampled 1st-Order ADAA Soft Clipper with 60 FPS `egui` GUI.
   10. **`ForgeSpaceVerbAndPreampPlug`** (`Forge SpaceVerb FDN & Neural Preamp`): Dilated Causal WaveNet Hardware Preamp (`Neve 1073`, `1176 All-Buttons`, `V76 Triode`, `Studer A800`) + 8x8 Walsh-Hadamard FDN Reverb with Vocal Auto-Ducking & `+12 st` Octave Shimmer + 60 FPS `egui` GUI. The stored `decay` knob keeps its `0.05` to `0.98` range (same ID, same saved state) and maps onto an RT60 of `0.2` to `20 s` on a log curve; the host and GUI show the value in seconds. The FDN's `0.985` feedback-gain ceiling holds the measured tail at about `13.5 s` at the top of the knob with default damping.
+  11. **`ForgeVocalTunePlug`** (`Forge Vocal Tune`): Real-time low-latency YIN F0 pitch tracker and scale-locked dual-grain PSOLA pitch corrector with formant shift.
 
 ---
 
-### 2.8 `forge-cli` & `forge-mcp` — Unified CLI Binary & JSON-RPC 2.0 MCP Agent Server
-- **`crates/forge-cli/src/main.rs` (`forge` binary):** Exposes 16 top-level subcommands (`audit`, `restore`, `unmask`, `phase-align`, `vocal`, `theory`, `deliver`, `master`, `ingest`, `reaper`, `sample-index`, `lyria`, `denoise`, `transcribe`, `separate`, `daw`) via `clap` derive macros.
-- **`crates/forge-mcp/src/main.rs` (`forge-mcp` binary):** Implements the Model Context Protocol (`protocolVersion: "2024-11-05"`) over `stdin`/`stdout` JSON-RPC 2.0, exposing 14 structured tools (`forge_deliver`, `forge_audit_audio`, `forge_restore_and_defizz`, `forge_spectral_unmask`, `forge_phase_align`, `forge_vocal_suite`, `forge_music_theory_midi`, `forge_master_distrokid`, `forge_ingest_to_reaper`, `forge_neural_denoise`, `forge_transcribe_midi`, `forge_separate_stems`, `forge_daw_inspect`, `forge_daw_bounce`) to Claude Code, Antigravity, Cursor, or custom studio agents.
+### 2.8 `forge-cli` & `forge-mcp` — Unified CLI Binary & `rmcp 3.11` MCP Agent Server
+- **`crates/forge-cli/src/main.rs` (`forge` binary):** Exposes 20 top-level subcommands (`audit`, `restore`, `unmask`, `phase-align`, `vocal`, `theory`, `deliver`, `master`, `ingest`, `reaper`, `sample-index`, `lyria`, `denoise`, `transcribe`, `separate`, `daw`, `neural-restore`, `vocal-rescue`, `beat-track`, `evaluate`) via `clap` derive macros.
+- **`crates/forge-mcp/src/main.rs` (`forge-mcp` binary):** Built on the official Rust `rmcp 3.11.0` SDK (negotiating `2026-07-28`, `2025-11-25`, and `2024-11-05` over `stdio` or loopback-guarded `--http`), exposing 18 structured tools with `outputSchema`, `structuredContent`, `ToolAnnotations`, read-only resources (`forge://targets`, `forge://models`, `forge://roots`), and workflow prompts (`master_ai_track`, `rescue_ai_vocals`, `prepare_reaper_session`) (`forge_deliver`, `forge_audit_audio`, `forge_restore_and_defizz`, `forge_spectral_unmask`, `forge_phase_align`, `forge_vocal_suite`, `forge_music_theory_midi`, `forge_master_distrokid`, `forge_ingest_to_reaper`, `forge_neural_denoise`, `forge_transcribe_midi`, `forge_separate_stems`, `forge_daw_inspect`, `forge_daw_bounce`, `forge_neural_restore`, `forge_vocal_rescue`, `forge_beat_track`, `forge_evaluate_quality`) to Claude Code, Antigravity, Cursor, or custom studio agents.
 
 ---
 
@@ -261,11 +274,16 @@ AI-generated audio (`Suno`, `Udio`, `YuE2`, `ACE-Step`) and harsh close-mic reco
 ## 4. REAPER 7.82 Native Integration (`JSFX`, `<PITCHENV`, Stretch Markers & Sidechain Routing)
 
 ForgeAudio integrates with REAPER 7.82 at four distinct layers:
-1. **EEL2 `JSFX` Plugins (`reaper-jsfx/`):**
-   - `Forge_OpenSoothe_DeFizz.jsfx` — Real-time dynamic 4-band resonance & AI fizz tamer + `<160 Hz` Sub Mono-Maker.
+1. **EEL2 `JSFX` Plugins (`reaper-jsfx/`, all 9 Apache-2.0):**
+   - `Forge_OpenSoothe_DeFizz.jsfx` — Real-time dynamic M/S resonance & AI fizz tamer, `<160 Hz` Sub Mono-Maker, `slider7` ultrasonic LPF, `slider8` M/S focus, `slider9` Soft/Hard curve.
    - `Forge_OpenSpacer_Unmask.jsfx` — 4-channel sidechain dynamic spectral unmasker reading main audio on `spl0/spl1` and sidechain trigger on `spl2/spl3`.
    - `Forge_SubBass_Reinforce.jsfx` — Sub-harmonic synthesizer & Linkwitz-Riley mono-maker.
    - `Forge_Vocal_Surgical.jsfx` — Zero-latency vocal de-clicker, de-plosive high-pass, split-band de-esser, and breath gate.
+   - `Forge_Master_Limiter.jsfx` — Lookahead brickwall true-peak limiter with drive, ceiling dBTP, and dual-stage release.
+   - `Forge_SplitEQ.jsfx` — 3-band structural transient/tonal splitter and shaper.
+   - `Forge_Density_Clipper.jsfx` — Upward density compressor + first-order ADAA `tanh` clipper.
+   - `Forge_SpaceVerb.jsfx` — Orthogonal 4x4 Walsh-Hadamard FDN stereo reverb with RT60, damping, and ducking.
+   - `Forge_Phase_MatchEQ.jsfx` — Integer sample delay aligner, polarity flip, and 3-band Low/Mid/Air tilt EQ.
 2. **Programmatic `.RPP` Multitrack Session Generation (`forge-reaper`):**
    - Automatically configures 4-channel sidechain buses (`NCHAN 4` + `AUXRECV <src> 0 1.0 0.0 0 0 0 0 1024`), routing Lead Vocal (`Ch 1/2`) into the Instrumental Bus (`Ch 3/4`) and Kick (`Ch 1/2`) into the Sub-Bass Bus (`Ch 3/4`).
 3. **Non-Destructive Take Pitch Envelopes (`<PITCHENV`):**
@@ -291,21 +309,21 @@ cargo test --workspace
 cargo build --release --workspace
 ```
 
-### Step 2: Bundle & Install Individual (or All 10) VST3 & CLAP Plugins (`plugins/forge-*`)
-Every plugin in ForgeAudio has its own standalone crate under `plugins/` so you can build, bundle, and install any single VST3/CLAP plugin on its own—or all 10 at once:
+### Step 2: Bundle & Install Individual (or All 11) VST3 & CLAP Plugins (`plugins/forge-*`)
+Every plugin in ForgeAudio has its own standalone crate under `plugins/` so you can build, bundle, and install any single VST3/CLAP plugin on its own—or all 11 at once:
 
 ```bash
-# List all 10 standalone VST3 & CLAP plugin packages
+# List all 11 standalone VST3 & CLAP plugin packages
 cargo run --package xtask -- list
 
 # Bundle a single standalone plugin (e.g., only Forge OpenSoothe or Forge SplitEQ)
 cargo run --package xtask -- bundle forge-opensoothe --release
 cargo run --package xtask -- bundle forge-spliteq --release
 
-# Bundle all 10 standalone VST3 & CLAP plugins into target/bundled/
+# Bundle all 11 standalone VST3 & CLAP plugins into target/bundled/
 cargo run --package xtask -- bundle-all --release
 
-# Install a single plugin (or --all 10 plugins) directly into your system VST3 & CLAP folders
+# Install a single plugin (or --all 11 plugins) directly into your system VST3 & CLAP folders
 cargo run --package xtask -- install forge-opensoothe --release
 cargo run --package xtask -- install --all --release
 ```
@@ -313,6 +331,7 @@ This produces individual standalone `.vst3` and `.clap` bundles in `target/bundl
 - `forge-opensoothe.vst3` / `forge-opensoothe.clap`
 - `forge-openspacer.vst3` / `forge-openspacer.clap`
 - `forge-vocal-surgical.vst3` / `forge-vocal-surgical.clap`
+- `forge-vocal-tune.vst3` / `forge-vocal-tune.clap`
 - `forge-submono-tape.vst3` / `forge-submono-tape.clap`
 - `forge-master-limiter.vst3` / `forge-master-limiter.clap`
 - `forge-drum-trigger.vst3` / `forge-drum-trigger.clap`
