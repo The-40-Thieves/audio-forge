@@ -36,7 +36,7 @@ jobs:
           bins: cargo-codspeed
 
       - name: Build the benchmark target(s)
-        run: cargo codspeed build -m simulation -p forge-dsp -p forge-vocal -p forge-theory
+        run: cargo codspeed build -m simulation -p forge-dsp -p forge-vocal -p forge-theory -p forge-engine
 
       # upload-artifact drops the executable bit, so ship the binaries as a tarball.
       - name: Pack the benchmark binaries
@@ -82,4 +82,4 @@ jobs:
         uses: CodSpeedHQ/action@af75f77f17a054769abefaa42fe8dc2975469b5f # v5.6.3
         with:
           mode: simulation
-          run: cargo codspeed run -p forge-dsp -p forge-vocal -p forge-theory
+          run: cargo codspeed run -p forge-dsp -p forge-vocal -p forge-theory -p forge-engine

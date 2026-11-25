@@ -51,7 +51,7 @@ pub const STANDALONE_PLUGINS: [(&str, &str); 11] = [
     ),
     (
         "forge-density-clipper",
-        "Forge Density & 3-Band ADAA Clipper (Upward Low-Level Density Compressor + 2x ADAA Soft Clipper)",
+        "Forge Density & 3-Band ADAA Clipper (Upward Low-Level Density Compressor + 4x ADAA Soft Clipper)",
     ),
     (
         "forge-spaceverb",
@@ -69,7 +69,7 @@ fn main() -> nih_plug_xtask::Result<()> {
 
     match subcommand {
         "list" => {
-            println!("ForgeAudio Standalone VST3 & CLAP Plugins (10 Individual Packages):");
+            println!("ForgeAudio Standalone VST3 & CLAP Plugins (11 Individual Packages):");
             for (idx, (pkg, desc)) in STANDALONE_PLUGINS.iter().enumerate() {
                 println!(
                     "  {:2}. {:22} -> {}.vst3 / {}.clap\n      {}",

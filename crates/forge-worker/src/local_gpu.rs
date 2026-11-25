@@ -68,6 +68,19 @@ pub fn resolve_worker_script(
     candidate.is_file().then_some(candidate)
 }
 
+/// Resolves the packaged `python-worker/forge_gpu_worker.py` sibling directory shipped alongside
+/// release binaries (`bin/forge*` + `python-worker/{forge_gpu_worker.py,pyproject.toml,uv.lock}`).
+pub fn resolve_packaged_worker_script(exe_path: &Path) -> Option<PathBuf> {
+    let resolved_exe = std::fs::canonicalize(exe_path).ok()?;
+    let bin_dir = resolved_exe.parent()?;
+    let root_dir = bin_dir.parent()?;
+    let worker_dir = root_dir.join("python-worker");
+    let script = worker_dir.join("forge_gpu_worker.py");
+    let manifest = worker_dir.join("pyproject.toml");
+    let lock = worker_dir.join("uv.lock");
+    (script.is_file() && manifest.is_file() && lock.is_file()).then_some(script)
+}
+
 fn worker_io_cmd(
     worker: &LocalWorkerCommand,
     subcmd: &str,
@@ -733,6 +746,28 @@ mod client_tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn resolve_packaged_worker_script_requires_complete_release_layout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe_dir = dir.path().join("bin");
+        let pw_dir = dir.path().join("python-worker");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&pw_dir).unwrap();
+        let fake_exe = exe_dir.join("forge");
+        std::fs::write(&fake_exe, b"bin").unwrap();
+
+        let script = pw_dir.join("forge_gpu_worker.py");
+        std::fs::write(&script, b"# worker").unwrap();
+        assert!(resolve_packaged_worker_script(&fake_exe).is_none());
+
+        std::fs::write(pw_dir.join("pyproject.toml"), b"[project]").unwrap();
+        assert!(resolve_packaged_worker_script(&fake_exe).is_none());
+
+        std::fs::write(pw_dir.join("uv.lock"), b"version = 1").unwrap();
+        let found = resolve_packaged_worker_script(&fake_exe).expect("complete packaged layout");
+        assert_eq!(found, std::fs::canonicalize(&script).unwrap());
     }
 }
 

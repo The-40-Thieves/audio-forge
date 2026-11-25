@@ -297,7 +297,7 @@ enum Commands {
 
     /// Install native ForgeAudio JSFX plugins into REAPER 7.82 or send live UDP OSC commands
     Reaper {
-        /// Install all 4 ForgeAudio JSFX plugins into REAPER Effects directory
+        /// Install all 9 ForgeAudio JSFX plugins into REAPER Effects directory
         #[arg(long)]
         install_jsfx: bool,
         /// Optional custom target directory for JSFX installation

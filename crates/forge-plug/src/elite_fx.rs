@@ -88,12 +88,12 @@ impl Plugin for ForgeSplitEqPlug {
         presets: SPLITEQ_PRESETS,
         grid_id: "spliteq_grid",
         params: [
-            ("tr_low", Float, trans_low_db, "Low Transient (<250 Hz)"),
-            ("tr_mid", Float, trans_mid_db, "Mid Transient (250-3.5kHz)"),
-            ("tr_high", Float, trans_high_db, "High Transient (>3.5kHz)"),
-            ("tn_low", Float, tonal_low_db, "Low Tonal Body (<250 Hz)"),
-            ("tn_mid", Float, tonal_mid_db, "Mid Tonal Sustain (250-3.5kHz)"),
-            ("tn_high", Float, tonal_high_db, "High Tonal Air (>3.5kHz)"),
+            ("tr_low", Float, trans_low_db, "Low Transient (<180 Hz)"),
+            ("tr_mid", Float, trans_mid_db, "Mid Transient (180-3.2kHz)"),
+            ("tr_high", Float, trans_high_db, "High Transient (>3.2kHz)"),
+            ("tn_low", Float, tonal_low_db, "Low Tonal Body (<180 Hz)"),
+            ("tn_mid", Float, tonal_mid_db, "Mid Tonal Sustain (180-3.2kHz)"),
+            ("tn_high", Float, tonal_high_db, "High Tonal Air (>3.2kHz)"),
         ]
     );
 
@@ -204,7 +204,7 @@ impl Default for DensityClipperParams {
             .with_value_to_string(formatters::v2s_f32_rounded(3))
             .with_smoother(SmoothingStyle::Linear(15.0)),
             clip_drive_db: FloatParam::new(
-                "3-Band 2x ADAA Clip Drive",
+                "3-Band 4x ADAA Clip Drive",
                 2.5,
                 FloatRange::Linear {
                     min: 0.0,
@@ -242,7 +242,7 @@ impl Plugin for ForgeDensityClipperPlug {
 
     forge_ab_editor!(
         title: "FORGE DENSITY & 3-BAND ADAA CLIPPER",
-        subtitle: "Upward Low-Level Density Lifter + 2x Oversampled Anti-Derivative Anti-Aliased Soft Clipper",
+        subtitle: "Upward Low-Level Density Lifter + 4x Oversampled Anti-Derivative Anti-Aliased Soft Clipper",
         presets: DENSITY_CLIPPER_PRESETS,
         grid_id: "density_grid",
         params: [
@@ -287,7 +287,7 @@ impl Plugin for ForgeDensityClipperPlug {
 impl_forge_formats!(
     ForgeDensityClipperPlug,
     clap_id: "org.the40thieves.forge-audio.density-adaa-clipper",
-    clap_desc: "Upward Low-Level Density Compressor & 3-Band 2x-Oversampled ADAA Soft Clipper",
+    clap_desc: "Upward Low-Level Density Compressor & 3-Band 4x-Oversampled ADAA Soft Clipper",
     clap_features: &[
         ClapFeature::AudioEffect,
         ClapFeature::Compressor,

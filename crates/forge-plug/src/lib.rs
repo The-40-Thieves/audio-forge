@@ -14,8 +14,9 @@
 //! 6. **Forge Drum Trigger & Theory MIDI** (Real-Time Audio-to-MIDI Drum Replacer `C1/D1/F#1` + Neo-Soul Chord Voicer)
 //! 7. **Forge Phase & Match EQ** (Phase/Polarity Aligner + 18-Band Mastering EQ & Genre Tonal Balance)
 //! 8. **Forge SplitEQ** (3-Band Structural Transient/Tonal Equalizer & Shaper)
-//! 9. **Forge Density & Clipper** (3-Band Upward Density Compressor & 2x ADAA Soft Clipper)
+//! 9. **Forge Density & Clipper** (3-Band Upward Density Compressor & 4x ADAA Soft Clipper)
 //! 10. **Forge SpaceVerb & Preamp** (8x8 Hadamard FDN Reverb with Ducking/Shimmer + Neural WaveNet Preamp)
+//! 11. **Forge Vocal Tune** (Low-Latency FFT-YIN F0 + Scale-Locked Dual-Grain PSOLA Pitch Corrector)
 
 #[macro_use]
 mod chassis;
@@ -486,5 +487,75 @@ mod tests {
         for text in ["", "Slot", "Slot I", "I", "9", "-1", "Slot AB", "on"] {
             assert_eq!(bus_slot_from_string(text), None, "{text:?}");
         }
+    }
+
+    struct MockInitContext {
+        latency_samples: std::cell::Cell<u32>,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl MockInitContext {
+        fn new() -> Self {
+            Self {
+                latency_samples: std::cell::Cell::new(0),
+                calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl<P: Plugin> InitContext<P> for MockInitContext {
+        fn plugin_api(&self) -> PluginApi {
+            PluginApi::Clap
+        }
+
+        fn execute(&self, _task: P::BackgroundTask) {}
+
+        fn set_latency_samples(&self, samples: u32) {
+            self.latency_samples.set(samples);
+            self.calls.set(self.calls.get() + 1);
+        }
+
+        fn set_current_voice_capacity(&self, _capacity: u32) {}
+    }
+
+    fn verify_plugin_lifecycle<P: Plugin + Default>() -> (u32, usize) {
+        let mut plug = P::default();
+        let layout = P::AUDIO_IO_LAYOUTS[0];
+        let cfg = BufferConfig {
+            sample_rate: 48_000.0,
+            min_buffer_size: Some(64),
+            max_buffer_size: 1024,
+            process_mode: ProcessMode::Realtime,
+        };
+        let mut ctx = MockInitContext::new();
+        assert!(plug.initialize(&layout, &cfg, &mut ctx));
+        plug.reset();
+        // Verify re-initializing at 96 kHz + resetting succeeds without panic.
+        let cfg_96k = BufferConfig {
+            sample_rate: 96_000.0,
+            ..cfg
+        };
+        assert!(plug.initialize(&layout, &cfg_96k, &mut ctx));
+        plug.reset();
+        (ctx.latency_samples.get(), ctx.calls.get())
+    }
+
+    #[test]
+    fn all_11_plugins_initialize_and_reset_cleanly() {
+        let (soothe_lat, soothe_calls) = verify_plugin_lifecycle::<ForgeOpenSoothePlug>();
+        assert!(soothe_calls >= 2 && soothe_lat > 0);
+        let (spacer_lat, _) = verify_plugin_lifecycle::<ForgeOpenSpacerPlug>();
+        assert!(spacer_lat > 0);
+        verify_plugin_lifecycle::<ForgeVocalSurgicalPlug>();
+        verify_plugin_lifecycle::<ForgeSubAndTapePlug>();
+        let (lim_lat, _) = verify_plugin_lifecycle::<ForgeMasterLimiterPlug>();
+        assert!(lim_lat > 0);
+        verify_plugin_lifecycle::<ForgeDrumTriggerPlug>();
+        verify_plugin_lifecycle::<ForgePhaseAndMatchPlug>();
+        verify_plugin_lifecycle::<ForgeSplitEqPlug>();
+        verify_plugin_lifecycle::<ForgeDensityClipperPlug>();
+        verify_plugin_lifecycle::<ForgeSpaceVerbAndPreampPlug>();
+        let (tune_lat, _) = verify_plugin_lifecycle::<ForgeVocalTunePlug>();
+        assert!(tune_lat > 0);
     }
 }

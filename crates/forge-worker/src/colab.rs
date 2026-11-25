@@ -20,6 +20,31 @@ use crate::routing::SeparationConfig;
 const MAX_COLAB_UPLOAD_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_COLAB_RESPONSE_BYTES: u64 = 512 * 1024 * 1024;
 
+fn is_blocked_private_or_metadata_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            let cgnat = octets[0] == 100 && (64..=127).contains(&octets[1]);
+            v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || cgnat
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return !mapped.is_loopback()
+                    && is_blocked_private_or_metadata_ip(std::net::IpAddr::V4(mapped));
+            }
+            let seg0 = v6.segments()[0];
+            let ula = (seg0 & 0xfe00) == 0xfc00;
+            let link_local = (seg0 & 0xffc0) == 0xfe80;
+            v6.is_unspecified() || v6.is_multicast() || ula || link_local
+        }
+    }
+}
+
 fn validate_colab_url(base_url: &str) -> Result<reqwest::Url> {
     let trimmed = base_url.trim();
     let url = reqwest::Url::parse(trimmed).map_err(|e| {
@@ -32,15 +57,22 @@ fn validate_colab_url(base_url: &str) -> Result<reqwest::Url> {
             "FORGE_COLAB_WORKER_URL must not embed userinfo credentials".to_string(),
         ));
     }
-    let loopback = matches!(url.host_str(), Some("localhost"))
-        || url
-            .host_str()
-            .and_then(|h| {
-                h.trim_matches(|c| c == '[' || c == ']')
-                    .parse::<std::net::IpAddr>()
-                    .ok()
-            })
-            .is_some_and(|ip| ip.is_loopback());
+    let parsed_ip = url.host_str().and_then(|h| {
+        h.trim_matches(|c| c == '[' || c == ']')
+            .parse::<std::net::IpAddr>()
+            .ok()
+    });
+    if let Some(ip) = parsed_ip
+        && !ip.is_loopback()
+        && is_blocked_private_or_metadata_ip(ip)
+    {
+        return Err(ForgeError::WorkerError(
+            "FORGE_COLAB_WORKER_URL must not target private, link-local, or metadata IP addresses"
+                .to_string(),
+        ));
+    }
+    let loopback =
+        matches!(url.host_str(), Some("localhost")) || parsed_ip.is_some_and(|ip| ip.is_loopback());
     if url.scheme() == "https" || (url.scheme() == "http" && loopback) {
         return Ok(url);
     }
@@ -95,10 +127,29 @@ fn execute_task_with_audio(
     Ok(reply)
 }
 
+fn validate_decoded_artifact_header(bytes: &[u8], out_path: &Path, label: &str) -> Result<()> {
+    let ext = out_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("wav") if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" => {
+            Err(ForgeError::WorkerError(format!(
+                "Colab {label} failed RIFF/WAVE header validation"
+            )))
+        }
+        Some("mid" | "midi") if bytes.len() < 4 || &bytes[0..4] != b"MThd" => Err(
+            ForgeError::WorkerError(format!("Colab {label} failed MThd MIDI header validation")),
+        ),
+        _ => Ok(()),
+    }
+}
+
 fn decode_b64_to_path(b64: &str, out_path: &Path, label: &str) -> Result<PathBuf> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .map_err(|e| ForgeError::WorkerError(format!("Colab {label} is not base64: {e}")))?;
+    validate_decoded_artifact_header(&bytes, out_path, label)?;
     if let Some(parent) = out_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -542,7 +593,8 @@ mod tests {
                     }
                 }
             }
-            let stem_b64 = base64::engine::general_purpose::STANDARD.encode(b"RIFFstem");
+            let stem_b64 =
+                base64::engine::general_purpose::STANDARD.encode(b"RIFF\x24\x00\x00\x00WAVEfmt ");
             let resp_body = json!({
                 "ok": true,
                 "data": {
@@ -587,5 +639,46 @@ mod tests {
         assert!(bundle.strings.as_ref().unwrap().is_file());
         assert!(bundle.cymbals.as_ref().unwrap().is_file());
         assert!(bundle.other.as_ref().unwrap().is_file());
+    }
+
+    #[test]
+    fn validate_colab_url_blocks_private_link_local_and_metadata_ips() {
+        for blocked in [
+            "https://169.254.169.254/latest/meta-data",
+            "https://10.0.0.1:8000",
+            "https://192.168.1.5:8000",
+            "https://172.16.0.1:8000",
+            "https://100.64.0.1:8000",
+            "https://[fe80::1]:8000",
+            "https://[fc00::1]:8000",
+            "https://[::ffff:169.254.169.254]:8000",
+        ] {
+            assert!(
+                validate_colab_url(blocked).is_err(),
+                "must reject SSRF target '{blocked}'"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_b64_to_path_validates_wav_and_midi_magic_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_wav_b64 = base64::engine::general_purpose::STANDARD.encode(b"NOT_A_WAV_FILE");
+        assert!(
+            decode_b64_to_path(&bad_wav_b64, &dir.path().join("bad.wav"), "stem").is_err(),
+            "corrupt .wav payload must be rejected"
+        );
+
+        let bad_mid_b64 = base64::engine::general_purpose::STANDARD.encode(b"NO_MIDI_HEADER");
+        assert!(
+            decode_b64_to_path(&bad_mid_b64, &dir.path().join("bad.mid"), "midi").is_err(),
+            "corrupt .mid payload must be rejected"
+        );
+
+        let good_mid_b64 =
+            base64::engine::general_purpose::STANDARD.encode(b"MThd\x00\x00\x00\x06");
+        let saved_mid = decode_b64_to_path(&good_mid_b64, &dir.path().join("ok.mid"), "midi")
+            .expect("valid MThd header should pass");
+        assert!(saved_mid.is_file());
     }
 }

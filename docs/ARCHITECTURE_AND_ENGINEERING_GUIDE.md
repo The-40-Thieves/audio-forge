@@ -18,7 +18,7 @@
    - [2.6 `forge-worker` — Hybrid AI Model Dispatcher (Local RTX GPU + Colab A100 + Lyria 3.5)](#26-forge-worker--hybrid-ai-model-dispatcher-local-rtx-gpu--colab-a100--lyria-35)
    - [2.7 `forge-plug` — 11 Native Cross-DAW VST3 & CLAP Real-Time Plugins (`nih-plug` + `egui`)](#27-forge-plug--11-native-cross-daw-vst3--clap-real-time-plugins-nih-plug--egui)
    - [2.8 `forge-cli` & `forge-mcp` — Unified CLI Binary & `rmcp 3.11` MCP Agent Server](#28-forge-cli--forge-mcp--unified-cli-binary--rmcp-311-mcp-agent-server)
-   - [2.9 `xtask` — Multi-Plugin VST3 & CLAP Bundle Packager](#29-xtask--multi-plugin-vst3--clap-bundle-packager)
+   - [2.9 `forge-engine`, `forge-daw` & `xtask` — Multitrack DAW Engine, Studio UI & Bundle Packager](#29-forge-engine-forge-daw--xtask--multitrack-daw-engine-studio-ui--bundle-packager)
 3. [Deep-Dive DSP Algorithms & Mathematical Foundations](#3-deep-dive-dsp-algorithms--mathematical-foundations)
 4. [REAPER 7.82 Native Integration (`JSFX`, `<PITCHENV`, Stretch Markers & Sidechain Routing)](#4-reaper-782-native-integration-jsfx-pitchenv-stretch-markers--sidechain-routing)
 5. [Step-by-Step Build, Installation & Operating Instructions](#5-step-by-step-build-installation--operating-instructions)
@@ -32,6 +32,7 @@ ForgeAudio (`audio-forge`) is architected with strict domain separation so the *
 2. **Command-Line Studio Pipelines (`forge-cli`)** with `<5 ms` startup time.
 3. **Autonomous AI Coding & Studio Agents (`forge-mcp`)** via the official `rmcp 3.11.0` SDK over `stdio` or loopback-guarded `--http` Streamable HTTP.
 4. **REAPER 7.82 Native Sessions (`forge-reaper` + `reaper-jsfx/`)** via compiled `.RPP` state chunks, 9 EEL2 `JSFX` scripts, and UDP Open Sound Control (`OSC`).
+5. **ForgeStudio Multitrack DAW (`forge-engine` + `forge-daw`)** providing object-oriented track/object FX, PDC mixing, variable tempo maps, SPSC hardware recording, and `wgpu`/`eframe` arrangement UI.
 
 ```mermaid
 flowchart TD
@@ -117,7 +118,7 @@ flowchart TD
   7. **`elite_dsp.rs` — Elite Commercial Gap-Closure Kernels:**
      - `AdaaTanh` & `AdaaSin`: 1st-Order Anti-Derivative Anti-Aliasing (`ADAA`) waveshapers + `Oversampler2x` (2x polyphase half-band upsampler/downsampler).
      - `RealtimeTransientTonalSplit`: 3-band structural Transient vs. Tonal separator & 6-channel shaper (`Eventide SplitEQ` / `oeksound Spiff` equivalent).
-     - `RealtimeDensityAndClipper`: Upward low-level "Density" compressor (`-48 dB` to `-16 dB`) + 3-band 2x-oversampled ADAA soft clipper (`oeksound Bloom` / `iZotope Neutron 5` equivalent).
+     - `RealtimeDensityAndClipper`: Upward low-level "Density" compressor (`-48 dB` to `-16 dB`) + 3-band 4x-oversampled ADAA soft clipper (`oeksound Bloom` / `iZotope Neutron 5` equivalent).
      - `RealtimeFdnReverb`: **Forge SpaceVerb** — 8x8 Fast Walsh-Hadamard Feedback Delay Network (`FDN`) reverb with LFO modulation, `<180 Hz` mud cut, automatic **Vocal Sidechain Ducking**, and **+12 st Octave Shimmer** (`Valhalla VintageVerb` / `Shimmer` / `Pro-R 2` equivalent).
      - `RealtimeNeuralPreamp`: Dilated causal WaveNet hardware modeler (`NAM` / `RTNeural` architecture) with 4 analog models (`Neve1073ClassA`, `Fet1176AllButtons`, `TubeV76Triode`, `StuderA800Tape`) and DC blocking.
      - `GenreTonalTarget` & `compute_genre_tonal_balance_eq`: Built-in 18-band statistical genre target corridors (`ModernPop`, `HipHopTrap`, `NeoSoulRnB`, `EdmClub`, `RockMetal`, `AcousticJazz` — `iZotope Tonal Balance Control 2` equivalent).
@@ -198,8 +199,8 @@ flowchart TD
 ---
 
 ### 2.7 `forge-plug` — 11 Native Cross-DAW VST3 & CLAP Real-Time Plugins (`nih-plug` + `egui`)
-- **File:** `crates/forge-plug/src/lib.rs`
-- **Architecture:** Built on `nih-plug` (`rev de421011`) and `nih_plug_egui` (`egui 0.31.1` + `egui_glow` + `baseview`). Exports **all 11 plugins** from a single compiled dynamic library into both `forge-plug.vst3` and `forge-plug.clap`:
+- **`crates/forge-plug/src/lib.rs` (7 modules):**
+- **Architecture:** Built on `nih-plug` (`rev de421011` + vendored CLAP/audio fixes) and `nih_plug_egui` (`egui 0.31.1` + `egui_glow` + `baseview`). Each plugin builds as its own standalone VST3/CLAP bundle via `plugins/forge-*` (`cargo xtask bundle-all`), or into one combined `forge-plug.{vst3,clap}` library when compiled with `--features all-in-one-export`:
   1. **`ForgeOpenSoothePlug`** (`Forge OpenSoothe De-Fizz`) — 2048-pt OLA STFT Dynamic Spectral Resonance & AI Fizz Suppressor (`2048`-sample STFT delay plus the limiter lookahead reported to the host for PDC, ultrasonic LPF `#[id = "ulpf"]`, `egui` 60 FPS spectrum GUI with live 2–12 kHz correlation & M/S fizz readout, 8-slot Shared Spectrum Bus).
   2. **`ForgeOpenSpacerPlug`** (`Forge OpenSpacer Unmask`) — 4-Channel Sidechain Spectral Unmasker (`aux_input_ports: &[new_nonzero_u32(2)]`).
   3. **`ForgeVocalSurgicalPlug`** (`Forge Vocal Surgical Strip`): Zero-Latency Mouth De-Click, `<115 Hz` Plosive Duck, Split-Band De-Esser & Breath Gate. All four controls ramp linearly over `20 ms` through `nih-plug` smoothers read every sample, so automation never steps.
@@ -208,7 +209,7 @@ flowchart TD
   6. **`ForgeDrumTriggerPlug`** (`Forge Drum Trigger & Theory MIDI`): Real-Time Audio-to-MIDI 3-Band Drum Replacer (`C1/D1/F#1`, each hit gated to a `20 ms` note with its own `NoteOff`) + 1-Finger MIDI-to-Neo-Soul 9th Chord Voicer (`NoteEvent::NoteOn` / `NoteOff`). `forge_dsp::DrumTriggerNotes` tracks every forwarded root and generated note in one occupancy count per channel and key: a NoteOn on a sounding key re-articulates it, and the key's `NoteOff` reaches the host only when its last holder releases, so a chord tone never cuts off a held root and shared chord tones never stack. Each root instance is matched by voice ID (a `NoteOff` without one releases every voice on that key), so it releases only the chord it started, even if voicing is toggled mid-note. Up to 64 root instances are held at once (the oldest is released early to make room), and reset or transport stop releases everything still held, forwarded roots included.
   7. **`ForgePhaseAndMatchPlug`** (`Forge PhaseAlign & 18-Band EQ`) — Sample-Accurate Phase/Polarity Aligner + 18-Band AI De-Harsh EQ + 6 Built-In Genre Tonal Balance Target Curves.
   8. **`ForgeSplitEqPlug`** (`Forge SplitEQ Transient & Tonal`) — 3-Band Structural Transient Attack vs. Tonal Sustain Equalizer & Shaper with 60 FPS `egui` GUI.
-  9. **`ForgeDensityClipperPlug`** (`Forge Density & 3-Band ADAA Clipper`) — Upward Low-Level Density Compressor + 3-Band 2x-Oversampled 1st-Order ADAA Soft Clipper with 60 FPS `egui` GUI.
+  9. **`ForgeDensityClipperPlug`** (`Forge Density & 3-Band ADAA Clipper`) — Upward Low-Level Density Compressor + 3-Band 4x-Oversampled 1st-Order ADAA Soft Clipper with 60 FPS `egui` GUI.
   10. **`ForgeSpaceVerbAndPreampPlug`** (`Forge SpaceVerb FDN & Neural Preamp`): Dilated Causal WaveNet Hardware Preamp (`Neve 1073`, `1176 All-Buttons`, `V76 Triode`, `Studer A800`) + 8x8 Walsh-Hadamard FDN Reverb with Vocal Auto-Ducking & `+12 st` Octave Shimmer + 60 FPS `egui` GUI. The stored `decay` knob keeps its `0.05` to `0.98` range (same ID, same saved state) and maps onto an RT60 of `0.2` to `20 s` on a log curve; the host and GUI show the value in seconds. The FDN's `0.985` feedback-gain ceiling holds the measured tail at about `13.5 s` at the top of the knob with default damping.
   11. **`ForgeVocalTunePlug`** (`Forge Vocal Tune`): Real-time low-latency YIN F0 pitch tracker and scale-locked dual-grain PSOLA pitch corrector with formant shift.
 
@@ -220,9 +221,10 @@ flowchart TD
 
 ---
 
-### 2.9 `xtask` — Multi-Plugin VST3 & CLAP Bundle Packager
-- **File:** `xtask/src/main.rs`
-- **How It Works:** Delegates to `nih_plug_xtask::main()`, which compiles `forge-plug` as a `cdylib` (`forge_plug.dll` on Windows, `libforge_plug.so` on Linux, `libforge_plug.dylib` on macOS), inspects its exported symbols (`nih_export_vst3!` and `nih_export_clap!`), and constructs the required VST3 bundle directory hierarchy (`target/bundled/forge-plug.vst3/Contents/x86_64-win/forge-plug.vst3`) and CLAP single-file binary (`target/bundled/forge-plug.clap`).
+### 2.9 `forge-engine`, `forge-daw` & `xtask` — Multitrack DAW Engine, Studio UI & Bundle Packager
+- **`crates/forge-engine/` (`project.rs`, `renderer.rs`, `audio_io.rs`, `midi.rs`, `fx.rs`):** Object-oriented multitrack DSP engine (`ObjectOrientedEngine`) supporting non-destructive per-object 3-band EQ, fade curves preserved across splits, per-object/track/aux/master FX inserts, automatic intra-track and inter-track PDC, polyphonic `PolySynth`, hardware playback/recording via `cpal 0.18` with `RealtimeSincResampler` + lock-free `StereoSpscRingBuffer`, and schema-validated `.forgeproj` persistence.
+- **`crates/forge-daw/` (`main.rs`, `inspector.rs`, `fx_ui.rs`, `mixer.rs`, `gpu.rs`):** Hardware-accelerated `eframe 0.37` (`wgpu`/`glow`) Studio UI with multi-track timeline, AI Track Studio workflows (Stem Split, AI Rescue, Pitch/Beat alignment), scrollable Piano Roll, channel mixer, and native `rfd 0.18` file dialogs.
+- **`xtask/src/main.rs`:** Multi-package plugin bundler (`bundle`, `bundle-all`, `install --all`, `list`, `check`) compiling all 11 standalone `plugins/forge-*` crates into individual `.vst3` / `.clap` bundles under `target/bundled/`, while also supporting `--features all-in-one-export` on `forge-plug` when a combined multi-plugin bundle is explicitly requested.
 
 ---
 
@@ -305,8 +307,11 @@ cd audio-forge
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
-# Build release binaries (`forge` CLI and `forge-mcp` server)
+# Build release binaries (`forge` CLI, `forge-mcp` server, and `forge-daw` Studio GUI)
 cargo build --release --workspace
+
+# Launch the ForgeStudio multitrack DAW UI
+cargo run --release -p forge-daw
 ```
 
 ### Step 2: Bundle & Install Individual (or All 11) VST3 & CLAP Plugins (`plugins/forge-*`)

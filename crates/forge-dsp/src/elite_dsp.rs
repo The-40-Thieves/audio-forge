@@ -336,7 +336,7 @@ impl RealtimeDensityAndClipper {
     }
 
     /// `density_amount`: `0.0..=1.0` (upward compression lifting micro-detail between `-48 dB` and `-14 dB`).
-    /// `clip_drive_db`: `0.0..=12.0` (per-band 2x-oversampled ADAA `tanh` soft clipping).
+    /// `clip_drive_db`: `0.0..=12.0` (per-band 4x-oversampled ADAA `tanh` soft clipping).
     #[inline]
     pub fn process_stereo_sample(
         &mut self,

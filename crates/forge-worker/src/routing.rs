@@ -170,7 +170,12 @@ impl SeparationConfig {
         let script = resolve_worker_script(
             env_nonempty("FORGE_GPU_WORKER_SCRIPT").map(PathBuf::from),
             Some(Path::new(BUILD_SOURCE_ROOT)),
-        );
+        )
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| crate::local_gpu::resolve_packaged_worker_script(&p))
+        });
         let backend = env_nonempty("FORGE_WORKER_BACKEND").map_or(WorkerBackend::Auto, |name| {
             parse_backend(&name, colab_url.as_deref()).unwrap_or_else(|e| {
                 eprintln!("forge-worker: {e}; using auto");
