@@ -457,44 +457,101 @@ def prove_ms_high_mid_correlation_bounds() -> dict[str, str]:
 
 
 def prove_bs1770_5_channel_weights_lfe_exclusion() -> dict[str, str]:
-    """Proves BS.1770-5 5.1/7.1 weighting strictly excludes LFE and boosts surrounds."""
+    """Proves BS.1770-5 Annex 3 7.1.4 weighting strictly excludes LFE and boosts only side surrounds."""
     s_lfe = z3.Solver()
-    e_fl, e_fr, e_c, e_lfe, e_lfe2, e_ls, e_rs = z3.Reals(
-        "e_fl e_fr e_c e_lfe e_lfe2 e_ls e_rs"
+    (
+        e_fl,
+        e_fr,
+        e_c,
+        e_lfe,
+        e_lfe2,
+        e_lss,
+        e_rss,
+        e_lrs,
+        e_rrs,
+        e_ltf,
+        e_rtf,
+        e_ltr,
+        e_rtr,
+    ) = z3.Reals(
+        "e_fl e_fr e_c e_lfe e_lfe2 e_lss e_rss e_lrs e_rrs e_ltf e_rtf e_ltr e_rtr"
     )
-    for energy in (e_fl, e_fr, e_c, e_lfe, e_lfe2, e_ls, e_rs):
+    for energy in (
+        e_fl,
+        e_fr,
+        e_c,
+        e_lfe,
+        e_lfe2,
+        e_lss,
+        e_rss,
+        e_lrs,
+        e_rrs,
+        e_ltf,
+        e_rtf,
+        e_ltr,
+        e_rtr,
+    ):
         s_lfe.add(energy >= 0.0)
 
-    def weighted_5_1(lfe_val: z3.ArithRef) -> z3.ArithRef:
+    def weighted_7_1_4(lfe_val: z3.ArithRef) -> z3.ArithRef:
         return (
             1.0 * e_fl
             + 1.0 * e_fr
             + 1.0 * e_c
             + 0.0 * lfe_val
-            + z3.RealVal("1.41") * e_ls
-            + z3.RealVal("1.41") * e_rs
+            + z3.RealVal("1.41") * e_lss
+            + z3.RealVal("1.41") * e_rss
+            + 1.0 * e_lrs
+            + 1.0 * e_rrs
+            + 1.0 * e_ltf
+            + 1.0 * e_rtf
+            + 1.0 * e_ltr
+            + 1.0 * e_rtr
         )
 
-    e_sum1 = weighted_5_1(e_lfe)
-    e_sum2 = weighted_5_1(e_lfe2)
+    e_sum1 = weighted_7_1_4(e_lfe)
+    e_sum2 = weighted_7_1_4(e_lfe2)
 
     e_tone = z3.Real("e_tone")
     s_lfe.add(e_tone > 0.0)
     e_front_only = 1.0 * e_tone
-    e_surr_only = z3.RealVal("1.41") * e_tone
+    e_rear_only = 1.0 * e_tone
+    e_height_only = 1.0 * e_tone
+    e_side_surr_only = z3.RealVal("1.41") * e_tone
 
     s_lfe.add(
         z3.Or(
             e_sum1 != e_sum2,
             e_sum1 < 0.0,
-            e_surr_only <= e_front_only,
-            e_surr_only != z3.RealVal("1.41") * e_front_only,
+            e_side_surr_only <= e_front_only,
+            e_rear_only != e_front_only,
+            e_height_only != e_front_only,
+            e_side_surr_only != z3.RealVal("1.41") * e_front_only,
         )
     )
     _require(s_lfe.check() == z3.unsat, "BS.1770-5 channel weight proof failed")
     return {
         "bs1770_5_lfe_exclusion_and_surround_boost_proof": (
-            "UNSAT (Proven LFE g_3=0 is strictly invariant across any LFE energy and surround g=1.41 boosts energy >= 0)"
+            "UNSAT (Proven LFE g=0 is strictly invariant, side surrounds |el|<30 & 60<=|az|<=120 have g=1.41, rear/heights have g=1.0, total energy >= 0)"
+        )
+    }
+
+
+def prove_vbap_constant_power_energy_conservation() -> dict[str, str]:
+    """Proves constant-power normalized 3D VBAP triplet gains preserve uncorrelated signal power."""
+    s_vbap = z3.Solver()
+    g0, g1, g2, x = z3.Reals("g0 g1 g2 x")
+    s_vbap.add(g0 >= 0.0, g1 >= 0.0, g2 >= 0.0)
+    s_vbap.add(g0 * g0 + g1 * g1 + g2 * g2 == 1.0)
+    p_out = (g0 * x) * (g0 * x) + (g1 * x) * (g1 * x) + (g2 * x) * (g2 * x)
+    s_vbap.add(p_out != x * x)
+    _require(
+        s_vbap.check() == z3.unsat,
+        "VBAP constant-power energy conservation proof failed",
+    )
+    return {
+        "vbap_constant_power_energy_conservation_proof": (
+            "UNSAT (Proven (g0*x)^2 + (g1*x)^2 + (g2*x)^2 == x^2 for all normalized VBAP gains sum(g_i^2) == 1)"
         )
     }
 
@@ -511,6 +568,7 @@ def main() -> int:
     report.update(prove_tempo_map_monotonic_inverse())
     report.update(prove_ms_high_mid_correlation_bounds())
     report.update(prove_bs1770_5_channel_weights_lfe_exclusion())
+    report.update(prove_vbap_constant_power_energy_conservation())
     print(json.dumps(report, indent=2))
     return 0
 

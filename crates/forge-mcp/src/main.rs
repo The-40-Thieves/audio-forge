@@ -1986,4 +1986,86 @@ mod tests {
         assert!(!is_error(&abc_out), "abc_input failed: {}", text(&abc_out));
         assert!(root.path().join("abc.mid").exists());
     }
+
+    fn push_mcp_wav_chunk(out: &mut Vec<u8>, id: &[u8; 4], payload: &[u8]) {
+        out.extend_from_slice(id);
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        if payload.len() % 2 == 1 {
+            out.push(0);
+        }
+    }
+
+    fn write_mcp_adm_object_wav(path: &std::path::Path) {
+        let sr = 48_000_u32;
+        let frames = sr as usize;
+        let mut pcm = Vec::with_capacity(frames * 3);
+        for i in 0..frames {
+            let s = 0.04 * (2.0 * std::f64::consts::PI * 1000.0 * (i as f64) / f64::from(sr)).sin();
+            let q = (s * 8_388_607.0).round() as i32;
+            pcm.extend_from_slice(&q.to_le_bytes()[0..3]);
+        }
+        let mut chunks = Vec::new();
+        let mut fmt = Vec::with_capacity(16);
+        fmt.extend_from_slice(&1_u16.to_le_bytes());
+        fmt.extend_from_slice(&1_u16.to_le_bytes());
+        fmt.extend_from_slice(&sr.to_le_bytes());
+        fmt.extend_from_slice(&(sr * 3).to_le_bytes());
+        fmt.extend_from_slice(&3_u16.to_le_bytes());
+        fmt.extend_from_slice(&24_u16.to_le_bytes());
+        push_mcp_wav_chunk(&mut chunks, b"fmt ", &fmt);
+        let mut chna = vec![0_u8; 44];
+        chna[0..2].copy_from_slice(&1_u16.to_le_bytes());
+        chna[2..4].copy_from_slice(&1_u16.to_le_bytes());
+        chna[4..6].copy_from_slice(&1_u16.to_le_bytes());
+        chna[6..18].copy_from_slice(b"ATU_00000010");
+        chna[18..32].copy_from_slice(b"AT_00031001_01");
+        chna[32..43].copy_from_slice(b"AP_00031001");
+        push_mcp_wav_chunk(&mut chunks, b"chna", &chna);
+        let axml = br#"<ebuCoreMain><audioFormatExtended><audioProgramme audioProgrammeID="APR_1"><audioContentIDRef>ACO_1</audioContentIDRef></audioProgramme><audioContent audioContentID="ACO_1"><audioObjectIDRef>AO_1</audioObjectIDRef></audioContent><audioObject audioObjectID="AO_1"><audioPackFormatIDRef>AP_00031001</audioPackFormatIDRef><audioTrackUIDRef>ATU_00000010</audioTrackUIDRef></audioObject><audioPackFormat audioPackFormatID="AP_00031001" typeDefinition="Objects"><audioChannelFormatIDRef>AC_00031001</audioChannelFormatIDRef></audioPackFormat><audioChannelFormat audioChannelFormatID="AC_00031001" typeDefinition="Objects"><audioBlockFormat rtime="00:00:00.00000"><position coordinate="azimuth">90.0</position><position coordinate="elevation">0.0</position></audioBlockFormat></audioChannelFormat><audioTrackFormat audioTrackFormatID="AT_00031001_01"><audioStreamFormatIDRef>AS_00031001</audioStreamFormatIDRef></audioTrackFormat><audioStreamFormat audioStreamFormatID="AS_00031001"><audioChannelFormatIDRef>AC_00031001</audioChannelFormatIDRef><audioPackFormatIDRef>AP_00031001</audioPackFormatIDRef></audioStreamFormat><audioTrackUID UID="ATU_00000010"><audioTrackFormatIDRef>AT_00031001_01</audioTrackFormatIDRef><audioPackFormatIDRef>AP_00031001</audioPackFormatIDRef></audioTrackUID></audioFormatExtended></ebuCoreMain>"#;
+        push_mcp_wav_chunk(&mut chunks, b"axml", axml);
+        push_mcp_wav_chunk(&mut chunks, b"data", &pcm);
+        let mut wav = Vec::with_capacity(12 + chunks.len());
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&((4 + chunks.len()) as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(&chunks);
+        std::fs::write(path, wav).expect("write adm wav");
+    }
+
+    #[test]
+    fn spatial_qc_renders_objects_and_marks_no_render_unverified() {
+        let (root, sb) = setup_mix_sandbox(0.25, 48_000);
+        write_mcp_adm_object_wav(&root.path().join("obj.wav"));
+
+        let rendered = call_tool(
+            &sb,
+            "forge_spatial_qc",
+            json!({ "input": "obj.wav", "reference_layout": "7.1.4", "render_objects": true }),
+        );
+        assert!(!is_error(&rendered), "{}", text(&rendered));
+        let rj: Value = serde_json::from_str(text(&rendered)).unwrap();
+        assert_eq!(rj["programme_kind"], "ObjectOnly");
+        assert_eq!(rj["loudness_status"], "VerifiedRenderedObjects");
+        assert!(rj["integrated_lkfs"].as_f64().is_some());
+        assert!(rj["preliminary_qc_passed"].as_bool().unwrap());
+
+        let no_render = call_tool(
+            &sb,
+            "forge_spatial_qc",
+            json!({ "input": "obj.wav", "render_objects": false }),
+        );
+        assert!(!is_error(&no_render), "{}", text(&no_render));
+        let nj: Value = serde_json::from_str(text(&no_render)).unwrap();
+        assert_eq!(nj["loudness_status"], "UnverifiedNoRenderer");
+        assert!(nj["integrated_lkfs"].is_null());
+        assert!(!nj["preliminary_qc_passed"].as_bool().unwrap());
+
+        assert_tool_err_contains(
+            &sb,
+            "forge_spatial_qc",
+            json!({ "input": "obj.wav", "reference_layout": "22.2" }),
+            "Unsupported reference_layout",
+        );
+    }
 }

@@ -5,11 +5,11 @@ use crate::sandbox::PathSandbox;
 use forge_core::{AudioBuffer, ForgeError, StemBundle};
 use forge_dsp::{
     DeFizzConfig, DeliveryOptions, DeliveryTarget, DitherMode, GenreTonalTarget, LimiterStyle,
-    RestorationConfig, ToneMatch, UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw,
-    align_vocal_double_dtw_elastic, analyze_beat_grid, apply_18_band_eq, apply_spectral_defizz,
-    apply_spectral_unmask, audit_audio, audit_spatial_adm_bwf_reader, clean_vocal_surgical,
-    compute_reference_match_eq, deliver, normalize_and_limit, quantize_to_constant_bpm,
-    run_full_restoration_chain,
+    ReferenceLoudspeakerConfig, RestorationConfig, SpatialQcOptions, SpatialRenderMode, ToneMatch,
+    UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw, align_vocal_double_dtw_elastic,
+    analyze_beat_grid, apply_18_band_eq, apply_spectral_defizz, apply_spectral_unmask, audit_audio,
+    audit_spatial_adm_bwf_reader_with_options, clean_vocal_surgical, compute_reference_match_eq,
+    deliver, normalize_and_limit, quantize_to_constant_bpm, run_full_restoration_chain,
 };
 use forge_reaper::{
     ReaperProjectBuilder, ReaperTrackSpec, ReleaseMetadata, install_jsfx_plugins, jsfx_install_dir,
@@ -272,10 +272,33 @@ fn dispatch_tool(
     handler(args, sandbox)
 }
 
+fn parse_reference_layout(args: &Value) -> Result<ReferenceLoudspeakerConfig, ForgeError> {
+    let raw = args
+        .get("reference_layout")
+        .and_then(Value::as_str)
+        .unwrap_or("7.1.4");
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "5.1" => Ok(ReferenceLoudspeakerConfig::Layout5_1),
+        "7.1" => Ok(ReferenceLoudspeakerConfig::Layout7_1),
+        "7.1.4" => Ok(ReferenceLoudspeakerConfig::Layout7_1_4),
+        other => Err(ForgeError::InvalidParameter(format!(
+            "Unsupported reference_layout '{other}' (expected 5.1, 7.1, or 7.1.4)"
+        ))),
+    }
+}
+
 fn tool_spatial_qc(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
     let input = path_arg(args, "input", sandbox)?;
+    let render_objects = bool_arg(args, "render_objects", true);
+    let options = SpatialQcOptions {
+        render_mode: if render_objects {
+            SpatialRenderMode::ReferenceRenderer(parse_reference_layout(args)?)
+        } else {
+            SpatialRenderMode::NoRenderer
+        },
+    };
     let mut file = sandbox.open_read(&input)?;
-    let report = audit_spatial_adm_bwf_reader(&mut file, &input)?;
+    let report = audit_spatial_adm_bwf_reader_with_options(&mut file, &input, options)?;
     Ok(serde_json::to_value(report)?.into())
 }
 

@@ -90,7 +90,7 @@ READY
 | `forge_daw_inspect` | Validate and inspect a ForgeStudio DAW `.forgeproj` session (BPM, sample rate, tracks, objects, MIDI clips, aux buses, total PDC). |
 | `forge_daw_bounce` | Headless 24-bit WAV mastering bounce (with BS.1770-4 audit) and optional batch per-track stem WAV export from a `.forgeproj` session. |
 | `forge_f0_track` | Fundamental frequency (F0) contour extraction via RMVPE, SwiftF0/FCPE, autocorrelation, or pure-Rust YIN pitch tracking. |
-| `forge_spatial_qc` | ITU-R BS.1770-5 multi-channel loudness and Dolby Atmos ADM BWF (`axml`/`chna`/`bext`) spatial delivery verification. |
+| `forge_spatial_qc` | ITU-R BS.2076 ADM BWF (`axml`/`chna`/`bext`) bed/object metadata validation, 3D VBAP reference object rendering (`5.1`/`7.1`/`7.1.4`), and preliminary BS.1770-5 Annex 3/4 loudness QC (not Atmos certification). |
 
 ### Delivery targets
 

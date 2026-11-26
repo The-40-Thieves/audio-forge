@@ -6,11 +6,12 @@ use clap::{Parser, Subcommand};
 use forge_core::AudioBuffer;
 use forge_dsp::{
     DeFizzConfig, DeliveryOptions, DeliveryTarget, DitherMode, GenreTonalTarget, LimiterStyle,
-    RestorationConfig, ToneMatch, UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw,
-    align_vocal_double_dtw_elastic, analyze_beat_grid, apply_18_band_eq, apply_spectral_defizz,
-    apply_spectral_unmask, audit_audio, audit_spatial_adm_bwf, clean_vocal_surgical,
-    compute_genre_tonal_balance_eq, compute_reference_match_eq, deliver, normalize_and_limit,
-    quantize_to_constant_bpm, run_full_restoration_chain,
+    ReferenceLoudspeakerConfig, RestorationConfig, SpatialQcOptions, SpatialRenderMode, ToneMatch,
+    UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw, align_vocal_double_dtw_elastic,
+    analyze_beat_grid, apply_18_band_eq, apply_spectral_defizz, apply_spectral_unmask, audit_audio,
+    audit_spatial_adm_bwf_with_options, clean_vocal_surgical, compute_genre_tonal_balance_eq,
+    compute_reference_match_eq, deliver, normalize_and_limit, quantize_to_constant_bpm,
+    run_full_restoration_chain,
 };
 use forge_engine::{ClipCache, DawProject, ObjectOrientedEngine};
 use forge_reaper::{
@@ -520,10 +521,16 @@ enum Commands {
         json: bool,
     },
 
-    /// Audit a multi-channel WAV/RF64 ADM BWF file (ITU-R BS.1770-5 + Dolby Atmos QC)
+    /// Audit a multi-channel WAV/RF64 ADM BWF file (ITU-R BS.1770-5 Annex 3/4 + ADM rendering; preliminary QC only)
     SpatialQc {
         /// Path to WAV/RF64 ADM BWF audio file
         input: PathBuf,
+        /// Target ITU-R BS.2051 reference loudspeaker layout for ADM object rendering (`5.1`, `7.1`, `7.1.4`)
+        #[arg(long, default_value = "7.1.4")]
+        layout: String,
+        /// Disable object rendering (object loudness will be marked unverified)
+        #[arg(long)]
+        no_render: bool,
         /// Emit raw JSON output
         #[arg(long)]
         json: bool,
@@ -627,7 +634,12 @@ fn try_dispatch_restore(command: Commands) -> anyhow::Result<Option<Commands>> {
 fn dispatch_mix_cli(command: Commands) -> anyhow::Result<Option<Commands>> {
     match command {
         Commands::Audit { input, json } => run_audit_cli(&input, json)?,
-        Commands::SpatialQc { input, json } => run_spatial_qc_cli(&input, json)?,
+        Commands::SpatialQc {
+            input,
+            layout,
+            no_render,
+            json,
+        } => run_spatial_qc_cli(&input, &layout, no_render, json)?,
         Commands::Unmask {
             target,
             sidechain,
@@ -680,22 +692,54 @@ fn dispatch_mix_cli(command: Commands) -> anyhow::Result<Option<Commands>> {
     Ok(None)
 }
 
-fn run_spatial_qc_cli(input: &std::path::Path, json: bool) -> anyhow::Result<()> {
-    let report = audit_spatial_adm_bwf(input)?;
+fn parse_spatial_layout(raw: &str) -> anyhow::Result<ReferenceLoudspeakerConfig> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "5.1" => Ok(ReferenceLoudspeakerConfig::Layout5_1),
+        "7.1" => Ok(ReferenceLoudspeakerConfig::Layout7_1),
+        "7.1.4" => Ok(ReferenceLoudspeakerConfig::Layout7_1_4),
+        other => anyhow::bail!(
+            "Unsupported reference spatial layout '{other}' (expected 5.1, 7.1, or 7.1.4)"
+        ),
+    }
+}
+
+fn run_spatial_qc_cli(
+    input: &std::path::Path,
+    layout: &str,
+    no_render: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let options = SpatialQcOptions {
+        render_mode: if no_render {
+            SpatialRenderMode::NoRenderer
+        } else {
+            SpatialRenderMode::ReferenceRenderer(parse_spatial_layout(layout)?)
+        },
+    };
+    let report = audit_spatial_adm_bwf_with_options(input, options)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
+    let lkfs = report
+        .integrated_lkfs
+        .map_or_else(|| "UNVERIFIED".to_string(), |v| format!("{v:.2} LKFS"));
+    let tp = report
+        .true_peak_dbtp
+        .map_or_else(|| "UNVERIFIED".to_string(), |v| format!("{v:.2} dBTP"));
     println!(
-        "Atmos Spatial QC ({:?}): {:.2} LKFS | {:.2} dBTP | {} Hz / {}-bit | ADM axml={} chna={} | Ready: {}",
-        report.layout,
-        report.integrated_lkfs,
-        report.true_peak_dbtp,
+        "Spatial ADM BWF QC ({:?} / {:?}): {lkfs} | {tp} | {} Hz / {}-bit | Renderer: {} | Preliminary QC Passed: {}\n{}",
+        report.programme_kind,
+        report.loudness_status,
         report.sample_rate,
         report.bits_per_sample,
-        report.adm.has_axml,
-        report.adm.has_chna,
-        if report.atmos_ready { "YES" } else { "NO" }
+        report.render_configuration.as_deref().unwrap_or("none"),
+        if report.preliminary_qc_passed {
+            "YES"
+        } else {
+            "NO"
+        },
+        report.certification_disclaimer,
     );
     Ok(())
 }

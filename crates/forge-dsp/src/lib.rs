@@ -1,5 +1,6 @@
 //! `forge-dsp` — Studio DSP, Restoration, Spectral Suppression, Unmasking, Alignment & Mastering.
 
+pub mod adm_render;
 pub mod beat_grid;
 pub mod delivery;
 pub mod drum_midi;
@@ -15,6 +16,9 @@ pub mod spectral_defizz;
 pub mod spectral_unmask;
 pub mod spectrum;
 
+pub use adm_render::{
+    ReferenceLoudspeakerConfig, compute_vbap_gains, render_adm_programme_to_layout,
+};
 pub use beat_grid::{
     BeatGridReport, TempoPoint, analyze_beat_grid, quantize_to_constant_bpm, warp_buffer_wsola,
 };
@@ -34,9 +38,10 @@ pub use elite_dsp::{
 pub use loudness_limiter::{
     Biquad, ChannelLayout, CytomicSvf, DitherMode, LIMITER_LOOKAHEAD_MS, LIMITER_RELEASE_MS,
     LimiterStyle, MasteringLimiterConfig, SILENCE_RMS_DBFS, SILENT_BAND_DB, TRUE_PEAK_PHASES,
-    apply_dither, audit_audio, bs1770_5_channel_weights, compute_bs1770_5_loudness,
-    compute_true_peak, flush_denormal_f64, normalize_and_limit, normalize_and_limit_with_config,
-    sanitize_param_f64, sanitize_sample_f32, sanitize_sample_f64,
+    apply_dither, audit_audio, bs1770_5_channel_weights, bs1770_5_position_weight,
+    compute_bs1770_5_loudness, compute_bs1770_5_loudness_with_weights, compute_true_peak,
+    flush_denormal_f64, normalize_and_limit, normalize_and_limit_with_config, sanitize_param_f64,
+    sanitize_sample_f32, sanitize_sample_f64,
 };
 pub use phase_align::{PhaseAlignmentResult, align_phase_gcc_phat};
 pub use realtime::{
@@ -52,7 +57,9 @@ pub use restoration::{
     sum_audio_buffers,
 };
 pub use spatial_qc::{
-    SpatialQcCheck, SpatialQcReport, audit_spatial_adm_bwf, audit_spatial_adm_bwf_reader,
+    LoudnessVerificationStatus, SpatialQcCheck, SpatialQcOptions, SpatialQcReport,
+    SpatialRenderMode, audit_spatial_adm_bwf, audit_spatial_adm_bwf_reader,
+    audit_spatial_adm_bwf_reader_with_options, audit_spatial_adm_bwf_with_options,
 };
 pub use spectral_defizz::{DeFizzConfig, apply_spectral_defizz};
 pub use spectral_unmask::{UnmaskConfig, apply_spectral_unmask};

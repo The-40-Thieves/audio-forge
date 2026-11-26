@@ -538,6 +538,23 @@ pub enum ChannelLayout {
     Custom(usize),
 }
 
+/// Returns the ITU-R BS.1770-5 Annex 3 speaker-position linear power weight `g_i`
+/// from spherical speaker coordinates (`azimuth_deg`, `elevation_deg`, `is_lfe`).
+///
+/// - LFE channels return `0.0` (excluded).
+/// - Horizontal/mid-plane surrounds (`|el| < 30 deg` and `60 <= |az| <= 120 deg`) return `1.41`.
+/// - Front (`|az| < 60 deg`), rear (`|az| > 120 deg`), and elevated (`|el| >= 30 deg`) speakers return `1.0`.
+pub fn bs1770_5_position_weight(azimuth_deg: f64, elevation_deg: f64, is_lfe: bool) -> f64 {
+    if is_lfe || !azimuth_deg.is_finite() || !elevation_deg.is_finite() {
+        return 0.0;
+    }
+    if elevation_deg.abs() < 30.0 && (60.0..=120.0).contains(&azimuth_deg.abs()) {
+        1.41
+    } else {
+        1.0
+    }
+}
+
 impl ChannelLayout {
     /// Infers the standard SMPTE/Atmos layout from the interleaved channel count.
     pub fn infer(num_channels: usize) -> Self {
@@ -551,16 +568,18 @@ impl ChannelLayout {
         }
     }
 
-    /// Returns ITU-R BS.1770-5 linear power channel weights `g_i` for `num_channels`.
+    /// Returns ITU-R BS.1770-5 Annex 3 linear power channel weights `g_i` for `num_channels`.
+    ///
+    /// Note: For 7.1 and 7.1.4 (SMPTE L, R, C, LFE, Lss, Rss, Lrs, Rrs[, Ltf, Rtf, Ltr, Rtr]),
+    /// side surrounds (`|az| = 90 deg`, `|el| < 30 deg`) receive `1.41`, rear surrounds
+    /// (`|az| = 135 deg`) and heights (`|el| >= 30 deg`) receive `1.0`, and LFE receives `0.0`.
     pub fn weights(self, num_channels: usize) -> Vec<f64> {
         match self {
             Self::Mono => vec![1.0],
             Self::Stereo => vec![1.0, 1.0],
             Self::Surround5_1 => vec![1.0, 1.0, 1.0, 0.0, 1.41, 1.41],
-            Self::Surround7_1 => vec![1.0, 1.0, 1.0, 0.0, 1.41, 1.41, 1.41, 1.41],
-            Self::Atmos7_1_4 => vec![
-                1.0, 1.0, 1.0, 0.0, 1.41, 1.41, 1.41, 1.41, 1.0, 1.0, 1.0, 1.0,
-            ],
+            Self::Surround7_1 => vec![1.0, 1.0, 1.0, 0.0, 1.41, 1.41, 1.0, 1.0],
+            Self::Atmos7_1_4 => vec![1.0, 1.0, 1.0, 0.0, 1.41, 1.41, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
             Self::Custom(_) => vec![1.0; num_channels],
         }
     }
@@ -630,11 +649,16 @@ pub fn compute_bs1770_5_loudness(
 ) -> (f64, f64, f64, f64) {
     let resolved = layout.unwrap_or_else(|| ChannelLayout::infer(buffer.num_channels()));
     let weights = resolved.weights(buffer.num_channels());
-    let sub_energies = compute_k_weighted_sub_energies_with_weights(
-        &buffer.channels,
-        buffer.sample_rate,
-        &weights,
-    );
+    compute_bs1770_5_loudness_with_weights(buffer, &weights)
+}
+
+/// Computes `(integrated_lkfs, short_term_max_lkfs, momentary_max_lkfs, lra_lu)` using explicit per-channel BS.1770-5 weights `g_i`.
+pub fn compute_bs1770_5_loudness_with_weights(
+    buffer: &AudioBuffer,
+    weights: &[f64],
+) -> (f64, f64, f64, f64) {
+    let sub_energies =
+        compute_k_weighted_sub_energies_with_weights(&buffer.channels, buffer.sample_rate, weights);
     compute_loudness_metrics_from_subs(&sub_energies)
 }
 

@@ -4,11 +4,14 @@ use std::f64::consts::PI;
 use std::io::Cursor;
 use std::path::Path;
 
+use forge_core::AdmProgrammeKind;
 use forge_core::AudioBuffer;
 use forge_dsp::{
-    ChannelLayout, RealtimeDensityAndClipper, RealtimeMasterLimiter, audit_audio,
-    audit_spatial_adm_bwf_reader, bs1770_5_channel_weights, compute_bs1770_5_loudness,
-    resample_buffer_sinc,
+    ChannelLayout, LoudnessVerificationStatus, RealtimeDensityAndClipper, RealtimeMasterLimiter,
+    ReferenceLoudspeakerConfig, SpatialQcOptions, SpatialRenderMode, audit_audio,
+    audit_spatial_adm_bwf_reader, audit_spatial_adm_bwf_reader_with_options,
+    bs1770_5_channel_weights, bs1770_5_position_weight, compute_bs1770_5_loudness,
+    compute_vbap_gains, resample_buffer_sinc,
 };
 use rustfft::{FftPlanner, num_complex::Complex};
 
@@ -96,49 +99,140 @@ fn push_wav_chunk(out: &mut Vec<u8>, id: &[u8; 4], payload: &[u8]) {
     }
 }
 
-fn build_adm_wav_bytes(sample_rate: u32, amp: f64, include_adm: bool) -> Vec<u8> {
-    let channels: u16 = 6;
-    let bits: u16 = 24;
-    let block_align = channels * (bits / 8);
-    let frames = sample_rate as usize;
-    let mut pcm = Vec::with_capacity(frames * usize::from(block_align));
-    for i in 0..frames {
-        let s = amp * (2.0 * PI * 1000.0 * (i as f64) / f64::from(sample_rate)).sin();
-        let q = (s * 8_388_607.0).round().clamp(-8_388_608.0, 8_388_607.0) as i32;
-        let bytes = q.to_le_bytes();
-        for ch in 0..usize::from(channels) {
-            let sample_bytes = if ch < 3 { &bytes[0..3] } else { &[0, 0, 0] };
-            pcm.extend_from_slice(sample_bytes);
+fn push_chna_rec(buf: &mut Vec<u8>, track: u16, uid: &str, track_ref: &str, pack_ref: &str) {
+    buf.extend_from_slice(&track.to_le_bytes());
+    let mut pad = [0_u8; 38];
+    let ub = uid.as_bytes();
+    let tb = track_ref.as_bytes();
+    let pb = pack_ref.as_bytes();
+    pad[..ub.len().min(12)].copy_from_slice(&ub[..ub.len().min(12)]);
+    pad[12..12 + tb.len().min(14)].copy_from_slice(&tb[..tb.len().min(14)]);
+    pad[26..26 + pb.len().min(11)].copy_from_slice(&pb[..pb.len().min(11)]);
+    buf.extend_from_slice(&pad);
+}
+
+fn encode_24bit_pcm(channels: &[Vec<f64>]) -> Vec<u8> {
+    let n_ch = channels.len();
+    let n_frames = channels.first().map_or(0, Vec::len);
+    let mut pcm = Vec::with_capacity(n_frames * n_ch * 3);
+    for i in 0..n_frames {
+        for ch in channels {
+            let q = (ch[i] * 8_388_607.0)
+                .round()
+                .clamp(-8_388_608.0, 8_388_607.0) as i32;
+            pcm.extend_from_slice(&q.to_le_bytes()[0..3]);
         }
     }
+    pcm
+}
 
+fn build_wav_with_adm(
+    sample_rate: u32,
+    channels: &[Vec<f64>],
+    adm_chunks: Option<(&[u8], &[u8])>,
+) -> Vec<u8> {
+    let n_ch = channels.len() as u16;
+    let block_align = n_ch * 3;
     let mut chunks = Vec::new();
     let mut fmt = Vec::with_capacity(16);
     fmt.extend_from_slice(&1_u16.to_le_bytes());
-    fmt.extend_from_slice(&channels.to_le_bytes());
+    fmt.extend_from_slice(&n_ch.to_le_bytes());
     fmt.extend_from_slice(&sample_rate.to_le_bytes());
     fmt.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
     fmt.extend_from_slice(&block_align.to_le_bytes());
-    fmt.extend_from_slice(&bits.to_le_bytes());
+    fmt.extend_from_slice(&24_u16.to_le_bytes());
     push_wav_chunk(&mut chunks, b"fmt ", &fmt);
-
-    if include_adm {
+    if let Some((chna, axml)) = adm_chunks {
         push_wav_chunk(&mut chunks, b"bext", &[0_u8; 602]);
-        let mut chna = vec![0_u8; 40];
-        chna[0..2].copy_from_slice(&1_u16.to_le_bytes());
-        chna[2..4].copy_from_slice(&1_u16.to_le_bytes());
-        push_wav_chunk(&mut chunks, b"chna", &chna);
-        let axml = br#"<?xml version="1.0" encoding="UTF-8"?><ebuCoreMain><coreMetadata><format><audioFormatExtended><audioProgramme audioProgrammeID="APR_1001" audioProgrammeName="AtmosMix"/><audioObject audioObjectID="AO_1001" binauralRenderMode="near"/></audioFormatExtended></format></coreMetadata></ebuCoreMain>"#;
+        push_wav_chunk(&mut chunks, b"chna", chna);
         push_wav_chunk(&mut chunks, b"axml", axml);
     }
-    push_wav_chunk(&mut chunks, b"data", &pcm);
-
+    push_wav_chunk(&mut chunks, b"data", &encode_24bit_pcm(channels));
     let mut wav = Vec::with_capacity(12 + chunks.len());
     wav.extend_from_slice(b"RIFF");
     wav.extend_from_slice(&((4 + chunks.len()) as u32).to_le_bytes());
     wav.extend_from_slice(b"WAVE");
     wav.extend_from_slice(&chunks);
     wav
+}
+
+fn build_permuted_5_1_bed_wav(amp_main: f64, amp_lfe: f64) -> Vec<u8> {
+    let t = sine_buffer(1, 48_000, 1.0, 1000.0, amp_main)
+        .channels
+        .pop()
+        .unwrap();
+    let lfe = sine_buffer(1, 48_000, 1.0, 80.0, amp_lfe)
+        .channels
+        .pop()
+        .unwrap();
+    // Permuted order: [C, LFE, Ls, Rs, L, R]
+    let channels = [t.clone(), lfe, t.clone(), t.clone(), t.clone(), t];
+    let mut chna = Vec::new();
+    chna.extend_from_slice(&6_u16.to_le_bytes());
+    chna.extend_from_slice(&6_u16.to_le_bytes());
+    let defs = [
+        "AT_00010003_01",
+        "AT_00010004_01",
+        "AT_00010005_01",
+        "AT_00010006_01",
+        "AT_00010001_01",
+        "AT_00010002_01",
+    ];
+    for (idx, tr) in defs.iter().enumerate() {
+        push_chna_rec(
+            &mut chna,
+            (idx + 1) as u16,
+            &format!("ATU_0000000{}", idx + 1),
+            tr,
+            "AP_00010002",
+        );
+    }
+    let axml = br#"<ebuCoreMain><audioFormatExtended>
+        <audioProgramme audioProgrammeID="APR_1"><audioContentIDRef>ACO_1</audioContentIDRef></audioProgramme>
+        <audioContent audioContentID="ACO_1"><audioObjectIDRef>AO_BED</audioObjectIDRef></audioContent>
+        <audioObject audioObjectID="AO_BED" binauralRenderMode="near">
+            <audioTrackUIDRef>ATU_00000001</audioTrackUIDRef><audioTrackUIDRef>ATU_00000002</audioTrackUIDRef>
+            <audioTrackUIDRef>ATU_00000003</audioTrackUIDRef><audioTrackUIDRef>ATU_00000004</audioTrackUIDRef>
+            <audioTrackUIDRef>ATU_00000005</audioTrackUIDRef><audioTrackUIDRef>ATU_00000006</audioTrackUIDRef>
+        </audioObject>
+        <audioTrackUID UID="ATU_00000001"><audioTrackFormatIDRef>AT_00010003_01</audioTrackFormatIDRef></audioTrackUID>
+        <audioTrackUID UID="ATU_00000002"><audioTrackFormatIDRef>AT_00010004_01</audioTrackFormatIDRef></audioTrackUID>
+        <audioTrackUID UID="ATU_00000003"><audioTrackFormatIDRef>AT_00010005_01</audioTrackFormatIDRef></audioTrackUID>
+        <audioTrackUID UID="ATU_00000004"><audioTrackFormatIDRef>AT_00010006_01</audioTrackFormatIDRef></audioTrackUID>
+        <audioTrackUID UID="ATU_00000005"><audioTrackFormatIDRef>AT_00010001_01</audioTrackFormatIDRef></audioTrackUID>
+        <audioTrackUID UID="ATU_00000006"><audioTrackFormatIDRef>AT_00010002_01</audioTrackFormatIDRef></audioTrackUID>
+    </audioFormatExtended></ebuCoreMain>"#;
+    build_wav_with_adm(48_000, &channels, Some((&chna, axml)))
+}
+
+fn build_object_adm_wav(raw_amp: f64, gain_db_second_half: f64) -> Vec<u8> {
+    let mono = sine_buffer(1, 48_000, 2.0, 1000.0, raw_amp).channels;
+    let mut chna = Vec::new();
+    chna.extend_from_slice(&1_u16.to_le_bytes());
+    chna.extend_from_slice(&1_u16.to_le_bytes());
+    push_chna_rec(
+        &mut chna,
+        1,
+        "ATU_00000010",
+        "AT_00031001_01",
+        "AP_00031001",
+    );
+    let axml = format!(
+        r#"<ebuCoreMain><audioFormatExtended>
+        <audioProgramme audioProgrammeID="APR_1"><audioContentIDRef>ACO_1</audioContentIDRef></audioProgramme>
+        <audioContent audioContentID="ACO_1"><audioObjectIDRef>AO_1</audioObjectIDRef></audioContent>
+        <audioObject audioObjectID="AO_1" binauralRenderMode="mid"><audioPackFormatIDRef>AP_00031001</audioPackFormatIDRef><audioTrackUIDRef>ATU_00000010</audioTrackUIDRef></audioObject>
+        <audioPackFormat audioPackFormatID="AP_00031001" typeDefinition="Objects"><audioChannelFormatIDRef>AC_00031001</audioChannelFormatIDRef></audioPackFormat>
+        <audioChannelFormat audioChannelFormatID="AC_00031001" typeDefinition="Objects">
+            <audioBlockFormat rtime="00:00:00.00000" duration="00:00:01.00000"><position coordinate="azimuth">0.0</position><position coordinate="elevation">0.0</position><gain gainUnit="linear">1.0</gain></audioBlockFormat>
+            <audioBlockFormat rtime="00:00:01.00000" duration="00:00:01.00000"><position coordinate="azimuth">90.0</position><position coordinate="elevation">0.0</position><gain gainUnit="dB">{gain_db_second_half:.2}</gain></audioBlockFormat>
+        </audioChannelFormat>
+        <audioTrackFormat audioTrackFormatID="AT_00031001_01"><audioStreamFormatIDRef>AS_00031001</audioStreamFormatIDRef></audioTrackFormat>
+        <audioStreamFormat audioStreamFormatID="AS_00031001"><audioChannelFormatIDRef>AC_00031001</audioChannelFormatIDRef><audioPackFormatIDRef>AP_00031001</audioPackFormatIDRef></audioStreamFormat>
+        <audioTrackUID UID="ATU_00000010"><audioTrackFormatIDRef>AT_00031001_01</audioTrackFormatIDRef><audioPackFormatIDRef>AP_00031001</audioPackFormatIDRef></audioTrackUID>
+    </audioFormatExtended></ebuCoreMain>"#
+    );
+    build_wav_with_adm(48_000, &mono, Some((&chna, axml.as_bytes())))
 }
 
 #[test]
@@ -250,6 +344,19 @@ fn bs1770_5_multichannel_excludes_lfe_and_weights_surrounds_plus_1_5_db() {
         bs1770_5_channel_weights(6),
         vec![1.0, 1.0, 1.0, 0.0, 1.41, 1.41]
     );
+    assert_eq!(
+        bs1770_5_channel_weights(8),
+        vec![1.0, 1.0, 1.0, 0.0, 1.41, 1.41, 1.0, 1.0]
+    );
+    assert_eq!(
+        bs1770_5_channel_weights(12),
+        vec![1.0, 1.0, 1.0, 0.0, 1.41, 1.41, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    );
+    assert_eq!(bs1770_5_position_weight(135.0, 0.0, false), 1.0);
+    assert_eq!(bs1770_5_position_weight(90.0, 30.0, false), 1.0);
+    assert_eq!(bs1770_5_position_weight(90.0, 0.0, false), 1.41);
+    assert_eq!(bs1770_5_position_weight(0.0, 0.0, true), 0.0);
+
     let mut lfe_only = AudioBuffer::new(6, 48_000, 48_000).unwrap();
     let amp_lfe = 10.0_f64.powf(-12.0 / 20.0);
     for i in 0..48_000 {
@@ -279,46 +386,95 @@ fn bs1770_5_multichannel_excludes_lfe_and_weights_surrounds_plus_1_5_db() {
 }
 
 #[test]
-fn spatial_adm_bwf_qc_validates_atmos_pass_and_rejects_loud_or_missing_adm() {
-    let pass_wav = build_adm_wav_bytes(48_000, 0.04, true);
-    let pass_rep =
-        audit_spatial_adm_bwf_reader(&mut Cursor::new(pass_wav), Path::new("pass.wav")).unwrap();
-    assert!(
-        pass_rep.atmos_ready,
-        "expected compliant Atmos mix to pass: {:?}",
-        pass_rep.checks
-    );
-    assert!(
-        pass_rep
-            .checks
-            .iter()
-            .filter(|c| c.mandatory)
-            .all(|c| c.passed)
-    );
+fn vbap_grid_conserves_constant_power_energy() {
+    for az in [-180.0, -135.0, -90.0, -45.0, 0.0, 30.0, 90.0, 110.0, 150.0] {
+        for el in [0.0, 15.0, 30.0, 60.0, 90.0] {
+            let g = compute_vbap_gains(ReferenceLoudspeakerConfig::Layout7_1_4, az, el);
+            assert_eq!(g[3], 0.0, "LFE must never receive VBAP energy");
+            let e: f64 = g.iter().map(|v| v * v).sum();
+            assert!(
+                (e - 1.0).abs() < 1e-6,
+                "VBAP power drift at ({az}, {el}): {e}"
+            );
+        }
+    }
+}
 
-    let loud_wav = build_adm_wav_bytes(48_000, 0.5, true);
-    let loud_rep =
-        audit_spatial_adm_bwf_reader(&mut Cursor::new(loud_wav), Path::new("loud.wav")).unwrap();
-    assert!(!loud_rep.atmos_ready);
-    assert!(
-        !loud_rep
-            .checks
-            .iter()
-            .find(|c| c.name == "integrated_loudness_max_neg18_lkfs")
-            .unwrap()
-            .passed
+#[test]
+fn spatial_adm_bwf_qc_audits_permuted_beds_and_rendered_objects() {
+    let bed_wav = build_permuted_5_1_bed_wav(0.03, 0.5);
+    let bed_rep =
+        audit_spatial_adm_bwf_reader(&mut Cursor::new(bed_wav), Path::new("bed.wav")).unwrap();
+    assert_eq!(bed_rep.programme_kind, AdmProgrammeKind::ChannelBedOnly);
+    assert_eq!(
+        bed_rep.loudness_status,
+        LoudnessVerificationStatus::VerifiedBedDirectSpeakers
     );
+    assert_eq!(
+        bed_rep.channel_weights,
+        vec![1.0, 0.0, 1.41, 1.41, 1.0, 1.0]
+    );
+    assert!(
+        bed_rep.preliminary_qc_passed,
+        "permuted bed checks: {:?}",
+        bed_rep.checks
+    );
+    assert!(bed_rep.certification_disclaimer.contains("NOT Dolby Atmos"));
 
-    let plain_wav = build_adm_wav_bytes(48_000, 0.04, false);
+    // Object with quiet raw track (-24 dBFS) boosted +12 dB in block 2 exceeds -18 LKFS only after rendering
+    let obj_loud = build_object_adm_wav(0.06, 12.0);
+    let obj_rep =
+        audit_spatial_adm_bwf_reader(&mut Cursor::new(obj_loud), Path::new("obj_loud.wav"))
+            .unwrap();
+    assert_eq!(obj_rep.programme_kind, AdmProgrammeKind::ObjectOnly);
+    assert_eq!(
+        obj_rep.loudness_status,
+        LoudnessVerificationStatus::VerifiedRenderedObjects
+    );
+    assert!(!obj_rep.preliminary_qc_passed);
+    assert!(obj_rep.integrated_lkfs.unwrap() > -18.0);
+}
+
+#[test]
+fn spatial_adm_bwf_qc_marks_unrendered_missing_and_invalid_adm_unverified() {
+    let obj_loud = build_object_adm_wav(0.06, 12.0);
+    let no_render_opts = SpatialQcOptions {
+        render_mode: SpatialRenderMode::NoRenderer,
+    };
+    let no_rep = audit_spatial_adm_bwf_reader_with_options(
+        &mut Cursor::new(obj_loud),
+        Path::new("obj.wav"),
+        no_render_opts,
+    )
+    .unwrap();
+    assert_eq!(
+        no_rep.loudness_status,
+        LoudnessVerificationStatus::UnverifiedNoRenderer
+    );
+    assert!(no_rep.integrated_lkfs.is_none());
+    assert!(!no_rep.preliminary_qc_passed);
+
+    let plain_chs = vec![vec![0.02; 48_000]; 6];
+    let plain = build_wav_with_adm(48_000, &plain_chs, None);
     let plain_rep =
-        audit_spatial_adm_bwf_reader(&mut Cursor::new(plain_wav), Path::new("plain.wav")).unwrap();
-    assert!(!plain_rep.atmos_ready);
-    assert!(
-        !plain_rep
-            .checks
-            .iter()
-            .find(|c| c.name == "adm_chunks_present")
-            .unwrap()
-            .passed
+        audit_spatial_adm_bwf_reader(&mut Cursor::new(plain), Path::new("plain.wav")).unwrap();
+    assert_eq!(
+        plain_rep.loudness_status,
+        LoudnessVerificationStatus::UnverifiedMissingAdm
     );
+    assert!(plain_rep.integrated_lkfs.is_none());
+    assert!(!plain_rep.preliminary_qc_passed);
+
+    let bad = build_wav_with_adm(
+        48_000,
+        &plain_chs[..1],
+        Some((&[1, 0, 1, 0], b"<ebuCoreMain><broken>")),
+    );
+    let bad_rep =
+        audit_spatial_adm_bwf_reader(&mut Cursor::new(bad), Path::new("bad.wav")).unwrap();
+    assert_eq!(
+        bad_rep.programme_kind,
+        AdmProgrammeKind::UnsupportedOrMalformed
+    );
+    assert!(!bad_rep.preliminary_qc_passed);
 }

@@ -930,16 +930,51 @@ pub(crate) fn build_tools() -> Vec<Tool> {
         }),
         req_str_tool(
             "forge_spatial_qc",
-            "Spatial ADM BWF & BS.1770-5 Atmos QC",
-            "Audit multi-channel WAV/RF64 ADM BWF (ITU-R BS.2076) and ITU-R BS.1770-5 loudness/true-peak Dolby Atmos delivery readiness inside the MCP sandbox.",
+            "Spatial ADM BWF & BS.1770-5 QC",
+            "Validate WAV/RF64 ADM BWF (ITU-R BS.2076) bed/object track associations, optionally render objects via 3D VBAP to a specified reference layout, and compute preliminary ITU-R BS.1770-5 Annex 3/4 loudness and true peak (NOT Dolby Atmos certification).",
             ToolKind::ReadOnly,
             &["input"],
-            vec![],
-            out_fields(&[
-                ("atmos_ready", "boolean"),
-                ("integrated_lkfs", "number"),
-                ("true_peak_dbtp", "number"),
-            ]),
+            vec![
+                (
+                    "reference_layout",
+                    prop_enum(
+                        "string",
+                        &["5.1", "7.1", "7.1.4"],
+                        json!("7.1.4"),
+                        "Reference ITU-R BS.2051 loudspeaker layout for rendering object/mixed ADM tracks",
+                    ),
+                ),
+                (
+                    "render_objects",
+                    prop_bool(
+                        true,
+                        "Render object/mixed ADM tracks before BS.1770-5 measurement (false marks object loudness unverified)",
+                    ),
+                ),
+            ],
+            object_schema(
+                &[
+                    (
+                        "preliminary_qc_passed",
+                        schema_prop("boolean", None, None, ""),
+                    ),
+                    ("programme_kind", schema_prop("string", None, None, "")),
+                    ("loudness_status", schema_prop("string", None, None, "")),
+                    (
+                        "render_configuration",
+                        json!({ "type": ["string", "null"] }),
+                    ),
+                    ("loudness_algorithm", schema_prop("string", None, None, "")),
+                    (
+                        "certification_disclaimer",
+                        schema_prop("string", None, None, ""),
+                    ),
+                    ("integrated_lkfs", json!({ "type": ["number", "null"] })),
+                    ("true_peak_dbtp", json!({ "type": ["number", "null"] })),
+                ],
+                None,
+                Some(true),
+            ),
         ),
     ]
 }
