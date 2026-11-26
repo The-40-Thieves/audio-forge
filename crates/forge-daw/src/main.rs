@@ -373,8 +373,19 @@ impl ForgeDawApp {
     }
 
     fn toggle_record(&mut self) {
-        if let Some(rec) = self.recorder.take() {
-            self.start_save_recording_job(rec);
+        if self.recorder.is_some() {
+            if self.is_io_busy() {
+                self.status_line = format!(
+                    "Wait for '{}' to finish before stopping recording (take preserved)",
+                    self.io_job_label
+                );
+                return;
+            }
+            if let Some(rec) = self.recorder.take()
+                && let Err(rec) = self.start_save_recording_job(rec)
+            {
+                self.recorder = Some(*rec);
+            }
         } else {
             if self.project.tracks.is_empty() {
                 self.status_line = "No tracks available for recording".to_string();
@@ -866,7 +877,9 @@ impl ForgeDawApp {
                     if self.recorder.is_some() {
                         self.toggle_record();
                     }
-                    if let Some(ref eng) = self.audio {
+                    if self.recorder.is_none()
+                        && let Some(ref eng) = self.audio
+                    {
                         eng.stop();
                     }
                 }
@@ -874,7 +887,7 @@ impl ForgeDawApp {
                 let is_recording = self.recorder.is_some();
                 if ui
                     .add_enabled(
-                        !io_busy || is_recording,
+                        !io_busy,
                         egui::Button::new(
                             egui::RichText::new(if is_recording { "Stop Rec" } else { "Rec" })
                                 .strong()
@@ -885,6 +898,7 @@ impl ForgeDawApp {
                                 }),
                         ),
                     )
+                    .on_disabled_hover_text("Wait for background I/O to finish before saving take")
                     .clicked()
                 {
                     self.toggle_record();
@@ -1336,5 +1350,34 @@ mod tests {
         proj.bpm = 240.0;
         proj.rescale_musical_midi_clips();
         assert_eq!(proj.tracks[0].midi_clips[0].length_samples, len_120 / 2);
+    }
+
+    #[test]
+    fn busy_io_preserves_live_recording_instead_of_dropping_take() {
+        let mut app = ForgeDawApp::from_parts(
+            DawProject::new("RecGuard", 48_000, 120.0),
+            ClipCache::default(),
+            None,
+            "Test".to_string(),
+            "Ready".to_string(),
+        );
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.io_job_rx = Some(rx);
+        app.io_job_label = "Bouncing master WAV".to_string();
+        app.recorder = Some(LiveRecorder::silent_stub_for_test(0, 96_000));
+
+        app.toggle_record();
+        assert!(
+            app.recorder.is_some(),
+            "toggle_record must not drop active recording while I/O is busy"
+        );
+        assert!(app.status_line.contains("take preserved"));
+
+        let rec = app.recorder.take().unwrap();
+        let preserved = app
+            .start_save_recording_job(rec)
+            .expect_err("busy I/O must return Err(rec)");
+        assert_eq!(preserved.track_idx(), 0);
+        assert_eq!(preserved.start_timeline_samples(), 96_000);
     }
 }

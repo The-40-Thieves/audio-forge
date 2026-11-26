@@ -268,8 +268,10 @@ def _make_fixtures(root: Path) -> list[tuple[str, Path, Path]]:
     mix_adm = root / "mixed_5_1_plus_obj.wav"
     mix_ref = root / "mixed_ref_5_1.wav"
     mix_ref_chs = [
-        [s + o for s, o in zip(bed_c, obj_c)]
-        for bed_c, obj_c in zip([s_l, s_r, s_c, s_lfe, s_ls, s_rs], obj_ref_chs)
+        [s + o for s, o in zip(bed_c, obj_c, strict=True)]
+        for bed_c, obj_c in zip(
+            [s_l, s_r, s_c, s_lfe, s_ls, s_rs], obj_ref_chs, strict=True
+        )
     ]
     mix_chna = _chna_bytes(
         [

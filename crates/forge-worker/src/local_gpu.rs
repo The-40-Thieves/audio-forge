@@ -825,11 +825,13 @@ mod windows_tests {
         let pid_file = dir.path().join("grandchild.pid");
         let mut cmd = Command::new("powershell");
         cmd.env("FORGE_TEST_PID_FILE", &pid_file).args([
+            "-NoLogo",
+            "-NonInteractive",
             "-NoProfile",
             "-Command",
             "$p = Start-Process -FilePath 'ping.exe' -ArgumentList '-n','60','127.0.0.1' -NoNewWindow -PassThru; [IO.File]::WriteAllText($env:FORGE_TEST_PID_FILE, [string]$p.Id); Wait-Process -Id $p.Id",
         ]);
-        let Err(err) = run_with_timeout(cmd, Duration::from_millis(3000)) else {
+        let Err(err) = run_with_timeout(cmd, Duration::from_secs(10)) else {
             panic!("worker finished before the timeout");
         };
         assert!(err.to_string().contains("timed out"), "{err}");

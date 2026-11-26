@@ -118,7 +118,7 @@ impl ForgeMcpServer {
         args: &Value,
         meta_wants_task: bool,
         context: &RequestContext<RoleServer>,
-    ) -> Option<rmcp::model::CreateTaskResult> {
+    ) -> Result<Option<rmcp::model::CreateTaskResult>, McpError> {
         let client_supports_tasks = context
             .peer
             .peer_info()
@@ -128,13 +128,13 @@ impl ForgeMcpServer {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if client_supports_tasks && (meta_wants_task || arg_wants_task) {
-            Some(
-                self.tasks
-                    .spawn_tool_task(name.to_string(), args.clone(), Arc::clone(&self.sandbox))
-                    .await,
-            )
+            let created = self
+                .tasks
+                .spawn_tool_task(name.to_string(), args.clone(), Arc::clone(&self.sandbox))
+                .await?;
+            Ok(Some(created))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -202,7 +202,7 @@ impl ServerHandler for ForgeMcpServer {
         let args = Value::Object(request.arguments.unwrap_or_default());
         if let Some(task) = self
             .try_spawn_task(&name, &args, meta_wants_task, &context)
-            .await
+            .await?
         {
             return Ok(CallToolResponse::Task(task));
         }
@@ -1786,7 +1786,8 @@ mod tests {
                 json!({ "input": "mix.wav" }),
                 Arc::clone(&sb),
             )
-            .await;
+            .await
+            .expect("spawn_tool_task");
         let task_id = created.task.task_id.clone();
 
         let mut final_res = None;
@@ -1811,7 +1812,8 @@ mod tests {
                 json!({ "input": "mix.wav" }),
                 Arc::clone(&sb),
             )
-            .await;
+            .await
+            .expect("spawn cancellable task");
         registry
             .cancel_task(&c_created.task.task_id)
             .await

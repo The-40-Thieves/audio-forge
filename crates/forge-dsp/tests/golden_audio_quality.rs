@@ -359,8 +359,8 @@ fn bs1770_5_multichannel_excludes_lfe_and_weights_surrounds_plus_1_5_db() {
 
     let mut lfe_only = AudioBuffer::new(6, 48_000, 48_000).unwrap();
     let amp_lfe = 10.0_f64.powf(-12.0 / 20.0);
-    for i in 0..48_000 {
-        lfe_only.channels[3][i] = amp_lfe * (2.0 * PI * 100.0 * (i as f64) / 48_000.0).sin();
+    for (i, sample) in lfe_only.channels[3].iter_mut().enumerate() {
+        *sample = amp_lfe * (2.0 * PI * 100.0 * (i as f64) / 48_000.0).sin();
     }
     let (lfe_lkfs, _, _, _) =
         compute_bs1770_5_loudness(&lfe_only, Some(ChannelLayout::Surround5_1));

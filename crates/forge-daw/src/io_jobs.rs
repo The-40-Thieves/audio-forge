@@ -199,7 +199,17 @@ impl ForgeDawApp {
         });
     }
 
-    pub(crate) fn start_save_recording_job(&mut self, rec: LiveRecorder) {
+    pub(crate) fn start_save_recording_job(
+        &mut self,
+        rec: LiveRecorder,
+    ) -> Result<(), Box<LiveRecorder>> {
+        if self.is_io_busy() {
+            self.status_line = format!(
+                "Wait for '{}' to finish before saving recording (take preserved)",
+                self.io_job_label
+            );
+            return Err(Box::new(rec));
+        }
         let track_idx = rec.track_idx();
         let start_samples = rec.start_timeline_samples();
         let obj_id = self.project.alloc_id();
@@ -222,6 +232,7 @@ impl ForgeDawApp {
                 obj_id,
             })
         });
+        Ok(())
     }
 
     fn apply_io_outcome(&mut self, outcome: IoJobOutcome) {

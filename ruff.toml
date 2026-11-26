@@ -1,0 +1,10 @@
+target-version = "py311"
+line-length = 88
+
+[lint]
+select = ["E", "F", "I", "B", "UP", "S"]
+ignore = ["E501"]
+
+[lint.per-file-ignores]
+"python-worker/test_*.py" = ["S101"]
+"scripts/verify_spatial_qc_reference.py" = ["S603"]

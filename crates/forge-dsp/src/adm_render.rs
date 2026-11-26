@@ -412,35 +412,64 @@ fn direct_speaker_gains(
     compute_vbap_gains(target, az, el)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ObjectInterpTracker {
+    active_block_idx: Option<usize>,
+    origin: (f64, f64, f64),
+    current: (f64, f64, f64),
+}
+
+impl ObjectInterpTracker {
+    fn new(first: &AdmObjectBlock, object_gain: f64) -> Self {
+        let initial = (
+            first.azimuth_deg,
+            first.elevation_deg,
+            object_gain * first.gain,
+        );
+        Self {
+            active_block_idx: None,
+            origin: initial,
+            current: initial,
+        }
+    }
+}
+
 fn eval_block_state_at(
     blocks: &[AdmObjectBlock],
     object_gain: f64,
     t_secs: f64,
-    prev_state: &mut (f64, f64, f64),
+    tracker: &mut ObjectInterpTracker,
 ) -> (f64, f64, f64) {
-    let active = blocks
+    let found = blocks
         .iter()
-        .find(|b| {
+        .enumerate()
+        .find(|(_, b)| {
             let end = b.start_secs + b.duration_secs.unwrap_or(f64::INFINITY);
             t_secs >= b.start_secs && t_secs < end
         })
-        .or_else(|| blocks.last());
-    let Some(blk) = active else {
-        return *prev_state;
+        .or_else(|| blocks.len().checked_sub(1).map(|idx| (idx, &blocks[idx])));
+    let Some((idx, blk)) = found else {
+        return tracker.current;
     };
-    let (az, el, g) = if blk.jump_position && blk.interpolation_secs.is_none_or(|v| v <= 0.0) {
-        (blk.azimuth_deg, blk.elevation_deg, object_gain * blk.gain)
+    if tracker.active_block_idx != Some(idx) {
+        tracker.origin = tracker.current;
+        tracker.active_block_idx = Some(idx);
+    }
+    let target = (blk.azimuth_deg, blk.elevation_deg, object_gain * blk.gain);
+    let state = if blk.jump_position && blk.interpolation_secs.is_none_or(|v| v <= 0.0) {
+        target
     } else if let Some(dur) = blk.interpolation_secs.filter(|&d| d > 0.0) {
         let alpha = ((t_secs - blk.start_secs) / dur).clamp(0.0, 1.0);
-        let az = prev_state.0 + alpha * (blk.azimuth_deg - prev_state.0);
-        let el = prev_state.1 + alpha * (blk.elevation_deg - prev_state.1);
-        let g = prev_state.2 + alpha * (object_gain * blk.gain - prev_state.2);
-        (az, el, g)
+        (
+            tracker.origin.0 + alpha * (target.0 - tracker.origin.0),
+            tracker.origin.1 + alpha * (target.1 - tracker.origin.1),
+            tracker.origin.2 + alpha * (target.2 - tracker.origin.2),
+        )
     } else {
-        (blk.azimuth_deg, blk.elevation_deg, object_gain * blk.gain)
+        target
     };
-    *prev_state = (az, el, g);
-    (az, el, g)
+    tracker.current = state;
+    state
 }
 
 fn render_object_track(
@@ -459,16 +488,12 @@ fn render_object_track(
         accumulate_constant_gains(src, out, &gains);
         return;
     }
-    let mut state = (
-        blocks[0].azimuth_deg,
-        blocks[0].elevation_deg,
-        object_gain * blocks[0].gain,
-    );
+    let mut tracker = ObjectInterpTracker::new(&blocks[0], object_gain);
     let mut start = 0usize;
     while start < src.len() {
         let end = (start + RENDER_BLOCK_STEP_FRAMES).min(src.len());
         let mid_secs = ((start + end) as f64) * 0.5 / sr;
-        let (az, el, gain) = eval_block_state_at(blocks, object_gain, mid_secs, &mut state);
+        let (az, el, gain) = eval_block_state_at(blocks, object_gain, mid_secs, &mut tracker);
         let vbap = compute_vbap_gains(target, az, el);
         for (ch_out, &g) in out.iter_mut().zip(&vbap) {
             let scaled = g * gain;
@@ -533,4 +558,55 @@ pub fn render_adm_programme_to_layout(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interpolation_length_linearly_interpolates_from_block_origin() {
+        let blocks = vec![
+            AdmObjectBlock {
+                start_secs: 0.0,
+                duration_secs: Some(1.0),
+                azimuth_deg: -30.0,
+                elevation_deg: 0.0,
+                distance: 1.0,
+                gain: 0.5,
+                jump_position: false,
+                interpolation_secs: None,
+            },
+            AdmObjectBlock {
+                start_secs: 1.0,
+                duration_secs: Some(1.0),
+                azimuth_deg: 30.0,
+                elevation_deg: 20.0,
+                distance: 1.0,
+                gain: 1.5,
+                jump_position: false,
+                interpolation_secs: Some(1.0),
+            },
+        ];
+        let mut tracker = ObjectInterpTracker::new(&blocks[0], 1.0);
+        // Step through block 0 and block 1 in multiple 64-frame-sized increments.
+        assert_eq!(
+            eval_block_state_at(&blocks, 1.0, 0.5, &mut tracker),
+            (-30.0, 0.0, 0.5)
+        );
+        let q1 = eval_block_state_at(&blocks, 1.0, 1.25, &mut tracker);
+        assert!((q1.0 - (-15.0)).abs() < 1e-9, "quarter az: {}", q1.0);
+        assert!((q1.1 - 5.0).abs() < 1e-9, "quarter el: {}", q1.1);
+        assert!((q1.2 - 0.75).abs() < 1e-9, "quarter gain: {}", q1.2);
+
+        let mid = eval_block_state_at(&blocks, 1.0, 1.5, &mut tracker);
+        assert!((mid.0 - 0.0).abs() < 1e-9, "midpoint az: {}", mid.0);
+        assert!((mid.1 - 10.0).abs() < 1e-9, "midpoint el: {}", mid.1);
+        assert!((mid.2 - 1.0).abs() < 1e-9, "midpoint gain: {}", mid.2);
+
+        let end = eval_block_state_at(&blocks, 1.0, 2.0, &mut tracker);
+        assert!((end.0 - 30.0).abs() < 1e-9, "end az: {}", end.0);
+        assert!((end.1 - 20.0).abs() < 1e-9, "end el: {}", end.1);
+        assert!((end.2 - 1.5).abs() < 1e-9, "end gain: {}", end.2);
+    }
 }

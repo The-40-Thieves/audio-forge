@@ -43,20 +43,15 @@ fn drain_retire_backlog(backlog: &mut Vec<RetiredResource>, tx: &SyncSender<Reti
 }
 
 /// Retires a heap-owning resource off the RT audio thread without invoking `Drop` on a full
-/// channel. Caller ensures `backlog.len() < backlog.capacity()` before consuming new commands.
+/// channel. Caller ensures `backlog.len() < backlog.capacity()` before consuming new commands so
+/// pushing into the pre-allocated backlog cannot reallocate on the RT thread.
 fn push_retired_no_drop(
     item: RetiredResource,
     backlog: &mut Vec<RetiredResource>,
     tx: &SyncSender<RetiredResource>,
 ) {
     if let Err(TrySendError::Full(unsent)) = tx.try_send(item) {
-        if backlog.len() < backlog.capacity() {
-            backlog.push(unsent);
-        } else {
-            // Preserve RT no-drop guarantee even under extreme misuse by leaking rather than freeing
-            // on the audio callback thread.
-            std::mem::forget(unsent);
-        }
+        backlog.push(unsent);
     }
 }
 
@@ -806,6 +801,20 @@ impl LiveRecorder {
 
     pub fn start_timeline_samples(&self) -> u64 {
         self.start_timeline_samples
+    }
+
+    /// Creates a hardware-free [`LiveRecorder`] stub for headless unit tests verifying recording
+    /// ownership and busy-I/O preservation without requiring a physical audio input device.
+    #[doc(hidden)]
+    pub fn silent_stub_for_test(track_idx: usize, start_timeline_samples: u64) -> Self {
+        Self {
+            stream: None,
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            collector: None,
+            input_sr: 48_000,
+            start_timeline_samples,
+            track_idx,
+        }
     }
 
     /// Stops recording, resamples to `target_sr` if needed, saves a 24-bit WAV to `output_wav`,
