@@ -478,3 +478,55 @@ fn spatial_adm_bwf_qc_marks_unrendered_missing_and_invalid_adm_unverified() {
     );
     assert!(!bad_rep.preliminary_qc_passed);
 }
+
+#[test]
+fn spatial_adm_bwf_qc_rejects_bed_with_unmapped_wav_channels() {
+    let tone = sine_buffer(1, 48_000, 1.0, 1000.0, 0.03)
+        .channels
+        .pop()
+        .unwrap();
+    let channels = vec![tone; 6];
+    let mut chna = Vec::new();
+    chna.extend_from_slice(&5_u16.to_le_bytes());
+    chna.extend_from_slice(&5_u16.to_le_bytes());
+    let defs = [
+        "AT_00010001_01",
+        "AT_00010002_01",
+        "AT_00010003_01",
+        "AT_00010004_01",
+        "AT_00010005_01",
+    ];
+    for (idx, tr) in defs.iter().enumerate() {
+        push_chna_rec(
+            &mut chna,
+            (idx + 1) as u16,
+            &format!("ATU_0000000{}", idx + 1),
+            tr,
+            "AP_00010002",
+        );
+    }
+    let axml = br#"<ebuCoreMain><audioFormatExtended>
+        <audioProgramme audioProgrammeID="APR_1"><audioContentIDRef>ACO_1</audioContentIDRef></audioProgramme>
+        <audioContent audioContentID="ACO_1"><audioObjectIDRef>AO_BED</audioObjectIDRef></audioContent>
+        <audioObject audioObjectID="AO_BED">
+            <audioTrackUIDRef>ATU_00000001</audioTrackUIDRef><audioTrackUIDRef>ATU_00000002</audioTrackUIDRef>
+            <audioTrackUIDRef>ATU_00000003</audioTrackUIDRef><audioTrackUIDRef>ATU_00000004</audioTrackUIDRef>
+            <audioTrackUIDRef>ATU_00000005</audioTrackUIDRef>
+        </audioObject>
+        <audioTrackUID UID="ATU_00000001"><audioTrackFormatIDRef>AT_00010003_01</audioTrackFormatIDRef></audioTrackUID>
+        <audioTrackUID UID="ATU_00000002"><audioTrackFormatIDRef>AT_00010004_01</audioTrackFormatIDRef></audioTrackUID>
+        <audioTrackUID UID="ATU_00000003"><audioTrackFormatIDRef>AT_00010005_01</audioTrackFormatIDRef></audioTrackUID>
+        <audioTrackUID UID="ATU_00000004"><audioTrackFormatIDRef>AT_00010006_01</audioTrackFormatIDRef></audioTrackUID>
+        <audioTrackUID UID="ATU_00000005"><audioTrackFormatIDRef>AT_00010001_01</audioTrackFormatIDRef></audioTrackUID>
+    </audioFormatExtended></ebuCoreMain>"#;
+    let wav = build_wav_with_adm(48_000, &channels, Some((&chna, axml)));
+    let rep =
+        audit_spatial_adm_bwf_reader(&mut Cursor::new(wav), Path::new("partial_bed.wav")).unwrap();
+    assert_eq!(rep.programme_kind, AdmProgrammeKind::ChannelBedOnly);
+    assert_eq!(
+        rep.loudness_status,
+        LoudnessVerificationStatus::UnverifiedInvalidMetadata
+    );
+    assert!(rep.integrated_lkfs.is_none());
+    assert!(!rep.preliminary_qc_passed);
+}

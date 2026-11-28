@@ -253,17 +253,33 @@ pub struct F0TrackResult {
     pub warnings: Vec<String>,
 }
 
-/// Resolves the default local GPU worker command from `FORGE_GPU_WORKER_SCRIPT` or
-/// `BUILD_SOURCE_ROOT`.
+/// Resolves the worker script path from `FORGE_GPU_WORKER_SCRIPT`, `BUILD_SOURCE_ROOT`, or the
+/// packaged sibling `python-worker/` layout next to `exe_path`.
+pub(crate) fn resolve_default_worker_script_with(
+    override_path: Option<PathBuf>,
+    source_root: Option<&Path>,
+    exe_path: Option<&Path>,
+) -> Option<PathBuf> {
+    resolve_worker_script(override_path, source_root)
+        .or_else(|| exe_path.and_then(resolve_packaged_worker_script))
+}
+
+/// Resolves the default local GPU worker command from `FORGE_GPU_WORKER_SCRIPT`,
+/// `BUILD_SOURCE_ROOT`, or the packaged sibling `python-worker/` layout next to the binary.
 pub fn resolve_default_local_worker() -> Result<LocalWorkerCommand> {
     let override_path = std::env::var_os("FORGE_GPU_WORKER_SCRIPT").map(PathBuf::from);
-    let script = resolve_worker_script(override_path, Some(Path::new(BUILD_SOURCE_ROOT)))
-        .ok_or_else(|| {
-            ForgeError::WorkerError(
-                "Could not locate python-worker/forge_gpu_worker.py; set FORGE_GPU_WORKER_SCRIPT"
-                    .to_string(),
-            )
-        })?;
+    let exe_path = std::env::current_exe().ok();
+    let script = resolve_default_worker_script_with(
+        override_path,
+        Some(Path::new(BUILD_SOURCE_ROOT)),
+        exe_path.as_deref(),
+    )
+    .ok_or_else(|| {
+        ForgeError::WorkerError(
+            "Could not locate python-worker/forge_gpu_worker.py; set FORGE_GPU_WORKER_SCRIPT"
+                .to_string(),
+        )
+    })?;
     Ok(LocalWorkerCommand::uv(&script))
 }
 
@@ -767,6 +783,26 @@ mod client_tests {
 
         std::fs::write(pw_dir.join("uv.lock"), b"version = 1").unwrap();
         let found = resolve_packaged_worker_script(&fake_exe).expect("complete packaged layout");
+        assert_eq!(found, std::fs::canonicalize(&script).unwrap());
+    }
+
+    #[test]
+    fn resolve_default_worker_falls_back_to_packaged_sibling_layout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing_src = dir.path().join("no_source_root");
+        let exe_dir = dir.path().join("bin");
+        let pw_dir = dir.path().join("python-worker");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&pw_dir).unwrap();
+        let fake_exe = exe_dir.join("forge-mcp");
+        std::fs::write(&fake_exe, b"bin").unwrap();
+        let script = pw_dir.join("forge_gpu_worker.py");
+        std::fs::write(&script, b"# worker").unwrap();
+        std::fs::write(pw_dir.join("pyproject.toml"), b"[project]").unwrap();
+        std::fs::write(pw_dir.join("uv.lock"), b"version = 1").unwrap();
+
+        let found = resolve_default_worker_script_with(None, Some(&missing_src), Some(&fake_exe))
+            .expect("falls back to packaged sibling layout");
         assert_eq!(found, std::fs::canonicalize(&script).unwrap());
     }
 }

@@ -309,6 +309,13 @@ fn pitch_frame(time_secs: f64, f0_hz: f64, scale: &VocalScale, retune: f64) -> P
 /// taken at the bottom of that dip and refined by parabolic interpolation, so the pitch is not
 /// quantized to whole-sample lags. `time_secs` is the centre of the analysis window, the instant
 /// every lag's comparisons are centred on. Silent and unvoiced frames have `f0_hz == 0.0`.
+/// Returns the actual frame hop duration in seconds used by [`track_vocal_pitch`] for `sample_rate`.
+pub fn yin_hop_secs(sample_rate: u32) -> f64 {
+    let yin = Yin::new(sample_rate);
+    (yin.hop as f64) / yin.sr
+}
+
+/// Tracks fundamental frequency (F0) per frame across `buffer` using YIN + octave stabilization.
 pub fn track_vocal_pitch(
     buffer: &AudioBuffer,
     scale: &VocalScale,

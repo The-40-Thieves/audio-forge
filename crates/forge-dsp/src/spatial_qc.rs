@@ -115,6 +115,7 @@ fn push_check(
 fn evaluate_bed_metrics(buf: &AudioBuffer, adm: &AdmBwfInfo) -> EvaluatedMetrics {
     let mut weights = vec![0.0_f64; buf.num_channels()];
     let mut labels = vec!["UNMAPPED".to_string(); buf.num_channels()];
+    let mut mapped = vec![false; buf.num_channels()];
     for assoc in &adm.track_associations {
         if let AdmTrackKind::DirectSpeaker(pos) = &assoc.kind
             && let Some(idx) = assoc.track_index.checked_sub(1).map(usize::from)
@@ -122,7 +123,18 @@ fn evaluate_bed_metrics(buf: &AudioBuffer, adm: &AdmBwfInfo) -> EvaluatedMetrics
         {
             labels[idx] = pos.label.clone();
             weights[idx] = bs1770_5_position_weight(pos.azimuth_deg, pos.elevation_deg, pos.is_lfe);
+            mapped[idx] = true;
         }
+    }
+    let mapped_count = mapped.iter().filter(|&&m| m).count();
+    if buf.num_channels() == 0 || mapped_count < buf.num_channels() {
+        return unverified_metrics(
+            LoudnessVerificationStatus::UnverifiedInvalidMetadata,
+            &format!(
+                "incomplete DirectSpeakers bed mapping ({mapped_count}/{} WAV channels mapped)",
+                buf.num_channels()
+            ),
+        );
     }
     let (integrated, short_term, momentary, lra) =
         compute_bs1770_5_loudness_with_weights(buf, &weights);

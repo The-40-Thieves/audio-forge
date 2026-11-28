@@ -9,7 +9,7 @@ use std::time::Duration;
 use forge_core::{ForgeError, Result, StemBundle};
 use serde::{Deserialize, Serialize};
 
-use crate::local_gpu::{BUILD_SOURCE_ROOT, LocalWorkerCommand, resolve_worker_script};
+use crate::local_gpu::{BUILD_SOURCE_ROOT, LocalWorkerCommand, resolve_default_worker_script_with};
 use crate::{colab, dsp_split, local_gpu};
 
 /// Default wall-clock limit for one local GPU worker run.
@@ -167,15 +167,12 @@ impl SeparationConfig {
     /// `FORGE_COLAB_TIMEOUT_SECS` and `FORGE_WORKER_REQUIRE_NEURAL` (`1` or `true`).
     pub fn from_env() -> Self {
         let colab_url = env_nonempty("FORGE_COLAB_WORKER_URL");
-        let script = resolve_worker_script(
+        let exe_path = std::env::current_exe().ok();
+        let script = resolve_default_worker_script_with(
             env_nonempty("FORGE_GPU_WORKER_SCRIPT").map(PathBuf::from),
             Some(Path::new(BUILD_SOURCE_ROOT)),
-        )
-        .or_else(|| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| crate::local_gpu::resolve_packaged_worker_script(&p))
-        });
+            exe_path.as_deref(),
+        );
         let backend = env_nonempty("FORGE_WORKER_BACKEND").map_or(WorkerBackend::Auto, |name| {
             parse_backend(&name, colab_url.as_deref()).unwrap_or_else(|e| {
                 eprintln!("forge-worker: {e}; using auto");

@@ -315,9 +315,15 @@ pub fn transcribe_midi_checked(
 fn rust_f0_track_fallback(
     staged_in: &Path,
     hop_secs: f64,
-    warnings: Vec<String>,
+    mut warnings: Vec<String>,
 ) -> Result<F0TrackResult, ForgeError> {
     let buf = AudioBuffer::load(staged_in)?;
+    let actual_hop_secs = forge_vocal::yin_hop_secs(buf.sample_rate);
+    if (hop_secs - actual_hop_secs).abs() > 1e-4 {
+        warnings.push(format!(
+            "pure-Rust YIN fallback uses fixed {actual_hop_secs:.4}s hop (requested {hop_secs:.4}s)"
+        ));
+    }
     let scale = forge_vocal::VocalScale::parse("C chromatic")?;
     let raw_frames = forge_vocal::track_vocal_pitch(&buf, &scale, 1.0);
     let frames: Vec<F0TrackFrame> = raw_frames
@@ -348,7 +354,7 @@ fn rust_f0_track_fallback(
     Ok(F0TrackResult {
         backend: "rust-yin".to_string(),
         sample_rate: buf.sample_rate,
-        hop_secs,
+        hop_secs: actual_hop_secs,
         voiced_ratio,
         median_f0_hz,
         frames,
@@ -517,5 +523,45 @@ mod tests {
             key: None,
             year: None,
         }
+    }
+
+    #[test]
+    fn rust_f0_track_fallback_reports_actual_yin_hop_secs() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sandbox = PathSandbox::new([root.path().to_path_buf()]).expect("sandbox");
+        let wav_path = sandbox
+            .check(&root.path().join("tone.wav"))
+            .expect("checked wav");
+        let sr = 48_000_u32;
+        let samples: Vec<f64> = (0..sr)
+            .map(|i| {
+                0.3 * (2.0 * std::f64::consts::PI * 220.0 * f64::from(i) / f64::from(sr)).sin()
+            })
+            .collect();
+        AudioBuffer::from_channels(vec![samples], sr)
+            .expect("buf")
+            .save_wav(&wav_path, 24)
+            .expect("save");
+
+        let res = f0_track_checked(&sandbox, &wav_path, "rust", 0.005, Duration::from_secs(5))
+            .expect("rust f0 track");
+        let expected_hop = forge_vocal::yin_hop_secs(sr);
+        assert!(
+            (res.hop_secs - expected_hop).abs() < 1e-9,
+            "expected actual YIN hop {expected_hop}, got {}",
+            res.hop_secs
+        );
+        assert!(res.frames.len() >= 2);
+        let spacing = res.frames[1].time_secs - res.frames[0].time_secs;
+        assert!(
+            (spacing - res.hop_secs).abs() < 1e-6,
+            "frame spacing {spacing} disagreed with reported hop_secs {}",
+            res.hop_secs
+        );
+        assert!(
+            res.warnings.iter().any(|w| w.contains("fixed 0.0200s hop")),
+            "expected hop override warning, got {:?}",
+            res.warnings
+        );
     }
 }

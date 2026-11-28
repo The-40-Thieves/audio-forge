@@ -541,8 +541,9 @@ def prove_vbap_constant_power_energy_conservation() -> dict[str, str]:
     """Proves constant-power normalized 3D VBAP triplet gains preserve uncorrelated signal power."""
     s_vbap = z3.Solver()
     g0, g1, g2, x = z3.Reals("g0 g1 g2 x")
-    s_vbap.add(g0 >= 0.0, g1 >= 0.0, g2 >= 0.0)
-    s_vbap.add(g0 * g0 + g1 * g1 + g2 * g2 == 1.0)
+    zero, one = z3.RealVal(0), z3.RealVal(1)
+    s_vbap.add(g0 >= zero, g1 >= zero, g2 >= zero)
+    s_vbap.add(g0 * g0 + g1 * g1 + g2 * g2 == one)
     p_out = (g0 * x) * (g0 * x) + (g1 * x) * (g1 * x) + (g2 * x) * (g2 * x)
     s_vbap.add(p_out != x * x)
     _require(

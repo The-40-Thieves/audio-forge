@@ -33,6 +33,8 @@ jobs:
 
       - name: Setup rust toolchain, cache and cargo-codspeed binary
         uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3 # v1.3.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           channel: stable
           cache-target: release
@@ -69,6 +71,8 @@ jobs:
       # No cache here, so this job never writes a cache entry.
       - name: Setup rust toolchain and cargo-codspeed binary
         uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3 # v1.3.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           channel: stable
           cache: false

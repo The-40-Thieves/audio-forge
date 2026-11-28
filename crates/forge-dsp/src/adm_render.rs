@@ -443,8 +443,13 @@ fn eval_block_state_at(
     let found = blocks
         .iter()
         .enumerate()
-        .find(|(_, b)| {
-            let end = b.start_secs + b.duration_secs.unwrap_or(f64::INFINITY);
+        .find(|(idx, b)| {
+            let end = match b.duration_secs {
+                Some(dur) => b.start_secs + dur,
+                None => blocks
+                    .get(idx + 1)
+                    .map_or(f64::INFINITY, |next| next.start_secs),
+            };
             t_secs >= b.start_secs && t_secs < end
         })
         .or_else(|| blocks.len().checked_sub(1).map(|idx| (idx, &blocks[idx])));
@@ -608,5 +613,40 @@ mod tests {
         assert!((end.0 - 30.0).abs() < 1e-9, "end az: {}", end.0);
         assert!((end.1 - 20.0).abs() < 1e-9, "end el: {}", end.1);
         assert!((end.2 - 1.5).abs() < 1e-9, "end gain: {}", end.2);
+    }
+
+    #[test]
+    fn omitted_block_duration_transitions_to_later_block() {
+        let blocks = vec![
+            AdmObjectBlock {
+                start_secs: 0.0,
+                duration_secs: None,
+                azimuth_deg: -30.0,
+                elevation_deg: 0.0,
+                distance: 1.0,
+                gain: 0.5,
+                jump_position: false,
+                interpolation_secs: None,
+            },
+            AdmObjectBlock {
+                start_secs: 1.0,
+                duration_secs: Some(1.0),
+                azimuth_deg: 30.0,
+                elevation_deg: 0.0,
+                distance: 1.0,
+                gain: 1.5,
+                jump_position: false,
+                interpolation_secs: None,
+            },
+        ];
+        let mut tracker = ObjectInterpTracker::new(&blocks[0], 1.0);
+        assert_eq!(
+            eval_block_state_at(&blocks, 1.0, 0.5, &mut tracker),
+            (-30.0, 0.0, 0.5)
+        );
+        assert_eq!(
+            eval_block_state_at(&blocks, 1.0, 1.5, &mut tracker),
+            (30.0, 0.0, 1.5)
+        );
     }
 }
