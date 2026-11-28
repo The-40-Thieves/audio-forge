@@ -6,7 +6,7 @@ readme = "../README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 dependencies = [
-    "audio-separator>=0.47.1",
+    "audio-separator>=0.47.2",
     # `audio-separator` 0.48 imports `audioread` unconditionally in `uvr_lib_v5/spec_utils.py`
     # and `vr_separator.py`, while `librosa>=1.0` dropped it on Python >=3.12.
     "audioread>=3.0.0",
@@ -16,10 +16,10 @@ dependencies = [
 
 [project.optional-dependencies]
 cpu = [
-    "audio-separator[cpu]>=0.47.1",
+    "audio-separator[cpu]>=0.47.2",
 ]
 gpu = [
-    "audio-separator[gpu]>=0.47.1; sys_platform != 'darwin'",
+    "audio-separator[gpu]>=0.47.2; sys_platform != 'darwin'",
     "torch>=2.10.0; (sys_platform == 'win32' or sys_platform == 'linux') and (platform_machine == 'AMD64' or platform_machine == 'x86_64') and python_full_version < '3.15'",
     "torchvision>=0.25.0; (sys_platform == 'win32' or sys_platform == 'linux') and (platform_machine == 'AMD64' or platform_machine == 'x86_64') and python_full_version < '3.15'",
 ]

@@ -249,7 +249,10 @@ impl Default for OpenSootheParams {
                     .parse::<f32>()
                     .ok()
                     .filter(|v| v.is_finite())
-                    .map(|v| v.clamp(0.0, 22_000.0))
+                    .map(|v| {
+                        let clamped = v.clamp(0.0, 22_000.0);
+                        if clamped < 1_000.0 { 0.0 } else { clamped }
+                    })
             })),
         }
     }

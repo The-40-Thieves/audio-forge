@@ -95,6 +95,56 @@ pub fn neural_restore_hybrid(
     )
 }
 
+/// Runs neural speech/vocal denoising (`DeepFilterNet3` / `Mel-Band-RoFormer`),
+/// trying local GPU first, then `FORGE_COLAB_WORKER_URL` if configured.
+pub fn denoise_hybrid(
+    input_path: &Path,
+    output_dir: &Path,
+    backend: &str,
+    attenuation_limit_db: Option<f64>,
+    timeout: Duration,
+) -> Result<NeuralDenoiseResult> {
+    std::fs::create_dir_all(output_dir)?;
+    try_local_then_colab(
+        "neural denoise",
+        |worker| {
+            run_local_neural_denoise(
+                worker,
+                input_path,
+                output_dir,
+                backend,
+                attenuation_limit_db,
+                timeout,
+            )
+        },
+        |url| {
+            colab::denoise(
+                url,
+                input_path,
+                output_dir,
+                backend,
+                attenuation_limit_db,
+                timeout,
+            )
+        },
+    )
+}
+
+/// Transcribes polyphonic audio to MIDI via `basic-pitch`,
+/// trying local GPU first, then `FORGE_COLAB_WORKER_URL` if configured.
+pub fn transcribe_midi_hybrid(
+    input_path: &Path,
+    output_dir: &Path,
+    timeout: Duration,
+) -> Result<MidiTranscribeResult> {
+    std::fs::create_dir_all(output_dir)?;
+    try_local_then_colab(
+        "MIDI transcription",
+        |worker| run_local_transcribe_midi(worker, input_path, output_dir, timeout),
+        |url| colab::transcribe(url, input_path, output_dir, timeout),
+    )
+}
+
 /// Rescues robotic / phasey AI vocals via `Seed-VC`, `Resemble Enhance`, or verified `RoFormer` chain.
 #[allow(clippy::too_many_arguments)]
 pub fn vocal_rescue_hybrid(

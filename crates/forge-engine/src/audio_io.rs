@@ -5,7 +5,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -29,6 +29,30 @@ enum EngineCommand {
 enum RetiredResource {
     Project(Box<DawProject>),
     Engine(Box<ObjectOrientedEngine>),
+}
+
+/// Drains any queued retired resources from the RT callback's pre-allocated backlog without blocking
+/// or dropping heap allocations on the audio thread.
+fn drain_retire_backlog(backlog: &mut Vec<RetiredResource>, tx: &SyncSender<RetiredResource>) {
+    while let Some(item) = backlog.pop() {
+        if let Err(TrySendError::Full(unsent)) = tx.try_send(item) {
+            backlog.push(unsent);
+            break;
+        }
+    }
+}
+
+/// Retires a heap-owning resource off the RT audio thread without invoking `Drop` on a full
+/// channel. Caller ensures `backlog.len() < backlog.capacity()` before consuming new commands so
+/// pushing into the pre-allocated backlog cannot reallocate on the RT thread.
+fn push_retired_no_drop(
+    item: RetiredResource,
+    backlog: &mut Vec<RetiredResource>,
+    tx: &SyncSender<RetiredResource>,
+) {
+    if let Err(TrySendError::Full(unsent)) = tx.try_send(item) {
+        backlog.push(unsent);
+    }
 }
 
 /// Pre-allocated zero-allocation real-time polyphase sinc resampler bridging `project_sr` to
@@ -69,8 +93,7 @@ impl RealtimeOutputResampler {
         self.src_len = 0;
         self.q_idx = 0;
         self.q_len = 0;
-        self.sinc
-            .reset(self.cached_project_sr, self.cached_device_sr);
+        self.sinc.clear_state();
     }
 
     /// Renders `out_frames` at `device_sr` by pulling project-rate blocks from `engine` with
@@ -299,7 +322,7 @@ impl LiveAudioEngine {
 
         let cmd_mailbox: Arc<Mutex<Option<EngineCommand>>> = Arc::new(Mutex::new(None));
         let cmd_mailbox_cb = Arc::clone(&cmd_mailbox);
-        let (retire_tx, retire_rx) = sync_channel::<RetiredResource>(64);
+        let (retire_tx, retire_rx) = sync_channel::<RetiredResource>(128);
         let stream_config: cpal::StreamConfig = supported.into();
 
         let play_cb = Arc::clone(&playing);
@@ -310,24 +333,35 @@ impl LiveAudioEngine {
 
         let mut engine = Box::new(compiled);
         let mut resampler = RealtimeOutputResampler::new(1024);
+        let mut retire_backlog: Vec<RetiredResource> = Vec::with_capacity(64);
         let mut last_seen_gen = 0_u64;
         let mut f32_buf = vec![0.0_f32; 8192];
 
         let mut render_f32 = move |out_f32: &mut [f32]| {
+            drain_retire_backlog(&mut retire_backlog, &retire_tx);
             // Pull latest UI command without blocking; pure Box pointer swap avoids RT alloc/drop.
-            if let Ok(mut slot) = cmd_mailbox_cb.try_lock()
+            if retire_backlog.len() < retire_backlog.capacity()
+                && let Ok(mut slot) = cmd_mailbox_cb.try_lock()
                 && let Some(cmd) = slot.take()
             {
                 drop(slot);
                 match cmd {
                     EngineCommand::SyncMixParams(mut proj) => {
                         let _ = engine.sync_mix_params_swap(&mut proj);
-                        let _ = retire_tx.try_send(RetiredResource::Project(proj));
+                        push_retired_no_drop(
+                            RetiredResource::Project(proj),
+                            &mut retire_backlog,
+                            &retire_tx,
+                        );
                     }
                     EngineCommand::ReplaceEngine(mut next) => {
                         next.set_playhead_samples(engine.playhead_samples());
                         let old = std::mem::replace(&mut engine, next);
-                        let _ = retire_tx.try_send(RetiredResource::Engine(old));
+                        push_retired_no_drop(
+                            RetiredResource::Engine(old),
+                            &mut retire_backlog,
+                            &retire_tx,
+                        );
                         resampler.reset();
                     }
                 }
@@ -387,6 +421,14 @@ impl LiveAudioEngine {
             cpal::SampleFormat::I32 => device.build_output_stream(
                 stream_config,
                 move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
+                    render_converted_output(data, channels, &mut f32_buf, &mut render_f32);
+                },
+                err_cb,
+                None,
+            ),
+            cpal::SampleFormat::F64 => device.build_output_stream(
+                stream_config,
+                move |data: &mut [f64], _: &cpal::OutputCallbackInfo| {
                     render_converted_output(data, channels, &mut f32_buf, &mut render_f32);
                 },
                 err_cb,
@@ -481,6 +523,36 @@ impl LiveAudioEngine {
         self.drain_retired();
     }
 
+    fn reload_headless(&self, project: &DawProject, cache: &ClipCache) {
+        if let Some(headless) = &self.headless_engine {
+            if let Ok(mut guard) = headless.lock()
+                && !guard.sync_mix_params(project)
+            {
+                let mut next = ObjectOrientedEngine::compile(project, cache);
+                next.set_playhead_samples(self.playhead_samples());
+                *guard = next;
+            }
+            if let Ok(mut prev) = self.last_project.lock() {
+                *prev = project.clone();
+            }
+        }
+    }
+
+    fn build_reload_command(
+        &self,
+        project: &DawProject,
+        cache: &ClipCache,
+        force_replace: bool,
+    ) -> EngineCommand {
+        if force_replace {
+            let mut next = ObjectOrientedEngine::compile(project, cache);
+            next.set_playhead_samples(self.playhead_samples());
+            EngineCommand::ReplaceEngine(Box::new(next))
+        } else {
+            EngineCommand::SyncMixParams(Box::new(project.clone()))
+        }
+    }
+
     /// Updates the live DSP graph from an edited [`DawProject`] without locking the audio thread.
     ///
     /// Sends a zero-alloc in-place parameter swap when topology is unchanged; compiles a fresh
@@ -493,47 +565,43 @@ impl LiveAudioEngine {
         {
             m.track_peaks_db.reserve(project.tracks.len());
         }
-
-        if let Some(headless) = &self.headless_engine {
-            if let Ok(mut guard) = headless.lock() {
-                if !guard.sync_mix_params(project) {
-                    let mut next = ObjectOrientedEngine::compile(project, cache);
-                    next.set_playhead_samples(self.playhead_samples());
-                    *guard = next;
-                }
-            }
-            if let Ok(mut prev) = self.last_project.lock() {
-                *prev = project.clone();
-            }
+        if self.headless_engine.is_some() {
+            self.reload_headless(project, cache);
             return;
         }
-
         let topology_same = self
             .last_project
             .lock()
             .map(|prev| ObjectOrientedEngine::topology_compatible(&prev, project))
             .unwrap_or(false);
+        let Some(mailbox) = &self.cmd_mailbox else {
+            return;
+        };
 
-        if let Some(mailbox) = &self.cmd_mailbox
-            && let Ok(mut slot) = mailbox.lock()
-        {
-            // If an unconsumed ReplaceEngine is already queued, keep replacing with a fresh
-            // compiled engine so we never overwrite a topology change with SyncMixParams.
-            let must_replace =
-                !topology_same || matches!(*slot, Some(EngineCommand::ReplaceEngine(_)));
-            let cmd = if must_replace {
-                let mut next = ObjectOrientedEngine::compile(project, cache);
-                next.set_playhead_samples(self.playhead_samples());
-                EngineCommand::ReplaceEngine(Box::new(next))
-            } else {
-                EngineCommand::SyncMixParams(Box::new(project.clone()))
-            };
-            // Replacing any unconsumed command drops it safely right here on the UI thread.
-            *slot = Some(cmd);
-            drop(slot);
-            if let Ok(mut prev) = self.last_project.lock() {
-                *prev = project.clone();
+        let mut force_replace = !topology_same;
+        for _ in 0..2 {
+            if !force_replace
+                && let Ok(slot) = mailbox.lock()
+                && matches!(*slot, Some(EngineCommand::ReplaceEngine(_)))
+            {
+                force_replace = true;
             }
+            // Never hold the mailbox mutex across ObjectOrientedEngine::compile.
+            let cmd = self.build_reload_command(project, cache, force_replace);
+            if let Ok(mut slot) = mailbox.lock() {
+                if matches!(cmd, EngineCommand::SyncMixParams(_))
+                    && matches!(*slot, Some(EngineCommand::ReplaceEngine(_)))
+                {
+                    force_replace = true;
+                    continue;
+                }
+                *slot = Some(cmd);
+                drop(slot);
+                if let Ok(mut prev) = self.last_project.lock() {
+                    *prev = project.clone();
+                }
+            }
+            break;
         }
     }
 
@@ -678,6 +746,14 @@ impl LiveRecorder {
                 err_cb,
                 None,
             ),
+            cpal::SampleFormat::F64 => device.build_input_stream(
+                stream_config,
+                move |data: &[f64], _: &cpal::InputCallbackInfo| {
+                    capture_input_frames(data, channels, &ring_cb);
+                },
+                err_cb,
+                None,
+            ),
             other => {
                 stop_flag.store(true, Ordering::Release);
                 let _ = collector.join();
@@ -725,6 +801,20 @@ impl LiveRecorder {
 
     pub fn start_timeline_samples(&self) -> u64 {
         self.start_timeline_samples
+    }
+
+    /// Creates a hardware-free [`LiveRecorder`] stub for headless unit tests verifying recording
+    /// ownership and busy-I/O preservation without requiring a physical audio input device.
+    #[doc(hidden)]
+    pub fn silent_stub_for_test(track_idx: usize, start_timeline_samples: u64) -> Self {
+        Self {
+            stream: None,
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            collector: None,
+            input_sr: 48_000,
+            start_timeline_samples,
+            track_idx,
+        }
     }
 
     /// Stops recording, resamples to `target_sr` if needed, saves a 24-bit WAV to `output_wav`,
@@ -847,5 +937,33 @@ mod tests {
         let mut buf_44k = vec![1.0_f32; 441 * 2];
         resampler.render_interleaved(&mut engine, &mut buf_44k, 2, 44_100.0);
         assert!(buf_44k.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn retire_backlog_prevents_rt_drop_when_channel_is_full() {
+        let (tx, rx) = sync_channel::<RetiredResource>(1);
+        let mut backlog = Vec::with_capacity(8);
+
+        for idx in 0..3 {
+            let proj = Box::new(DawProject::new(format!("P{idx}"), 48_000, 120.0));
+            push_retired_no_drop(RetiredResource::Project(proj), &mut backlog, &tx);
+        }
+        assert_eq!(backlog.len(), 2, "overflow items must remain in RT backlog");
+
+        let mut drained = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            drained.push(item);
+        }
+        drain_retire_backlog(&mut backlog, &tx);
+        while let Ok(item) = rx.try_recv() {
+            drained.push(item);
+        }
+        assert_eq!(backlog.len(), 1);
+        drain_retire_backlog(&mut backlog, &tx);
+        while let Ok(item) = rx.try_recv() {
+            drained.push(item);
+        }
+        assert!(backlog.is_empty());
+        assert_eq!(drained.len(), 3);
     }
 }

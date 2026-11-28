@@ -65,6 +65,21 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  msrv:
+    name: msrv (1.95)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y $LINUX_DEPS
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo check --workspace --locked
+
   docs:
     name: rustdoc
     runs-on: ubuntu-latest
@@ -135,6 +150,7 @@ jobs:
       - run: "pip install --no-cache-dir --only-binary=:all: ruff==0.17.6 z3-solver==5.4.1.0 mypy==2.4.1 uv==0.11.7"
       - run: uv lock --project python-worker --check
       - run: ruff check python-worker scripts
+      - run: ruff check --select S scripts
       - run: ruff format --check python-worker scripts
       - run: mypy --ignore-missing-imports python-worker/forge_gpu_worker.py python-worker/test_forge_gpu_worker.py scripts/verify_dsp_invariants_z3.py
       # Stem picking and timeouts, with fakes for audio-separator and gradio_client.

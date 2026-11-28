@@ -527,9 +527,76 @@ pub const SILENT_BAND_DB: f64 = -120.0;
 /// RMS level (dBFS, DC removed) at or below which `audit_audio` treats the input as silence.
 pub const SILENCE_RMS_DBFS: f64 = -100.0;
 
+/// Multi-channel speaker layout for ITU-R BS.1770-5 loudness weighting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ChannelLayout {
+    Mono,
+    Stereo,
+    Surround5_1,
+    Surround7_1,
+    Atmos7_1_4,
+    Custom(usize),
+}
+
+/// Returns the ITU-R BS.1770-5 Annex 3 speaker-position linear power weight `g_i`
+/// from spherical speaker coordinates (`azimuth_deg`, `elevation_deg`, `is_lfe`).
+///
+/// - LFE channels return `0.0` (excluded).
+/// - Horizontal/mid-plane surrounds (`|el| < 30 deg` and `60 <= |az| <= 120 deg`) return `1.41`.
+/// - Front (`|az| < 60 deg`), rear (`|az| > 120 deg`), and elevated (`|el| >= 30 deg`) speakers return `1.0`.
+pub fn bs1770_5_position_weight(azimuth_deg: f64, elevation_deg: f64, is_lfe: bool) -> f64 {
+    if is_lfe || !azimuth_deg.is_finite() || !elevation_deg.is_finite() {
+        return 0.0;
+    }
+    if elevation_deg.abs() < 30.0 && (60.0..=120.0).contains(&azimuth_deg.abs()) {
+        1.41
+    } else {
+        1.0
+    }
+}
+
+impl ChannelLayout {
+    /// Infers the standard SMPTE/Atmos layout from the interleaved channel count.
+    pub fn infer(num_channels: usize) -> Self {
+        match num_channels {
+            1 => Self::Mono,
+            2 => Self::Stereo,
+            6 => Self::Surround5_1,
+            8 => Self::Surround7_1,
+            12 => Self::Atmos7_1_4,
+            n => Self::Custom(n),
+        }
+    }
+
+    /// Returns ITU-R BS.1770-5 Annex 3 linear power channel weights `g_i` for `num_channels`.
+    ///
+    /// Note: For 7.1 and 7.1.4 (SMPTE L, R, C, LFE, Lss, Rss, Lrs, Rrs[, Ltf, Rtf, Ltr, Rtr]),
+    /// side surrounds (`|az| = 90 deg`, `|el| < 30 deg`) receive `1.41`, rear surrounds
+    /// (`|az| = 135 deg`) and heights (`|el| >= 30 deg`) receive `1.0`, and LFE receives `0.0`.
+    pub fn weights(self, num_channels: usize) -> Vec<f64> {
+        match self {
+            Self::Mono => vec![1.0],
+            Self::Stereo => vec![1.0, 1.0],
+            Self::Surround5_1 => vec![1.0, 1.0, 1.0, 0.0, 1.41, 1.41],
+            Self::Surround7_1 => vec![1.0, 1.0, 1.0, 0.0, 1.41, 1.41, 1.0, 1.0],
+            Self::Atmos7_1_4 => vec![1.0, 1.0, 1.0, 0.0, 1.41, 1.41, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            Self::Custom(_) => vec![1.0; num_channels],
+        }
+    }
+}
+
+/// Returns ITU-R BS.1770-5 linear power channel weights (`LFE = 0.0`, `surround = 1.41`).
+pub fn bs1770_5_channel_weights(num_channels: usize) -> Vec<f64> {
+    ChannelLayout::infer(num_channels).weights(num_channels)
+}
+
 /// Computes 100 ms K-weighted sub-block energies in a single streaming pass per channel
-/// (O(num_subs) memory instead of O(frames)), matching ITU-R BS.1770-4 channel summation.
-fn compute_k_weighted_sub_energies(channels: &[Vec<f64>], sample_rate: u32) -> Vec<f64> {
+/// using explicit BS.1770-5 linear channel weights `g_i`.
+fn compute_k_weighted_sub_energies_with_weights(
+    channels: &[Vec<f64>],
+    sample_rate: u32,
+    weights: &[f64],
+) -> Vec<f64> {
     let sr = f64::from(sample_rate.max(1));
     let frames = channels.first().map_or(0, Vec::len);
     let sub_len = (sr * 0.1).round().max(1.0) as usize;
@@ -540,7 +607,11 @@ fn compute_k_weighted_sub_energies(channels: &[Vec<f64>], sample_rate: u32) -> V
 
     let inv_sub_len = 1.0 / (sub_len as f64);
     let mut sub_energies = vec![0.0_f64; num_subs];
-    for ch in channels {
+    for (ch_idx, ch) in channels.iter().enumerate() {
+        let g = weights.get(ch_idx).copied().unwrap_or(1.0);
+        if !g.is_finite() || g <= 0.0 {
+            continue;
+        }
         let mut shelf = Biquad::k_weight_pre_shelf(sr);
         let mut rlb = Biquad::k_weight_rlb_highpass(sr);
         let usable = ch.len().min(num_subs * sub_len);
@@ -559,10 +630,36 @@ fn compute_k_weighted_sub_energies(channels: &[Vec<f64>], sample_rate: u32) -> V
                 shelf.flush_state();
                 rlb.flush_state();
             }
-            *slot += ch_sq * inv_sub_len;
+            *slot += g * ch_sq * inv_sub_len;
         }
     }
     sub_energies
+}
+
+/// Computes 100 ms K-weighted sub-block energies using inferred ITU-R BS.1770-5 channel weights.
+fn compute_k_weighted_sub_energies(channels: &[Vec<f64>], sample_rate: u32) -> Vec<f64> {
+    let weights = bs1770_5_channel_weights(channels.len());
+    compute_k_weighted_sub_energies_with_weights(channels, sample_rate, &weights)
+}
+
+/// Computes `(integrated_lkfs, short_term_max_lkfs, momentary_max_lkfs, lra_lu)` using ITU-R BS.1770-5 weights.
+pub fn compute_bs1770_5_loudness(
+    buffer: &AudioBuffer,
+    layout: Option<ChannelLayout>,
+) -> (f64, f64, f64, f64) {
+    let resolved = layout.unwrap_or_else(|| ChannelLayout::infer(buffer.num_channels()));
+    let weights = resolved.weights(buffer.num_channels());
+    compute_bs1770_5_loudness_with_weights(buffer, &weights)
+}
+
+/// Computes `(integrated_lkfs, short_term_max_lkfs, momentary_max_lkfs, lra_lu)` using explicit per-channel BS.1770-5 weights `g_i`.
+pub fn compute_bs1770_5_loudness_with_weights(
+    buffer: &AudioBuffer,
+    weights: &[f64],
+) -> (f64, f64, f64, f64) {
+    let sub_energies =
+        compute_k_weighted_sub_energies_with_weights(&buffer.channels, buffer.sample_rate, weights);
+    compute_loudness_metrics_from_subs(&sub_energies)
 }
 
 /// Computes ITU-R BS.1770-4 two-stage gated integrated loudness (LUFS) directly from channels.
@@ -652,9 +749,8 @@ fn compute_short_term_and_lra(
     (short_term_max_lufs, loudness_range_lu)
 }
 
-/// Computes Momentary, Short-Term, Integrated LUFS and LRA from 100 ms K-weighted blocks.
-fn compute_loudness_metrics(channels: &[Vec<f64>], sample_rate: u32) -> (f64, f64, f64, f64) {
-    let sub_energies = compute_k_weighted_sub_energies(channels, sample_rate);
+/// Computes Momentary, Short-Term, Integrated LUFS and LRA from 100 ms K-weighted sub-block energies.
+fn compute_loudness_metrics_from_subs(sub_energies: &[f64]) -> (f64, f64, f64, f64) {
     let abs_gate_e = 10.0_f64.powf((-70.0 + 0.691) / 10.0);
     let mut gated_abs = Vec::new();
     let mut momentary_max_lufs = -70.0_f64;
@@ -681,13 +777,19 @@ fn compute_loudness_metrics(channels: &[Vec<f64>], sample_rate: u32) -> (f64, f6
 
     let integrated_lufs = compute_relative_gated_lufs(&gated_abs);
     let (short_term_max_lufs, loudness_range_lu) =
-        compute_short_term_and_lra(&sub_energies, integrated_lufs, momentary_max_lufs);
+        compute_short_term_and_lra(sub_energies, integrated_lufs, momentary_max_lufs);
     (
         integrated_lufs,
         short_term_max_lufs,
         momentary_max_lufs,
         loudness_range_lu,
     )
+}
+
+/// Computes Momentary, Short-Term, Integrated LUFS and LRA from 100 ms K-weighted blocks.
+fn compute_loudness_metrics(channels: &[Vec<f64>], sample_rate: u32) -> (f64, f64, f64, f64) {
+    let sub_energies = compute_k_weighted_sub_energies(channels, sample_rate);
+    compute_loudness_metrics_from_subs(&sub_energies)
 }
 
 /// Maximum bin-over-neighborhood prominence (dB) across `b_lo..=b_hi` (excluding 3-bin main lobe).

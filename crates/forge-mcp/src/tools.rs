@@ -1,4 +1,4 @@
-//! MCP tool schemas (`inputSchema`, `outputSchema`, `ToolAnnotations`) for all 18 ForgeAudio tools.
+//! MCP tool schemas (`inputSchema`, `outputSchema`, `ToolAnnotations`) for all 19 ForgeAudio tools.
 
 use forge_dsp::DeliveryTarget;
 use rmcp::model::{JsonObject, Tool, ToolAnnotations};
@@ -183,6 +183,7 @@ fn req_str_tool(
 
 const DENOISE_BACKENDS: &[&str] = &[
     "auto",
+    "clearervoice",
     "deepfilternet",
     "deepfilternet3",
     "mel-band-roformer",
@@ -190,6 +191,7 @@ const DENOISE_BACKENDS: &[&str] = &[
 ];
 const RESTORE_BACKENDS: &[&str] = &[
     "auto",
+    "clearervoice",
     "apollo",
     "flowhigh",
     "audiosr",
@@ -206,6 +208,7 @@ const BEAT_BACKENDS: &[&str] = &[
     "pure_rust_onset",
 ];
 const EVAL_BACKENDS: &[&str] = &["auto", "audiobox", "singmos", "acoustic-proxy", "rust"];
+const F0_BACKENDS: &[&str] = &["auto", "swiftf0", "rmvpe", "fcpe", "autocorr", "rust"];
 
 struct WorkerToolSpec {
     meta: (&'static str, &'static str, &'static str, ToolKind),
@@ -515,6 +518,31 @@ pub(crate) fn build_tools() -> Vec<Tool> {
                     "WSOLA time-warp separated stems onto a constant bpm grid instead of emitting variable <TEMPOENVEX>",
                 ),
             ),
+            (
+                "stems",
+                prop_enum(
+                    "integer",
+                    &[2, 4, 6],
+                    json!(6),
+                    "Primary stem count (2, 4, or 6)",
+                ),
+            ),
+            (
+                "quality",
+                prop_enum(
+                    "string",
+                    &["fast", "studio", "ultra"],
+                    json!("studio"),
+                    "Separation quality tier",
+                ),
+            ),
+            (
+                "drum_sep",
+                prop_bool(
+                    false,
+                    "Also split isolated drums into Kick, Snare, Toms, Hi-Hat, and Cymbals",
+                ),
+            ),
         ],
     );
 
@@ -606,12 +634,26 @@ pub(crate) fn build_tools() -> Vec<Tool> {
         req_str_tool(
             "forge_music_theory_midi",
             "Music Theory Chords & Groove MIDI",
-            "Generate voice-led MIDI chords, Neo-Soul/Jazz reharmonizations, Dilla/MPC humanized grooves, and ABC notation.",
+            "Generate voice-led MIDI chords, Neo-Soul/Jazz reharmonizations, Dilla/MPC humanized grooves, and ABC notation (or compile ABC notation directly via abc_input).",
             ToolKind::WriteLocal,
-            &["chords", "output_midi"],
+            &["output_midi"],
             vec![
+                (
+                    "chords",
+                    prop_str(
+                        None,
+                        "Space-separated chord progression (optional when abc_input is supplied)",
+                    ),
+                ),
                 ("bpm", prop_num(Some(92.0), "")),
                 ("style", prop_str(Some("neo-soul"), "")),
+                (
+                    "abc_input",
+                    prop_str(
+                        None,
+                        "Optional ABC notation string to parse into MIDI notes",
+                    ),
+                ),
             ],
             out_fields(&[
                 ("output_midi", "string"),
@@ -864,5 +906,75 @@ pub(crate) fn build_tools() -> Vec<Tool> {
             ],
             output_schema: out_fields(&[("backend", "string")]),
         }),
+        worker_tool(WorkerToolSpec {
+            meta: (
+                "forge_f0_track",
+                "Fundamental Frequency (F0) Pitch Tracker",
+                "Extract frame-accurate fundamental frequency (F0) contour via RMVPE, FCPE, autocorrelation worker, or pure-Rust YIN pitch tracking within the MCP path sandbox.",
+                ToolKind::ReadOpenWorld,
+            ),
+            output_dir_desc: None,
+            backends: F0_BACKENDS,
+            default_timeout_secs: 300,
+            extra: vec![(
+                "hop_secs",
+                prop_num(Some(0.01), "Analysis hop size in seconds (0.002..=0.2)"),
+            )],
+            output_schema: out_fields(&[
+                ("backend", "string"),
+                ("sample_rate", "integer"),
+                ("hop_secs", "number"),
+                ("voiced_ratio", "number"),
+                ("frames", "array"),
+            ]),
+        }),
+        req_str_tool(
+            "forge_spatial_qc",
+            "Spatial ADM BWF & BS.1770-5 QC",
+            "Validate WAV/RF64 ADM BWF (ITU-R BS.2076) bed/object track associations, optionally render objects via 3D VBAP to a specified reference layout, and compute preliminary ITU-R BS.1770-5 Annex 3/4 loudness and true peak (NOT Dolby Atmos certification).",
+            ToolKind::ReadOnly,
+            &["input"],
+            vec![
+                (
+                    "reference_layout",
+                    prop_enum(
+                        "string",
+                        &["5.1", "7.1", "7.1.4"],
+                        json!("7.1.4"),
+                        "Reference ITU-R BS.2051 loudspeaker layout for rendering object/mixed ADM tracks",
+                    ),
+                ),
+                (
+                    "render_objects",
+                    prop_bool(
+                        true,
+                        "Render object/mixed ADM tracks before BS.1770-5 measurement (false marks object loudness unverified)",
+                    ),
+                ),
+            ],
+            object_schema(
+                &[
+                    (
+                        "preliminary_qc_passed",
+                        schema_prop("boolean", None, None, ""),
+                    ),
+                    ("programme_kind", schema_prop("string", None, None, "")),
+                    ("loudness_status", schema_prop("string", None, None, "")),
+                    (
+                        "render_configuration",
+                        json!({ "type": ["string", "null"] }),
+                    ),
+                    ("loudness_algorithm", schema_prop("string", None, None, "")),
+                    (
+                        "certification_disclaimer",
+                        schema_prop("string", None, None, ""),
+                    ),
+                    ("integrated_lkfs", json!({ "type": ["number", "null"] })),
+                    ("true_peak_dbtp", json!({ "type": ["number", "null"] })),
+                ],
+                None,
+                Some(true),
+            ),
+        ),
     ]
 }

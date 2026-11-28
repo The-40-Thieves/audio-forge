@@ -30,6 +30,7 @@ import importlib
 import json
 import math
 import os
+import shutil
 import struct
 import sys
 from collections.abc import Mapping, Sequence
@@ -110,15 +111,27 @@ VERIFIED_MODEL_REGISTRY: tuple[tuple[str, str, str], ...] = (
 VALID_MODEL_PROFILES = frozenset({"fast", "studio", "all"})
 
 VALID_QUALITIES = frozenset({"fast", "studio", "ultra"})
-VALID_RESTORE_BACKENDS = frozenset(
-    {"auto", "apollo", "flowhigh", "audiosr", "sonicmaster", "exciter"}
+VALID_DENOISE_BACKENDS = frozenset(
+    {"auto", "clearervoice", "deepfilternet", "mel-band-roformer"}
 )
+VALID_RESTORE_BACKENDS = frozenset(
+    {
+        "auto",
+        "clearervoice",
+        "apollo",
+        "flowhigh",
+        "audiosr",
+        "sonicmaster",
+        "exciter",
+    }
+)
+VALID_TRANSCRIBE_BACKENDS = frozenset({"auto", "yourmt3", "basic-pitch"})
 VALID_VOCAL_RESCUE_BACKENDS = frozenset(
     {"auto", "resemble-enhance", "seed-vc", "roformer-clean"}
 )
 VALID_BEAT_BACKENDS = frozenset({"auto", "beat-this", "librosa", "energy"})
 VALID_EVAL_BACKENDS = frozenset({"auto", "audiobox", "singmos", "acoustic-proxy"})
-VALID_F0_BACKENDS = frozenset({"auto", "rmvpe", "fcpe", "autocorr"})
+VALID_F0_BACKENDS = frozenset({"auto", "swiftf0", "fcpe", "rmvpe", "autocorr"})
 
 
 def _env_model_override(var_name: str) -> str | None:
@@ -518,18 +531,25 @@ def _separate_multistem_with_fallback(
 
 
 def _restore_wav_bandwidth(src_path: Path, out_path: Path, drive: float = 0.12) -> Path:
-    """Phase-coherent spectral bandwidth restoration fallback for 16/24/32-bit PCM & float WAVs.
+    """Phase-coherent spectral bandwidth restoration fallback for WAV and non-WAV audio.
 
     Synthesizes gentle upper-band harmonic air from the first-order high-frequency difference
-    signal and blends it at ``drive`` (~ -18 dB). Falls back to ``src_path`` for stub/mock files.
+    signal and blends it at ``drive`` (~ -18 dB). Always writes/stages inside ``out_path``'s
+    directory so returned paths never escape ``output_dir``.
     """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     decoded = _read_wav_float(src_path)
     if decoded is None:
-        return src_path
+        try:
+            decoded = _read_audio_float(src_path)
+        except RuntimeError:
+            shutil.copy2(src_path, out_path)
+            return out_path
     channels, sr, sw, fmt = decoded
     nframes = len(channels[0]) if channels else 0
     if nframes <= 1:
-        return src_path
+        shutil.copy2(src_path, out_path)
+        return out_path
     out_channels: list[list[float]] = []
     for ch in channels:
         dst = list(ch)
@@ -905,14 +925,52 @@ def _validated_output_path(output_dir: Path, filename: str) -> Path:
     return out_path
 
 
-def run_transcribe(input_path: Path, output_dir: Path) -> dict[str, str]:
-    """Run polyphonic audio-to-MIDI transcription via Spotify basic-pitch."""
+def _transcribe_with_yourmt3(input_path: Path, out_midi: Path) -> Path:
+    mod = importlib.import_module("yourmt3")
+    transcribe_fn = getattr(mod, "transcribe_file", None) or getattr(
+        mod, "predict", None
+    )
+    if callable(transcribe_fn):
+        transcribe_fn(str(input_path), str(out_midi))
+    elif hasattr(mod, "YourMT3"):
+        engine = mod.YourMT3()
+        engine.transcribe(str(input_path), str(out_midi))
+    else:
+        raise RuntimeError(
+            "Installed 'yourmt3' module exposes no supported transcription entry point"
+        )
+    if not out_midi.is_file():
+        raise RuntimeError(f"YourMT3+ produced no MIDI file at {out_midi}")
+    return out_midi
+
+
+def run_transcribe(
+    input_path: Path,
+    output_dir: Path,
+    backend: str = "auto",
+) -> dict[str, str]:
+    """Run polyphonic audio-to-MIDI transcription via YourMT3+ or Spotify basic-pitch."""
+    if backend not in VALID_TRANSCRIBE_BACKENDS:
+        raise ValueError(
+            f"Unsupported transcribe backend {backend!r}; expected one of {sorted(VALID_TRANSCRIBE_BACKENDS)}"
+        )
     resolved_input, resolved_output = _resolve_io_paths(input_path, output_dir)
+    if backend in {"auto", "yourmt3"}:
+        mt3_midi = _validated_output_path(
+            resolved_output, f"{_safe_stem(resolved_input)}_yourmt3.mid"
+        )
+        try:
+            written = _transcribe_with_yourmt3(resolved_input, mt3_midi)
+            return {"midi": str(written), "backend": "yourmt3"}
+        except (ImportError, AttributeError, RuntimeError, OSError) as exc:
+            if backend == "yourmt3":
+                raise RuntimeError(f"YourMT3+ transcription failed: {exc}") from exc
+
     try:
         from basic_pitch.inference import predict
     except ImportError as exc:
         raise RuntimeError(
-            "basic-pitch is not installed in the worker venv. "
+            "Neither yourmt3 nor basic-pitch is installed in the worker venv. "
             "Run: uv sync --project python-worker"
         ) from exc
 
@@ -921,7 +979,7 @@ def run_transcribe(input_path: Path, output_dir: Path) -> dict[str, str]:
         resolved_output, f"{_safe_stem(resolved_input)}_basic_pitch.mid"
     )
     midi_data.write(str(out_midi))
-    return {"midi": str(out_midi)}
+    return {"midi": str(out_midi), "backend": "basic-pitch"}
 
 
 def _safe_stem(path: Path) -> str:
@@ -929,6 +987,31 @@ def _safe_stem(path: Path) -> str:
         ch if (ch.isalnum() or ch in {"-", "_"}) else "_" for ch in path.stem
     )
     return cleaned.strip("._") or "audio"
+
+
+def _run_clearervoice_task(
+    task: str,
+    model_name: str,
+    input_path: Path,
+    out_path: Path,
+) -> Path:
+    mod = importlib.import_module("clearvoice")
+    cv = mod.ClearVoice(task=task, model_names=[model_name])
+    output_wav = cv(input_path=str(input_path), online_write=False)
+    if not out_path.is_file():
+        cv.write(output_wav, output_path=str(out_path))
+    if not out_path.is_file():
+        raise RuntimeError(f"ClearerVoice {task} produced no output at {out_path}")
+    return out_path
+
+
+def _denoise_with_clearervoice(input_path: Path, output_dir: Path) -> Path:
+    out_path = _validated_output_path(
+        output_dir, f"{_safe_stem(input_path)}_denoised_clearervoice.wav"
+    )
+    return _run_clearervoice_task(
+        "speech_enhancement", "MossFormer2_SE_48K", input_path, out_path
+    )
 
 
 def _denoise_with_deepfilternet(
@@ -971,17 +1054,27 @@ def run_denoise(
     attenuation_limit_db: float | None = None,
     backend: str = "auto",
 ) -> dict[str, str]:
-    """Run neural audio denoising via DeepFilterNet3 or Mel-Band-RoFormer denoise."""
-    if backend not in {"auto", "deepfilternet", "mel-band-roformer"}:
+    """Run neural audio denoising via ClearerVoice, DeepFilterNet3, or Mel-Band-RoFormer."""
+    if backend not in VALID_DENOISE_BACKENDS:
         raise ValueError(
             f"Unsupported denoise backend {backend!r}; "
-            "expected auto, deepfilternet, or mel-band-roformer"
+            f"expected one of {sorted(VALID_DENOISE_BACKENDS)}"
         )
     if attenuation_limit_db is not None and not (0.0 <= attenuation_limit_db <= 100.0):
         raise ValueError(
             f"attenuation_limit_db must be finite and in [0, 100], got {attenuation_limit_db!r}"
         )
     resolved_input, resolved_output = _resolve_io_paths(input_path, output_dir)
+
+    if backend in {"auto", "clearervoice"}:
+        try:
+            out_path = _denoise_with_clearervoice(resolved_input, resolved_output)
+            return {"denoised": str(out_path), "backend": "clearervoice"}
+        except (ImportError, AttributeError, RuntimeError, OSError) as exc:
+            if backend == "clearervoice":
+                raise RuntimeError(
+                    f"ClearerVoice MossFormer2_SE_48K denoise failed: {exc}"
+                ) from exc
 
     if backend in {"auto", "deepfilternet"}:
         try:
@@ -1002,8 +1095,14 @@ def run_denoise(
         return {"denoised": str(out_path), "backend": "mel-band-roformer"}
     except ImportError as exc:
         raise RuntimeError(
-            "Neither deepfilternet nor audio-separator is installed in the worker venv."
+            "Neither clearervoice, deepfilternet, nor audio-separator is installed in the worker venv."
         ) from exc
+
+
+def _restore_via_clearervoice(input_path: Path, out_path: Path) -> Path:
+    return _run_clearervoice_task(
+        "speech_super_resolution", "MossFormer2_SR_48K", input_path, out_path
+    )
 
 
 def _restore_via_apollo(input_path: Path, out_path: Path, chunk_secs: float) -> Path:
@@ -1088,9 +1187,9 @@ def run_restore(
 
     if backend == "auto":
         order = (
-            ["sonicmaster", "apollo", "flowhigh", "audiosr"]
+            ["sonicmaster", "clearervoice", "apollo", "flowhigh", "audiosr"]
             if prompt
-            else ["apollo", "flowhigh", "sonicmaster", "audiosr"]
+            else ["clearervoice", "apollo", "flowhigh", "sonicmaster", "audiosr"]
         )
     else:
         order = [backend]
@@ -1104,7 +1203,9 @@ def run_restore(
                 "warnings": warnings,
             }
         try:
-            if cand == "apollo":
+            if cand == "clearervoice":
+                _restore_via_clearervoice(resolved_input, out_path)
+            elif cand == "apollo":
                 _restore_via_apollo(resolved_input, out_path, chunk_secs)
             elif cand == "flowhigh":
                 _restore_via_flowhigh(resolved_input, out_path)
@@ -1147,11 +1248,14 @@ def _rescue_via_resemble(input_path: Path, out_path: Path) -> Path:
     if hasattr(inf, "enhance_file"):
         inf.enhance_file(str(input_path), str(out_path))
         return out_path
+    torch = importlib.import_module("torch")
+    cuda = getattr(torch, "cuda", None)
+    device = "cuda" if cuda is not None and cuda.is_available() else "cpu"
     torchaudio = importlib.import_module("torchaudio")
     wav, sr = torchaudio.load(str(input_path))
     mono = wav.mean(dim=0)
-    denoised, _ = inf.denoise(mono, sr, "cpu")
-    enhanced, new_sr = inf.enhance(denoised, sr, "cpu")
+    denoised, _ = inf.denoise(mono, sr, device)
+    enhanced, new_sr = inf.enhance(denoised, sr, device)
     torchaudio.save(str(out_path), enhanced.unsqueeze(0), new_sr)
     return out_path
 
@@ -1206,6 +1310,14 @@ def _rescue_via_roformer_chain(
         warnings.append(f"vocals-revive failed ({exc}); using denoise-roformer")
         current = _denoise_with_roformer(current, output_dir)
         stages.append("denoise-roformer")
+    resolved_out = output_dir.resolve()
+    if current == input_path or not current.resolve().is_relative_to(resolved_out):
+        staged = _validated_output_path(
+            output_dir,
+            f"{_safe_stem(input_path)}_vocal_rescued{input_path.suffix or '.wav'}",
+        )
+        shutil.copy2(current, staged)
+        current = staged
     return current, stages
 
 
@@ -1660,7 +1772,7 @@ def _load_sha256_manifest() -> dict[str, str]:
     raw = os.environ.get("FORGE_MODEL_SHA256_MANIFEST", "").strip()
     if not raw:
         return {}
-    path = Path(raw).expanduser().resolve()
+    path = _validate_worker_path(Path(raw), must_exist_file=True)
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, Mapping):
         raise ValueError("FORGE_MODEL_SHA256_MANIFEST must contain a JSON object")
@@ -1927,7 +2039,20 @@ def _neural_f0_track(
         return []
     hop_samples = max(1, int(round(sr * hop_secs)))
     target_len = max(1, (len(mono) + hop_samples - 1) // hop_samples)
-    if backend == "fcpe":
+    if backend == "swiftf0":
+        swift_mod = importlib.import_module("swift_f0")
+        detector_cls = getattr(swift_mod, "SwiftF0", None)
+        if detector_cls is not None:
+            result = detector_cls().detect_from_array(mono, sr)
+            f0_raw = getattr(result, "pitch_hz", result)
+        elif hasattr(swift_mod, "detect_f0"):
+            f0_raw = swift_mod.detect_f0(mono, sr=sr, hop_secs=hop_secs)
+        else:
+            raise RuntimeError(
+                "Installed 'swift_f0' module exposes no SwiftF0/detect_f0 API"
+            )
+        hz_seq = _extract_f0_hz_sequence(f0_raw)
+    elif backend == "fcpe":
         fcpe_mod = importlib.import_module("torchfcpe")
         torch_mod = importlib.import_module("torch")
         device = "cuda" if torch_mod.cuda.is_available() else "cpu"
@@ -2022,10 +2147,10 @@ def run_f0_track(
     warnings: list[str] = []
 
     candidates = (
-        ["fcpe", "rmvpe"]
+        ["swiftf0", "fcpe", "rmvpe"]
         if backend == "auto"
         else [backend]
-        if backend in {"fcpe", "rmvpe"}
+        if backend in {"swiftf0", "fcpe", "rmvpe"}
         else []
     )
     frames: list[dict[str, object]] | None = None
@@ -2143,14 +2268,17 @@ def main() -> int:
         sep_p.add_argument(flag, action="store_true", help=help_text)
 
     _add_io_parser(
-        sub, "transcribe", "Run polyphonic audio-to-MIDI transcription via basic-pitch"
+        sub,
+        "transcribe",
+        "Run polyphonic audio-to-MIDI transcription via YourMT3+ or basic-pitch",
+        backend_choices=sorted(VALID_TRANSCRIBE_BACKENDS),
     )
 
     den_p = _add_io_parser(
         sub,
         "denoise",
-        "Run neural denoising (DeepFilterNet3 / Mel-Band-RoFormer)",
-        backend_choices=["auto", "deepfilternet", "mel-band-roformer"],
+        "Run neural denoising (ClearerVoice MossFormer2 / DeepFilterNet3 / Mel-Band-RoFormer)",
+        backend_choices=sorted(VALID_DENOISE_BACKENDS),
     )
     den_p.add_argument(
         "--attenuation-limit-db",
@@ -2268,7 +2396,7 @@ def main() -> int:
             )
             print(json.dumps(res))
         elif args.command == "transcribe":
-            res = run_transcribe(args.input, args.output_dir)
+            res = run_transcribe(args.input, args.output_dir, backend=args.backend)
             print(json.dumps(res))
         elif args.command == "denoise":
             res = run_denoise(

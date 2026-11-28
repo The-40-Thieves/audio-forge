@@ -1728,6 +1728,7 @@ name = "forge-engine"
 version = "0.1.0"
 dependencies = [
  "assert_no_alloc",
+ "codspeed-divan-compat",
  "cpal",
  "forge-core",
  "forge-dsp",

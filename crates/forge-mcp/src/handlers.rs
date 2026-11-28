@@ -5,10 +5,11 @@ use crate::sandbox::PathSandbox;
 use forge_core::{AudioBuffer, ForgeError, StemBundle};
 use forge_dsp::{
     DeFizzConfig, DeliveryOptions, DeliveryTarget, DitherMode, GenreTonalTarget, LimiterStyle,
-    RestorationConfig, ToneMatch, UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw,
-    align_vocal_double_dtw_elastic, analyze_beat_grid, apply_18_band_eq, apply_spectral_defizz,
-    apply_spectral_unmask, audit_audio, clean_vocal_surgical, compute_reference_match_eq, deliver,
-    normalize_and_limit, quantize_to_constant_bpm, run_full_restoration_chain,
+    ReferenceLoudspeakerConfig, RestorationConfig, SpatialQcOptions, SpatialRenderMode, ToneMatch,
+    UnmaskConfig, align_phase_gcc_phat, align_vocal_double_dtw, align_vocal_double_dtw_elastic,
+    analyze_beat_grid, apply_18_band_eq, apply_spectral_defizz, apply_spectral_unmask, audit_audio,
+    audit_spatial_adm_bwf_reader_with_options, clean_vocal_surgical, compute_reference_match_eq,
+    deliver, normalize_and_limit, quantize_to_constant_bpm, run_full_restoration_chain,
 };
 use forge_reaper::{
     ReaperProjectBuilder, ReaperTrackSpec, ReleaseMetadata, install_jsfx_plugins, jsfx_install_dir,
@@ -16,7 +17,7 @@ use forge_reaper::{
 };
 use forge_theory::{
     GrooveStyle, NoteEvent, VoicingStyle, export_abc_score, extract_drum_midi_triggers,
-    reharmonize_progression, solve_voice_leading, validate_bpm,
+    parse_abc_score, reharmonize_progression, solve_voice_leading, validate_bpm,
 };
 use forge_vocal::{
     PitchFrame, VocalScale, generate_vocal_harmony_stack, shift_vocal_pitch_formant_preserved,
@@ -129,12 +130,6 @@ fn resolve_path_value(
         .as_str()
         .ok_or_else(|| ForgeError::InvalidParameter(format!("'{key}' must be a string path")))?;
     sandbox.resolve(raw)
-}
-
-fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, ForgeError> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| ForgeError::InvalidParameter(format!("Missing '{key}'")))
 }
 
 fn bool_arg(args: &Value, key: &str, default: bool) -> bool {
@@ -266,6 +261,8 @@ fn dispatch_tool(
         "forge_vocal_rescue" => tool_vocal_rescue,
         "forge_beat_track" => tool_beat_track,
         "forge_evaluate_quality" => tool_evaluate_quality,
+        "forge_f0_track" => tool_f0_track,
+        "forge_spatial_qc" => tool_spatial_qc,
         _ => {
             return Err(ForgeError::InvalidParameter(format!(
                 "Unknown tool: {name}"
@@ -273,6 +270,36 @@ fn dispatch_tool(
         }
     };
     handler(args, sandbox)
+}
+
+fn parse_reference_layout(args: &Value) -> Result<ReferenceLoudspeakerConfig, ForgeError> {
+    let raw = args
+        .get("reference_layout")
+        .and_then(Value::as_str)
+        .unwrap_or("7.1.4");
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "5.1" => Ok(ReferenceLoudspeakerConfig::Layout5_1),
+        "7.1" => Ok(ReferenceLoudspeakerConfig::Layout7_1),
+        "7.1.4" => Ok(ReferenceLoudspeakerConfig::Layout7_1_4),
+        other => Err(ForgeError::InvalidParameter(format!(
+            "Unsupported reference_layout '{other}' (expected 5.1, 7.1, or 7.1.4)"
+        ))),
+    }
+}
+
+fn tool_spatial_qc(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
+    let input = path_arg(args, "input", sandbox)?;
+    let render_objects = bool_arg(args, "render_objects", true);
+    let options = SpatialQcOptions {
+        render_mode: if render_objects {
+            SpatialRenderMode::ReferenceRenderer(parse_reference_layout(args)?)
+        } else {
+            SpatialRenderMode::NoRenderer
+        },
+    };
+    let mut file = sandbox.open_read(&input)?;
+    let report = audit_spatial_adm_bwf_reader_with_options(&mut file, &input, options)?;
+    Ok(serde_json::to_value(report)?.into())
 }
 
 fn tool_deliver(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
@@ -457,6 +484,7 @@ fn tool_neural_denoise(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput
         args,
         &[
             "auto",
+            "clearervoice",
             "deepfilternet",
             "deepfilternet3",
             "mel-band-roformer",
@@ -495,6 +523,7 @@ fn tool_neural_restore(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput
         args,
         &[
             "auto",
+            "clearervoice",
             "apollo",
             "flowhigh",
             "audiosr",
@@ -577,6 +606,18 @@ fn tool_evaluate_quality(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
         backend,
         timeout,
     )?;
+    Ok(serde_json::to_value(res)?.into())
+}
+
+fn tool_f0_track(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
+    let input = path_arg(args, "input", sandbox)?;
+    let backend = validate_backend_arg(
+        args,
+        &["auto", "swiftf0", "rmvpe", "fcpe", "autocorr", "rust"],
+    )?;
+    let hop_secs = bounded_f64_arg(args, "hop_secs", 0.01, 0.002, 0.2)?;
+    let timeout = timeout_secs_arg(args)?;
+    let res = external::f0_track_checked(sandbox, &input, backend, hop_secs, timeout)?;
     Ok(serde_json::to_value(res)?.into())
 }
 
@@ -668,23 +709,67 @@ fn voice_chords(chords: &str, style: VoicingStyle) -> Result<VoicedChords, Forge
     Ok((reharm, chord_notes, bass_notes))
 }
 
+fn resolve_theory_chords(
+    args: &Value,
+    parsed_abc: Option<&(Vec<String>, Vec<NoteEvent>)>,
+) -> Result<String, ForgeError> {
+    if let Some(chords) = args
+        .get("chords")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(chords.to_string());
+    }
+    match parsed_abc {
+        Some((abc_chords, _)) if !abc_chords.is_empty() => Ok(abc_chords.join(" ")),
+        Some(_) => Ok("C".to_string()),
+        None => Err(ForgeError::InvalidParameter(
+            "Missing 'chords' (or 'abc_input')".into(),
+        )),
+    }
+}
+
 fn tool_music_theory_midi(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput, ForgeError> {
-    let chords = str_arg(args, "chords")?;
     let output_midi = path_arg(args, "output_midi", sandbox)?;
     let bpm = validate_bpm(f64_arg(args, "bpm", 92.0))?;
     let style = parse_voicing_style(str_arg_or(args, "style", "neo-soul"));
-    let (reharm, chord_notes, bass_notes) = voice_chords(chords, style)?;
-    sandbox.write_midi(
-        &output_midi,
-        bpm,
-        480,
-        &[("Voiced_Chords", &chord_notes), ("Sub_Bass", &bass_notes)],
-    )?;
+    let parsed_abc = args
+        .get("abc_input")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|raw| parse_abc_score(raw, 480))
+        .transpose()?;
+    let chords = resolve_theory_chords(args, parsed_abc.as_ref())?;
+    let (reharm, chord_notes, bass_notes) = voice_chords(&chords, style)?;
+    let mut parsed_abc_notes = 0_usize;
+    if let Some((_, melody_notes)) = &parsed_abc {
+        parsed_abc_notes = melody_notes.len();
+        sandbox.write_midi(
+            &output_midi,
+            bpm,
+            480,
+            &[
+                ("ABC_Melody", melody_notes),
+                ("Voiced_Chords", &chord_notes),
+                ("Sub_Bass", &bass_notes),
+            ],
+        )?;
+    } else {
+        sandbox.write_midi(
+            &output_midi,
+            bpm,
+            480,
+            &[("Voiced_Chords", &chord_notes), ("Sub_Bass", &bass_notes)],
+        )?;
+    }
     let abc = export_abc_score("ForgeAudio Progression", "C", bpm.round() as u32, &reharm);
     Ok(json!({
         "output_midi": output_midi,
         "abc_notation": abc,
-        "reharmonized_chords": reharm
+        "reharmonized_chords": reharm,
+        "parsed_abc_notes": parsed_abc_notes
     })
     .into())
 }
@@ -784,12 +869,28 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
 
     let require_neural = bool_arg(args, "require_neural", false);
     let backend_override = args.get("backend").and_then(Value::as_str);
+    let stems = match args.get("stems").and_then(Value::as_u64) {
+        None => 6_u8,
+        Some(2) => 2_u8,
+        Some(4) => 4_u8,
+        Some(6) => 6_u8,
+        Some(other) => {
+            return Err(ForgeError::InvalidParameter(format!(
+                "stems must be 2, 4, or 6, got {other}"
+            )));
+        }
+    };
+    let quality = forge_worker::parse_quality(str_arg_or(args, "quality", "studio"))?;
+    let drum_sep = bool_arg(args, "drum_sep", false);
     let (mut bundle, stem_separation) = separate_ingest_stems(
         sandbox,
         &input,
         &paths.stems_dir,
         require_neural,
         backend_override,
+        stems,
+        quality,
+        drum_sep,
     )?;
 
     let mut primary_stems: Vec<(PathBuf, AudioBuffer)> = Vec::new();
@@ -963,15 +1064,22 @@ fn tool_ingest_to_reaper(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutp
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn separate_ingest_stems(
     sandbox: &PathSandbox,
     input: &Path,
     stems_dir: &Path,
     require_neural: bool,
     backend_override: Option<&str>,
+    stems: u8,
+    quality: forge_worker::SeparationQuality,
+    drum_sep: bool,
 ) -> Result<(StemBundle, Value), ForgeError> {
     let mut config = SeparationConfig::from_env();
     config.require_neural |= require_neural;
+    config.stems = stems;
+    config.quality = quality;
+    config.drum_sep = drum_sep;
     if let Some(raw) = backend_override {
         match raw.trim().to_ascii_lowercase().as_str() {
             "auto" | "" => {}
@@ -1251,6 +1359,23 @@ fn tool_separate_stems(args: &Value, sandbox: &PathSandbox) -> Result<ToolOutput
     Ok(payload.into())
 }
 
+fn resolve_daw_clip_path(
+    source_path: &Path,
+    project_dir: Option<&Path>,
+    sandbox: &PathSandbox,
+) -> Result<std::path::PathBuf, ForgeError> {
+    if !source_path.is_relative() {
+        return sandbox.check(source_path);
+    }
+    if let Some(dir) = project_dir
+        && let Ok(candidate) = sandbox.check(&dir.join(source_path))
+        && candidate.is_file()
+    {
+        return Ok(candidate);
+    }
+    sandbox.resolve(&source_path.to_string_lossy())
+}
+
 fn load_sandboxed_daw_project(
     project_path: &Path,
     sandbox: &PathSandbox,
@@ -1276,9 +1401,10 @@ fn load_sandboxed_daw_project(
     let proj = forge_engine::DawProject::from_json(&raw)?;
     let mut cache = forge_engine::ClipCache::default();
     let mut missing_clips = Vec::new();
+    let proj_dir = project_path.parent();
     for tr in &proj.tracks {
         for obj in &tr.objects {
-            let safe_clip = sandbox.check(&obj.source_path)?;
+            let safe_clip = resolve_daw_clip_path(&obj.source_path, proj_dir, sandbox)?;
             match sandbox.load_audio(&safe_clip) {
                 Ok(buf) => {
                     cache.insert_memory_clip(obj.source_path.clone(), buf);

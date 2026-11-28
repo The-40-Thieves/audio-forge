@@ -60,8 +60,39 @@ jobs:
           cargo deny -L error check
       - name: Test before packaging
         run: cargo test --workspace --locked
+      - name: Verify python-worker
+        if: runner.os == 'Linux'
+        run: |
+          pip install --no-cache-dir --only-binary=:all: uv==0.11.7
+          uv lock --project python-worker --check
+          python3 -m unittest discover -s python-worker -v
       - name: Bundle VST3 / CLAP plugins
         run: cargo xtask bundle-all --release
+      - name: Validate bundled CLAP plugins
+        if: runner.os == 'Linux'
+        env:
+          CLAP_VALIDATOR_VERSION: 0.4.1
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cv_build="clap-validator-${CLAP_VALIDATOR_VERSION}-127-g152b982"
+          cv_asset="${cv_build}-ubuntu-22.04.zip"
+          cv_sha256="49edadcfb407ea0dd946ce418300e853fbd2660fa4b0d00e4f19ff8eef24ad90"
+          mkdir -p tools/clap-validator
+          gh release download "$CLAP_VALIDATOR_VERSION" --repo free-audio/clap-validator \
+            --pattern "$cv_asset" --dir tools
+          printf '%s  %s\n' "$cv_sha256" "tools/$cv_asset" > tools/SHA256SUMS
+          sha256sum -c tools/SHA256SUMS
+          unzip -q "tools/$cv_asset" -d tools/clap-validator
+          find tools/clap-validator -name '*.tar.gz' -exec tar -xzf {} -C tools/clap-validator \;
+          clap_validator="$(find "$PWD/tools/clap-validator" -type f -name clap-validator | head -n1)"
+          test -f "$clap_validator"
+          chmod +x "$clap_validator"
+          for plugin in target/bundled/*.clap; do
+            xvfb-run -a "$clap_validator" validate --only-failed "$plugin"
+          done
+          rm -rf tools
       - name: Build forge CLI, MCP server, and ForgeStudio DAW
         run: cargo build --release --locked -p forge-cli -p forge-mcp -p forge-daw
       - name: Package

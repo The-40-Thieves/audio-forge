@@ -25,6 +25,7 @@ pub(crate) fn draw_fx_slot_controls(
         FxSlotConfig::OpenSoothe {
             sensitivity_db,
             max_depth_db,
+            sharpness_bins,
             low_latency,
             tilt_db_per_oct,
             ultrasonic_lpf_hz,
@@ -35,6 +36,9 @@ pub(crate) fn draw_fx_slot_controls(
         } => {
             changed |= slider(ui, sensitivity_db, 0.5..=12.0, "Sens (dB)");
             changed |= slider(ui, max_depth_db, 0.5..=18.0, "Depth (dB)");
+            changed |= ui
+                .add(egui::Slider::new(sharpness_bins, 2..=24).text("Sharp (bins)"))
+                .changed();
             changed |= slider(ui, tilt_db_per_oct, -6.0..=6.0, "Tilt (dB/oct)");
             changed |= slider(ui, ultrasonic_lpf_hz, 0.0..=22_000.0, "Ultra LPF (0=Off)");
             changed |= slider(ui, mid_side_balance, -1.0..=1.0, "M/S Focus");
@@ -48,6 +52,7 @@ pub(crate) fn draw_fx_slot_controls(
             declick,
             deplosive,
             deess_thresh_db,
+            gate_thresh_db,
             ..
         } => {
             ui.horizontal(|ui| {
@@ -57,15 +62,20 @@ pub(crate) fn draw_fx_slot_controls(
             changed |= ui
                 .add(egui::Slider::new(deess_thresh_db, -36.0..=-4.0).text("De-Ess (dB)"))
                 .changed();
+            changed |= slider(ui, gate_thresh_db, -80.0..=-12.0, "Gate (dB)");
         }
         FxSlotConfig::SubMonoTape {
             mono_cutoff_hz,
+            sub_reinforce,
+            stereo_width,
             tape_drive,
             ..
         } => {
             changed |= ui
                 .add(egui::Slider::new(mono_cutoff_hz, 60.0..=250.0).text("Mono Hz"))
                 .changed();
+            changed |= slider(ui, sub_reinforce, 0.0..=1.0, "Sub Boost");
+            changed |= slider(ui, stereo_width, 0.0..=2.0, "Width");
             changed |= ui
                 .add(egui::Slider::new(tape_drive, 0.0..=1.0).text("Tape Drive"))
                 .changed();
@@ -73,6 +83,7 @@ pub(crate) fn draw_fx_slot_controls(
         FxSlotConfig::MasterLimiter {
             drive_db,
             ceiling_dbtp,
+            release_ms,
             isp_8x,
             ..
         } => {
@@ -82,6 +93,7 @@ pub(crate) fn draw_fx_slot_controls(
             changed |= ui
                 .add(egui::Slider::new(ceiling_dbtp, -6.0..=-0.1).text("Ceil (dBTP)"))
                 .changed();
+            changed |= slider(ui, release_ms, 10.0..=500.0, "Release (ms)");
             changed |= ui.checkbox(isp_8x, "8x ISP Oversampling").changed();
         }
         FxSlotConfig::SplitEq {
@@ -294,8 +306,11 @@ pub(crate) fn draw_fx_slot_controls(
             changed |= slider(ui, input_drive_db, -12.0..=24.0, "Drive (dB)");
             changed |= slider(ui, output_trim_db, -24.0..=12.0, "Trim (dB)");
         }
-        FxSlotConfig::DrumTrigger { threshold_db, .. } => {
+        FxSlotConfig::DrumTrigger {
+            threshold_db, mix, ..
+        } => {
             changed |= slider(ui, threshold_db, -60.0..=0.0, "Thresh (dB)");
+            changed |= slider(ui, mix, 0.0..=1.0, "Punch Mix");
         }
     }
     changed

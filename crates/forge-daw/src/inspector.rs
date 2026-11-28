@@ -437,12 +437,15 @@ impl ForgeDawApp {
             changed = true;
         } else if let Some((start, pitch)) = add_note {
             let unique_id = self.project.alloc_id();
+            let beat_smp = ((60.0 / self.project.bpm.max(30.0)) * sr).max(1.0);
             self.project.tracks[tr_idx].midi_clips[clip_idx]
                 .notes
                 .push(MidiNote {
                     id: unique_id,
                     start_samples: start,
                     length_samples: step_smp.saturating_mul(9) / 10,
+                    start_beats: Some((start as f64) / beat_smp),
+                    length_beats: Some(0.225),
                     pitch,
                     velocity: 0.82,
                 });
@@ -621,7 +624,7 @@ impl ForgeDawApp {
                 "+ Add Track Insert...",
                 &mut self.project.tracks[tr_idx].inserts,
                 &track_sc_choices,
-                false,
+                true,
             );
 
             ui.separator();
@@ -646,7 +649,7 @@ impl ForgeDawApp {
                     "+ Add Aux Insert...",
                     &mut bus.inserts,
                     &all_sc_choices,
-                    false,
+                    true,
                 );
             }
 
@@ -658,7 +661,7 @@ impl ForgeDawApp {
                 "+ Add Master Insert...",
                 &mut self.project.master_inserts,
                 &all_sc_choices,
-                false,
+                true,
             );
         });
 

@@ -1127,7 +1127,43 @@ mod tests {
         assert!(JSFX_MASTER_LIMITER.contains("init_tp_phase(tp_c2, 0.50)"));
         assert!(JSFX_MASTER_LIMITER.contains("init_tp_phase(tp_c3, 0.75)"));
         assert!(JSFX_MASTER_LIMITER.contains("peak_buf["));
-        assert!(JSFX_MASTER_LIMITER.contains("loop(lookahead + 1,"));
+        assert!(JSFX_MASTER_LIMITER.contains("seg_set("));
+        assert!(JSFX_MASTER_LIMITER.contains("pdc_bot_ch = 0;"));
+        assert!(JSFX_MASTER_LIMITER.contains("pdc_top_ch = 2;"));
         assert!(JSFX_MASTER_LIMITER.contains("gain_env = min(gain_env, req_here);"));
+        assert!(JSFX_DENSITY_CLIPPER.contains("safe_tanh("));
+        assert!(JSFX_SPACEVERB.contains("damp_g = exp(-2.0 * $pi * damp_fc / srate_safe);"));
+    }
+
+    #[test]
+    fn write_distrokid_metadata_validates_isrc_and_errors_cleanly_on_invalid_input() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let in_wav = dir.path().join("in.wav");
+        let out_wav = dir.path().join("nested_out").join("tagged.wav");
+
+        let bad_meta = ReleaseMetadata {
+            title: "Test".to_string(),
+            artist: "Artist".to_string(),
+            album: "Single".to_string(),
+            isrc: "INVALID-ISRC".to_string(),
+            bpm: Some(120),
+            key: Some("C".to_string()),
+            year: Some(2026),
+        };
+        let err = write_distrokid_metadata(&in_wav, &out_wav, &bad_meta)
+            .expect_err("invalid ISRC must fail before creating output directories");
+        assert!(matches!(err, ForgeError::IsrcError(_)), "got: {err:?}");
+        assert!(!out_wav.parent().unwrap().exists());
+
+        let valid_meta = ReleaseMetadata {
+            isrc: "US-S1Z-26-00001".to_string(),
+            ..bad_meta
+        };
+        let missing_err = write_distrokid_metadata(&in_wav, &out_wav, &valid_meta)
+            .expect_err("missing input WAV must return an explicit error");
+        assert!(
+            matches!(missing_err, ForgeError::ReaperError(_) | ForgeError::Io(_)),
+            "unexpected error kind: {missing_err:?}"
+        );
     }
 }

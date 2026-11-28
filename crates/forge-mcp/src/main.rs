@@ -12,19 +12,21 @@ mod external;
 mod handlers;
 mod resources;
 mod sandbox;
+mod tasks;
 #[cfg(all(test, unix))]
 mod toctou_tests;
 mod tools;
 
 use clap::Parser;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use hyper_util::service::TowerToHyperService;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, GetPromptRequestParams, GetPromptResponse,
-    Implementation, ListPromptsResult, ListResourcesResult, ListToolsResult,
-    PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
-    ServerCapabilities, ServerConfig, Tool,
+    CallToolRequestParams, CallToolResponse, CancelTaskParams, GetPromptRequestParams,
+    GetPromptResponse, GetTaskParams, GetTaskResult, Implementation, ListPromptsResult,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
+    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities,
+    ServerConfig, TASKS_EXTENSION_ID, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::io::stdio_pipes;
@@ -34,9 +36,13 @@ use rmcp::transport::streamable_http_server::{
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
 use sandbox::PathSandbox;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::TcpListener;
+use std::time::Duration;
+use tasks::TaskRegistry;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, watch};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TransportMode {
@@ -44,6 +50,7 @@ enum TransportMode {
     Http {
         addr: SocketAddr,
         allow_non_loopback: bool,
+        stateless: bool,
     },
 }
 
@@ -57,6 +64,10 @@ struct McpCli {
     /// Allow binding Streamable HTTP to non-loopback addresses (requires FORGE_MCP_HTTP_TOKEN).
     #[arg(long)]
     allow_non_loopback: bool,
+
+    /// Serve Streamable HTTP in strict stateless JSON-response mode (2026-07-28 compliant).
+    #[arg(long)]
+    stateless: bool,
 }
 
 fn cli_to_transport_mode(cli: McpCli) -> Result<TransportMode, String> {
@@ -71,6 +82,7 @@ fn cli_to_transport_mode(cli: McpCli) -> Result<TransportMode, String> {
             Ok(TransportMode::Http {
                 addr,
                 allow_non_loopback: cli.allow_non_loopback,
+                stateless: cli.stateless,
             })
         }
     }
@@ -88,6 +100,7 @@ fn parse_cli_args(args: &[String]) -> Result<TransportMode, String> {
 struct ForgeMcpServer {
     sandbox: Arc<PathSandbox>,
     tools: Arc<Vec<Tool>>,
+    tasks: TaskRegistry,
 }
 
 impl ForgeMcpServer {
@@ -95,6 +108,51 @@ impl ForgeMcpServer {
         Self {
             sandbox,
             tools: Arc::new(tools::build_tools()),
+            tasks: TaskRegistry::default(),
+        }
+    }
+
+    async fn try_spawn_task(
+        &self,
+        name: &str,
+        args: &Value,
+        meta_wants_task: bool,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<Option<rmcp::model::CreateTaskResult>, McpError> {
+        let client_supports_tasks = context
+            .peer
+            .peer_info()
+            .is_some_and(|p| p.capabilities.supports_tasks());
+        let arg_wants_task = args
+            .get("async_task")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if client_supports_tasks && (meta_wants_task || arg_wants_task) {
+            let created = self
+                .tasks
+                .spawn_tool_task(name.to_string(), args.clone(), Arc::clone(&self.sandbox))
+                .await?;
+            Ok(Some(created))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn notify_tool_progress(
+        context: &RequestContext<RoleServer>,
+        token: Option<&rmcp::model::ProgressToken>,
+        progress: f64,
+        message: String,
+    ) {
+        if let Some(tok) = token {
+            let _ = context
+                .peer
+                .notify_progress(
+                    ProgressNotificationParam::new(tok.clone(), progress)
+                        .with_total(1.0)
+                        .with_message(message),
+                )
+                .await;
         }
     }
 }
@@ -106,6 +164,7 @@ impl ServerHandler for ForgeMcpServer {
                 .enable_tools()
                 .enable_resources()
                 .enable_prompts()
+                .enable_tasks()
                 .build(),
         )
         .with_protocol_version(ProtocolVersion::LATEST)
@@ -133,15 +192,59 @@ impl ServerHandler for ForgeMcpServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let name = request.name.into_owned();
+        let meta_wants_task = request
+            .meta
+            .as_ref()
+            .is_some_and(|m| m.0.contains_key(TASKS_EXTENSION_ID));
         let args = Value::Object(request.arguments.unwrap_or_default());
+        if let Some(task) = self
+            .try_spawn_task(&name, &args, meta_wants_task, &context)
+            .await?
+        {
+            return Ok(CallToolResponse::Task(task));
+        }
+        let progress_token = context.meta.get_progress_token();
+        Self::notify_tool_progress(
+            &context,
+            progress_token.as_ref(),
+            0.0,
+            format!("Starting {name}"),
+        )
+        .await;
         let sandbox = Arc::clone(&self.sandbox);
-        tokio::task::spawn_blocking(move || handlers::call_tool_result(&name, &args, &sandbox))
-            .await
-            .map(CallToolResponse::from)
-            .map_err(|e| McpError::internal_error(format!("Tool worker task failed: {e}"), None))
+        let tool_label = name.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            handlers::call_tool_result(&tool_label, &args, &sandbox)
+        })
+        .await
+        .map_err(|e| McpError::internal_error(format!("Tool worker task failed: {e}"), None))?;
+        Self::notify_tool_progress(
+            &context,
+            progress_token.as_ref(),
+            1.0,
+            format!("Completed {name}"),
+        )
+        .await;
+        Ok(CallToolResponse::from(res))
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, McpError> {
+        self.tasks.get_task(&request.task_id).await
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.tasks.cancel_task(&request.task_id).await
     }
 
     async fn list_resources(
@@ -182,12 +285,12 @@ impl ServerHandler for ForgeMcpServer {
 
 enum AuthBody<B> {
     Upstream(B),
-    Unauthorized(&'static [u8]),
+    Bytes(Cow<'static, [u8]>),
 }
 
 impl<B: hyper::body::Body + Unpin> hyper::body::Body for AuthBody<B>
 where
-    B::Data: From<&'static [u8]>,
+    B::Data: From<&'static [u8]> + From<Vec<u8>>,
 {
     type Data = B::Data;
     type Error = B::Error;
@@ -198,12 +301,15 @@ where
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
         match &mut *self {
             Self::Upstream(inner) => std::pin::Pin::new(inner).poll_frame(cx),
-            Self::Unauthorized(msg) => {
-                if msg.is_empty() {
+            Self::Bytes(bytes) => {
+                if bytes.is_empty() {
                     std::task::Poll::Ready(None)
                 } else {
-                    let slice = std::mem::take(msg);
-                    std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(slice.into()))))
+                    let frame_data = match std::mem::replace(bytes, Cow::Borrowed(b"")) {
+                        Cow::Borrowed(s) => s.into(),
+                        Cow::Owned(v) => v.into(),
+                    };
+                    std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(frame_data))))
                 }
             }
         }
@@ -212,14 +318,14 @@ where
     fn is_end_stream(&self) -> bool {
         match self {
             Self::Upstream(inner) => inner.is_end_stream(),
-            Self::Unauthorized(msg) => msg.is_empty(),
+            Self::Bytes(bytes) => bytes.is_empty(),
         }
     }
 
     fn size_hint(&self) -> hyper::body::SizeHint {
         match self {
             Self::Upstream(inner) => inner.size_hint(),
-            Self::Unauthorized(msg) => hyper::body::SizeHint::with_exact(msg.len() as u64),
+            Self::Bytes(bytes) => hyper::body::SizeHint::with_exact(bytes.len() as u64),
         }
     }
 }
@@ -272,13 +378,193 @@ fn resolve_http_policy(
     Ok((disable_host_check, secret))
 }
 
+fn parse_authority_host(authority: &str) -> Option<&str> {
+    if authority.contains('/')
+        || authority.contains('@')
+        || authority.contains('?')
+        || authority.contains('#')
+    {
+        return None;
+    }
+    if let Some(after_open) = authority.strip_prefix('[') {
+        let (ip6, port_part) = after_open.split_once(']')?;
+        if !port_part.is_empty()
+            && port_part
+                .strip_prefix(':')
+                .is_none_or(|p| p.parse::<u16>().is_err())
+        {
+            return None;
+        }
+        return Some(ip6);
+    }
+    match authority.rsplit_once(':') {
+        Some((h, p)) if p.parse::<u16>().is_ok() => Some(h),
+        Some(_) => None,
+        None => Some(authority),
+    }
+}
+
+fn is_allowed_loopback_origin(headers: &hyper::HeaderMap) -> bool {
+    let Some(val) = headers.get(hyper::header::ORIGIN) else {
+        return true;
+    };
+    let Ok(origin) = val.to_str() else {
+        return false;
+    };
+    let Some(authority) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let Some(host) = parse_authority_host(authority) else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+fn static_http_response<B>(
+    status: hyper::StatusCode,
+    bearer_challenge: Option<&str>,
+    body: &'static [u8],
+) -> hyper::Response<AuthBody<B>> {
+    let mut builder = hyper::Response::builder().status(status);
+    if let Some(challenge) = bearer_challenge {
+        builder = builder.header(hyper::header::WWW_AUTHENTICATE, challenge);
+    }
+    builder
+        .body(AuthBody::Bytes(Cow::Borrowed(body)))
+        .expect("valid HTTP response")
+}
+
+fn oauth_protected_resource_response<B>(
+    headers: &hyper::HeaderMap,
+    issuer: &str,
+) -> hyper::Response<AuthBody<B>> {
+    let host = headers
+        .get(hyper::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .filter(|h| !h.trim().is_empty())
+        .unwrap_or("127.0.0.1");
+    let resource_url = format!("http://{host}");
+    let payload = serde_json::json!({
+        "resource": resource_url,
+        "authorization_servers": [issuer],
+        "bearer_methods_supported": ["header"],
+    });
+    let bytes = serde_json::to_vec_pretty(&payload).unwrap_or_else(|_| b"{}".to_vec());
+    hyper::Response::builder()
+        .status(hyper::StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(AuthBody::Bytes(Cow::Owned(bytes)))
+        .expect("valid OAuth metadata response")
+}
+
+fn preflight_http_request<B>(
+    headers: &hyper::HeaderMap,
+    auth_header: Option<&str>,
+    enforce_loopback_origin: bool,
+    oauth_issuer: Option<&str>,
+) -> Option<hyper::Response<AuthBody<B>>> {
+    if enforce_loopback_origin && !is_allowed_loopback_origin(headers) {
+        return Some(static_http_response(
+            hyper::StatusCode::FORBIDDEN,
+            None,
+            b"Forbidden origin\n",
+        ));
+    }
+    if let Some(expected) = auth_header
+        && !check_bearer_auth(headers, expected)
+    {
+        let challenge = oauth_issuer.map_or_else(
+            || "Bearer".to_string(),
+            |_| {
+                let host = headers
+                    .get(hyper::header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .filter(|h| !h.trim().is_empty())
+                    .unwrap_or("127.0.0.1");
+                format!(
+                    "Bearer resource_metadata=\"http://{host}/.well-known/oauth-protected-resource\""
+                )
+            },
+        );
+        let builder = hyper::Response::builder()
+            .status(hyper::StatusCode::UNAUTHORIZED)
+            .header(hyper::header::WWW_AUTHENTICATE, challenge);
+        if let Ok(resp) = builder.body(AuthBody::Bytes(Cow::Borrowed(b"Unauthorized\n"))) {
+            return Some(resp);
+        }
+    }
+    None
+}
+
+async fn serve_http_connection(
+    stream: TcpStream,
+    svc: TowerToHyperService<StreamableHttpService<ForgeMcpServer, LocalSessionManager>>,
+    auth_header: Option<Arc<str>>,
+    enforce_loopback_origin: bool,
+    oauth_issuer: Option<Arc<str>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    _permit: OwnedSemaphorePermit,
+) {
+    let io = TokioIo::new(stream);
+    let hyper_svc =
+        hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+            let svc = svc.clone();
+            let auth_header = auth_header.clone();
+            let oauth_issuer = oauth_issuer.clone();
+            async move {
+                if req.method() == hyper::Method::GET
+                    && req.uri().path() == "/.well-known/oauth-protected-resource"
+                    && let Some(issuer) = oauth_issuer.as_deref()
+                {
+                    return Ok::<_, std::convert::Infallible>(oauth_protected_resource_response(
+                        req.headers(),
+                        issuer,
+                    ));
+                }
+                if let Some(denied) = preflight_http_request(
+                    req.headers(),
+                    auth_header.as_deref(),
+                    enforce_loopback_origin,
+                    oauth_issuer.as_deref(),
+                ) {
+                    return Ok::<_, std::convert::Infallible>(denied);
+                }
+                let resp = hyper::service::Service::call(&svc, req)
+                    .await
+                    .expect("TowerToHyperService error is Infallible");
+                Ok::<_, std::convert::Infallible>(resp.map(AuthBody::Upstream))
+            }
+        });
+    let mut builder = AutoServerBuilder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(30));
+    let conn = builder.serve_connection(io, hyper_svc);
+    tokio::select! {
+        res = conn => {
+            if let Err(err) = res {
+                eprintln!("forge-mcp: HTTP connection error: {err}");
+            }
+        }
+        _ = shutdown_rx.wait_for(|&closed| closed) => {}
+    }
+}
+
 async fn run_http_on_listener(
     server: ForgeMcpServer,
     listener: TcpListener,
     mut config: StreamableHttpServerConfig,
     expected_secret: Option<Arc<str>>,
+    enforce_loopback_origin: bool,
+    oauth_issuer: Option<Arc<str>>,
 ) {
     let ct = config.cancellation_token.clone();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(64));
     let mcp_svc = TowerToHyperService::new(StreamableHttpService::new(
         move || Ok(server.clone()),
         Arc::new(LocalSessionManager::default()),
@@ -291,58 +577,40 @@ async fn run_http_on_listener(
                 let Ok((stream, _)) = accepted else {
                     break;
                 };
-                let svc = mcp_svc.clone();
-                let auth_header = expected_secret.clone();
-                let conn_ct = ct.child_token();
-                tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let hyper_svc = hyper::service::service_fn(
-                        move |req: hyper::Request<hyper::body::Incoming>| {
-                            let svc = svc.clone();
-                            let auth_header = auth_header.clone();
-                            async move {
-                                if let Some(ref expected) = auth_header
-                                    && !check_bearer_auth(req.headers(), expected)
-                                {
-                                    let resp = hyper::Response::builder()
-                                        .status(hyper::StatusCode::UNAUTHORIZED)
-                                        .header(hyper::header::WWW_AUTHENTICATE, "Bearer")
-                                        .body(AuthBody::Unauthorized(b"Unauthorized\n"))
-                                        .expect("valid 401 response");
-                                    return Ok::<_, std::convert::Infallible>(resp);
-                                }
-                                let resp = hyper::service::Service::call(&svc, req)
-                                    .await
-                                    .expect("TowerToHyperService error is Infallible");
-                                Ok::<_, std::convert::Infallible>(resp.map(AuthBody::Upstream))
-                            }
-                        },
-                    );
-                    let builder = AutoServerBuilder::new(TokioExecutor::new());
-                    let conn = builder.serve_connection(io, hyper_svc);
-                    tokio::select! {
-                        res = conn => {
-                            if let Err(err) = res {
-                                eprintln!("forge-mcp: HTTP connection error: {err}");
-                            }
-                        }
-                        _ = conn_ct.cancelled() => {}
-                    }
-                });
+                let Ok(permit) = conn_limit.clone().try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
+                tokio::spawn(serve_http_connection(
+                    stream,
+                    mcp_svc.clone(),
+                    expected_secret.clone(),
+                    enforce_loopback_origin,
+                    oauth_issuer.clone(),
+                    shutdown_rx.clone(),
+                    permit,
+                ));
             }
         }
     }
+    let _ = shutdown_tx.send(true);
 }
 
 async fn run_http(
     server: ForgeMcpServer,
     addr: SocketAddr,
     allow_non_loopback: bool,
+    stateless: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let raw_secret = std::env::var("FORGE_MCP_HTTP_TOKEN").ok();
     let (disable_host_check, secret) =
         resolve_http_policy(addr, allow_non_loopback, raw_secret.as_deref())
             .map_err(std::io::Error::other)?;
+    let oauth_issuer = std::env::var("FORGE_MCP_OAUTH_ISSUER")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(Arc::<str>::from);
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
     eprintln!("forge-mcp: Streamable HTTP listening on http://{local_addr}");
@@ -350,12 +618,24 @@ async fn run_http(
     if disable_host_check {
         config = config.disable_allowed_hosts();
     }
+    if stateless {
+        config.legacy_session_mode = false;
+        config.json_response = true;
+    }
     let shutdown_ct = config.cancellation_token.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         shutdown_ct.cancel();
     });
-    run_http_on_listener(server, listener, config, secret.map(Arc::<str>::from)).await;
+    run_http_on_listener(
+        server,
+        listener,
+        config,
+        secret.map(Arc::<str>::from),
+        !disable_host_check,
+        oauth_issuer,
+    )
+    .await;
     Ok(())
 }
 
@@ -404,8 +684,9 @@ async fn main() {
         TransportMode::Http {
             addr,
             allow_non_loopback,
+            stateless,
         } => {
-            if let Err(e) = run_http(server, addr, allow_non_loopback).await {
+            if let Err(e) = run_http(server, addr, allow_non_loopback, stateless).await {
                 eprintln!("forge-mcp: HTTP server failure: {e}");
                 std::process::exit(1);
             }
@@ -1087,7 +1368,7 @@ mod tests {
         )
         .await;
         let listed_tools = list["result"]["tools"].as_array().unwrap();
-        assert_eq!(listed_tools.len(), 18);
+        assert_eq!(listed_tools.len(), 20);
         assert!(listed_tools[0]["outputSchema"].is_object());
         assert!(listed_tools[0]["annotations"].is_object());
         assert!(list["result"]["ttlMs"].is_number());
@@ -1122,7 +1403,7 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(res_list["result"]["resources"].as_array().unwrap().len(), 3);
+        assert_eq!(res_list["result"]["resources"].as_array().unwrap().len(), 4);
 
         for uri in ["forge://targets", "forge://models", "forge://roots"] {
             let read = rpc_roundtrip(
@@ -1237,7 +1518,7 @@ mod tests {
             )
             .await;
             assert!(list["result"].get("resultType").is_none(), "{list}");
-            assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 18);
+            assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 20);
 
             let call = rpc_roundtrip(
                 &mut client_write,
@@ -1287,7 +1568,15 @@ mod tests {
         let config = StreamableHttpServerConfig::default();
         let ct = config.cancellation_token.clone();
         let handle = tokio::spawn(async move {
-            run_http_on_listener(server, listener, config, Some(Arc::from("s3cr3t"))).await;
+            run_http_on_listener(
+                server,
+                listener,
+                config,
+                Some(Arc::from("s3cr3t")),
+                true,
+                None,
+            )
+            .await;
         });
 
         async fn send_http(addr: SocketAddr, req_head: &str) -> String {
@@ -1323,6 +1612,30 @@ mod tests {
         assert!(
             bad_host.starts_with("HTTP/1.1 403 ") || bad_host.starts_with("HTTP/1.1 421 "),
             "expected Host rejection on loopback, got: {bad_host}"
+        );
+
+        let bad_origin = send_http(
+            local_addr,
+            &format!(
+                "POST / HTTP/1.1\r\nHost: {local_addr}\r\nOrigin: https://evil.example\r\nConnection: close\r\nAuthorization: Bearer s3cr3t\r\nContent-Length: 0\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            bad_origin.starts_with("HTTP/1.1 403 "),
+            "expected Origin rejection on loopback, got: {bad_origin}"
+        );
+
+        let good_origin = send_http(
+            local_addr,
+            &format!(
+                "POST / HTTP/1.1\r\nHost: {local_addr}\r\nOrigin: http://127.0.0.1:3000\r\nConnection: close\r\nAuthorization: Bearer s3cr3t\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: 2\r\n\r\n{{}}"
+            ),
+        )
+        .await;
+        assert!(
+            !good_origin.starts_with("HTTP/1.1 401 ") && !good_origin.starts_with("HTTP/1.1 403 "),
+            "loopback Origin was unexpectedly rejected: {good_origin}"
         );
 
         let valid_auth = send_http(
@@ -1427,6 +1740,334 @@ mod tests {
         assert!(
             rpp.contains("LENGTH 2.0000"),
             "expected 2.0 s LENGTH even at 48k session SR: {rpp}"
+        );
+    }
+
+    #[test]
+    fn daw_inspect_resolves_relative_clip_paths_from_project_dir_inside_sandbox() {
+        let (_root, sb) = setup_mix_sandbox(0.05, 48_000);
+        let sub_dir = _root.path().join("session");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let wav_buf = AudioBuffer::new(2, 4_800, 48_000).unwrap();
+        let rel_wav = Path::new("stems").join("clip.wav");
+        std::fs::create_dir_all(sub_dir.join("stems")).unwrap();
+        wav_buf.save_wav(sub_dir.join(&rel_wav), 24).unwrap();
+
+        let mut proj = forge_engine::DawProject::new("RelTest", 48_000, 120.0);
+        let obj_id = proj.alloc_id();
+        proj.tracks[0].objects.push(forge_engine::AudioObject::new(
+            obj_id, "Clip", rel_wav, 4_800,
+        ));
+        let proj_path = sub_dir.join("test.forgeproj");
+        proj.save_to_file(&proj_path).unwrap();
+
+        let out = call_tool(
+            &sb,
+            "forge_daw_inspect",
+            json!({ "project": proj_path.to_string_lossy() }),
+        );
+        assert!(!is_error(&out), "inspect failed: {}", text(&out));
+        let payload: Value = serde_json::from_str(text(&out)).expect("inspect JSON");
+        let missing = payload["missing_clips"].as_array().unwrap();
+        assert!(missing.is_empty(), "unexpected missing clips: {missing:?}");
+    }
+
+    #[tokio::test]
+    async fn task_registry_lifecycle_complete_cancel_and_unknown() {
+        use rmcp::model::{TaskPayload, TaskStatus};
+
+        let (_root, sb) = setup_mix_sandbox(0.05, 48_000);
+        let sb = Arc::new(sb);
+        let registry = TaskRegistry::default();
+
+        let created = registry
+            .spawn_tool_task(
+                "forge_audit".to_string(),
+                json!({ "input": "mix.wav" }),
+                Arc::clone(&sb),
+            )
+            .await
+            .expect("spawn_tool_task");
+        let task_id = created.task.task_id.clone();
+
+        let mut final_res = None;
+        for _ in 0..100 {
+            let res = registry.get_task(&task_id).await.expect("get_task");
+            if res.task.status() != TaskStatus::Working {
+                final_res = Some(res);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let finished = final_res.expect("task should complete within timeout");
+        assert_eq!(finished.task.status(), TaskStatus::Completed);
+        assert!(matches!(
+            finished.task.payload,
+            TaskPayload::Completed { .. }
+        ));
+
+        let c_created = registry
+            .spawn_tool_task(
+                "forge_audit".to_string(),
+                json!({ "input": "mix.wav" }),
+                Arc::clone(&sb),
+            )
+            .await
+            .expect("spawn cancellable task");
+        registry
+            .cancel_task(&c_created.task.task_id)
+            .await
+            .expect("cancel_task");
+        let cancelled = registry
+            .get_task(&c_created.task.task_id)
+            .await
+            .expect("get_task after cancel");
+        assert_eq!(cancelled.task.status(), TaskStatus::Cancelled);
+
+        assert!(registry.get_task("missing-task").await.is_err());
+        assert!(registry.cancel_task("missing-task").await.is_err());
+    }
+
+    #[test]
+    fn stateless_cli_flag_parses_into_http_transport_mode() {
+        let mode = parse_cli_args(&[
+            "--http".to_string(),
+            "127.0.0.1:8088".to_string(),
+            "--stateless".to_string(),
+        ])
+        .expect("parse --stateless HTTP mode");
+        assert_eq!(
+            mode,
+            TransportMode::Http {
+                addr: "127.0.0.1:8088".parse().unwrap(),
+                allow_non_loopback: false,
+                stateless: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_protected_resource_metadata_endpoint_serves_rfc9728_json() {
+        use tokio::io::AsyncReadExt;
+
+        let (_root, sb) = setup_mix_sandbox(0.05, 48_000);
+        let server = ForgeMcpServer::new(Arc::new(sb));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let config = StreamableHttpServerConfig::default();
+        let ct = config.cancellation_token.clone();
+        let handle = tokio::spawn(async move {
+            run_http_on_listener(
+                server,
+                listener,
+                config,
+                Some(Arc::from("oauth-token")),
+                true,
+                Some(Arc::from("https://auth.example.com")),
+            )
+            .await;
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(local_addr).await.unwrap();
+        let req = format!(
+            "GET /.well-known/oauth-protected-resource HTTP/1.1\r\nHost: {local_addr}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let raw = String::from_utf8_lossy(&buf);
+
+        assert!(raw.starts_with("HTTP/1.1 200 "), "got: {raw}");
+        let body_str = raw.split("\r\n\r\n").nth(1).expect("HTTP body");
+        let meta: Value = serde_json::from_str(body_str).expect("RFC 9728 JSON");
+        assert_eq!(
+            meta["authorization_servers"],
+            json!(["https://auth.example.com"])
+        );
+        assert!(
+            meta["resource"]
+                .as_str()
+                .is_some_and(|r| r.contains(&local_addr.to_string())),
+            "missing resource URL in {meta}"
+        );
+
+        let mut unauth_stream = tokio::net::TcpStream::connect(local_addr).await.unwrap();
+        let unauth_req = format!(
+            "POST / HTTP/1.1\r\nHost: {local_addr}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        );
+        unauth_stream
+            .write_all(unauth_req.as_bytes())
+            .await
+            .unwrap();
+        unauth_stream.flush().await.unwrap();
+        let mut unauth_buf = Vec::new();
+        unauth_stream.read_to_end(&mut unauth_buf).await.unwrap();
+        let unauth_raw = String::from_utf8_lossy(&unauth_buf);
+        assert!(unauth_raw.starts_with("HTTP/1.1 401 "), "got: {unauth_raw}");
+        assert!(
+            unauth_raw.contains("resource_metadata=\"http://"),
+            "expected RFC 9728 WWW-Authenticate header in: {unauth_raw}"
+        );
+
+        ct.cancel();
+        let _ = handle.await;
+    }
+
+    #[test]
+    fn audit_dashboard_app_resource_returns_html() {
+        let (_root, sb) = setup_mix_sandbox(0.05, 48_000);
+        let list = resources::list_resources();
+        assert!(list.iter().any(|r| r.uri == "forge://apps/audit-dashboard"));
+
+        let res = resources::read_resource("forge://apps/audit-dashboard", &sb)
+            .expect("read audit-dashboard resource");
+        let content = res.contents.first().expect("resource content");
+        let json_val = serde_json::to_value(content).expect("serialize resource content");
+        assert_eq!(json_val["mimeType"], json!("text/html;profile=mcp-app"));
+        assert!(
+            json_val["text"]
+                .as_str()
+                .is_some_and(|html| html.contains("ForgeAudio Studio Telemetry")),
+            "unexpected dashboard HTML: {json_val}"
+        );
+    }
+
+    #[test]
+    fn ingest_tool_schema_exposes_stems_quality_and_drum_sep() {
+        let all = tools::build_tools();
+        let ingest = all
+            .iter()
+            .find(|t| t.name.as_ref() == "forge_ingest_to_reaper")
+            .expect("forge_ingest_to_reaper schema");
+        let props = ingest
+            .input_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("schema properties");
+        assert!(props.contains_key("stems"));
+        assert!(props.contains_key("quality"));
+        assert!(props.contains_key("drum_sep"));
+    }
+
+    #[test]
+    fn f0_track_rust_fallback_and_abc_input_compile_midi() {
+        let (root, sb) = setup_mix_sandbox(0.25, 48_000);
+        let sr = 48_000_u32;
+        let frames = sr as usize;
+        let mono: Vec<f64> = (0..frames)
+            .map(|i| 0.35 * (2.0 * std::f64::consts::PI * 220.0 * (i as f64) / f64::from(sr)).sin())
+            .collect();
+        AudioBuffer::from_channels(vec![mono.clone(), mono], sr)
+            .expect("voc")
+            .save_wav(root.path().join("voc.wav"), 24)
+            .expect("save voc");
+
+        let f0 = call_tool(
+            &sb,
+            "forge_f0_track",
+            json!({ "input": "voc.wav", "backend": "rust" }),
+        );
+        assert!(!is_error(&f0), "forge_f0_track failed: {}", text(&f0));
+        let f0_json: Value = serde_json::from_str(text(&f0)).expect("f0 JSON");
+        assert_eq!(f0_json["backend"], json!("rust-yin"));
+        assert!(
+            f0_json["voiced_ratio"].as_f64().is_some_and(|v| v > 0.5),
+            "expected voiced frames in {f0_json}"
+        );
+
+        let abc_out = call_tool(
+            &sb,
+            "forge_music_theory_midi",
+            json!({
+                "abc_input": "X:1\nM:4/4\nL:1/4\nK:C\n\"C\"C E G c |\n",
+                "output_midi": "abc.mid",
+                "bpm": 120.0
+            }),
+        );
+        assert!(!is_error(&abc_out), "abc_input failed: {}", text(&abc_out));
+        assert!(root.path().join("abc.mid").exists());
+    }
+
+    fn push_mcp_wav_chunk(out: &mut Vec<u8>, id: &[u8; 4], payload: &[u8]) {
+        out.extend_from_slice(id);
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        if payload.len() % 2 == 1 {
+            out.push(0);
+        }
+    }
+
+    fn write_mcp_adm_object_wav(path: &std::path::Path) {
+        let sr = 48_000_u32;
+        let frames = sr as usize;
+        let mut pcm = Vec::with_capacity(frames * 3);
+        for i in 0..frames {
+            let s = 0.04 * (2.0 * std::f64::consts::PI * 1000.0 * (i as f64) / f64::from(sr)).sin();
+            let q = (s * 8_388_607.0).round() as i32;
+            pcm.extend_from_slice(&q.to_le_bytes()[0..3]);
+        }
+        let mut chunks = Vec::new();
+        let mut fmt = Vec::with_capacity(16);
+        fmt.extend_from_slice(&1_u16.to_le_bytes());
+        fmt.extend_from_slice(&1_u16.to_le_bytes());
+        fmt.extend_from_slice(&sr.to_le_bytes());
+        fmt.extend_from_slice(&(sr * 3).to_le_bytes());
+        fmt.extend_from_slice(&3_u16.to_le_bytes());
+        fmt.extend_from_slice(&24_u16.to_le_bytes());
+        push_mcp_wav_chunk(&mut chunks, b"fmt ", &fmt);
+        let mut chna = vec![0_u8; 44];
+        chna[0..2].copy_from_slice(&1_u16.to_le_bytes());
+        chna[2..4].copy_from_slice(&1_u16.to_le_bytes());
+        chna[4..6].copy_from_slice(&1_u16.to_le_bytes());
+        chna[6..18].copy_from_slice(b"ATU_00000010");
+        chna[18..32].copy_from_slice(b"AT_00031001_01");
+        chna[32..43].copy_from_slice(b"AP_00031001");
+        push_mcp_wav_chunk(&mut chunks, b"chna", &chna);
+        let axml = br#"<ebuCoreMain><audioFormatExtended><audioProgramme audioProgrammeID="APR_1"><audioContentIDRef>ACO_1</audioContentIDRef></audioProgramme><audioContent audioContentID="ACO_1"><audioObjectIDRef>AO_1</audioObjectIDRef></audioContent><audioObject audioObjectID="AO_1"><audioPackFormatIDRef>AP_00031001</audioPackFormatIDRef><audioTrackUIDRef>ATU_00000010</audioTrackUIDRef></audioObject><audioPackFormat audioPackFormatID="AP_00031001" typeDefinition="Objects"><audioChannelFormatIDRef>AC_00031001</audioChannelFormatIDRef></audioPackFormat><audioChannelFormat audioChannelFormatID="AC_00031001" typeDefinition="Objects"><audioBlockFormat rtime="00:00:00.00000"><position coordinate="azimuth">90.0</position><position coordinate="elevation">0.0</position></audioBlockFormat></audioChannelFormat><audioTrackFormat audioTrackFormatID="AT_00031001_01"><audioStreamFormatIDRef>AS_00031001</audioStreamFormatIDRef></audioTrackFormat><audioStreamFormat audioStreamFormatID="AS_00031001"><audioChannelFormatIDRef>AC_00031001</audioChannelFormatIDRef><audioPackFormatIDRef>AP_00031001</audioPackFormatIDRef></audioStreamFormat><audioTrackUID UID="ATU_00000010"><audioTrackFormatIDRef>AT_00031001_01</audioTrackFormatIDRef><audioPackFormatIDRef>AP_00031001</audioPackFormatIDRef></audioTrackUID></audioFormatExtended></ebuCoreMain>"#;
+        push_mcp_wav_chunk(&mut chunks, b"axml", axml);
+        push_mcp_wav_chunk(&mut chunks, b"data", &pcm);
+        let mut wav = Vec::with_capacity(12 + chunks.len());
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&((4 + chunks.len()) as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(&chunks);
+        std::fs::write(path, wav).expect("write adm wav");
+    }
+
+    #[test]
+    fn spatial_qc_renders_objects_and_marks_no_render_unverified() {
+        let (root, sb) = setup_mix_sandbox(0.25, 48_000);
+        write_mcp_adm_object_wav(&root.path().join("obj.wav"));
+
+        let rendered = call_tool(
+            &sb,
+            "forge_spatial_qc",
+            json!({ "input": "obj.wav", "reference_layout": "7.1.4", "render_objects": true }),
+        );
+        assert!(!is_error(&rendered), "{}", text(&rendered));
+        let rj: Value = serde_json::from_str(text(&rendered)).unwrap();
+        assert_eq!(rj["programme_kind"], "ObjectOnly");
+        assert_eq!(rj["loudness_status"], "VerifiedRenderedObjects");
+        assert!(rj["integrated_lkfs"].as_f64().is_some());
+        assert!(rj["preliminary_qc_passed"].as_bool().unwrap());
+
+        let no_render = call_tool(
+            &sb,
+            "forge_spatial_qc",
+            json!({ "input": "obj.wav", "render_objects": false }),
+        );
+        assert!(!is_error(&no_render), "{}", text(&no_render));
+        let nj: Value = serde_json::from_str(text(&no_render)).unwrap();
+        assert_eq!(nj["loudness_status"], "UnverifiedNoRenderer");
+        assert!(nj["integrated_lkfs"].is_null());
+        assert!(!nj["preliminary_qc_passed"].as_bool().unwrap());
+
+        assert_tool_err_contains(
+            &sb,
+            "forge_spatial_qc",
+            json!({ "input": "obj.wav", "reference_layout": "22.2" }),
+            "Unsupported reference_layout",
         );
     }
 }

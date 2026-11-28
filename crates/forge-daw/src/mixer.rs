@@ -50,7 +50,13 @@ impl ForgeDawApp {
                         .max_width((ui.available_width() - 320.0).max(200.0))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                let first_aux_id = self.project.aux_buses.first().map(|b| b.id);
+                                let aux_meta: Vec<(u64, String)> = self
+                                    .project
+                                    .aux_buses
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, b)| (b.id, format!("Aux{}", i + 1)))
+                                    .collect();
                                 for (ti, tr) in self.project.tracks.iter_mut().enumerate() {
                                     ui.group(|ui| {
                                         ui.set_width(120.0);
@@ -92,26 +98,28 @@ impl ForgeDawApp {
                                                     .text("Pan"),
                                             )
                                             .changed();
-                                        if let Some(aux_id) = first_aux_id {
+                                        for (aux_id, aux_lbl) in &aux_meta {
                                             let mut send_db = tr
                                                 .sends
                                                 .iter()
-                                                .find(|s| s.bus_id == aux_id)
+                                                .find(|s| s.bus_id == *aux_id)
                                                 .map_or(-60.0, |s| s.gain_db);
                                             if ui
                                                 .add(
                                                     egui::Slider::new(&mut send_db, -60.0..=6.0)
-                                                        .text("Aux1"),
+                                                        .text(aux_lbl.as_str()),
                                                 )
                                                 .changed()
                                             {
-                                                if let Some(s) =
-                                                    tr.sends.iter_mut().find(|s| s.bus_id == aux_id)
+                                                if let Some(s) = tr
+                                                    .sends
+                                                    .iter_mut()
+                                                    .find(|s| s.bus_id == *aux_id)
                                                 {
                                                     s.gain_db = send_db;
                                                 } else {
                                                     tr.sends.push(TrackSend {
-                                                        bus_id: aux_id,
+                                                        bus_id: *aux_id,
                                                         gain_db: send_db,
                                                         pre_fader: false,
                                                         mute: false,
@@ -151,6 +159,12 @@ impl ForgeDawApp {
                                             .add(
                                                 egui::Slider::new(&mut bus.gain_db, -48.0..=12.0)
                                                     .text("Ret"),
+                                            )
+                                            .changed();
+                                        changed |= ui
+                                            .add(
+                                                egui::Slider::new(&mut bus.pan, -1.0..=1.0)
+                                                    .text("Pan"),
                                             )
                                             .changed();
                                     });

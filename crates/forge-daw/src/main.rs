@@ -14,15 +14,19 @@ use std::path::PathBuf;
 mod fx_ui;
 mod gpu;
 mod inspector;
+mod io_jobs;
 mod mixer;
+mod timeline;
 
 use eframe::egui;
 use forge_core::AudioBuffer;
 use forge_engine::{
     AudioObject, BeatGridReport, ClipCache, DawProject, FxSlotConfig, LiveAudioEngine,
-    LiveRecorder, MidiClip, ObjectOrientedEngine, TimelineMarker, UndoStack,
+    LiveRecorder, MidiClip, TimelineMarker, UndoStack,
 };
 use gpu::{build_native_options, configure_studio_theme, detect_gpu_label};
+use io_jobs::{IoJobOutcome, unique_job_media_dir};
+use timeline::{AutoLaneMode, DragTarget};
 
 fn main() -> eframe::Result {
     let primary = build_native_options(eframe::Renderer::Wgpu);
@@ -172,37 +176,40 @@ pub(crate) fn stage_selected_object_wav(
 }
 
 struct ForgeDawApp {
-    project: DawProject,
-    undo: UndoStack,
-    cache: ClipCache,
-    audio: Option<LiveAudioEngine>,
-    recorder: Option<LiveRecorder>,
-    selected_track_idx: usize,
-    selected_object_id: Option<u64>,
-    selected_midi_clip_id: Option<u64>,
-    inspector_tab: InspectorTab,
-    active_drag: Option<(usize, u64, DragMode)>,
-    drag_anchor_samples: u64,
-    drag_anchor_x: f32,
-    snap_grid: SnapGrid,
-    auto_crossfade: bool,
-    pixels_per_sec: f32,
-    scroll_secs: f32,
-    import_path_buf: String,
-    project_path_buf: String,
-    bounce_path_buf: String,
-    gpu_backend_label: String,
-    status_line: String,
-    show_mixer: bool,
-    pointer_down: bool,
-    undo_gesture_active: bool,
-    piano_roll_base_octave: u8,
-    piano_roll_bar: u64,
-    stem_split_rx:
+    pub(crate) project: DawProject,
+    pub(crate) undo: UndoStack,
+    pub(crate) cache: ClipCache,
+    pub(crate) audio: Option<LiveAudioEngine>,
+    pub(crate) recorder: Option<LiveRecorder>,
+    pub(crate) selected_track_idx: usize,
+    pub(crate) selected_object_id: Option<u64>,
+    pub(crate) selected_midi_clip_id: Option<u64>,
+    pub(crate) inspector_tab: InspectorTab,
+    pub(crate) active_drag: Option<(usize, DragTarget, DragMode)>,
+    pub(crate) drag_anchor_samples: u64,
+    pub(crate) drag_anchor_x: f32,
+    pub(crate) snap_grid: SnapGrid,
+    pub(crate) auto_crossfade: bool,
+    pub(crate) auto_lane_mode: AutoLaneMode,
+    pub(crate) pixels_per_sec: f32,
+    pub(crate) scroll_secs: f32,
+    pub(crate) import_path_buf: String,
+    pub(crate) project_path_buf: String,
+    pub(crate) bounce_path_buf: String,
+    pub(crate) gpu_backend_label: String,
+    pub(crate) status_line: String,
+    pub(crate) show_mixer: bool,
+    pub(crate) pointer_down: bool,
+    pub(crate) undo_gesture_active: bool,
+    pub(crate) piano_roll_base_octave: u8,
+    pub(crate) piano_roll_bar: u64,
+    pub(crate) stem_split_rx:
         Option<std::sync::mpsc::Receiver<Result<(u64, forge_worker::SeparationReport), String>>>,
-    ai_job_rx: Option<std::sync::mpsc::Receiver<Result<AiJobOutcome, String>>>,
-    ai_job_label: String,
-    ai_audit_summary: String,
+    pub(crate) ai_job_rx: Option<std::sync::mpsc::Receiver<Result<AiJobOutcome, String>>>,
+    pub(crate) ai_job_label: String,
+    pub(crate) ai_audit_summary: String,
+    pub(crate) io_job_rx: Option<std::sync::mpsc::Receiver<Result<IoJobOutcome, String>>>,
+    pub(crate) io_job_label: String,
 }
 
 impl ForgeDawApp {
@@ -249,6 +256,7 @@ impl ForgeDawApp {
             drag_anchor_x: 0.0,
             snap_grid: SnapGrid::Quarter,
             auto_crossfade: true,
+            auto_lane_mode: AutoLaneMode::Volume,
             pixels_per_sec: 120.0,
             scroll_secs: 0.0,
             import_path_buf: String::new(),
@@ -265,10 +273,12 @@ impl ForgeDawApp {
             ai_job_rx: None,
             ai_job_label: String::new(),
             ai_audit_summary: String::new(),
+            io_job_rx: None,
+            io_job_label: String::new(),
         }
     }
 
-    fn commit_project_change(&mut self, prev: DawProject) {
+    pub(crate) fn commit_project_change(&mut self, prev: DawProject) {
         if self.pointer_down || self.undo_gesture_active {
             if !self.undo_gesture_active {
                 self.undo.push(prev);
@@ -286,19 +296,19 @@ impl ForgeDawApp {
         }
     }
 
-    fn playhead_samples(&self) -> u64 {
+    pub(crate) fn playhead_samples(&self) -> u64 {
         self.audio
             .as_ref()
             .map_or(0, LiveAudioEngine::playhead_samples)
     }
 
-    fn set_playhead_samples(&self, pos: u64) {
+    pub(crate) fn set_playhead_samples(&self, pos: u64) {
         if let Some(ref eng) = self.audio {
             eng.seek(pos);
         }
     }
 
-    fn project_media_dir(&self) -> PathBuf {
+    pub(crate) fn project_media_dir(&self) -> PathBuf {
         let proj = PathBuf::from(self.project_path_buf.trim());
         let parent = proj
             .parent()
@@ -359,81 +369,22 @@ impl ForgeDawApp {
     }
 
     fn import_wav_to_selected_track(&mut self) {
-        let raw = self.import_path_buf.trim().to_string();
-        if raw.is_empty() {
-            self.status_line = "Enter a WAV/audio file path to import".to_string();
-            return;
-        }
-        let path = PathBuf::from(&raw);
-        match self
-            .cache
-            .load_clip_for_rate(&path, self.project.sample_rate)
-        {
-            Ok(buf) => {
-                let prev = self.project.clone();
-                if self.project.tracks.is_empty() {
-                    self.project.add_track("01 Audio Track");
-                }
-                let id = self.project.alloc_id();
-                let name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("Clip")
-                    .to_string();
-                let mut obj = AudioObject::new(id, name, path, buf.num_frames() as u64);
-                obj.timeline_start_samples = self.playhead_samples();
-                let tr_idx = self
-                    .selected_track_idx
-                    .min(self.project.tracks.len().saturating_sub(1));
-                self.project.tracks[tr_idx].objects.push(obj);
-                self.selected_object_id = Some(id);
-                self.commit_project_change(prev);
-                self.status_line = format!(
-                    "Imported '{}' ({} Hz) onto track {}",
-                    raw,
-                    self.project.sample_rate,
-                    tr_idx + 1
-                );
-            }
-            Err(e) => {
-                self.status_line = format!("Import failed: {e}");
-            }
-        }
+        self.start_import_audio_job();
     }
 
     fn toggle_record(&mut self) {
-        if let Some(rec) = self.recorder.take() {
-            let rec_track_idx = rec.track_idx();
-            let start_pos = rec.start_timeline_samples();
-            let id = self.project.alloc_id();
-            let media_dir = self.project_media_dir();
-            let out_wav = media_dir.join(format!("recording_{id}.wav"));
-            match rec.stop_and_save(&out_wav, self.project.sample_rate) {
-                Ok(buf) => {
-                    let prev = self.project.clone();
-                    if self.project.tracks.is_empty() {
-                        self.project.add_track("Recorded Track");
-                    }
-                    let tr_idx = rec_track_idx.min(self.project.tracks.len().saturating_sub(1));
-                    let len = buf.num_frames() as u64;
-                    self.cache.insert_memory_clip(out_wav.clone(), buf);
-                    let mut obj = AudioObject::new(id, format!("Take {id}"), out_wav, len);
-                    obj.timeline_start_samples = start_pos;
-                    self.project.tracks[tr_idx].objects.push(obj);
-                    self.selected_object_id = Some(id);
-                    self.commit_project_change(prev);
-                    self.status_line = format!(
-                        "Recorded {:.2}s onto track {}",
-                        (len as f64) / f64::from(self.project.sample_rate.max(1)),
-                        tr_idx + 1
-                    );
-                }
-                Err(e) => {
-                    self.status_line = format!("Recording failed: {e}");
-                }
+        if self.recorder.is_some() {
+            if self.is_io_busy() {
+                self.status_line = format!(
+                    "Wait for '{}' to finish before stopping recording (take preserved)",
+                    self.io_job_label
+                );
+                return;
             }
-            if let Some(ref eng) = self.audio {
-                eng.set_playing(false);
+            if let Some(rec) = self.recorder.take()
+                && let Err(rec) = self.start_save_recording_job(rec)
+            {
+                self.recorder = Some(*rec);
             }
         } else {
             if self.project.tracks.is_empty() {
@@ -465,12 +416,12 @@ impl ForgeDawApp {
         }
     }
 
-    fn start_stem_split_for_object(&mut self, obj_id: u64) {
+    pub(crate) fn start_stem_split_for_object(&mut self, obj_id: u64) {
         if self.stem_split_rx.is_some() {
             self.status_line = "Stem separation already running in background...".to_string();
             return;
         }
-        let Some((src_path, start_pos, obj_name)) = self
+        let Some((src_path, start_pos, src_offset, obj_len, time_stretch, obj_name)) = self
             .project
             .tracks
             .iter()
@@ -480,13 +431,18 @@ impl ForgeDawApp {
                 (
                     o.source_path.clone(),
                     o.timeline_start_samples,
+                    o.source_offset_samples,
+                    o.length_samples,
+                    o.time_stretch,
                     o.name.clone(),
                 )
             })
         else {
             return;
         };
-        let out_dir = self.project_media_dir().join(format!("stems_{obj_id}"));
+        let job_id = self.project.alloc_id();
+        let out_dir = unique_job_media_dir(&self.project_media_dir(), "stems", obj_id, job_id);
+        let proj_sr = self.project.sample_rate;
         let (tx, rx) = std::sync::mpsc::channel();
         self.stem_split_rx = Some(rx);
         self.status_line = format!("Splitting '{obj_name}' (6-Stem Studio RoFormer cascade)...");
@@ -496,9 +452,19 @@ impl ForgeDawApp {
             cfg.stems = 6;
             cfg.quality = forge_worker::SeparationQuality::Studio;
             cfg.dereverb = true;
-            let res = forge_worker::separate_stems(&src_path, &out_dir, &cfg)
-                .map(|report| (start_pos, report))
-                .map_err(|e| e.to_string());
+            let res = stage_selected_object_wav(
+                &src_path,
+                &out_dir,
+                proj_sr,
+                src_offset,
+                obj_len,
+                time_stretch,
+            )
+            .and_then(|staged| {
+                forge_worker::separate_stems(&staged, &out_dir, &cfg)
+                    .map(|report| (start_pos, report))
+                    .map_err(|e| e.to_string())
+            });
             let _ = tx.send(res);
         });
     }
@@ -594,7 +560,8 @@ impl ForgeDawApp {
             return;
         };
         let (src_path, start_smp, src_offset, obj_len, time_stretch, pitch_st) = found;
-        let out_dir = self.project_media_dir().join(format!("ai_studio_{obj_id}"));
+        let job_id = self.project.alloc_id();
+        let out_dir = unique_job_media_dir(&self.project_media_dir(), "ai_studio", obj_id, job_id);
         let bpm_hint = self.project.bpm;
         let proj_sr = self.project.sample_rate;
         let (tx, rx) = std::sync::mpsc::channel();
@@ -828,7 +795,7 @@ impl ForgeDawApp {
         self.status_line = format!("Added marker M{idx} at sample {pos}");
     }
 
-    fn add_demo_midi_clip(&mut self) {
+    pub(crate) fn add_demo_midi_clip(&mut self) {
         let prev = self.project.clone();
         if self.project.tracks.is_empty() {
             self.project.add_track("01 Synth Track");
@@ -836,11 +803,15 @@ impl ForgeDawApp {
         let id = self.project.alloc_id();
         let mut clip =
             MidiClip::demo_am7_progression(id, self.project.sample_rate, self.project.bpm);
-        clip.timeline_start_samples = self.playhead_samples();
+        let start_smp = self.playhead_samples();
+        clip.timeline_start_samples = start_smp;
+        let sr = f64::from(self.project.sample_rate.max(8_000));
+        clip.timeline_start_beats = Some(self.project.secs_to_beat((start_smp as f64) / sr));
         let tr_idx = self
             .selected_track_idx
             .min(self.project.tracks.len().saturating_sub(1));
         self.project.tracks[tr_idx].midi_clips.push(clip);
+        self.selected_object_id = None;
         self.selected_midi_clip_id = Some(id);
         self.inspector_tab = InspectorTab::PianoRoll;
         self.commit_project_change(prev);
@@ -852,35 +823,25 @@ impl ForgeDawApp {
     }
 
     fn export_stems(&mut self) {
-        let out_dir = PathBuf::from("stems_export");
-        match ObjectOrientedEngine::bounce_stems(&self.project, &self.cache, &out_dir) {
-            Ok(paths) => {
-                self.status_line = format!(
-                    "Exported {} PDC-aligned 24-bit WAV stems into '{}'",
-                    paths.len(),
-                    out_dir.display()
-                );
-            }
-            Err(e) => {
-                self.status_line = format!("Stem export failed: {e}");
-            }
-        }
+        self.start_export_stems_job();
     }
 
     fn bounce_master(&mut self) {
-        let out_path = PathBuf::from(self.bounce_path_buf.trim());
-        match ObjectOrientedEngine::bounce_to_wav(&self.project, &self.cache, &out_path) {
-            Ok(report) => {
-                self.status_line = format!(
-                    "Bounced '{}' | {:.2} LUFS | {:.2} dBTP | DistroKid Ready: {}",
-                    out_path.display(),
-                    report.integrated_lufs,
-                    report.true_peak_dbtp,
-                    if report.distrokid_ready { "YES" } else { "NO" }
-                );
-            }
-            Err(e) => {
-                self.status_line = format!("Bounce failed: {e}");
+        self.start_bounce_master_job();
+    }
+
+    fn delete_selected_midi_clip(&mut self) {
+        let Some(sel_id) = self.selected_midi_clip_id else {
+            return;
+        };
+        let prev = self.project.clone();
+        for tr in &mut self.project.tracks {
+            if let Some(mi) = tr.midi_clips.iter().position(|c| c.id == sel_id) {
+                tr.midi_clips.remove(mi);
+                self.selected_midi_clip_id = None;
+                self.commit_project_change(prev);
+                self.status_line = "Deleted selected MIDI clip".to_string();
+                return;
             }
         }
     }
@@ -916,21 +877,28 @@ impl ForgeDawApp {
                     if self.recorder.is_some() {
                         self.toggle_record();
                     }
-                    if let Some(ref eng) = self.audio {
+                    if self.recorder.is_none()
+                        && let Some(ref eng) = self.audio
+                    {
                         eng.stop();
                     }
                 }
+                let io_busy = self.is_io_busy();
                 let is_recording = self.recorder.is_some();
                 if ui
-                    .button(
-                        egui::RichText::new(if is_recording { "Stop Rec" } else { "Rec" })
-                            .strong()
-                            .color(if is_recording {
-                                egui::Color32::from_rgb(248, 113, 113)
-                            } else {
-                                egui::Color32::from_rgb(252, 165, 165)
-                            }),
+                    .add_enabled(
+                        !io_busy,
+                        egui::Button::new(
+                            egui::RichText::new(if is_recording { "Stop Rec" } else { "Rec" })
+                                .strong()
+                                .color(if is_recording {
+                                    egui::Color32::from_rgb(248, 113, 113)
+                                } else {
+                                    egui::Color32::from_rgb(252, 165, 165)
+                                }),
+                        ),
                     )
+                    .on_disabled_hover_text("Wait for background I/O to finish before saving take")
                     .clicked()
                 {
                     self.toggle_record();
@@ -1017,7 +985,10 @@ impl ForgeDawApp {
                     )
                     .changed()
                 {
+                    let prev = self.project.clone();
                     self.project.bpm = bpm;
+                    self.project.rescale_musical_midi_clips();
+                    self.commit_project_change(prev);
                 }
 
                 ui.separator();
@@ -1055,10 +1026,16 @@ impl ForgeDawApp {
                     self.add_marker_at_playhead();
                 }
                 ui.checkbox(&mut self.auto_crossfade, "XFade");
-                if ui.button("Bounce Master").clicked() {
+                if ui
+                    .add_enabled(!io_busy, egui::Button::new("Bounce Master"))
+                    .clicked()
+                {
                     self.bounce_master();
                 }
-                if ui.button("Export Stems").clicked() {
+                if ui
+                    .add_enabled(!io_busy, egui::Button::new("Export Stems"))
+                    .clicked()
+                {
                     self.export_stems();
                 }
                 ui.checkbox(&mut self.show_mixer, "Mixer");
@@ -1066,6 +1043,7 @@ impl ForgeDawApp {
 
             // Second compact I/O bar: Import WAV + Save/Load .forgeproj + Bounce path
             ui.horizontal(|ui| {
+                let io_busy = self.is_io_busy();
                 ui.label(egui::RichText::new("WAV:").small());
                 ui.add(
                     egui::TextEdit::singleline(&mut self.import_path_buf)
@@ -1073,7 +1051,7 @@ impl ForgeDawApp {
                         .hint_text("path/to/audio.wav"),
                 );
                 if ui
-                    .small_button("…")
+                    .add_enabled(!io_busy, egui::Button::new("…").small())
                     .on_hover_text("Browse audio file")
                     .clicked()
                     && let Some(path) = rfd::FileDialog::new()
@@ -1083,14 +1061,17 @@ impl ForgeDawApp {
                     self.import_path_buf = path.display().to_string();
                     self.import_wav_to_selected_track();
                 }
-                if ui.small_button("Import").clicked() {
+                if ui
+                    .add_enabled(!io_busy, egui::Button::new("Import").small())
+                    .clicked()
+                {
                     self.import_wav_to_selected_track();
                 }
                 ui.separator();
                 ui.label(egui::RichText::new("Project:").small());
                 ui.add(egui::TextEdit::singleline(&mut self.project_path_buf).desired_width(135.0));
                 if ui
-                    .small_button("…")
+                    .add_enabled(!io_busy, egui::Button::new("…").small())
                     .on_hover_text("Open .forgeproj")
                     .clicked()
                     && let Some(path) = rfd::FileDialog::new()
@@ -1099,31 +1080,17 @@ impl ForgeDawApp {
                 {
                     self.project_path_buf = path.display().to_string();
                 }
-                if ui.small_button("Save").clicked() {
-                    let p = PathBuf::from(self.project_path_buf.trim());
-                    match self.project.save_to_file(&p) {
-                        Ok(()) => self.status_line = format!("Saved '{}'", p.display()),
-                        Err(e) => self.status_line = format!("Save failed: {e}"),
-                    }
+                if ui
+                    .add_enabled(!io_busy, egui::Button::new("Save").small())
+                    .clicked()
+                {
+                    self.start_save_project_job();
                 }
-                if ui.small_button("Load").clicked() {
-                    let p = PathBuf::from(self.project_path_buf.trim());
-                    match DawProject::load_from_file(&p) {
-                        Ok(loaded) => {
-                            let prev = self.project.clone();
-                            self.project = loaded;
-                            let target_sr = self.project.sample_rate;
-                            for tr in &self.project.tracks {
-                                for obj in &tr.objects {
-                                    let _ =
-                                        self.cache.load_clip_for_rate(&obj.source_path, target_sr);
-                                }
-                            }
-                            self.commit_project_change(prev);
-                            self.status_line = format!("Loaded '{}'", p.display());
-                        }
-                        Err(e) => self.status_line = format!("Load failed: {e}"),
-                    }
+                if ui
+                    .add_enabled(!io_busy, egui::Button::new("Load").small())
+                    .clicked()
+                {
+                    self.start_load_project_job();
                 }
                 ui.separator();
                 ui.label(egui::RichText::new("Out:").small());
@@ -1149,686 +1116,13 @@ impl ForgeDawApp {
             ui.add_space(4.0);
         });
     }
-
-    fn draw_arrange_timeline(&mut self, ui: &mut egui::Ui) {
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("ARRANGE TIMELINE").strong());
-                ui.separator();
-                ui.add(
-                    egui::Slider::new(&mut self.pixels_per_sec, 30.0..=400.0).text("Zoom (px/s)"),
-                );
-                let sr = f64::from(self.project.sample_rate.max(1));
-                let max_scroll_secs =
-                    ((self.project.total_length_samples() as f64 / sr) as f32 + 30.0).max(120.0);
-                ui.add(
-                    egui::Slider::new(&mut self.scroll_secs, 0.0..=max_scroll_secs)
-                        .text("Scroll (s)"),
-                );
-            });
-            ui.separator();
-
-            let sr = f64::from(self.project.sample_rate.max(1));
-            let playhead_secs = (self.playhead_samples() as f64 / sr) as f32;
-            let header_w = 175.0_f32;
-            let lane_h = 84.0_f32;
-
-            // Clickable Time Ruler
-            ui.horizontal(|ui| {
-                ui.allocate_exact_size(egui::vec2(header_w, 22.0), egui::Sense::hover());
-                let (ruler_rect, ruler_resp) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width().max(200.0), 22.0),
-                    egui::Sense::click_and_drag(),
-                );
-                let rp = ui.painter_at(ruler_rect);
-                rp.rect_filled(ruler_rect, 3.0, egui::Color32::from_rgb(22, 28, 40));
-
-                if (ruler_resp.clicked() || ruler_resp.dragged())
-                    && let Some(pos) = ruler_resp.interact_pointer_pos()
-                {
-                    let rel_x = (pos.x - ruler_rect.left()).max(0.0);
-                    let target_secs = f64::from(self.scroll_secs + rel_x / self.pixels_per_sec);
-                    self.set_playhead_samples((target_secs * sr).round() as u64);
-                }
-
-                let start_sec = self.scroll_secs.floor() as i32;
-                let vis_secs = (ruler_rect.width() / self.pixels_per_sec).ceil() as i32 + 2;
-                for s in start_sec..(start_sec + vis_secs) {
-                    if s < 0 {
-                        continue;
-                    }
-                    let x =
-                        ruler_rect.left() + ((s as f32) - self.scroll_secs) * self.pixels_per_sec;
-                    if x >= ruler_rect.left() && x <= ruler_rect.right() {
-                        rp.line_segment(
-                            [
-                                egui::pos2(x, ruler_rect.top()),
-                                egui::pos2(x, ruler_rect.bottom()),
-                            ],
-                            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(60, 74, 96)),
-                        );
-                        rp.text(
-                            egui::pos2(x + 3.0, ruler_rect.center().y),
-                            egui::Align2::LEFT_CENTER,
-                            format!("{s}s"),
-                            egui::FontId::monospace(10.0),
-                            egui::Color32::from_rgb(165, 175, 195),
-                        );
-                    }
-                }
-
-                if !self.project.tempo_map.is_empty() {
-                    let vis_end_s = f64::from(self.scroll_secs)
-                        + f64::from(ruler_rect.width() / self.pixels_per_sec)
-                        + 2.0;
-                    let b_start = self
-                        .project
-                        .secs_to_beat(f64::from(self.scroll_secs.max(0.0)))
-                        .floor() as u64;
-                    let b_end = (self.project.secs_to_beat(vis_end_s).ceil() as u64)
-                        .min(b_start.saturating_add(512));
-                    let bar_len = u64::from(self.project.time_sig_num.max(1));
-                    for b in b_start..=b_end {
-                        if !b.is_multiple_of(bar_len) {
-                            continue;
-                        }
-                        let bx = ruler_rect.left()
-                            + (self.project.beat_to_secs(b as f64) as f32 - self.scroll_secs)
-                                * self.pixels_per_sec;
-                        if bx >= ruler_rect.left() && bx <= ruler_rect.right() {
-                            rp.line_segment(
-                                [
-                                    egui::pos2(bx, ruler_rect.center().y),
-                                    egui::pos2(bx, ruler_rect.bottom()),
-                                ],
-                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(250, 204, 21)),
-                            );
-                        }
-                    }
-                    for tp in self.project.tempo_map.iter().take(64) {
-                        let tx = ruler_rect.left()
-                            + (tp.time_secs as f32 - self.scroll_secs) * self.pixels_per_sec;
-                        if tx >= ruler_rect.left() && tx <= ruler_rect.right() {
-                            rp.text(
-                                egui::pos2(tx + 2.0, ruler_rect.top() + 2.0),
-                                egui::Align2::LEFT_TOP,
-                                format!("{:.0}", tp.bpm),
-                                egui::FontId::monospace(8.5),
-                                egui::Color32::from_rgb(250, 204, 21),
-                            );
-                        }
-                    }
-                }
-
-                // Draw clickable Timeline Marker flags on the ruler
-                for mk in &self.project.markers {
-                    let mk_secs = (mk.sample_pos as f64 / sr) as f32;
-                    let mx = ruler_rect.left() + (mk_secs - self.scroll_secs) * self.pixels_per_sec;
-                    if mx >= ruler_rect.left() && mx <= ruler_rect.right() {
-                        let flag_rect = egui::Rect::from_min_size(
-                            egui::pos2(mx, ruler_rect.top() + 1.0),
-                            egui::vec2(38.0, 14.0),
-                        );
-                        rp.rect_filled(flag_rect, 2.0, egui::Color32::from_rgb(14, 116, 144));
-                        rp.text(
-                            egui::pos2(mx + 3.0, ruler_rect.top() + 8.0),
-                            egui::Align2::LEFT_CENTER,
-                            &mk.name,
-                            egui::FontId::monospace(9.5),
-                            egui::Color32::WHITE,
-                        );
-                        if ruler_resp.clicked()
-                            && let Some(pt) = ruler_resp.interact_pointer_pos()
-                            && flag_rect.contains(pt)
-                        {
-                            self.set_playhead_samples(mk.sample_pos);
-                        }
-                    }
-                }
-            });
-
-            let prev_snapshot = self.project.clone();
-            let mut changed = false;
-
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for ti in 0..self.project.tracks.len() {
-                    let tr_color = egui::Color32::from_rgb(
-                        self.project.tracks[ti].color_rgb[0],
-                        self.project.tracks[ti].color_rgb[1],
-                        self.project.tracks[ti].color_rgb[2],
-                    );
-
-                    ui.horizontal(|ui| {
-                        // Track Header
-                        let selected_tr = self.selected_track_idx == ti;
-                        egui::Frame::group(ui.style())
-                            .fill(if selected_tr {
-                                egui::Color32::from_rgb(30, 41, 59)
-                            } else {
-                                egui::Color32::from_rgb(20, 26, 37)
-                            })
-                            .show(ui, |ui| {
-                                ui.set_min_size(egui::vec2(header_w - 14.0, lane_h - 10.0));
-                                ui.set_max_size(egui::vec2(header_w - 14.0, lane_h - 10.0));
-                                ui.vertical(|ui| {
-                                    if ui
-                                        .selectable_label(
-                                            selected_tr,
-                                            egui::RichText::new(&self.project.tracks[ti].name)
-                                                .strong()
-                                                .color(tr_color),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.selected_track_idx = ti;
-                                    }
-                                    ui.horizontal(|ui| {
-                                        if ui
-                                            .selectable_label(self.project.tracks[ti].mute, "M")
-                                            .clicked()
-                                        {
-                                            self.project.tracks[ti].mute =
-                                                !self.project.tracks[ti].mute;
-                                            changed = true;
-                                        }
-                                        if ui
-                                            .selectable_label(self.project.tracks[ti].solo, "S")
-                                            .clicked()
-                                        {
-                                            self.project.tracks[ti].solo =
-                                                !self.project.tracks[ti].solo;
-                                            changed = true;
-                                        }
-                                        if ui
-                                            .selectable_label(
-                                                self.project.tracks[ti].record_armed,
-                                                egui::RichText::new("R").color(
-                                                    if self.project.tracks[ti].record_armed {
-                                                        egui::Color32::from_rgb(248, 113, 113)
-                                                    } else {
-                                                        egui::Color32::from_rgb(160, 170, 188)
-                                                    },
-                                                ),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.project.tracks[ti].record_armed =
-                                                !self.project.tracks[ti].record_armed;
-                                        }
-                                        if ui
-                                            .selectable_label(
-                                                self.project.tracks[ti].show_automation,
-                                                egui::RichText::new("A").color(
-                                                    if self.project.tracks[ti].show_automation {
-                                                        egui::Color32::from_rgb(250, 204, 21)
-                                                    } else {
-                                                        egui::Color32::from_rgb(160, 170, 188)
-                                                    },
-                                                ),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.project.tracks[ti].show_automation =
-                                                !self.project.tracks[ti].show_automation;
-                                            if self.project.tracks[ti].show_automation {
-                                                self.project.tracks[ti].volume_auto.enabled = true;
-                                                changed = true;
-                                            }
-                                        }
-                                    });
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{:+.1} dB",
-                                            self.project.tracks[ti].gain_db
-                                        ))
-                                        .monospace()
-                                        .small(),
-                                    );
-                                });
-                            });
-
-                        // Track Lane Canvas
-                        let (lane_rect, lane_resp) = ui.allocate_exact_size(
-                            egui::vec2(ui.available_width().max(200.0), lane_h),
-                            egui::Sense::click_and_drag(),
-                        );
-                        let p = ui.painter_at(lane_rect);
-                        p.rect_filled(lane_rect, 4.0, egui::Color32::from_rgb(14, 18, 26));
-                        p.rect_stroke(
-                            lane_rect,
-                            4.0,
-                            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(35, 45, 62)),
-                            egui::StrokeKind::Inside,
-                        );
-
-                        // Draw Audio Objects on this track
-                        for oi in 0..self.project.tracks[ti].objects.len() {
-                            let obj_id = self.project.tracks[ti].objects[oi].id;
-                            let start_s =
-                                (self.project.tracks[ti].objects[oi].timeline_start_samples as f64
-                                    / sr) as f32;
-                            let len_s = (self.project.tracks[ti].objects[oi].length_samples as f64
-                                / sr) as f32;
-                            let x0 = lane_rect.left()
-                                + (start_s - self.scroll_secs) * self.pixels_per_sec;
-                            let w = (len_s * self.pixels_per_sec).max(16.0);
-                            let obj_rect = egui::Rect::from_min_size(
-                                egui::pos2(x0, lane_rect.top() + 4.0),
-                                egui::vec2(w, lane_rect.height() - 8.0),
-                            );
-
-                            let is_sel = self.selected_object_id == Some(obj_id);
-                            let fill = egui::Color32::from_rgba_unmultiplied(
-                                tr_color.r(),
-                                tr_color.g(),
-                                tr_color.b(),
-                                if is_sel { 80 } else { 42 },
-                            );
-                            p.rect_filled(obj_rect, 4.0, fill);
-                            p.rect_stroke(
-                                obj_rect,
-                                4.0,
-                                egui::Stroke::new(
-                                    if is_sel { 2.0_f32 } else { 1.0_f32 },
-                                    if is_sel {
-                                        egui::Color32::from_rgb(250, 204, 21)
-                                    } else {
-                                        tr_color
-                                    },
-                                ),
-                                egui::StrokeKind::Inside,
-                            );
-
-                            // Viewport-culled waveform peaks inside the object (O(visible width))
-                            if let Some(peaks) = self
-                                .cache
-                                .get_peaks(&self.project.tracks[ti].objects[oi].source_path)
-                            {
-                                let mid_y = obj_rect.center().y;
-                                let half_h = (obj_rect.height() * 0.42).max(4.0);
-                                let step_px = 2.0_f32;
-                                let n_cols = ((obj_rect.width() / step_px) as usize).max(1);
-                                let c_start = (((lane_rect.left() - obj_rect.left()) / step_px)
-                                    .floor()
-                                    .max(0.0)
-                                    as usize)
-                                    .min(n_cols);
-                                let c_end = (((lane_rect.right() - obj_rect.left()) / step_px)
-                                    .ceil()
-                                    .max(0.0)
-                                    as usize)
-                                    .min(n_cols);
-                                let obj_len =
-                                    self.project.tracks[ti].objects[oi].length_samples.max(1);
-                                let src_off =
-                                    self.project.tracks[ti].objects[oi].source_offset_samples;
-                                for c in c_start..c_end {
-                                    let frac = (c as f64) / (n_cols as f64);
-                                    let smp =
-                                        src_off.saturating_add((frac * (obj_len as f64)) as u64);
-                                    let bucket = (smp as usize) / peaks.samples_per_bucket;
-                                    if let Some(&(mn, mx)) = peaks.min_max.get(bucket) {
-                                        let cx = obj_rect.left() + (c as f32) * step_px;
-                                        p.line_segment(
-                                            [
-                                                egui::pos2(cx, mid_y - mx * half_h),
-                                                egui::pos2(cx, mid_y - mn * half_h),
-                                            ],
-                                            egui::Stroke::new(1.0_f32, tr_color),
-                                        );
-                                    }
-                                }
-                            }
-
-                            // Visual Fade-In / Fade-Out curve overlays
-                            let fade_in_s = (self.project.tracks[ti].objects[oi].fade_in_samples
-                                as f64
-                                / sr) as f32;
-                            if fade_in_s > 0.001 {
-                                let fi_w = (fade_in_s * self.pixels_per_sec).min(obj_rect.width());
-                                p.line_segment(
-                                    [
-                                        egui::pos2(obj_rect.left(), obj_rect.bottom()),
-                                        egui::pos2(obj_rect.left() + fi_w, obj_rect.top()),
-                                    ],
-                                    egui::Stroke::new(
-                                        1.5_f32,
-                                        egui::Color32::from_rgba_unmultiplied(250, 204, 21, 200),
-                                    ),
-                                );
-                            }
-                            let fade_out_s = (self.project.tracks[ti].objects[oi].fade_out_samples
-                                as f64
-                                / sr) as f32;
-                            if fade_out_s > 0.001 {
-                                let fo_w = (fade_out_s * self.pixels_per_sec).min(obj_rect.width());
-                                p.line_segment(
-                                    [
-                                        egui::pos2(obj_rect.right() - fo_w, obj_rect.top()),
-                                        egui::pos2(obj_rect.right(), obj_rect.bottom()),
-                                    ],
-                                    egui::Stroke::new(
-                                        1.5_f32,
-                                        egui::Color32::from_rgba_unmultiplied(250, 204, 21, 200),
-                                    ),
-                                );
-                            }
-
-                            // Object header label + FX count badge
-                            let fx_count = self.project.tracks[ti].objects[oi].fx_chain.len();
-                            let label = if fx_count > 0 {
-                                format!(
-                                    "{}  [FX:{}]",
-                                    self.project.tracks[ti].objects[oi].name, fx_count
-                                )
-                            } else {
-                                self.project.tracks[ti].objects[oi].name.clone()
-                            };
-                            p.text(
-                                egui::pos2(obj_rect.left() + 6.0, obj_rect.top() + 10.0),
-                                egui::Align2::LEFT_CENTER,
-                                label,
-                                egui::FontId::proportional(11.0),
-                                egui::Color32::WHITE,
-                            );
-
-                            // Lock onto the grabbed object on drag_started (Move / TrimLeft / TrimRight)
-                            if lane_resp.drag_started()
-                                && !self.project.tracks[ti].show_automation
-                                && let Some(pt) = lane_resp.interact_pointer_pos()
-                                && obj_rect.contains(pt)
-                            {
-                                self.selected_track_idx = ti;
-                                self.selected_object_id = Some(obj_id);
-                                let mode = if (pt.x - obj_rect.left()).abs() <= 8.0 {
-                                    DragMode::TrimLeft
-                                } else if (obj_rect.right() - pt.x).abs() <= 8.0 {
-                                    DragMode::TrimRight
-                                } else {
-                                    DragMode::Move
-                                };
-                                self.active_drag = Some((ti, obj_id, mode));
-                                self.drag_anchor_samples =
-                                    self.project.tracks[ti].objects[oi].timeline_start_samples;
-                                self.drag_anchor_x = pt.x;
-                            }
-                            if lane_resp.clicked()
-                                && !self.project.tracks[ti].show_automation
-                                && let Some(pt) = lane_resp.interact_pointer_pos()
-                                && obj_rect.contains(pt)
-                            {
-                                self.selected_track_idx = ti;
-                                self.selected_object_id = Some(obj_id);
-                            }
-                            if let Some((drag_ti, drag_id, drag_mode)) = self.active_drag
-                                && drag_ti == ti
-                                && drag_id == obj_id
-                                && lane_resp.dragged()
-                            {
-                                let dx = lane_resp.drag_delta().x;
-                                let cum_dx = lane_resp
-                                    .interact_pointer_pos()
-                                    .map_or(dx, |pt| pt.x - self.drag_anchor_x);
-                                if dx.abs() > 0.1 || matches!(drag_mode, DragMode::Move) {
-                                    let delta_smp =
-                                        (f64::from(dx / self.pixels_per_sec) * sr).round() as i64;
-                                    let move_snapped = if matches!(drag_mode, DragMode::Move) {
-                                        let cum_smp = (f64::from(cum_dx / self.pixels_per_sec) * sr)
-                                            .round()
-                                            as i64;
-                                        let raw = (self.drag_anchor_samples as i64 + cum_smp).max(0)
-                                            as u64;
-                                        Some(
-                                            self.snap_grid
-                                                .snap_samples_for_project(raw, &self.project),
-                                        )
-                                    } else {
-                                        None
-                                    };
-                                    let obj = &mut self.project.tracks[ti].objects[oi];
-                                    match drag_mode {
-                                        DragMode::Move => {
-                                            if let Some(snapped) = move_snapped
-                                                && snapped != obj.timeline_start_samples
-                                            {
-                                                obj.timeline_start_samples = snapped;
-                                                changed = true;
-                                            }
-                                        }
-                                        DragMode::TrimLeft => {
-                                            let max_shift = obj
-                                                .length_samples
-                                                .saturating_sub(256)
-                                                .min(i64::MAX as u64)
-                                                as i64;
-                                            let min_lim = obj
-                                                .source_offset_samples
-                                                .min(obj.timeline_start_samples)
-                                                .min(i64::MAX as u64)
-                                                as i64;
-                                            let min_shift = (-min_lim).min(max_shift);
-                                            let shift = delta_smp.clamp(min_shift, max_shift);
-                                            if shift >= 0 {
-                                                let s = shift as u64;
-                                                obj.timeline_start_samples =
-                                                    obj.timeline_start_samples.saturating_add(s);
-                                                obj.source_offset_samples =
-                                                    obj.source_offset_samples.saturating_add(s);
-                                                obj.length_samples =
-                                                    obj.length_samples.saturating_sub(s);
-                                            } else {
-                                                let s = (-shift) as u64;
-                                                obj.timeline_start_samples =
-                                                    obj.timeline_start_samples.saturating_sub(s);
-                                                obj.source_offset_samples =
-                                                    obj.source_offset_samples.saturating_sub(s);
-                                                obj.length_samples =
-                                                    obj.length_samples.saturating_add(s);
-                                            }
-                                            changed = true;
-                                        }
-                                        DragMode::TrimRight => {
-                                            let new_len = (obj.length_samples as i64 + delta_smp)
-                                                .max(256)
-                                                as u64;
-                                            obj.length_samples = new_len;
-                                            changed = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if lane_resp.drag_stopped() {
-                            self.active_drag = None;
-                        }
-
-                        // Render MIDI Clips with miniature piano-roll note bars
-                        for mc in &self.project.tracks[ti].midi_clips {
-                            let ms = (mc.timeline_start_samples as f64 / sr) as f32;
-                            let ml = (mc.length_samples as f64 / sr) as f32;
-                            let mx0 =
-                                lane_rect.left() + (ms - self.scroll_secs) * self.pixels_per_sec;
-                            let mw = (ml * self.pixels_per_sec).max(20.0);
-                            let mrect = egui::Rect::from_min_size(
-                                egui::pos2(mx0, lane_rect.top() + 4.0),
-                                egui::vec2(mw, lane_rect.height() - 8.0),
-                            );
-                            p.rect_filled(
-                                mrect,
-                                4.0,
-                                egui::Color32::from_rgba_unmultiplied(168, 85, 247, 55),
-                            );
-                            p.rect_stroke(
-                                mrect,
-                                4.0,
-                                egui::Stroke::new(1.25_f32, egui::Color32::from_rgb(192, 132, 252)),
-                                egui::StrokeKind::Inside,
-                            );
-                            p.text(
-                                egui::pos2(mrect.left() + 6.0, mrect.top() + 10.0),
-                                egui::Align2::LEFT_CENTER,
-                                format!("MIDI: {}", mc.name),
-                                egui::FontId::proportional(10.5),
-                                egui::Color32::from_rgb(233, 213, 255),
-                            );
-                            for note in &mc.notes {
-                                let nx0 = mrect.left()
-                                    + ((note.start_samples as f64 / sr) as f32)
-                                        * self.pixels_per_sec;
-                                let nw = (((note.length_samples as f64 / sr) as f32)
-                                    * self.pixels_per_sec)
-                                    .max(3.0);
-                                let pitch_norm =
-                                    ((f32::from(note.pitch) - 44.0) / 32.0).clamp(0.0, 1.0);
-                                let ny =
-                                    mrect.bottom() - 6.0 - pitch_norm * (mrect.height() - 22.0);
-                                if nx0 + nw >= lane_rect.left() && nx0 <= lane_rect.right() {
-                                    p.rect_filled(
-                                        egui::Rect::from_min_size(
-                                            egui::pos2(nx0, ny),
-                                            egui::vec2(nw, 3.5),
-                                        ),
-                                        1.0,
-                                        egui::Color32::from_rgb(216, 180, 254),
-                                    );
-                                }
-                            }
-                            if lane_resp.clicked()
-                                && let Some(pt) = lane_resp.interact_pointer_pos()
-                                && mrect.contains(pt)
-                            {
-                                self.selected_track_idx = ti;
-                                self.selected_midi_clip_id = Some(mc.id);
-                                self.inspector_tab = InspectorTab::PianoRoll;
-                            }
-                        }
-
-                        // Highlight automatic Equal-Power Crossfade overlap zones
-                        for (ov_start, ov_end) in self.project.tracks[ti].overlap_regions() {
-                            let ox0 = lane_rect.left()
-                                + (((ov_start as f64 / sr) as f32) - self.scroll_secs)
-                                    * self.pixels_per_sec;
-                            let ox1 = lane_rect.left()
-                                + (((ov_end as f64 / sr) as f32) - self.scroll_secs)
-                                    * self.pixels_per_sec;
-                            if ox1 > lane_rect.left() && ox0 < lane_rect.right() {
-                                let xrect = egui::Rect::from_min_max(
-                                    egui::pos2(ox0.max(lane_rect.left()), lane_rect.top() + 4.0),
-                                    egui::pos2(
-                                        ox1.min(lane_rect.right()),
-                                        lane_rect.bottom() - 4.0,
-                                    ),
-                                );
-                                p.rect_filled(
-                                    xrect,
-                                    2.0,
-                                    egui::Color32::from_rgba_unmultiplied(250, 204, 21, 45),
-                                );
-                                p.line_segment(
-                                    [xrect.left_top(), xrect.right_bottom()],
-                                    egui::Stroke::new(
-                                        1.25_f32,
-                                        egui::Color32::from_rgb(250, 204, 21),
-                                    ),
-                                );
-                                p.line_segment(
-                                    [xrect.left_bottom(), xrect.right_top()],
-                                    egui::Stroke::new(
-                                        1.25_f32,
-                                        egui::Color32::from_rgb(250, 204, 21),
-                                    ),
-                                );
-                            }
-                        }
-
-                        // Interactive Volume Automation Lane Overlay
-                        if self.project.tracks[ti].show_automation {
-                            let db_to_y = |db: f32| -> f32 {
-                                let norm = ((db.clamp(-48.0, 12.0) + 48.0) / 60.0).clamp(0.0, 1.0);
-                                lane_rect.bottom() - 6.0 - norm * (lane_rect.height() - 12.0)
-                            };
-                            let y_to_db = |y: f32| -> f32 {
-                                let norm = ((lane_rect.bottom() - 6.0 - y)
-                                    / (lane_rect.height() - 12.0).max(1.0))
-                                .clamp(0.0, 1.0);
-                                norm * 60.0 - 48.0
-                            };
-
-                            if (lane_resp.clicked() || lane_resp.dragged())
-                                && let Some(pt) = lane_resp.interact_pointer_pos()
-                                && lane_rect.contains(pt)
-                            {
-                                let secs = ((pt.x - lane_rect.left()) / self.pixels_per_sec)
-                                    + self.scroll_secs;
-                                let raw_smp = (f64::from(secs.max(0.0)) * sr).round() as u64;
-                                let smp = self
-                                    .snap_grid
-                                    .snap_samples_for_project(raw_smp, &self.project);
-                                let db = y_to_db(pt.y);
-                                self.project.tracks[ti].volume_auto.enabled = true;
-                                self.project.tracks[ti].volume_auto.upsert_point(smp, db);
-                                changed = true;
-                            }
-
-                            let pts = &self.project.tracks[ti].volume_auto.points;
-                            let mut screen_pts = Vec::with_capacity(pts.len());
-                            for ap in pts {
-                                let ax = lane_rect.left()
-                                    + (((ap.sample_pos as f64 / sr) as f32) - self.scroll_secs)
-                                        * self.pixels_per_sec;
-                                let ay = db_to_y(ap.value);
-                                screen_pts.push(egui::pos2(ax, ay));
-                            }
-                            if screen_pts.len() >= 2 {
-                                p.add(egui::Shape::line(
-                                    screen_pts.clone(),
-                                    egui::Stroke::new(
-                                        2.0_f32,
-                                        egui::Color32::from_rgb(250, 204, 21),
-                                    ),
-                                ));
-                            }
-                            for sp in screen_pts {
-                                if sp.x >= lane_rect.left() && sp.x <= lane_rect.right() {
-                                    p.circle_filled(sp, 4.0, egui::Color32::from_rgb(250, 204, 21));
-                                }
-                            }
-                        }
-
-                        // Playhead line
-                        let ph_x = lane_rect.left()
-                            + (playhead_secs - self.scroll_secs) * self.pixels_per_sec;
-                        if ph_x >= lane_rect.left() && ph_x <= lane_rect.right() {
-                            p.line_segment(
-                                [
-                                    egui::pos2(ph_x, lane_rect.top()),
-                                    egui::pos2(ph_x, lane_rect.bottom()),
-                                ],
-                                egui::Stroke::new(1.75_f32, egui::Color32::from_rgb(248, 113, 113)),
-                            );
-                        }
-                    });
-                    ui.add_space(4.0);
-                }
-            });
-
-            if changed {
-                if self.auto_crossfade {
-                    for tr in &mut self.project.tracks {
-                        tr.auto_crossfade_overlaps();
-                    }
-                }
-                self.commit_project_change(prev_snapshot);
-            }
-        });
-    }
 }
 
 impl eframe::App for ForgeDawApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_stem_split_result();
         self.poll_ai_job_result();
+        self.poll_io_job_result();
         self.pointer_down = ui.input(|i| i.pointer.primary_down());
         // Drag-and-drop audio file import directly onto the DAW window
         let dropped: Vec<PathBuf> = ui.input(|i| {
@@ -1865,7 +1159,11 @@ impl eframe::App for ForgeDawApp {
                 self.add_marker_at_playhead();
             }
             if del {
-                self.delete_selected_object();
+                if self.selected_object_id.is_some() {
+                    self.delete_selected_object();
+                } else if self.selected_midi_clip_id.is_some() {
+                    self.delete_selected_midi_clip();
+                }
             }
             if undo && let Some(prev) = self.undo.undo(self.project.clone()) {
                 self.project = prev;
@@ -1895,7 +1193,7 @@ impl eframe::App for ForgeDawApp {
 
         if self.audio.as_ref().is_some_and(LiveAudioEngine::is_playing) || self.recorder.is_some() {
             ui.request_repaint();
-        } else if self.stem_split_rx.is_some() || self.ai_job_rx.is_some() {
+        } else if self.stem_split_rx.is_some() || self.ai_job_rx.is_some() || self.is_io_busy() {
             ui.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
@@ -2011,5 +1309,75 @@ mod tests {
         let loaded = AudioBuffer::load(&staged).expect("load staged");
         assert_eq!(loaded.num_frames(), 2_400);
         assert!((loaded.channels[0][0] - 0.4).abs() < 1e-4);
+    }
+
+    #[test]
+    fn load_project_and_clips_reports_missing_audio_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let proj_path = dir.path().join("missing_clips.forgeproj");
+        let mut proj = DawProject::new("MissingTest", 48_000, 120.0);
+        proj.tracks[0].objects.push(AudioObject::new(
+            1,
+            "Missing",
+            dir.path().join("does_not_exist.wav"),
+            4800,
+        ));
+        proj.save_to_file(&proj_path).expect("save");
+
+        let outcome = io_jobs::load_project_and_clips(&proj_path).expect("load outcome");
+        match outcome {
+            IoJobOutcome::LoadedProject { missing_clips, .. } => {
+                assert_eq!(missing_clips.len(), 1);
+                assert!(missing_clips[0].ends_with("does_not_exist.wav"));
+            }
+            _ => panic!("expected LoadedProject outcome"),
+        }
+    }
+
+    #[test]
+    fn unique_job_media_dir_produces_distinct_paths_and_midi_rescales_with_bpm() {
+        let base = PathBuf::from("session_media");
+        assert_ne!(
+            unique_job_media_dir(&base, "ai_studio", 7, 100),
+            unique_job_media_dir(&base, "ai_studio", 7, 101)
+        );
+        let mut proj = DawProject::new("MidiRescale", 48_000, 120.0);
+        let id = proj.alloc_id();
+        proj.tracks[0]
+            .midi_clips
+            .push(MidiClip::demo_am7_progression(id, 48_000, 120.0));
+        let len_120 = proj.tracks[0].midi_clips[0].length_samples;
+        proj.bpm = 240.0;
+        proj.rescale_musical_midi_clips();
+        assert_eq!(proj.tracks[0].midi_clips[0].length_samples, len_120 / 2);
+    }
+
+    #[test]
+    fn busy_io_preserves_live_recording_instead_of_dropping_take() {
+        let mut app = ForgeDawApp::from_parts(
+            DawProject::new("RecGuard", 48_000, 120.0),
+            ClipCache::default(),
+            None,
+            "Test".to_string(),
+            "Ready".to_string(),
+        );
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.io_job_rx = Some(rx);
+        app.io_job_label = "Bouncing master WAV".to_string();
+        app.recorder = Some(LiveRecorder::silent_stub_for_test(0, 96_000));
+
+        app.toggle_record();
+        assert!(
+            app.recorder.is_some(),
+            "toggle_record must not drop active recording while I/O is busy"
+        );
+        assert!(app.status_line.contains("take preserved"));
+
+        let rec = app.recorder.take().unwrap();
+        let preserved = app
+            .start_save_recording_job(rec)
+            .expect_err("busy I/O must return Err(rec)");
+        assert_eq!(preserved.track_idx(), 0);
+        assert_eq!(preserved.start_timeline_samples(), 96_000);
     }
 }

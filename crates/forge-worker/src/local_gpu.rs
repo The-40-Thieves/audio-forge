@@ -68,6 +68,19 @@ pub fn resolve_worker_script(
     candidate.is_file().then_some(candidate)
 }
 
+/// Resolves the packaged `python-worker/forge_gpu_worker.py` sibling directory shipped alongside
+/// release binaries (`bin/forge*` + `python-worker/{forge_gpu_worker.py,pyproject.toml,uv.lock}`).
+pub fn resolve_packaged_worker_script(exe_path: &Path) -> Option<PathBuf> {
+    let resolved_exe = std::fs::canonicalize(exe_path).ok()?;
+    let bin_dir = resolved_exe.parent()?;
+    let root_dir = bin_dir.parent()?;
+    let worker_dir = root_dir.join("python-worker");
+    let script = worker_dir.join("forge_gpu_worker.py");
+    let manifest = worker_dir.join("pyproject.toml");
+    let lock = worker_dir.join("uv.lock");
+    (script.is_file() && manifest.is_file() && lock.is_file()).then_some(script)
+}
+
 fn worker_io_cmd(
     worker: &LocalWorkerCommand,
     subcmd: &str,
@@ -240,17 +253,33 @@ pub struct F0TrackResult {
     pub warnings: Vec<String>,
 }
 
-/// Resolves the default local GPU worker command from `FORGE_GPU_WORKER_SCRIPT` or
-/// `BUILD_SOURCE_ROOT`.
+/// Resolves the worker script path from `FORGE_GPU_WORKER_SCRIPT`, `BUILD_SOURCE_ROOT`, or the
+/// packaged sibling `python-worker/` layout next to `exe_path`.
+pub(crate) fn resolve_default_worker_script_with(
+    override_path: Option<PathBuf>,
+    source_root: Option<&Path>,
+    exe_path: Option<&Path>,
+) -> Option<PathBuf> {
+    resolve_worker_script(override_path, source_root)
+        .or_else(|| exe_path.and_then(resolve_packaged_worker_script))
+}
+
+/// Resolves the default local GPU worker command from `FORGE_GPU_WORKER_SCRIPT`,
+/// `BUILD_SOURCE_ROOT`, or the packaged sibling `python-worker/` layout next to the binary.
 pub fn resolve_default_local_worker() -> Result<LocalWorkerCommand> {
     let override_path = std::env::var_os("FORGE_GPU_WORKER_SCRIPT").map(PathBuf::from);
-    let script = resolve_worker_script(override_path, Some(Path::new(BUILD_SOURCE_ROOT)))
-        .ok_or_else(|| {
-            ForgeError::WorkerError(
-                "Could not locate python-worker/forge_gpu_worker.py; set FORGE_GPU_WORKER_SCRIPT"
-                    .to_string(),
-            )
-        })?;
+    let exe_path = std::env::current_exe().ok();
+    let script = resolve_default_worker_script_with(
+        override_path,
+        Some(Path::new(BUILD_SOURCE_ROOT)),
+        exe_path.as_deref(),
+    )
+    .ok_or_else(|| {
+        ForgeError::WorkerError(
+            "Could not locate python-worker/forge_gpu_worker.py; set FORGE_GPU_WORKER_SCRIPT"
+                .to_string(),
+        )
+    })?;
     Ok(LocalWorkerCommand::uv(&script))
 }
 
@@ -734,6 +763,48 @@ mod client_tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn resolve_packaged_worker_script_requires_complete_release_layout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe_dir = dir.path().join("bin");
+        let pw_dir = dir.path().join("python-worker");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&pw_dir).unwrap();
+        let fake_exe = exe_dir.join("forge");
+        std::fs::write(&fake_exe, b"bin").unwrap();
+
+        let script = pw_dir.join("forge_gpu_worker.py");
+        std::fs::write(&script, b"# worker").unwrap();
+        assert!(resolve_packaged_worker_script(&fake_exe).is_none());
+
+        std::fs::write(pw_dir.join("pyproject.toml"), b"[project]").unwrap();
+        assert!(resolve_packaged_worker_script(&fake_exe).is_none());
+
+        std::fs::write(pw_dir.join("uv.lock"), b"version = 1").unwrap();
+        let found = resolve_packaged_worker_script(&fake_exe).expect("complete packaged layout");
+        assert_eq!(found, std::fs::canonicalize(&script).unwrap());
+    }
+
+    #[test]
+    fn resolve_default_worker_falls_back_to_packaged_sibling_layout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing_src = dir.path().join("no_source_root");
+        let exe_dir = dir.path().join("bin");
+        let pw_dir = dir.path().join("python-worker");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&pw_dir).unwrap();
+        let fake_exe = exe_dir.join("forge-mcp");
+        std::fs::write(&fake_exe, b"bin").unwrap();
+        let script = pw_dir.join("forge_gpu_worker.py");
+        std::fs::write(&script, b"# worker").unwrap();
+        std::fs::write(pw_dir.join("pyproject.toml"), b"[project]").unwrap();
+        std::fs::write(pw_dir.join("uv.lock"), b"version = 1").unwrap();
+
+        let found = resolve_default_worker_script_with(None, Some(&missing_src), Some(&fake_exe))
+            .expect("falls back to packaged sibling layout");
+        assert_eq!(found, std::fs::canonicalize(&script).unwrap());
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -769,5 +840,47 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(!alive(pid), "grandchild {pid} survived the timeout");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    fn pid_alive(pid: &str) -> bool {
+        let needle = format!("\"{pid}\"");
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&needle))
+    }
+
+    #[test]
+    fn timeout_kills_windows_grandchild_process_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("grandchild.pid");
+        let mut cmd = Command::new("powershell");
+        cmd.env("FORGE_TEST_PID_FILE", &pid_file).args([
+            "-NoLogo",
+            "-NonInteractive",
+            "-NoProfile",
+            "-Command",
+            "$p = Start-Process -FilePath 'ping.exe' -ArgumentList '-n','60','127.0.0.1' -NoNewWindow -PassThru; [IO.File]::WriteAllText($env:FORGE_TEST_PID_FILE, [string]$p.Id); Wait-Process -Id $p.Id",
+        ]);
+        let Err(err) = run_with_timeout(cmd, Duration::from_secs(10)) else {
+            panic!("worker finished before the timeout");
+        };
+        assert!(err.to_string().contains("timed out"), "{err}");
+
+        let pid = std::fs::read_to_string(&pid_file).expect("pid file written by worker");
+        let pid = pid.trim();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pid_alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            !pid_alive(pid),
+            "Windows grandchild PID {pid} survived timeout kill_tree"
+        );
     }
 }

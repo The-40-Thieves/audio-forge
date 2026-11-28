@@ -15,8 +15,13 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+divan = { version = "6.1.0", package = "codspeed-divan-compat" }
 tempfile.workspace = true
 assert_no_alloc = { git = "https://github.com/robbert-vdh/rust-assert-no-alloc.git", branch = "feature/nested-permit-forbid", features = ["warn_debug"] }
+
+[[bench]]
+name = "engine"
+harness = false
 
 [lints]
 workspace = true

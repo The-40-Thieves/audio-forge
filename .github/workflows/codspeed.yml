@@ -28,15 +28,20 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install Linux audio dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
       - name: Setup rust toolchain, cache and cargo-codspeed binary
         uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3 # v1.3.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           channel: stable
           cache-target: release
           bins: cargo-codspeed
 
       - name: Build the benchmark target(s)
-        run: cargo codspeed build -m simulation -p forge-dsp -p forge-vocal -p forge-theory
+        run: cargo codspeed build -m simulation -p forge-dsp -p forge-vocal -p forge-theory -p forge-engine
 
       # upload-artifact drops the executable bit, so ship the binaries as a tarball.
       - name: Pack the benchmark binaries
@@ -66,6 +71,8 @@ jobs:
       # No cache here, so this job never writes a cache entry.
       - name: Setup rust toolchain and cargo-codspeed binary
         uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3 # v1.3.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           channel: stable
           cache: false
@@ -82,4 +89,4 @@ jobs:
         uses: CodSpeedHQ/action@af75f77f17a054769abefaa42fe8dc2975469b5f # v5.6.3
         with:
           mode: simulation
-          run: cargo codspeed run -p forge-dsp -p forge-vocal -p forge-theory
+          run: cargo codspeed run -p forge-dsp -p forge-vocal -p forge-theory -p forge-engine

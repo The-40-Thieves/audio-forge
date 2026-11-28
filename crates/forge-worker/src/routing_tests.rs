@@ -208,7 +208,10 @@ fn require_neural_fails_instead_of_falling_back_to_dsp() {
 fn auto_tries_colab_after_a_missing_local_worker() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = config(WorkerBackend::Auto);
-    cfg.colab_url = Some(serve_once(Some((200, colab_reply(b"RIFFcolab")))));
+    cfg.colab_url = Some(serve_once(Some((
+        200,
+        colab_reply(b"RIFF\x24\x00\x00\x00WAVEcolab"),
+    ))));
     let stems = dir.path().join("stems");
     let report = separate_stems(&write_mix(dir.path()), &stems, &cfg).unwrap();
     assert_eq!(
@@ -220,7 +223,10 @@ fn auto_tries_colab_after_a_missing_local_worker() {
     assert!(report.fallbacks[0].starts_with("local_gpu skipped"));
     let vocals = report.bundle.vocals.unwrap();
     assert_eq!(vocals, stems.join("colab_vocals.wav"));
-    assert_eq!(std::fs::read(vocals).unwrap(), b"RIFFcolab");
+    assert_eq!(
+        std::fs::read(vocals).unwrap(),
+        b"RIFF\x24\x00\x00\x00WAVEcolab"
+    );
 }
 
 #[test]

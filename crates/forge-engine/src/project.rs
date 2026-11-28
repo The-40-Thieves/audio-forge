@@ -178,6 +178,8 @@ pub enum FxSlotConfig {
     DrumTrigger {
         bypass: bool,
         threshold_db: f32,
+        #[serde(default = "default_drum_mix")]
+        mix: f32,
     },
 }
 
@@ -355,12 +357,17 @@ impl FxSlotConfig {
         Self::DrumTrigger {
             bypass: false,
             threshold_db: -24.0,
+            mix: 0.35,
         }
     }
 }
 
 fn default_one_f32() -> f32 {
     1.0
+}
+
+fn default_drum_mix() -> f32 {
+    0.35
 }
 
 /// Samplitude-style **Audio Object** living on a track timeline.
@@ -824,6 +831,18 @@ impl DawProject {
         id
     }
 
+    /// Recomputes sample positions/lengths for any MIDI clips anchored in musical beats (`*_beats`)
+    /// after a tempo (`bpm`) or `sample_rate` change.
+    pub fn rescale_musical_midi_clips(&mut self) {
+        let sr = self.sample_rate.max(8_000);
+        let bpm = self.clean_base_bpm();
+        for tr in &mut self.tracks {
+            for mc in &mut tr.midi_clips {
+                mc.sync_samples_from_beats(sr, bpm);
+            }
+        }
+    }
+
     /// Total timeline length in samples across all audio objects and MIDI clips (minimum 10 seconds).
     pub fn total_length_samples(&self) -> u64 {
         let max_audio = self
@@ -904,6 +923,12 @@ impl DawProject {
             )));
         }
         let mut proj: Self = serde_json::from_str(raw)?;
+        if proj.schema_version == 0 || proj.schema_version > PROJECT_SCHEMA_VERSION {
+            return Err(ForgeError::InvalidParameter(format!(
+                "Unsupported project schema_version {} (supported: 1..={PROJECT_SCHEMA_VERSION})",
+                proj.schema_version
+            )));
+        }
         proj.sample_rate = proj.sample_rate.clamp(8_000, 384_000);
         if !proj.bpm.is_finite() {
             proj.bpm = 120.0;

@@ -1,3 +1,3 @@
 # Workspace Clippy configuration for ForgeAudio.
-msrv = "1.87"
+msrv = "1.95"
 too-many-arguments-threshold = 8

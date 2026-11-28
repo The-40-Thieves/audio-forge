@@ -308,4 +308,28 @@ mod tests {
         let output = sb.resolve("master.wav").expect("allowed");
         assert!(sb.check(&output.with_extension("delivery.json")).is_err());
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn junction_escaping_root_is_rejected() {
+        let (dir, sb) = sandbox();
+        let other = tempfile::tempdir().expect("tempdir");
+        std::fs::write(other.path().join("victim.wav"), b"keep").expect("write");
+        let link = dir.path().join("junc");
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &other.path().to_string_lossy(),
+            ])
+            .status()
+            .expect("invoke mklink");
+        if status.success() {
+            let err = sb.resolve("junc\\victim.wav");
+            let _ = std::fs::remove_dir(&link);
+            assert!(err.is_err(), "junction escape should be rejected");
+        }
+    }
 }

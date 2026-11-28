@@ -89,6 +89,8 @@ READY
 | `forge_evaluate_quality` | Perceptual audio quality scoring (Meta Audiobox Aesthetics PQ/PC/CE/CU, SingMOS, or acoustic proxy metrics). |
 | `forge_daw_inspect` | Validate and inspect a ForgeStudio DAW `.forgeproj` session (BPM, sample rate, tracks, objects, MIDI clips, aux buses, total PDC). |
 | `forge_daw_bounce` | Headless 24-bit WAV mastering bounce (with BS.1770-4 audit) and optional batch per-track stem WAV export from a `.forgeproj` session. |
+| `forge_f0_track` | Fundamental frequency (F0) contour extraction via RMVPE, SwiftF0/FCPE, autocorrelation, or pure-Rust YIN pitch tracking. |
+| `forge_spatial_qc` | ITU-R BS.2076 ADM BWF (`axml`/`chna`/`bext`) bed/object metadata validation, 3D VBAP reference object rendering (`5.1`/`7.1`/`7.1.4`), and preliminary BS.1770-5 Annex 3/4 loudness QC (not Atmos certification). |
 
 ### Delivery targets
 
@@ -148,7 +150,7 @@ These are independent implementations of well-known techniques. They are not clo
 | Loudness and limiter | BS.1770-4 metering, then gain to target and a 3 ms lookahead true-peak limiter with a final true-peak trim. | FabFilter Pro-L, loudness meters | [`loudness_limiter.rs`](crates/forge-dsp/src/loudness_limiter.rs), EBU reference tests |
 | Mastering EQ and tone match | 18-band EQ, plus curves matched to a reference track or to built-in genre tonal-balance targets. | Ozone, Tonal Balance Control | [`elite_dsp.rs`](crates/forge-dsp/src/elite_dsp.rs), [`restoration.rs`](crates/forge-dsp/src/restoration.rs) |
 | Transient and tonal split | A 3-band transient/sustain split with independent shaping. | Eventide SplitEQ | [`elite_dsp.rs`](crates/forge-dsp/src/elite_dsp.rs), proptest partition of unity |
-| Density and clipper | Upward low-level compression and a 3-band, 2x oversampled, first-order ADAA `tanh` clipper. | oeksound Bloom, multiband clippers | [`elite_dsp.rs`](crates/forge-dsp/src/elite_dsp.rs), ADAA proptests |
+| Density and clipper | Upward low-level compression and a 3-band, 4x oversampled, first-order ADAA `tanh` clipper. | oeksound Bloom, multiband clippers | [`elite_dsp.rs`](crates/forge-dsp/src/elite_dsp.rs), ADAA proptests |
 | SpaceVerb and preamp | An 8x8 Walsh-Hadamard FDN reverb with ducking and shimmer, plus a small dilated causal WaveNet preamp model. | Valhalla reverbs, NAM-style amp modeling | [`elite_dsp.rs`](crates/forge-dsp/src/elite_dsp.rs), FDN decay and hysteresis proptests |
 | Music theory | A voice-leading solver, Neo-Soul and jazz reharmonization, Dilla/MPC micro-timing, audio-to-MIDI drum triggers, and ABC export. | Scaler, Slate Trigger | [`forge-theory`](crates/forge-theory/src/lib.rs): unit test and proptests |
 | Stem separation | Dispatches to a local or Colab GPU worker that runs Mel-Band-RoFormer (`FORGE_WORKER_BACKEND`, `FORGE_COLAB_WORKER_URL`). Without a worker it falls back to a basic Rust DSP band split and reports which backend ran. | Stem-splitting services | [`forge-worker`](crates/forge-worker/), [`python-worker/`](python-worker/) |

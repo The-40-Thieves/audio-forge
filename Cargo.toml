@@ -31,7 +31,7 @@ exclude = ["vendor"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.95"
 license = "Apache-2.0"
 authors = ["The 40 Thieves"]
 repository = "https://github.com/The-40-Thieves/audio-forge"
@@ -81,9 +81,9 @@ cpal = "0.18"
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "wgpu", "glow", "x11", "wayland"] }
 rfd = { version = "0.18", default-features = false, features = ["xdg-portal"] }
 
-# nih-plug's CLAP wrapper aborts the host on corrupt state and never asks the host to rescan
-# parameter values after loading state, which fails clap-validator. Until the fixes land upstream,
-# use a vendored copy of `nih_plug` at the locked upstream commit with those two fixes applied.
+# Vendored `nih_plug` (rev `de421011`) includes fixes not yet upstreamed: CLAP `ext_state_load`
+# chunked cap & `Task::RescanParamValues`, `Task::LatencyChanged` via `request_restart()` outside
+# `activate()`, and `src/audio_setup.rs` `main_output_name`. See `vendor/nih-plug/PATCHES.md`.
 [patch."https://github.com/robbert-vdh/nih-plug.git"]
 nih_plug = { path = "vendor/nih-plug" }
 

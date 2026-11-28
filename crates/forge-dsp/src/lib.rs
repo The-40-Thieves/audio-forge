@@ -1,5 +1,6 @@
 //! `forge-dsp` — Studio DSP, Restoration, Spectral Suppression, Unmasking, Alignment & Mastering.
 
+pub mod adm_render;
 pub mod beat_grid;
 pub mod delivery;
 pub mod drum_midi;
@@ -10,10 +11,14 @@ pub mod phase_align;
 pub mod realtime;
 pub mod resample;
 pub mod restoration;
+pub mod spatial_qc;
 pub mod spectral_defizz;
 pub mod spectral_unmask;
 pub mod spectrum;
 
+pub use adm_render::{
+    ReferenceLoudspeakerConfig, compute_vbap_gains, render_adm_programme_to_layout,
+};
 pub use beat_grid::{
     BeatGridReport, TempoPoint, analyze_beat_grid, quantize_to_constant_bpm, warp_buffer_wsola,
 };
@@ -31,10 +36,12 @@ pub use elite_dsp::{
     compute_genre_tonal_balance_eq,
 };
 pub use loudness_limiter::{
-    Biquad, CytomicSvf, DitherMode, LIMITER_LOOKAHEAD_MS, LIMITER_RELEASE_MS, LimiterStyle,
-    MasteringLimiterConfig, SILENCE_RMS_DBFS, SILENT_BAND_DB, TRUE_PEAK_PHASES, apply_dither,
-    audit_audio, compute_true_peak, flush_denormal_f64, normalize_and_limit,
-    normalize_and_limit_with_config, sanitize_param_f64, sanitize_sample_f32, sanitize_sample_f64,
+    Biquad, ChannelLayout, CytomicSvf, DitherMode, LIMITER_LOOKAHEAD_MS, LIMITER_RELEASE_MS,
+    LimiterStyle, MasteringLimiterConfig, SILENCE_RMS_DBFS, SILENT_BAND_DB, TRUE_PEAK_PHASES,
+    apply_dither, audit_audio, bs1770_5_channel_weights, bs1770_5_position_weight,
+    compute_bs1770_5_loudness, compute_bs1770_5_loudness_with_weights, compute_true_peak,
+    flush_denormal_f64, normalize_and_limit, normalize_and_limit_with_config, sanitize_param_f64,
+    sanitize_sample_f32, sanitize_sample_f64,
 };
 pub use phase_align::{PhaseAlignmentResult, align_phase_gcc_phat};
 pub use realtime::{
@@ -48,6 +55,11 @@ pub use restoration::{
     apply_hum_notch_cascade, apply_mid_side_spatial_cleanup, clean_vocal_surgical,
     compute_reference_match_eq, remove_dc_and_declip, run_full_restoration_chain,
     sum_audio_buffers,
+};
+pub use spatial_qc::{
+    LoudnessVerificationStatus, SpatialQcCheck, SpatialQcOptions, SpatialQcReport,
+    SpatialRenderMode, audit_spatial_adm_bwf, audit_spatial_adm_bwf_reader,
+    audit_spatial_adm_bwf_reader_with_options, audit_spatial_adm_bwf_with_options,
 };
 pub use spectral_defizz::{DeFizzConfig, apply_spectral_defizz};
 pub use spectral_unmask::{UnmaskConfig, apply_spectral_unmask};
@@ -142,6 +154,17 @@ mod tests {
                 unpacked_side[b]
             );
         }
+    }
+
+    #[test]
+    fn opensoothe_ultrasonic_lpf_bypasses_below_1000_hz() {
+        let mut soothe = RealtimeOpenSoothe::new(48_000.0);
+        soothe.set_ultrasonic_lpf_hz(500.0);
+        assert_eq!(soothe.ultrasonic_lpf_hz(), 0.0);
+        soothe.set_ultrasonic_lpf_hz(999.0);
+        assert_eq!(soothe.ultrasonic_lpf_hz(), 0.0);
+        soothe.set_ultrasonic_lpf_hz(16_000.0);
+        assert!((soothe.ultrasonic_lpf_hz() - 16_000.0).abs() < 1e-6);
     }
 
     #[test]

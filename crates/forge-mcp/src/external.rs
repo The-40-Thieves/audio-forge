@@ -14,11 +14,12 @@ use forge_core::{AudioBuffer, ForgeError, StemBundle};
 use forge_dsp::BeatGridReport;
 use forge_reaper::{ReleaseMetadata, write_distrokid_metadata};
 use forge_worker::{
-    DrumHit, MidiTranscribeResult, NeuralDenoiseResult, NeuralRestoreResult, QualityEvalResult,
-    SeparationConfig, SeparationReport, VocalRescueResult, evaluate_quality_hybrid,
-    index_drum_sample_library, neural_restore_hybrid, render_drum_sample_layer,
-    resolve_default_local_worker, run_local_neural_denoise, run_local_transcribe_midi,
-    separate_stems, track_beats_hybrid, vocal_rescue_hybrid,
+    DrumHit, F0TrackFrame, F0TrackResult, MidiTranscribeResult, NeuralDenoiseResult,
+    NeuralRestoreResult, QualityEvalResult, SeparationConfig, SeparationReport, VocalRescueResult,
+    evaluate_quality_hybrid, index_drum_sample_library, neural_restore_hybrid,
+    render_drum_sample_layer, resolve_default_local_worker, run_local_f0_track,
+    run_local_neural_denoise, run_local_transcribe_midi, separate_stems, track_beats_hybrid,
+    vocal_rescue_hybrid,
 };
 use std::fs::File;
 use std::io::{self, Write};
@@ -311,6 +312,85 @@ pub fn transcribe_midi_checked(
     Ok(res)
 }
 
+fn rust_f0_track_fallback(
+    staged_in: &Path,
+    hop_secs: f64,
+    mut warnings: Vec<String>,
+) -> Result<F0TrackResult, ForgeError> {
+    let buf = AudioBuffer::load(staged_in)?;
+    let actual_hop_secs = forge_vocal::yin_hop_secs(buf.sample_rate);
+    if (hop_secs - actual_hop_secs).abs() > 1e-4 {
+        warnings.push(format!(
+            "pure-Rust YIN fallback uses fixed {actual_hop_secs:.4}s hop (requested {hop_secs:.4}s)"
+        ));
+    }
+    let scale = forge_vocal::VocalScale::parse("C chromatic")?;
+    let raw_frames = forge_vocal::track_vocal_pitch(&buf, &scale, 1.0);
+    let frames: Vec<F0TrackFrame> = raw_frames
+        .iter()
+        .map(|f| F0TrackFrame {
+            time_secs: f.time_secs,
+            f0_hz: f.f0_hz,
+            voiced: f.f0_hz > 0.0,
+            confidence: if f.f0_hz > 0.0 { 0.85 } else { 0.0 },
+        })
+        .collect();
+    let mut voiced_hz: Vec<f64> = frames
+        .iter()
+        .filter(|f| f.voiced && f.f0_hz.is_finite() && f.f0_hz > 0.0)
+        .map(|f| f.f0_hz)
+        .collect();
+    voiced_hz.sort_by(f64::total_cmp);
+    let median_f0_hz = if voiced_hz.is_empty() {
+        None
+    } else {
+        Some(voiced_hz[voiced_hz.len() / 2])
+    };
+    let voiced_ratio = if frames.is_empty() {
+        0.0
+    } else {
+        (voiced_hz.len() as f64) / (frames.len() as f64)
+    };
+    Ok(F0TrackResult {
+        backend: "rust-yin".to_string(),
+        sample_rate: buf.sample_rate,
+        hop_secs: actual_hop_secs,
+        voiced_ratio,
+        median_f0_hz,
+        frames,
+        warnings,
+    })
+}
+
+/// Extracts frame-level F0 pitch contour (`rmvpe`/`fcpe`/`autocorr` worker, or `rust` YIN fallback)
+/// from a private staged copy of `input`.
+pub fn f0_track_checked(
+    sandbox: &PathSandbox,
+    input: &Path,
+    backend: &str,
+    hop_secs: f64,
+    timeout: Duration,
+) -> Result<F0TrackResult, ForgeError> {
+    let stage = tempfile::tempdir()?;
+    let staged_in = stage_in(sandbox, input, stage.path())?;
+    if backend.eq_ignore_ascii_case("rust") {
+        return rust_f0_track_fallback(&staged_in, hop_secs, Vec::new());
+    }
+    match resolve_default_local_worker()
+        .and_then(|worker| run_local_f0_track(&worker, &staged_in, backend, hop_secs, timeout))
+    {
+        Ok(res) => Ok(res),
+        Err(err) if backend.eq_ignore_ascii_case("auto") => rust_f0_track_fallback(
+            &staged_in,
+            hop_secs,
+            vec![format!(
+                "worker skipped ({err}), used pure-Rust YIN fallback"
+            )],
+        ),
+        Err(err) => Err(err),
+    }
+}
+
 /// Indexes `.wav` one-shots from a sandboxed `samples_dir` inside a private staging directory
 /// and renders a sample-layered drum track without unanchored directory reads in `FORGE_MCP_ROOT`.
 pub fn render_drum_layer_checked(
@@ -443,5 +523,45 @@ mod tests {
             key: None,
             year: None,
         }
+    }
+
+    #[test]
+    fn rust_f0_track_fallback_reports_actual_yin_hop_secs() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let sandbox = PathSandbox::new([root.path().to_path_buf()]).expect("sandbox");
+        let wav_path = sandbox
+            .check(&root.path().join("tone.wav"))
+            .expect("checked wav");
+        let sr = 48_000_u32;
+        let samples: Vec<f64> = (0..sr)
+            .map(|i| {
+                0.3 * (2.0 * std::f64::consts::PI * 220.0 * f64::from(i) / f64::from(sr)).sin()
+            })
+            .collect();
+        AudioBuffer::from_channels(vec![samples], sr)
+            .expect("buf")
+            .save_wav(&wav_path, 24)
+            .expect("save");
+
+        let res = f0_track_checked(&sandbox, &wav_path, "rust", 0.005, Duration::from_secs(5))
+            .expect("rust f0 track");
+        let expected_hop = forge_vocal::yin_hop_secs(sr);
+        assert!(
+            (res.hop_secs - expected_hop).abs() < 1e-9,
+            "expected actual YIN hop {expected_hop}, got {}",
+            res.hop_secs
+        );
+        assert!(res.frames.len() >= 2);
+        let spacing = res.frames[1].time_secs - res.frames[0].time_secs;
+        assert!(
+            (spacing - res.hop_secs).abs() < 1e-6,
+            "frame spacing {spacing} disagreed with reported hop_secs {}",
+            res.hop_secs
+        );
+        assert!(
+            res.warnings.iter().any(|w| w.contains("fixed 0.0200s hop")),
+            "expected hop override warning, got {:?}",
+            res.warnings
+        );
     }
 }

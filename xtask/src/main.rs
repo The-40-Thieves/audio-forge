@@ -7,6 +7,8 @@
 //!   Bundles all 11 individual standalone VST3 & CLAP plugins into `target/bundled/`.
 //! - `cargo run --package xtask -- install <plugin-name|--all> [--release] [--dest <folder>]`
 //!   Bundles and installs an individual plugin (or `--all` 11 standalone plugins) into the DAW VST3 & CLAP directories.
+//! - `cargo run --package xtask -- wrap-au <plugin-name|--all> [--release] [--out <folder>]`
+//!   Wraps bundled CLAP plugins as macOS Audio Unit v2 (`.component`) bundles via `clap-wrapper` (`cmake`).
 //! - `cargo run --package xtask -- list`
 //!   Lists all 11 standalone VST3/CLAP plugins and their descriptions.
 //! - `cargo run --package xtask -- check`
@@ -51,7 +53,7 @@ pub const STANDALONE_PLUGINS: [(&str, &str); 11] = [
     ),
     (
         "forge-density-clipper",
-        "Forge Density & 3-Band ADAA Clipper (Upward Low-Level Density Compressor + 2x ADAA Soft Clipper)",
+        "Forge Density & 3-Band ADAA Clipper (Upward Low-Level Density Compressor + 4x ADAA Soft Clipper)",
     ),
     (
         "forge-spaceverb",
@@ -69,7 +71,7 @@ fn main() -> nih_plug_xtask::Result<()> {
 
     match subcommand {
         "list" => {
-            println!("ForgeAudio Standalone VST3 & CLAP Plugins (10 Individual Packages):");
+            println!("ForgeAudio Standalone VST3 & CLAP Plugins (11 Individual Packages):");
             for (idx, (pkg, desc)) in STANDALONE_PLUGINS.iter().enumerate() {
                 println!(
                     "  {:2}. {:22} -> {}.vst3 / {}.clap\n      {}",
@@ -90,6 +92,7 @@ fn main() -> nih_plug_xtask::Result<()> {
             Ok(())
         }
         "install" => run_install(&args[1..]),
+        "wrap-au" => run_wrap_au(&args[1..]),
         "check" => run_check(),
         _ => nih_plug_xtask::main_with_args("cargo xtask", args),
     }
@@ -137,7 +140,7 @@ fn parse_install_args(args: &[String]) -> Result<InstallArgs, UsageError> {
         match arg.as_str() {
             "--release" => is_release = true,
             "--all" => install_all = true,
-            "--dest" => dest = Some(take_dest_value(iter.next())?),
+            "--dest" => dest = Some(take_dir_value("--dest", iter.next())?),
             flag if flag.starts_with("--") => {
                 return Err(UsageError(format!("unknown argument `{flag}`")));
             }
@@ -152,11 +155,63 @@ fn parse_install_args(args: &[String]) -> Result<InstallArgs, UsageError> {
     })
 }
 
-fn take_dest_value(value: Option<&String>) -> Result<PathBuf, UsageError> {
+fn take_dir_value(flag: &str, value: Option<&String>) -> Result<PathBuf, UsageError> {
     match value {
         Some(dir) if !dir.is_empty() && !dir.starts_with("--") => Ok(PathBuf::from(dir)),
-        _ => Err(UsageError("`--dest` requires a directory".to_string())),
+        _ => Err(UsageError(format!("`{flag}` requires a directory"))),
     }
+}
+
+const WRAP_AU_USAGE: &str =
+    "Usage: cargo run --package xtask -- wrap-au <plugin-name|--all> [--release] [--out <dir>]";
+
+/// Parsed arguments of the `wrap-au` subcommand.
+#[derive(Debug, PartialEq, Eq)]
+struct WrapAuArgs {
+    all: bool,
+    plugins: Vec<String>,
+    release: bool,
+    out_dir: Option<PathBuf>,
+}
+
+/// Parses arguments that follow `wrap-au`.
+fn parse_wrap_au_args(args: &[String]) -> Result<WrapAuArgs, CheckError> {
+    let mut release = false;
+    let mut all = false;
+    let mut out_dir = None;
+    let mut plugin: Option<&str> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--release" => release = true,
+            "--all" => all = true,
+            "--out" => {
+                out_dir = Some(
+                    take_dir_value("--out", iter.next())
+                        .map_err(|e| CheckError(format!("{}\n{WRAP_AU_USAGE}", e.0)))?,
+                );
+            }
+            flag if flag.starts_with("--") => {
+                return Err(CheckError(format!(
+                    "unknown argument `{flag}`\n{WRAP_AU_USAGE}"
+                )));
+            }
+            name => {
+                plugin = Some(
+                    take_plugin_name(plugin, name)
+                        .map_err(|e| CheckError(format!("{}\n{WRAP_AU_USAGE}", e.0)))?,
+                );
+            }
+        }
+    }
+    let plugins = resolve_targets(all, plugin)
+        .map_err(|e| CheckError(format!("{}\n{WRAP_AU_USAGE}", e.0)))?;
+    Ok(WrapAuArgs {
+        all,
+        plugins,
+        release,
+        out_dir,
+    })
 }
 
 fn take_plugin_name<'a>(previous: Option<&str>, name: &'a str) -> Result<&'a str, UsageError> {
@@ -274,7 +329,91 @@ fn run_install(args: &[String]) -> nih_plug_xtask::Result<()> {
     Ok(())
 }
 
-/// Copies a plugin bundle, which is a directory on macOS (and for VST3 everywhere)
+fn run_wrap_au(args: &[String]) -> nih_plug_xtask::Result<()> {
+    let parsed = parse_wrap_au_args(args)?;
+    run_wrap_au_for_targets(&parsed, cfg!(target_os = "macos"))
+}
+
+fn run_wrap_au_for_targets(parsed: &WrapAuArgs, is_macos: bool) -> nih_plug_xtask::Result<()> {
+    if !is_macos {
+        return Err(CheckError(format!(
+            "wrap-au requires macOS (`clap-wrapper` + `cmake`/`auval` build AUv2 .component bundles only on macOS); resolved targets: {}",
+            parsed.plugins.join(", ")
+        ))
+        .into());
+    }
+    ensure_macos_wrap_tools()?;
+    let bundled_root = PathBuf::from("target").join("bundled");
+    let out_dir = parsed.out_dir.as_deref().unwrap_or(bundled_root.as_path());
+    std::fs::create_dir_all(out_dir)?;
+    for pkg in &parsed.plugins {
+        let clap_path = bundled_root.join(format!("{pkg}.clap"));
+        if !clap_path.exists() {
+            bundle_single_package(pkg, parsed.release)?;
+        }
+        invoke_clap_wrapper_au(pkg, &clap_path, out_dir, parsed.release)?;
+    }
+    Ok(())
+}
+
+fn ensure_macos_wrap_tools() -> nih_plug_xtask::Result<()> {
+    let cmake_ok = Command::new("cmake")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !cmake_ok {
+        return Err(CheckError(
+            "wrap-au requires `cmake` on PATH (`brew install cmake`) to invoke clap-wrapper"
+                .to_string(),
+        )
+        .into());
+    }
+    let wrapper_dir = std::env::var_os("CLAP_WRAPPER_DIR").filter(|p| Path::new(p).is_dir());
+    if wrapper_dir.is_none() {
+        return Err(CheckError(
+            "wrap-au requires CLAP_WRAPPER_DIR to point to a local clap-wrapper checkout"
+                .to_string(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn invoke_clap_wrapper_au(
+    pkg: &str,
+    clap_path: &Path,
+    out_dir: &Path,
+    release: bool,
+) -> nih_plug_xtask::Result<()> {
+    let wrapper_dir = PathBuf::from(
+        std::env::var_os("CLAP_WRAPPER_DIR")
+            .ok_or_else(|| CheckError("CLAP_WRAPPER_DIR is not set".to_string()))?,
+    );
+    let build_dir = out_dir.join(format!(".wrap-au-{pkg}"));
+    let cfg = if release { "Release" } else { "Debug" };
+    let configure = Command::new("cmake")
+        .arg("-S")
+        .arg(&wrapper_dir)
+        .arg("-B")
+        .arg(&build_dir)
+        .arg(format!("-DCMAKE_BUILD_TYPE={cfg}"))
+        .arg(format!("-DCLAP_WRAPPER_INPUT={}", clap_path.display()))
+        .arg(format!("-DCLAP_WRAPPER_OUTPUT_DIR={}", out_dir.display()))
+        .status()?;
+    if !configure.success() {
+        return Err(CheckError(format!("cmake configure failed for `{pkg}`")).into());
+    }
+    let build = Command::new("cmake")
+        .arg("--build")
+        .arg(&build_dir)
+        .arg("--config")
+        .arg(cfg)
+        .status()?;
+    if !build.success() {
+        return Err(CheckError(format!("cmake build failed for `{pkg}`")).into());
+    }
+    Ok(())
+}
 /// but a single file for CLAP on Windows and Linux.
 fn copy_bundle(src: &Path, dst: &Path) -> std::io::Result<()> {
     if src.is_dir() {
@@ -492,5 +631,40 @@ mod tests {
         let labels: Vec<&str> = CHECK_STEPS.iter().map(|s| s.label).collect();
         assert_eq!(labels, vec!["rustfmt", "clippy", "test", "rustdoc"]);
         assert!(CHECK_STEPS.iter().all(|s| !s.args.is_empty()));
+    }
+
+    #[test]
+    fn wrap_au_parses_single_all_release_and_out_dir() {
+        let single =
+            parse_wrap_au_args(&args(&["forge-spliteq", "--release", "--out", "au-out"])).unwrap();
+        assert_eq!(
+            single,
+            WrapAuArgs {
+                all: false,
+                plugins: vec!["forge-spliteq".to_string()],
+                release: true,
+                out_dir: Some(PathBuf::from("au-out")),
+            }
+        );
+
+        let all = parse_wrap_au_args(&args(&["--all"])).unwrap();
+        assert!(all.all);
+        assert_eq!(all.plugins.len(), STANDALONE_PLUGINS.len());
+        assert!(!all.release);
+        assert_eq!(all.out_dir, None);
+
+        let err = parse_wrap_au_args(&args(&["forge-spliteq", "--bad-flag"])).unwrap_err();
+        assert!(err.0.contains("--bad-flag") && err.0.contains(WRAP_AU_USAGE));
+    }
+
+    #[test]
+    fn wrap_au_reports_clear_error_off_macos() {
+        let parsed = parse_wrap_au_args(&args(&["forge-master-limiter"])).unwrap();
+        let err = run_wrap_au_for_targets(&parsed, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("macOS") && msg.contains("forge-master-limiter"),
+            "{msg}"
+        );
     }
 }

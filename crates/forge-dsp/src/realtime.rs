@@ -65,6 +65,18 @@ impl ParamSmoother {
             flush_denormal_f64(self.coeff * self.current + (1.0 - self.coeff) * self.target);
         self.current
     }
+
+    #[inline]
+    pub fn reset(&mut self, value: f64) {
+        let v = if value.is_finite() { value } else { 0.0 };
+        self.current = v;
+        self.target = v;
+    }
+
+    #[inline]
+    pub fn current(&self) -> f64 {
+        self.current
+    }
 }
 
 /// Pre-allocated zero-allocation Stereo Overlap-Add STFT engine shared by spectral processors.
@@ -697,12 +709,12 @@ impl RealtimeOpenSoothe {
         ];
     }
 
-    /// Sets optional ultrasonic gentle Butterworth LPF cutoff in Hz (`<= 0.0` or `>= 0.49 * sr`
+    /// Sets optional ultrasonic gentle Butterworth LPF cutoff in Hz (`< 1_000.0` or `>= 0.48 * sr`
     /// bypasses cleanly). Zero-alloc.
     #[inline]
     pub fn set_ultrasonic_lpf_hz(&mut self, hz: f64) {
         let nyquist_guard = (0.48 * self.sample_rate).max(1_000.0);
-        if !hz.is_finite() || hz <= 0.0 || hz >= nyquist_guard {
+        if !hz.is_finite() || hz < 1_000.0 || hz >= nyquist_guard {
             self.ultrasonic_lpf_hz = 0.0;
             return;
         }

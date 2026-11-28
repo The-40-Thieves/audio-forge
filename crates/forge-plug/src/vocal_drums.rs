@@ -117,8 +117,47 @@ impl_standard_plugin_default!(
     RealtimeVocalSurgical
 );
 
+impl ForgeVocalSurgicalPlug {
+    pub(crate) fn process_slices(&mut self, main_slices: &mut [&mut [f32]]) {
+        let len = main_slices.first().map_or(0, |s| s.len());
+        for i in 0..len {
+            let ctl = next_vocal_surgical_controls(&self.params);
+            let in_l = main_slices
+                .first()
+                .and_then(|c| c.get(i).copied())
+                .unwrap_or(0.0);
+            let in_r = main_slices
+                .get(1)
+                .and_then(|c| c.get(i).copied())
+                .unwrap_or(in_l);
+            let (out_l, out_r) = self.dsp.process_stereo_sample(
+                in_l,
+                in_r,
+                ctl.declick,
+                ctl.deplosive,
+                ctl.deess_db,
+                ctl.gate_db,
+            );
+            let gr_est = estimate_gr_db(in_l, in_r, out_l, out_r);
+            self.analyzer.push_stereo_sample(out_l, out_r);
+            self.telemetry
+                .update_peaks(in_l, in_r, out_l, out_r, gr_est);
+            if let Some(c0) = main_slices.first_mut() {
+                c0[i] = out_l;
+            }
+            if let Some(c1) = main_slices.get_mut(1) {
+                c1[i] = out_r;
+            }
+        }
+        finish_block_spectrum(&self.analyzer, &self.telemetry);
+    }
+}
+
 impl Plugin for ForgeVocalSurgicalPlug {
-    forge_plugin_common!("Forge Vocal Surgical Strip", crate::chassis::STEREO_LAYOUTS);
+    forge_plugin_common!(
+        "Forge Vocal Surgical Strip",
+        crate::chassis::STEREO_OR_MONO_LAYOUTS
+    );
 
     forge_ab_editor!(
         title: "FORGE VOCAL SURGICAL STRIP",
@@ -141,30 +180,13 @@ impl Plugin for ForgeVocalSurgicalPlug {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        for mut channel_samples in buffer.iter_samples() {
-            let ctl = next_vocal_surgical_controls(&self.params);
-            let (in_l, in_r) = read_stereo(&mut channel_samples);
-            let (out_l, out_r) = self.dsp.process_stereo_sample(
-                in_l,
-                in_r,
-                ctl.declick,
-                ctl.deplosive,
-                ctl.deess_db,
-                ctl.gate_db,
-            );
-            let gr_est = estimate_gr_db(in_l, in_r, out_l, out_r);
-            finish_stereo_sample(
-                &mut self.analyzer,
-                &self.telemetry,
-                &mut channel_samples,
-                in_l,
-                in_r,
-                out_l,
-                out_r,
-                gr_est,
-            );
+        let main_slices = buffer.as_slice();
+        let mut refs: [&mut [f32]; 2] = [&mut [], &mut []];
+        let count = main_slices.len().min(2);
+        for (dst, src) in refs.iter_mut().zip(main_slices.iter_mut()).take(count) {
+            *dst = src;
         }
-        finish_block_spectrum(&self.analyzer, &self.telemetry);
+        self.process_slices(&mut refs[..count]);
         ProcessStatus::Normal
     }
 }
@@ -251,7 +273,7 @@ impl Default for ForgeDrumTriggerPlug {
 impl Plugin for ForgeDrumTriggerPlug {
     forge_plugin_common!(
         "Forge Drum Trigger & Theory MIDI",
-        crate::chassis::STEREO_LAYOUTS,
+        crate::chassis::STEREO_OR_MONO_LAYOUTS,
         midi_in = MidiConfig::Basic,
         midi_out = MidiConfig::Basic
     );
@@ -314,7 +336,7 @@ impl Plugin for ForgeDrumTriggerPlug {
                 pending = context.next_event();
             }
 
-            let (in_l, in_r) = read_stereo(&mut channel_samples);
+            let (in_l, in_r) = read_stereo_or_mono(&mut channel_samples);
             self.analyzer.push_stereo_sample(in_l, in_r);
             self.telemetry.update_peaks(in_l, in_r, in_l, in_r, 0.0);
             self.trigger_drums(context, sample_idx as u32, in_l, in_r, thresh);
@@ -565,7 +587,8 @@ impl Default for VocalTuneParams {
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
             .with_value_to_string(formatters::v2s_f32_percentage(0))
-            .with_string_to_value(formatters::s2v_f32_percentage()),
+            .with_string_to_value(formatters::s2v_f32_percentage())
+            .with_smoother(SmoothingStyle::Linear(10.0)),
             humanize: FloatParam::new(
                 "Humanize (Vibrato)",
                 0.15,
@@ -585,7 +608,8 @@ impl Default for VocalTuneParams {
             .with_unit(" st"),
             wet_mix: FloatParam::new("Wet Mix", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
                 .with_value_to_string(formatters::v2s_f32_percentage(0))
-                .with_string_to_value(formatters::s2v_f32_percentage()),
+                .with_string_to_value(formatters::s2v_f32_percentage())
+                .with_smoother(SmoothingStyle::Linear(10.0)),
         }
     }
 }
